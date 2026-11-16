@@ -84,6 +84,7 @@ async fn test_state() -> AppState {
         known_proxies: Arc::new(Vec::new()),
         ws_broadcast: ws_tx,
         log_level_tx: _log_level_tx,
+        live_log: Default::default(),
         cache,
         image_cache,
         http_client: reqwest::Client::new(),
@@ -19697,6 +19698,7 @@ async fn b103_log_reaches(state: &AppState, socket: &mut G1cSocket) -> bool {
         level: "INFO".to_string(),
         message: "b103: a server log line".to_string(),
         target: None,
+        seq: None,
     };
     state
         .ws_broadcast
@@ -28786,6 +28788,7 @@ async fn g1c_session_events_reach_only_their_owner_and_admins() {
         level: "INFO".to_string(),
         message: format!("g1c: a log line naming {owner_id}"),
         target: None,
+        seq: None,
     };
     let events = [
         WsEvent::SessionChanged {
@@ -30285,6 +30288,173 @@ async fn b17_new_socket_lists_the_scans_in_progress() {
         Vec::<String>::new(),
         "no scan is in progress"
     );
+}
+
+// R3 live log: LiveLogStart replays the kept lines, then sends new ones, to an administrator only.
+
+fn r3livelog_line(message: &str) -> rustyfin_model::ws_event::LogMessageData {
+    rustyfin_model::ws_event::LogMessageData {
+        timestamp: "2026-11-15T10:00:00.000+00:00".to_string(),
+        level: "INFO".to_string(),
+        message: message.to_string(),
+        target: Some("rustyfin_core::scanner".to_string()),
+        seq: None,
+    }
+}
+
+/// The messages of the socket's next `count` LogMessage frames.
+async fn r3livelog_next(socket: &mut G1cSocket, count: usize) -> Vec<serde_json::Value> {
+    let mut frames = Vec::new();
+    while frames.len() < count {
+        let frame = tokio::time::timeout(std::time::Duration::from_secs(5), socket.next())
+            .await
+            .expect("a log line within 5 s");
+        if frame["MessageType"] == "LogMessage" {
+            frames.push(frame["Data"].clone());
+        }
+    }
+    frames
+}
+
+#[tokio::test]
+async fn r3livelog_socket_replays_the_history_before_new_lines() {
+    let state = test_state().await;
+    let app = app(state.clone());
+    let (owner, _, viewer, _) = g1_owner_and_viewer(&state, &app).await;
+    let addr = b17_serve(&app).await;
+    state.live_log.push(r3livelog_line("first"));
+    state.live_log.push(r3livelog_line("second task=3"));
+
+    let mut socket = G1cSocket::open(addr, &owner).await;
+    r3tasks_send(&mut socket, r#"{"MessageType":"LiveLogStart"}"#).await;
+    let replay = r3livelog_next(&mut socket, 2).await;
+    assert_eq!(replay[0]["Message"], "first");
+    assert_eq!(replay[1]["Message"], "second task=3");
+    assert_eq!(replay[1]["Level"], "INFO");
+    assert_eq!(replay[1]["Target"], "rustyfin_core::scanner");
+    assert_eq!(replay[1]["Timestamp"], "2026-11-15T10:00:00.000+00:00");
+
+    state.live_log.push(r3livelog_line("third"));
+    assert_eq!(r3livelog_next(&mut socket, 1).await[0]["Message"], "third");
+
+    // A user who is not an administrator gets no log lines, neither the replay nor new ones.
+    let mut other = G1cSocket::open(addr, &viewer).await;
+    r3tasks_send(&mut other, r#"{"MessageType":"LiveLogStart"}"#).await;
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    state.live_log.push(r3livelog_line("fourth"));
+    assert_eq!(r3livelog_next(&mut socket, 1).await[0]["Message"], "fourth");
+    let marker = WsEvent::LibraryChanged {
+        data: serde_json::json!({ "LibraryName": "g1c-end" }),
+    };
+    state.ws_broadcast.send(marker).unwrap();
+    assert_eq!(other.until_end().await, Vec::<String>::new());
+}
+
+/// Pushes a log line, then the "g1c-end" marker after the line has had time to arrive, and says
+/// whether `socket` got the line.
+async fn r3livelog_reaches(state: &AppState, socket: &mut G1cSocket, message: &str) -> bool {
+    state.live_log.push(r3livelog_line(message));
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    let marker = WsEvent::LibraryChanged {
+        data: serde_json::json!({ "LibraryName": "g1c-end" }),
+    };
+    state.ws_broadcast.send(marker).unwrap();
+    socket
+        .until_end()
+        .await
+        .iter()
+        .any(|frame| frame == "LogMessage")
+}
+
+// A demoted administrator's live log stops once the socket rechecks the token, every 5 s.
+#[tokio::test]
+async fn r3livelog_a_demoted_administrator_stops_getting_lines() {
+    let t = b103().await;
+    let addr = b17_serve(&t.app).await;
+    let mut socket = G1cSocket::open(addr, &t.ada).await;
+    r3tasks_send(&mut socket, r#"{"MessageType":"LiveLogStart"}"#).await;
+    assert!(
+        r3livelog_reaches(&t.state, &mut socket, "before").await,
+        "an administrator's live log gets new lines"
+    );
+
+    let demote = serde_json::json!({ "IsAdministrator": false });
+    assert_eq!(
+        t.policy(&t.owner, &t.ada_id, demote).await.0,
+        StatusCode::OK
+    );
+    // The socket rechecks its token every 5 s; allow three rounds.
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
+    while r3livelog_reaches(&t.state, &mut socket, "after").await {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "ada's live log still gets lines 15 s after her demotion"
+        );
+    }
+}
+
+// POST /System/LogLevel stores the live log's level, and GET gives it back.
+#[tokio::test]
+async fn r3livelog_log_level_post_is_kept() {
+    let state = test_state().await;
+    let app = app(state.clone());
+    let (owner, _, _, _) = g1_owner_and_viewer(&state, &app).await;
+    let body = r#"{"LogLevel":"Debug"}"#;
+    let (status, answer) = send_authed(&app, "POST", "/System/LogLevel", &owner, Some(body)).await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{answer}");
+    let (status, level) = send_authed(&app, "GET", "/System/LogLevel", &owner, None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(level, serde_json::json!({ "LogLevel": "debug" }));
+}
+
+// The socket's keep-alive frames have Jellyfin's shape: ForceKeepAlive with the interval in
+// seconds first, and a KeepAlive answer to the client's KeepAlive.
+#[tokio::test]
+async fn r3livelog_keep_alive_frames_are_jellyfins() {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+
+    let state = test_state().await;
+    let app = app(state.clone());
+    let (owner, _, _, _) = g1_owner_and_viewer(&state, &app).await;
+    let addr = b17_serve(&app).await;
+    let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+    let request = format!(
+        "GET /socket?api_key={owner} HTTP/1.1\r\nHost: {addr}\r\nConnection: Upgrade\r\n\
+         Upgrade: websocket\r\nSec-WebSocket-Version: 13\r\n\
+         Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n"
+    );
+    stream.write_all(request.as_bytes()).await.unwrap();
+    let mut reader = tokio::io::BufReader::new(stream);
+    let mut line = String::new();
+    while line != "\r\n" {
+        line.clear();
+        assert_ne!(reader.read_line(&mut line).await.unwrap(), 0, "headers end");
+    }
+    let mut socket = G1cSocket(reader);
+    assert_eq!(
+        socket.next().await,
+        serde_json::json!({ "MessageType": "ForceKeepAlive", "Data": 60 })
+    );
+    assert_eq!(socket.next().await["MessageType"], "TimeSync");
+
+    r3tasks_send(&mut socket, r#"{"MessageType":"KeepAlive"}"#).await;
+    let answer = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let frame = socket.next().await;
+            if frame["MessageType"] == "KeepAlive" {
+                return frame;
+            }
+        }
+    })
+    .await
+    .expect("a KeepAlive answer within 5 s");
+    assert_eq!(answer, serde_json::json!({ "MessageType": "KeepAlive" }));
+}
+
+// The live log view's rows, level filter, cap and scrolling (tests/web/r3livelog_view.mjs).
+#[test]
+fn r3livelog_web_view() {
+    b124_node_test("r3livelog_view.mjs");
 }
 
 // ── B18: one scan per run, and Scan all's order ──

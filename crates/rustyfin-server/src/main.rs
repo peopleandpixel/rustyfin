@@ -14,7 +14,7 @@ use tracing_subscriber::EnvFilter;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 
-use rustyfin_api::log_stream::LogStreamLayer;
+use rustyfin_api::log_stream::{self, LogStreamLayer};
 use rustyfin_api::middleware::{
     DEFAULT_LOGIN_LIMIT, DEFAULT_LOGIN_WINDOW_SECS, DEFAULT_RESOURCE_LIMIT,
     DEFAULT_RESOURCE_WINDOW_SECS, RateLimiter,
@@ -28,11 +28,11 @@ use rustyfin_model::server_info::ServerConfiguration;
 async fn main() {
     let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into());
 
-    // Live log level channel — default "info", can be changed at runtime via API
-    let (log_level_tx, log_level_rx) = watch::channel("info".to_string());
+    // The live log view's level starts at the most verbose level the console prints, so it shows
+    // what the console shows; the view can change it through the API.
+    let console_level = log_stream::level_name_for(env_filter.max_level_hint());
+    let (log_level_tx, _) = watch::channel(console_level.to_string());
 
-    // We need ws_broadcast before LogStreamLayer, but ws_broadcast is created later.
-    // So we create it here and pass it to both LogStreamLayer and AppState.
     // Broadcast channel size increased to 256 to prevent event loss with many connected clients
     let (ws_broadcast, _) = broadcast::channel::<rustyfin_model::ws_event::WsEvent>(256);
 
@@ -41,7 +41,12 @@ async fn main() {
         .map(|v| v == "1" || v == "true")
         .unwrap_or(false);
 
-    let log_layer = LogStreamLayer::new(ws_broadcast.clone(), Arc::new(log_level_rx));
+    // The live log keeps the last lines (RUSTYFIN_LOG_HISTORY, default 1000, at most 100,000) for
+    // a view that opens later. A bad value is logged once the logger is up.
+    let (log_history, log_history_warning) =
+        log_stream::history_size(std::env::var("RUSTYFIN_LOG_HISTORY").ok().as_deref());
+    let live_log = log_stream::LogHistory::new(log_history);
+    let log_layer = LogStreamLayer::new(live_log.clone());
 
     if use_json {
         tracing_subscriber::fmt()
@@ -59,6 +64,9 @@ async fn main() {
             .finish()
             .with(log_layer)
             .init();
+    }
+    if let Some(warning) = log_history_warning {
+        tracing::warn!("{warning}");
     }
 
     let data_dir = data_dir();
@@ -430,6 +438,7 @@ async fn main() {
         known_proxies,
         ws_broadcast,
         log_level_tx,
+        live_log,
         cache,
         image_cache,
         http_client,

@@ -372,7 +372,7 @@
         "clear": "Clear",
         "disconnected": "Disconnected",
         "connecting_to_server": "Connecting to server…",
-        "live_log_hint": "Shows the last 500 log entries in real time. Verbosity changes take effect immediately.",
+        "live_log_hint": "Shows up to 2,000 recent lines of the server log, as its console prints them, and new lines in real time. The verbosity filters what this view shows.",
         "state_ready": "Ready",
         "state_running": "Running",
         "state_stopping": "Stopping",

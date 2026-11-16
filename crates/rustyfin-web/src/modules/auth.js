@@ -341,6 +341,7 @@ function afterSignOut() {
     stopScanProgressWebSocket();
     LiveLog.disconnect();
     LiveLog.messages = [];
+    LiveLog.clearedSeq = 0;
     jiShownCodes.clear();
     jiPendingNames = new Map();
     jiChoice.clear();

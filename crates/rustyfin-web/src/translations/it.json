@@ -250,7 +250,6 @@
         "clear": "Cancella",
         "disconnected": "Disconnesso",
         "connecting_to_server": "Connessione al server…",
-        "live_log_hint": "Mostra le ultime 500 voci del registro in tempo reale. Le modifiche alla verbosità hanno effetto immediato.",
         "state_ready": "Pronto",
         "state_running": "In esecuzione",
         "state_stopping": "Arresto in corso",

@@ -250,7 +250,6 @@
         "clear": "Effacer",
         "disconnected": "Déconnecté",
         "connecting_to_server": "Connexion au serveur…",
-        "live_log_hint": "Affiche les 500 dernières entrées du journal en temps réel. Les changements de verbosité prennent effet immédiatement.",
         "state_ready": "Prêt",
         "state_running": "En cours",
         "state_stopping": "Arrêt en cours",

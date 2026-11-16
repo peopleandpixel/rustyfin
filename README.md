@@ -307,6 +307,7 @@ Hardening options (ProtectHome, ProtectSystem, NoNewPrivileges) are enabled by d
 | `RUSTYFIN_RATE_LIMIT` | Login and password-reset attempts per window, per client IP (`0` disables) | `10` |
 | `RUSTYFIN_RATE_WINDOW` | Rate-limit window, in seconds | `60` |
 | `RUST_LOG` | Log level (`debug`, `info`, `rustyfin=trace`) | `info` |
+| `RUSTYFIN_LOG_HISTORY` | Recent log lines kept for the admin live log, sent when it opens (`0` keeps none, at most `100000`; each line keeps up to 8 KiB) | `1000` |
 
 **Example (production):**
 ```bash

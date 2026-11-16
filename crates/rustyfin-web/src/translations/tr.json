@@ -250,7 +250,6 @@
         "clear": "Temizle",
         "disconnected": "Bağlantı kesildi",
         "connecting_to_server": "Sunucuya bağlanılıyor…",
-        "live_log_hint": "Son 500 günlük girişini gerçek zamanlı gösterir. Ayrıntı düzeyi değişiklikleri hemen geçerli olur.",
         "state_ready": "Hazır",
         "state_running": "Çalışıyor",
         "state_stopping": "Durduruluyor",

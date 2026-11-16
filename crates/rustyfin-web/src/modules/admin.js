@@ -823,53 +823,63 @@ async function submitAddUser(e) {
 }
 
 // --- Live Log Functions ---
+const LIVELOG_MAX_ROWS = 2000;
+const LOG_LEVEL_RANK = { error: 1, warn: 2, info: 3, debug: 4, trace: 5 };
+// The view's level; it starts at the server's, the most verbose level its console prints
+let liveLogLevel = 'info';
 let liveLogInitialized = false;
 
 function initLiveLog() {
-    if (liveLogInitialized) return;
-    liveLogInitialized = true;
+    if (typeof LiveLog === 'undefined') return;
+    if (!liveLogInitialized) {
+        liveLogInitialized = true;
+        LiveLog.listeners.push({ add: entry => appendLogEntry(entry), reset: renderLiveLog });
+    }
+    // Also after a sign-out and back in, which disconnects it
+    LiveLog.connect();
+    const select = $('livelog-level');
+    if (select) select.value = liveLogLevel;
+    loadLiveLogLevel();
 
-    // Connect WebSocket
-    if (typeof LiveLog !== 'undefined') {
-        LiveLog.onMessage((entry) => {
-            appendLogEntry(entry);
-        });
-        LiveLog.connect();
-
-        // Update status indicator
-        const checkStatus = () => {
-            const statusEl = $('livelog-status');
-            if (!statusEl) return;
-            if (LiveLog.connected) {
-                statusEl.innerHTML = `<span class="w-2 h-2 rounded-full bg-emerald-400"></span><span class="text-emerald-400">${t('admin.connected')}</span>`;
-            } else {
-                statusEl.innerHTML = `<span class="w-2 h-2 rounded-full bg-amber-400"></span><span class="text-amber-400">${t('admin.connecting')}</span>`;
-            }
-        };
-        const statusInterval = setInterval(() => {
-            checkStatus();
-            if (LiveLog.connected) clearInterval(statusInterval);
-        }, 1000);
+    // Update status indicator
+    const checkStatus = () => {
+        const statusEl = $('livelog-status');
+        if (!statusEl) return;
+        if (LiveLog.connected) {
+            statusEl.innerHTML = `<span class="w-2 h-2 rounded-full bg-emerald-400"></span><span class="text-emerald-400">${t('admin.connected')}</span>`;
+        } else {
+            statusEl.innerHTML = `<span class="w-2 h-2 rounded-full bg-amber-400"></span><span class="text-amber-400">${t('admin.connecting')}</span>`;
+        }
+    };
+    const statusInterval = setInterval(() => {
         checkStatus();
-    }
+        if (LiveLog.connected) clearInterval(statusInterval);
+    }, 1000);
+    checkStatus();
 
-    // Load existing messages
-    const container = $('livelog-container');
-    if (container && LiveLog.messages.length) {
-        container.innerHTML = '';
-        LiveLog.messages.forEach(entry => appendLogEntry(entry, false));
-    }
+    // The lines received so far
+    renderLiveLog();
 }
 
-function appendLogEntry(entry, scroll = true) {
-    const container = $('livelog-container');
-    if (!container) return;
+async function loadLiveLogLevel() {
+    try {
+        const res = await API.getLogLevel();
+        if (!LOG_LEVEL_RANK[res?.LogLevel] || res.LogLevel === liveLogLevel) return;
+        liveLogLevel = res.LogLevel;
+        const select = $('livelog-level');
+        if (select) select.value = liveLogLevel;
+        renderLiveLog();
+    } catch {}
+}
 
-    // Remove loading text on first entry
-    if (container.querySelector('p')) {
-        container.innerHTML = '';
-    }
+// Whether the view's level shows the line
+function logShown(entry) {
+    const rank = LOG_LEVEL_RANK[String(entry.Level || 'info').toLowerCase()] || LOG_LEVEL_RANK.info;
+    return rank <= LOG_LEVEL_RANK[liveLogLevel];
+}
 
+// One line's row: time, level, target, and the message with its fields
+function logRow(entry) {
     const line = document.createElement('div');
     line.className = 'flex gap-2 leading-relaxed';
 
@@ -898,17 +908,47 @@ function appendLogEntry(entry, scroll = true) {
     line.innerHTML = `
         <span class="text-white/25 shrink-0">${escapeHtml(timeStr)}</span>
         <span class="font-bold ${levelColor} shrink-0 w-10">${escapeHtml(levelShort)}</span>
-        <span class="text-white/70 break-all">${escapeHtml(entry.Message || '')}</span>
+        <span class="text-white/40 shrink-0">${escapeHtml(entry.Target || '')}</span>
+        <span class="text-white/70 break-all whitespace-pre-wrap">${escapeHtml(entry.Message || '')}</span>
     `;
+    return line;
+}
 
-    container.appendChild(line);
+// Whether the view is scrolled to its end, so that new lines keep it there
+function liveLogAtEnd(container) {
+    return container.scrollHeight - container.scrollTop - container.clientHeight < 32;
+}
 
-    // Keep max 500 DOM elements
-    while (container.children.length > 500) {
+// Shows the received lines at the view's level, the newest LIVELOG_MAX_ROWS
+function renderLiveLog() {
+    const container = $('livelog-container');
+    if (!container) return;
+    const rows = LiveLog.messages.filter(logShown).slice(-LIVELOG_MAX_ROWS).map(logRow);
+    if (!rows.length && !LiveLog.connected) {
+        container.innerHTML = `<p class="text-white/30 italic">${t('admin.connecting_to_server')}</p>`;
+        return;
+    }
+    container.replaceChildren(...rows);
+    container.scrollTop = container.scrollHeight;
+}
+
+function appendLogEntry(entry) {
+    const container = $('livelog-container');
+    if (!container || !logShown(entry)) return;
+    const atEnd = liveLogAtEnd(container);
+
+    // Remove the placeholder on the first line
+    if (container.querySelector('p')) {
+        container.innerHTML = '';
+    }
+
+    container.appendChild(logRow(entry));
+    while (container.children.length > LIVELOG_MAX_ROWS) {
         container.removeChild(container.firstChild);
     }
 
-    if (scroll) {
+    // Follow new lines, unless the user scrolled up to read
+    if (atEnd) {
         container.scrollTop = container.scrollHeight;
     }
 }
@@ -919,11 +959,15 @@ function clearLiveLog() {
         container.innerHTML = `<p class="text-white/30 italic">${t('admin.log_cleared')}</p>`;
     }
     if (typeof LiveLog !== 'undefined') {
-        LiveLog.messages = [];
+        LiveLog.clear();
     }
 }
 
+// Shows the lines at `level` and keeps it as the server's live log level
 async function setLogLevel(level) {
+    if (!LOG_LEVEL_RANK[level]) return;
+    liveLogLevel = level;
+    renderLiveLog();
     try {
         await API.setLogLevel(level);
         toast(t('admin.log_level_set', { level }));

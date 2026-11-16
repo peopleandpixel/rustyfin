@@ -250,7 +250,6 @@
         "clear": "クリア",
         "disconnected": "切断されました",
         "connecting_to_server": "サーバーに接続中…",
-        "live_log_hint": "最新の500件のログエントリをリアルタイムで表示します。詳細レベルの変更はすぐに反映されます。",
         "state_ready": "準備完了",
         "state_running": "実行中",
         "state_stopping": "停止中",

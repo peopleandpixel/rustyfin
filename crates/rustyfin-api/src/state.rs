@@ -56,8 +56,11 @@ pub struct AppState {
     pub known_proxies: Arc<Vec<IpNet>>,
     /// Broadcast channel for WebSocket real-time events
     pub ws_broadcast: broadcast::Sender<WsEvent>,
-    /// Watch channel to control live log verbosity level (e.g. "info", "debug", "trace")
+    /// The live log view's level (e.g. "info", "debug", "trace"); it starts at the most verbose
+    /// level `RUST_LOG` prints
     pub log_level_tx: watch::Sender<String>,
+    /// The server's recent log lines and the channel of new ones, for the live log view
+    pub live_log: crate::log_stream::LogHistory,
     /// In-memory response caches for API endpoints
     pub cache: ApiCache,
     /// In-memory cache for image proxy results

@@ -74,6 +74,7 @@ async fn test_state() -> (AppState, DataDir) {
         known_proxies: Arc::new(Vec::new()),
         ws_broadcast: ws_tx,
         log_level_tx,
+        live_log: Default::default(),
         cache: ApiCache::new(),
         image_cache: ImageCache::new(),
         http_client: reqwest::Client::new(),

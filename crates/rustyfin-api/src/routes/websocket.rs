@@ -12,7 +12,9 @@ use tokio::sync::RwLock;
 use tokio::sync::broadcast;
 
 use crate::error::ApiError;
+use crate::log_stream;
 use crate::state::AppState;
+use rustyfin_model::ws_event::LogMessageData;
 
 /// Shared state for active WebSocket connections
 #[derive(Default)]
@@ -156,25 +158,25 @@ async fn handle_socket(socket: WebSocket, state: AppState, token: String) {
 
     tracing::info!("WebSocket: session {} connected", session_id);
 
-    // Send initial ForceKeepAlive message (Jellyfin protocol)
-    let keep_alive = rustyfin_model::ws_event::WsEvent::ForceKeepAlive(60);
-    if let Ok(json) = serde_json::to_string(&keep_alive) {
-        let _ = sender.send(Message::Text(json.into())).await;
+    // The keep-alive interval the client is to keep (Jellyfin protocol)
+    let keep_alive = rustyfin_model::ws_event::WsEvent::ForceKeepAlive { data: 60 };
+    if let Some(frame) = text_frame(&keep_alive) {
+        let _ = sender.send(frame).await;
     }
 
     // Send TimeSync event
     let time_sync = rustyfin_model::ws_event::WsEvent::TimeSync {
         data: chrono::Utc::now().timestamp_millis(),
     };
-    if let Ok(json) = serde_json::to_string(&time_sync) {
-        let _ = sender.send(Message::Text(json.into())).await;
+    if let Some(frame) = text_frame(&time_sync) {
+        let _ = sender.send(frame).await;
     }
 
     // The scans in progress at their current percent, so this socket starts from them
     for (library_id, scan) in scans_now {
-        let frame = refresh_progress(library_id, scan.progress.unwrap_or(0), scan.status);
-        if let Ok(json) = serde_json::to_string(&frame) {
-            let _ = sender.send(Message::Text(json.into())).await;
+        let event = refresh_progress(library_id, scan.progress.unwrap_or(0), scan.status);
+        if let Some(frame) = text_frame(&event) {
+            let _ = sender.send(frame).await;
         }
     }
 
@@ -182,6 +184,8 @@ async fn handle_socket(socket: WebSocket, state: AppState, token: String) {
     let mut recheck = tokio::time::interval_at(tokio::time::Instant::now() + period, period);
     // The ScheduledTasksInfo timer an administrator's ScheduledTasksInfoStart sets
     let mut tasks_info: Option<tokio::time::Interval> = None;
+    // The server's log lines, to an administrator's live log view after its LiveLogStart
+    let mut live_log: Option<broadcast::Receiver<LogMessageData>> = None;
 
     loop {
         tokio::select! {
@@ -196,10 +200,10 @@ async fn handle_socket(socket: WebSocket, state: AppState, token: String) {
                         if let Ok(incoming) = serde_json::from_str::<WsMessage>(&text) {
                             match incoming.message_type.as_str() {
                                 "KeepAlive" => {
-                                    // Respond with keep-alive acknowledgement
-                                    let resp = rustyfin_model::ws_event::WsEvent::ForceKeepAlive(60);
-                                    if let Ok(json) = serde_json::to_string(&resp) {
-                                        let _ = sender.send(Message::Text(json.into())).await;
+                                    // Jellyfin answers a client's KeepAlive with a KeepAlive
+                                    let resp = rustyfin_model::ws_event::WsEvent::KeepAlive;
+                                    if let Some(frame) = text_frame(&resp) {
+                                        let _ = sender.send(frame).await;
                                     }
                                 }
                                 // Only an administrator may follow the tasks; the timer also
@@ -211,6 +215,18 @@ async fn handle_socket(socket: WebSocket, state: AppState, token: String) {
                                     tracing::debug!("ws: ScheduledTasksInfoStart from a non-administrator ignored");
                                 }
                                 "ScheduledTasksInfoStop" => tasks_info = None,
+                                // The live log view: the recent lines first, then each new one
+                                "LiveLogStart" if viewer.is_admin => {
+                                    let (history, rx) = state.live_log.subscribe();
+                                    live_log = Some(rx);
+                                    if send_log_lines(&mut sender, history).await.is_err() {
+                                        break;
+                                    }
+                                }
+                                "LiveLogStart" => {
+                                    tracing::debug!("ws: LiveLogStart from a non-administrator ignored");
+                                }
+                                "LiveLogStop" => live_log = None,
                                 "SessionsStart" | "ActivityLogEntryStart" => {
                                     // Acknowledge subscription-style messages
                                     tracing::debug!("ws subscription: {}", incoming.message_type);
@@ -240,9 +256,9 @@ async fn handle_socket(socket: WebSocket, state: AppState, token: String) {
             res = scans_rx.recv() => {
                 match res {
                     Ok(update) => {
-                        let frame = refresh_progress(update.library_id, update.progress, update.status);
-                        if let Ok(json) = serde_json::to_string(&frame)
-                            && sender.send(Message::Text(json.into())).await.is_err() {
+                        let event = refresh_progress(update.library_id, update.progress, update.status);
+                        if let Some(frame) = text_frame(&event)
+                            && sender.send(frame).await.is_err() {
                                 tracing::debug!("WebSocket: session {} sender closed", session_id);
                                 break;
                             }
@@ -266,8 +282,8 @@ async fn handle_socket(socket: WebSocket, state: AppState, token: String) {
                     // Another user's session and playback events, and logs for non-administrators
                     Ok(event) if !receives(&viewer, &event) => {}
                     Ok(event) => {
-                        if let Ok(json) = serde_json::to_string(&event)
-                            && sender.send(Message::Text(json.into())).await.is_err() {
+                        if let Some(frame) = text_frame(&event)
+                            && sender.send(frame).await.is_err() {
                                 tracing::debug!("WebSocket: session {} sender closed", session_id);
                                 break;
                             }
@@ -286,8 +302,8 @@ async fn handle_socket(socket: WebSocket, state: AppState, token: String) {
             res = cmd_rx.recv() => {
                 match res {
                     Ok(event) => {
-                        if let Ok(json) = serde_json::to_string(&event)
-                            && sender.send(Message::Text(json.into())).await.is_err() {
+                        if let Some(frame) = text_frame(&event)
+                            && sender.send(frame).await.is_err() {
                                 tracing::debug!("WebSocket: session {} sender closed", session_id);
                                 break;
                             }
@@ -317,6 +333,19 @@ async fn handle_socket(socket: WebSocket, state: AppState, token: String) {
                 }
             }
 
+            // The server's new log lines, or how many this socket fell behind by
+            line = async { log_stream::next_line(live_log.as_mut().unwrap()).await }, if live_log.is_some() => {
+                match line {
+                    Some(line) if viewer.is_admin => {
+                        if send_log_lines(&mut sender, [line]).await.is_err() {
+                            break;
+                        }
+                    }
+                    // Closed, or the user is no longer an administrator
+                    _ => live_log = None,
+                }
+            }
+
             // Close the socket once its user token stops validating; otherwise refresh
             // the socket's administrator rights so a demotion takes effect
             _ = recheck.tick(), if user_token => {
@@ -338,6 +367,31 @@ async fn handle_socket(socket: WebSocket, state: AppState, token: String) {
         let mut connections = WS_CONNECTIONS.write().await;
         connections.connections.remove(&session_id);
         tracing::debug!("WebSocket: unregistered session {}", session_id);
+    }
+}
+
+/// Sends each log line as a `LogMessage` frame.
+async fn send_log_lines(
+    sender: &mut futures_util::stream::SplitSink<WebSocket, Message>,
+    lines: impl IntoIterator<Item = LogMessageData>,
+) -> Result<(), axum::Error> {
+    for data in lines {
+        let event = rustyfin_model::ws_event::WsEvent::LogMessage { data };
+        if let Some(frame) = text_frame(&event) {
+            sender.send(frame).await?;
+        }
+    }
+    Ok(())
+}
+
+/// `event` as a text frame. An event that does not serialize is logged, not dropped silently.
+fn text_frame(event: &impl serde::Serialize) -> Option<Message> {
+    match serde_json::to_string(event) {
+        Ok(json) => Some(Message::Text(json.into())),
+        Err(e) => {
+            tracing::warn!(error = %e, "WebSocket: could not serialize an event");
+            None
+        }
     }
 }
 
