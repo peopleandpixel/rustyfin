@@ -32383,6 +32383,82 @@ async fn g4_insert_source(
         .unwrap();
 }
 
+// R3 playback: Universal keeps the client's PlaySessionId, as Jellyfin does, so the client stops
+// its transcode with the id it sent; without one the server makes one per call
+#[tokio::test]
+async fn r3playback_universal_keeps_the_clients_play_session_id() {
+    let state = test_state().await;
+    let (token, _) = admin_session(&state).await;
+    let folder = std::path::PathBuf::from(media_folder(&state, "r3universal"));
+    let file = folder.join("R3 Film.mkv");
+    std::fs::write(&file, b"r3").unwrap();
+    let id = g4_insert_item(&state, "Movie", &file).await;
+    g4_insert_source(
+        &state,
+        id,
+        "mkv",
+        &file,
+        &[("Video", "hevc"), ("Audio", "ac3")],
+    )
+    .await;
+    let audio_file = folder.join("R3 Song.flac");
+    std::fs::write(&audio_file, b"r3").unwrap();
+    let song = g4_insert_item(&state, "Audio", &audio_file).await;
+    g4_insert_source(&state, song, "flac", &audio_file, &[("Audio", "flac")]).await;
+    let app = app(state);
+
+    let lists = "VideoCodecs=h264&AudioCodecs=aac";
+    for (sent, expected_in_url) in [
+        ("client-1", "PlaySessionId=client-1"),
+        ("%20%20client-2%20", "PlaySessionId=client-2"),
+        (
+            "a%26VideoCodec%3Dhevc",
+            "PlaySessionId=a%26VideoCodec%3Dhevc",
+        ),
+    ] {
+        let uri = format!("/Videos/{id}/Universal?{lists}&PlaySessionId={sent}");
+        let (status, body) = send(&app, request("GET", &uri, Some(&token), None)).await;
+        assert_eq!(status, StatusCode::OK, "{uri}");
+        let url = body["Url"].as_str().unwrap();
+        assert!(url.contains("main.m3u8"), "{url}");
+        assert!(url.ends_with(expected_in_url), "{url}");
+        let decoded: String = form_urlencoded::parse(sent.as_bytes())
+            .map(|(k, _)| k.into_owned())
+            .collect();
+        assert_eq!(body["PlaySessionId"], decoded.trim(), "{uri}");
+        // The name matches without case, as ASP.NET binds it
+        let lower = format!("/Videos/{id}/Universal?{lists}&playSessionId={sent}");
+        let (_, body) = send(&app, request("GET", &lower, Some(&token), None)).await;
+        assert_eq!(body["PlaySessionId"], decoded.trim(), "{lower}");
+    }
+    let uri = format!("/Audio/{song}/universal?PlaySessionId=client-audio");
+    let (status, body) = send(&app, request("GET", &uri, Some(&token), None)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["PlaySessionId"], "client-audio");
+
+    // No id, or a blank one: a new id each call
+    let mut ids = std::collections::HashSet::new();
+    for query in [lists.to_string(), format!("{lists}&PlaySessionId=%20")] {
+        let uri = format!("/Videos/{id}/Universal?{query}");
+        let (_, body) = send(&app, request("GET", &uri, Some(&token), None)).await;
+        let sent = body["PlaySessionId"].as_str().unwrap().to_string();
+        assert!(uuid::Uuid::parse_str(&sent).is_ok(), "{sent}");
+        assert!(
+            body["Url"]
+                .as_str()
+                .unwrap()
+                .ends_with(&format!("PlaySessionId={sent}"))
+        );
+        ids.insert(sent);
+    }
+    assert_eq!(ids.len(), 2);
+}
+
+#[test]
+fn r3playback_web_session_id() {
+    b124_node_test("r3playback_session_id.mjs");
+}
+
 #[tokio::test]
 async fn g4_universal_sends_unplayable_audio_to_transcode() {
     let state = test_state().await;

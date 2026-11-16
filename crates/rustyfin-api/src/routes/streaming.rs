@@ -57,6 +57,19 @@ pub(crate) enum Version {
 
 /// The request's MediaSourceId (name matched in any ASCII case), trimmed. None when absent or
 /// blank.
+/// The PlaySessionId a request sends, trimmed; None when it sends none or a blank one. Jellyfin's
+/// Universal routes keep the client's id, so `DELETE /Videos/ActiveEncodings?PlaySessionId=` with
+/// that id stops the transcode.
+fn requested_play_session_id(params: &HashMap<String, String>) -> Option<String> {
+    params
+        .iter()
+        .filter(|(name, _)| name.eq_ignore_ascii_case("PlaySessionId"))
+        .map(|(_, value)| value.trim())
+        .filter(|value| !value.is_empty())
+        .min()
+        .map(str::to_string)
+}
+
 pub(crate) fn requested_source_id(params: &HashMap<String, String>) -> Option<&str> {
     params
         .iter()
@@ -827,6 +840,9 @@ async fn audio_universal(
     Path(id): Path<Uuid>,
     Query(params): Query<HashMap<String, String>>,
 ) -> Result<Response, ApiError> {
+    // The client's play session id, else a new one
+    let play_session_id =
+        requested_play_session_id(&params).unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
     let query = AudioUniversalQuery::from(params);
 
     // Single query: verify item exists and fetch media sources with streams
@@ -845,9 +861,6 @@ async fn audio_universal(
     } else {
         media_sources.first().cloned()
     };
-
-    // Generate playback session ID
-    let play_session_id = uuid::Uuid::new_v4().to_string();
 
     // Determine if direct play is possible
     let can_direct_play = query.enable_direct_play
@@ -1146,10 +1159,10 @@ async fn video_universal(
         Version::Primary => 0,
         Version::Source(index) => index,
     };
+    // The client's play session id, else a new one: the client stops its transcode by it
+    let play_session_id =
+        requested_play_session_id(&params).unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
     let query = VideoPlaybackInfoQuery::from(params);
-
-    // Generate playback session ID
-    let play_session_id = uuid::Uuid::new_v4().to_string();
 
     // The tracks the request names that a direct play or stream would not carry
     let needs = match media_sources.get(index) {
@@ -1231,7 +1244,8 @@ async fn video_universal(
         if let Some(seg_time) = query.segment_time {
             url.push_str(&format!("&SegmentTime={}", seg_time));
         }
-        url.push_str(&format!("&PlaySessionId={}", play_session_id));
+        let encoded: String = form_urlencoded::byte_serialize(play_session_id.as_bytes()).collect();
+        url.push_str(&format!("&PlaySessionId={encoded}"));
         Some(url)
     } else {
         None
