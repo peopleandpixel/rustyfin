@@ -26852,6 +26852,7 @@ fn r3music_tabs() {
     b124_node_test("r3music_tabs.mjs");
 }
 
+
 // R3 collections: the web client's collection and playlist lists, pages, Remove and reordering
 // (tests/web/r3collections_web.mjs)
 #[test]
@@ -27956,6 +27957,25 @@ async fn r3tabs_movie_recommendations_are_jellyfin_rows() {
             .is_empty(),
         "no history, no rows"
     );
+}
+
+// A library's Latest row asks /Items/Latest with its IncludeItemTypes, which keeps that type.
+#[tokio::test]
+async fn r3tabs_latest_keeps_include_item_types() {
+    let state = test_state().await;
+    let app = app(state.clone());
+    let (owner, _, _, _) = g1_owner_and_viewer(&state, &app).await;
+    let (lib, _) = r3tabs_movies(&state, "R3 Tabs Latest", &[("Kilo", 2000), ("Lima", 2001)]).await;
+    for (types, expected) in [("Movie", 2), ("Episode", 0)] {
+        let uri = format!("/Items/Latest?ParentId={lib}&IncludeItemTypes={types}");
+        let (status, json) = send(&app, request("GET", &uri, Some(&owner), None)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            json.as_array().map(Vec::len),
+            Some(expected),
+            "{uri}: {json}"
+        );
+    }
 }
 
 // A TV library's Next Up and Upcoming list only its own episodes when asked with ParentId.

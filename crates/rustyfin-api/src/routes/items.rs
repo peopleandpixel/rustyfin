@@ -3226,7 +3226,7 @@ async fn get_latest(
         .include_item_types
         .as_deref()
         .or(query.include_item_types_lower.as_deref())
-        .map(|s| format!("\"{}\"", s.split(',').next().unwrap_or("").trim()));
+        .map(|s| s.split(',').next().unwrap_or("").trim().to_string());
     let library_id = query.parent_id.or(query.parent_id_lower);
     let hidden = HiddenItems::for_caller(&state, &claims).await?.json();
     let mut items = rustyfin_db::repo_media::get_latest_items(
