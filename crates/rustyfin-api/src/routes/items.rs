@@ -42,19 +42,13 @@ async fn populate_media_sources(
             .unwrap_or_default();
         item.media_sources = sources;
     }
-    // The subtitle files beside each source, read concurrently
-    let sources = items
+    // The subtitle files beside each source, each folder read once
+    let mut sources: Vec<_> = items
         .iter_mut()
-        .flat_map(|item| item.media_sources.iter_mut());
-    futures_util::future::join_all(sources.map(add_external_subtitles)).await;
+        .flat_map(|item| item.media_sources.iter_mut())
+        .collect();
+    crate::routes::subtitle::add_external_streams(&mut sources).await;
     Ok(())
-}
-
-/// Adds the external subtitle files beside `source` that its streams don't list, as Jellyfin
-/// lists them with the item's streams; PlaybackInfo adds the same streams.
-async fn add_external_subtitles(source: &mut rustyfin_model::media_source::MediaSourceResponse) {
-    let external = crate::routes::subtitle::external_streams(source).await;
-    source.media_streams.extend(external);
 }
 
 /// Populate `media_sources` on a single item.
@@ -64,9 +58,8 @@ async fn populate_media_source_single(
 ) -> Result<(), ApiError> {
     let sources = rustyfin_db::repo_media_source::get_media_sources(pool, &item.id).await?;
     item.media_sources = sources;
-    for source in &mut item.media_sources {
-        add_external_subtitles(source).await;
-    }
+    let mut sources: Vec<_> = item.media_sources.iter_mut().collect();
+    crate::routes::subtitle::add_external_streams(&mut sources).await;
     Ok(())
 }
 

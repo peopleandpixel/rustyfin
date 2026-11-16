@@ -17710,6 +17710,17 @@ async fn r3playback_subtitle_languages_filter_matches_both_iso_codes() {
     // Rustyfin's older single SubtitleLanguage still filters
     assert_eq!(found("SubtitleLanguage=deu").await, sorted(&[german]));
     assert!(found("SubtitleLanguages=spa").await.is_empty());
+    // A list longer than SQLite binds in one query still finds its languages
+    let mut many: Vec<String> = (0..1500).map(|i| format!("q{i:04}")).collect();
+    many.push("deu".to_string());
+    let uri = format!(
+        "/Items?Recursive=true&IncludeItemTypes=Movie&SubtitleLanguages={}",
+        many.join(",")
+    );
+    let (status, body) = send(&app, request("GET", &uri, Some(&token), None)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["Items"][0]["Id"].as_str(), Some(german.as_str()));
+    assert_eq!(body["Items"].as_array().unwrap().len(), 1);
     // Without the filter, or with a blank one, all three
     assert_eq!(found("SubtitleLanguages=").await.len(), 3);
     assert_eq!(found("Fields=Path").await.len(), 3);
