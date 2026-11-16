@@ -48037,3 +48037,314 @@ async fn r3admin_restart_stops_with_the_restart_exit_code() {
 fn r3admin_web_dashboard() {
     b124_node_test("r3admin_dashboard.mjs");
 }
+
+/// GET `uri` as `token` and return the status and the answer, which is an array (Latest) or a
+/// query result.
+async fn r3queues_get(
+    app: &axum::Router,
+    token: &str,
+    uri: &str,
+) -> (StatusCode, serde_json::Value) {
+    send(app, request("GET", uri, Some(token), None)).await
+}
+
+/// The ids of a Latest answer (an array) or a query result's `Items`, in order.
+fn r3queues_ids(body: &serde_json::Value) -> Vec<uuid::Uuid> {
+    body.get("Items")
+        .unwrap_or(body)
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|i| i["Id"].as_str().unwrap().parse().unwrap())
+        .collect()
+}
+
+/// Jellyfin's `TvShowsController.GetEpisodes`: `startItemId` drops the episodes before it,
+/// `adjacentTo` keeps it and its neighbours (only the first episode when it is not in the list),
+/// `isMissing` filters on Virtual episodes, and the count is of the filtered list.
+#[tokio::test]
+async fn r3queues_episodes_start_item_adjacent_and_missing() {
+    let state = test_state().await;
+    let app = app(state.clone());
+    let (token, user) = admin_session(&state).await;
+    let (series, [e1, e2, e3]) = g1f_insert_show(&state).await;
+    let season = b93_season_of(&state, e1).await;
+    let base = format!("/Shows/{series}/Episodes?userId={user}");
+    let stranger = uuid::Uuid::new_v4();
+    let cases = [
+        (format!("{base}&startItemId={e2}"), vec![e2, e3]),
+        (format!("{base}&StartItemId={e2}"), vec![e2, e3]),
+        (
+            format!("/Shows/{series}/Episodes?seasonId={season}&startItemId={e3}"),
+            vec![e3],
+        ),
+        (format!("{base}&startItemId={stranger}"), vec![]),
+        (format!("{base}&adjacentTo={e2}"), vec![e1, e2, e3]),
+        (format!("{base}&adjacentTo={e1}"), vec![e1, e2]),
+        (format!("{base}&adjacentTo={e3}&limit=3"), vec![e2, e3]),
+        (format!("{base}&adjacentTo={stranger}"), vec![e1]),
+        (
+            format!("{base}&startItemId={e2}&adjacentTo={e3}"),
+            vec![e2, e3],
+        ),
+        (format!("{base}&isMissing=false"), vec![e1, e2, e3]),
+        (format!("{base}&IsMissing=True"), vec![]),
+        (format!("{base}&startItemId={e1}&limit=2"), vec![e1, e2]),
+    ];
+    for (uri, want) in cases {
+        let (status, body) = r3queues_get(&app, &token, &uri).await;
+        assert_eq!(status, StatusCode::OK, "{uri}");
+        assert_eq!(r3queues_ids(&body), want, "{uri}");
+    }
+    // The count is of the filtered list, before paging.
+    let (_, body) = r3queues_get(&app, &token, &format!("{base}&startItemId={e2}&limit=1")).await;
+    assert_eq!(body["TotalRecordCount"], 2);
+    // sortBy=Random keeps the same episodes.
+    let (_, body) = r3queues_get(&app, &token, &format!("{base}&sortBy=Random")).await;
+    let mut ids = r3queues_ids(&body);
+    ids.sort();
+    let mut all = vec![e1, e2, e3];
+    all.sort();
+    assert_eq!(ids, all);
+    // Not a series, or a seasonId that is not a season: 404, as in Jellyfin.
+    for uri in [
+        format!("/Shows/{stranger}/Episodes"),
+        format!("/Shows/{e1}/Episodes"),
+        format!("/Shows/{series}/Episodes?seasonId={series}"),
+    ] {
+        assert_eq!(
+            r3queues_get(&app, &token, &uri).await.0,
+            StatusCode::NOT_FOUND,
+            "{uri}"
+        );
+    }
+}
+
+/// Next Up's `enableResumable=false` leaves out a series whose next episode is in progress.
+#[tokio::test]
+async fn r3queues_next_up_enable_resumable() {
+    let state = test_state().await;
+    let app = app(state.clone());
+    let (token, user) = admin_session(&state).await;
+    let (_, [e1, e2, _]) = g1f_insert_show(&state).await;
+    rustyfin_db::repo_playback::mark_played(&state.db, user, e1)
+        .await
+        .unwrap();
+    rustyfin_db::repo_playback::update_playback_position(&state.db, user, e2, 50_000_000)
+        .await
+        .unwrap();
+    for (uri, want) in [
+        ("/Shows/NextUp", vec![e2]),
+        ("/Shows/NextUp?enableResumable=true", vec![e2]),
+        ("/Shows/NextUp?enableResumable=false", vec![]),
+        ("/Shows/NextUp?EnableResumable=False", vec![]),
+    ] {
+        let (status, body) = r3queues_get(&app, &token, uri).await;
+        assert_eq!(status, StatusCode::OK, "{uri}");
+        assert_eq!(r3queues_ids(&body), want, "{uri}");
+    }
+    let (_, body) = r3queues_get(&app, &token, "/Shows/NextUp?enableTotalRecordCount=false").await;
+    assert_eq!(body["TotalRecordCount"], 0);
+    assert_eq!(r3queues_ids(&body), vec![e2]);
+}
+
+/// `nextUpDateCutoff` leaves out series whose newest play is older (not with `seriesId`), and
+/// `enableRewatching` offers the played episode after the most recently played one.
+#[tokio::test]
+async fn r3queues_next_up_date_cutoff_and_rewatching() {
+    let state = test_state().await;
+    let app = app(state.clone());
+    let (token, user) = admin_session(&state).await;
+    let (series, [e1, e2, e3]) = g1f_insert_show(&state).await;
+    let at = |d: &str| {
+        Some(
+            chrono::DateTime::parse_from_rfc3339(d)
+                .unwrap()
+                .with_timezone(&chrono::Utc),
+        )
+    };
+    rustyfin_db::repo_playback::mark_played_on(&state.db, user, e1, at("2010-05-01T00:00:00Z"))
+        .await
+        .unwrap();
+    for (uri, want) in [
+        ("/Shows/NextUp".to_string(), vec![e2]),
+        (
+            "/Shows/NextUp?nextUpDateCutoff=2010-01-01T00:00:00.000Z".to_string(),
+            vec![e2],
+        ),
+        (
+            "/Shows/NextUp?nextUpDateCutoff=2011-01-01T00:00:00Z".to_string(),
+            vec![],
+        ),
+        (
+            "/Shows/NextUp?NextUpDateCutoff=2011-01-01".to_string(),
+            vec![],
+        ),
+        (
+            format!("/Shows/NextUp?seriesId={series}&nextUpDateCutoff=2011-01-01"),
+            vec![e2],
+        ),
+    ] {
+        let (status, body) = r3queues_get(&app, &token, &uri).await;
+        assert_eq!(status, StatusCode::OK, "{uri}");
+        assert_eq!(r3queues_ids(&body), want, "{uri}");
+    }
+    assert_eq!(
+        r3queues_get(&app, &token, "/Shows/NextUp?nextUpDateCutoff=soon")
+            .await
+            .0,
+        StatusCode::BAD_REQUEST
+    );
+
+    // All watched, the first one last: nothing is next, but a rewatch goes on with episode 2.
+    rustyfin_db::repo_playback::mark_played_on(&state.db, user, e2, at("2010-03-01T00:00:00Z"))
+        .await
+        .unwrap();
+    rustyfin_db::repo_playback::mark_played_on(&state.db, user, e3, at("2010-04-01T00:00:00Z"))
+        .await
+        .unwrap();
+    for (uri, want) in [
+        ("/Shows/NextUp", vec![]),
+        ("/Shows/NextUp?enableRewatching=false", vec![]),
+        ("/Shows/NextUp?enableRewatching=true", vec![e2]),
+    ] {
+        let (status, body) = r3queues_get(&app, &token, uri).await;
+        assert_eq!(status, StatusCode::OK, "{uri}");
+        assert_eq!(r3queues_ids(&body), want, "{uri}");
+    }
+}
+
+/// Latest groups new episodes under their series with `ChildCount` (`groupItems`, default true),
+/// hides played items while the user's `HidePlayedInLatest` is on (the default), and takes
+/// `isPlayed` and every `includeItemTypes` value.
+#[tokio::test]
+async fn r3queues_latest_group_items_and_is_played() {
+    let state = test_state().await;
+    let app = app(state.clone());
+    let (token, user) = admin_session(&state).await;
+    let (series, [e1, e2, e3]) = g1f_insert_show(&state).await;
+
+    let (status, body) = r3queues_get(&app, &token, "/Items/Latest").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(r3queues_ids(&body), vec![series]);
+    assert_eq!(body[0]["ChildCount"], 3);
+
+    let (_, body) = r3queues_get(&app, &token, "/Items/Latest?groupItems=false").await;
+    let mut ids = r3queues_ids(&body);
+    ids.sort();
+    let mut all = vec![e1, e2, e3];
+    all.sort();
+    assert_eq!(ids, all);
+    assert!(
+        body.as_array()
+            .unwrap()
+            .iter()
+            .all(|i| i["ChildCount"] == 0)
+    );
+
+    let (_, body) = r3queues_get(
+        &app,
+        &token,
+        "/Items/Latest?includeItemTypes=Movie,Episode&GroupItems=False&limit=2",
+    )
+    .await;
+    assert_eq!(body.as_array().unwrap().len(), 2, "limit and both types");
+
+    rustyfin_db::repo_playback::mark_played(&state.db, user, e1)
+        .await
+        .unwrap();
+    let (_, body) = r3queues_get(&app, &token, "/Items/Latest").await;
+    assert_eq!(r3queues_ids(&body), vec![series]);
+    assert_eq!(body[0]["ChildCount"], 2, "the played episode is hidden");
+    // One new item in a group is shown as itself.
+    let (_, body) = r3queues_get(&app, &token, "/Items/Latest?isPlayed=true").await;
+    assert_eq!(r3queues_ids(&body), vec![e1]);
+    assert_eq!(body[0]["ChildCount"], 0);
+    let (_, body) = r3queues_get(&app, &token, &format!("/Users/{user}/Items/Latest")).await;
+    assert_eq!(body[0]["ChildCount"], 2, "the legacy route");
+
+    // With HidePlayedInLatest off, played items count again.
+    rustyfin_db::repo_user::update_configuration(
+        &state.db,
+        user,
+        &serde_json::json!({ "HidePlayedInLatest": false }),
+    )
+    .await
+    .unwrap();
+    let (_, body) = r3queues_get(&app, &token, "/Items/Latest").await;
+    assert_eq!(body[0]["ChildCount"], 3);
+}
+
+/// UserViews leaves out the user's `MyMediaExcludes` unless `includeHidden=true`.
+#[tokio::test]
+async fn r3queues_user_views_include_hidden() {
+    let state = test_state().await;
+    let app = app(state.clone());
+    let (token, user) = admin_session(&state).await;
+    g1f_insert_show(&state).await;
+    let (_, body) = r3queues_get(&app, &token, "/UserViews").await;
+    let library = r3queues_ids(&body);
+    assert_eq!(library.len(), 1);
+    rustyfin_db::repo_user::update_configuration(
+        &state.db,
+        user,
+        &serde_json::json!({ "MyMediaExcludes": [library[0].simple().to_string()] }),
+    )
+    .await
+    .unwrap();
+    for (uri, want) in [
+        ("/UserViews".to_string(), vec![]),
+        ("/UserViews?includeHidden=false".to_string(), vec![]),
+        ("/UserViews?includeHidden=true".to_string(), library.clone()),
+        (
+            format!("/Users/{user}/Views?IncludeHidden=true"),
+            library.clone(),
+        ),
+        (format!("/Users/{user}/Views"), vec![]),
+    ] {
+        let (status, body) = r3queues_get(&app, &token, &uri).await;
+        assert_eq!(status, StatusCode::OK, "{uri}");
+        assert_eq!(r3queues_ids(&body), want, "{uri}");
+        assert_eq!(body["TotalRecordCount"], want.len(), "{uri}");
+    }
+}
+
+/// Resume's `excludeActiveSessions=true` leaves out what the user's sessions are playing.
+#[tokio::test]
+async fn r3queues_resume_exclude_active_sessions() {
+    let state = test_state().await;
+    let app = app(state.clone());
+    let (token, user) = admin_session(&state).await;
+    let (_, [e1, e2, _]) = g1f_insert_show(&state).await;
+    for (item, ticks) in [(e1, 40_000_000), (e2, 50_000_000)] {
+        rustyfin_db::repo_playback::update_playback_position(&state.db, user, item, ticks)
+            .await
+            .unwrap();
+    }
+    let (status, _) = send(
+        &app,
+        request(
+            "POST",
+            "/Sessions/Playing",
+            Some(&token),
+            Some(serde_json::json!({ "ItemId": e2, "PositionTicks": 50_000_000 })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let (_, body) = r3queues_get(&app, &token, "/UserItems/Resume").await;
+    let mut ids = r3queues_ids(&body);
+    ids.sort();
+    let mut both = vec![e1, e2];
+    both.sort();
+    assert_eq!(ids, both);
+    for uri in [
+        "/UserItems/Resume?excludeActiveSessions=true".to_string(),
+        format!("/Users/{user}/Items/Resume?ExcludeActiveSessions=True"),
+    ] {
+        let (status, body) = r3queues_get(&app, &token, &uri).await;
+        assert_eq!(status, StatusCode::OK, "{uri}");
+        assert_eq!(r3queues_ids(&body), vec![e1], "{uri}");
+        assert_eq!(body["TotalRecordCount"], 1, "{uri}");
+    }
+}
