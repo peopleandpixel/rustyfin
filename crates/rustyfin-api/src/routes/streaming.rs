@@ -1103,7 +1103,10 @@ async fn video_universal(
         }
         if let Some(bitrate) = query.max_video_bitrate {
             url.push_str(&format!("&VideoBitrate={}", bitrate));
-        } else if let Some(kbps) = streaming_video_kbps(query.max_streaming_bitrate) {
+        } else if let Some(kbps) = streaming_video_kbps(
+            query.max_streaming_bitrate,
+            media_sources.get(index).and_then(|source| source.bitrate),
+        ) {
             url.push_str(&format!("&VideoBitrate={}", kbps));
         }
         if let Some(bitrate) = query.max_audio_bitrate {
@@ -1475,14 +1478,20 @@ fn check_direct_play(
 }
 
 /// The video bitrate in kbps (the HLS transcode's `VideoBitrate` unit) for a transcode under the client's
-/// `MaxStreamingBitrate` in bits per second: the limit less the transcoded audio. Only a limit below the
-/// transcode's default bitrate changes it, so a high or missing limit keeps today's transcode.
-fn streaming_video_kbps(max_streaming_bitrate: Option<u32>) -> Option<u32> {
+/// `MaxStreamingBitrate` in bits per second: the limit less the transcoded audio. As in Jellyfin, a source
+/// over the limit is encoded up to the limit (so the video is never copied above it), and a limit below the
+/// transcode's default bitrate lowers it. A source that fits a high limit, or no limit, keeps the default.
+fn streaming_video_kbps(
+    max_streaming_bitrate: Option<u32>,
+    source_bitrate: Option<u32>,
+) -> Option<u32> {
     let default = rustyfin_core::transcode::TranscodeProfile::default();
-    let kbps = (max_streaming_bitrate? / 1000)
+    let limit = max_streaming_bitrate?;
+    let kbps = (limit / 1000)
         .saturating_sub(default.max_audio_bitrate_kbps)
         .max(64);
-    (kbps < default.max_video_bitrate_kbps).then_some(kbps)
+    let over_limit = source_bitrate.is_some_and(|bitrate| bitrate > limit);
+    (over_limit || kbps < default.max_video_bitrate_kbps).then_some(kbps)
 }
 
 /// Check if a media source can be directly streamed (re-muxed without transcoding).
