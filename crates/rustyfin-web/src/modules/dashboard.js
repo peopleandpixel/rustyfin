@@ -155,10 +155,7 @@ async function loadGeneralSettings() {
         ]);
         generalConfig = cfg;
         const list = value => (Array.isArray(value) ? value : []);
-        // Jellyfin's /Localization/Options is a list of { Name, Value }; a server without it offers the cultures
-        const display = Array.isArray(uiCultures) ? uiCultures
-            : list(cultures).map(c => ({ Name: c.DisplayName, Value: c.TwoLetterISOLanguageName }));
-        box.innerHTML = generalSettingsHtml(cfg, info, list(cultures), list(countries), display);
+        box.innerHTML = generalSettingsHtml(cfg, info, list(cultures), list(countries), list(uiCultures));
     } catch (err) {
         box.innerHTML = `<p class="text-xs text-red-400">${escapeHtml(t('dashboard.load_failed', { message: err.message }))}</p>`;
     }
