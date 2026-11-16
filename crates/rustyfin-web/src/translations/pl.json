@@ -87,7 +87,10 @@
         "key_saved": "Klucz zapisany – wpisz nowy, aby go zastąpić",
         "key_clear": "Usuń zapisany klucz",
         "save_config": "Zapisz konfigurację",
-        "server_config_updated": "Konfiguracja serwera została zaktualizowana"
+        "server_config_updated": "Konfiguracja serwera została zaktualizowana",
+        "playback": "Odtwarzanie",
+        "next_episode_autoplay": "Automatycznie odtwarzaj następny odcinek",
+        "next_episode_autoplay_saved": "Zapisano ustawienie odtwarzania"
     },
     "nav": {
         "toggle_menu": "Przełącz menu",

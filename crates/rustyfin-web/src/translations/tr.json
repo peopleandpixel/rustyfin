@@ -83,7 +83,10 @@
         "key_saved": "Anahtar kayıtlı – değiştirmek için yenisini yazın",
         "key_clear": "Kayıtlı anahtarı kaldır",
         "save_config": "Yapılandırmayı kaydet",
-        "server_config_updated": "Sunucu yapılandırması güncellendi"
+        "server_config_updated": "Sunucu yapılandırması güncellendi",
+        "playback": "Oynatma",
+        "next_episode_autoplay": "Sonraki bölümü otomatik oynat",
+        "next_episode_autoplay_saved": "Oynatma ayarı kaydedildi"
     },
     "nav": {
         "toggle_menu": "Menüyü aç/kapat",

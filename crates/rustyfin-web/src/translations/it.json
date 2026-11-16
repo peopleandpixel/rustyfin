@@ -83,7 +83,10 @@
         "key_saved": "Chiave salvata: inseriscine una nuova per sostituirla",
         "key_clear": "Rimuovi la chiave salvata",
         "save_config": "Salva configurazione",
-        "server_config_updated": "Configurazione server aggiornata"
+        "server_config_updated": "Configurazione server aggiornata",
+        "playback": "Riproduzione",
+        "next_episode_autoplay": "Riproduci automaticamente l'episodio successivo",
+        "next_episode_autoplay_saved": "Impostazione di riproduzione salvata"
     },
     "nav": {
         "toggle_menu": "Mostra/nascondi menu",
