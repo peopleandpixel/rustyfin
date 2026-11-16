@@ -1,7 +1,8 @@
 use chrono::{NaiveDateTime, TimeZone, Utc};
 use rustyfin_model::media::MediaItem;
 use rustyfin_model::playlist::{PlaylistDto, PlaylistUserPermissions};
-use sqlx::SqlitePool;
+use sqlx::{SqliteConnection, SqlitePool};
+use std::collections::HashSet;
 use uuid::Uuid;
 
 /// Who calls: a user, who reaches the playlists Jellyfin lets them (their own, public ones, and
@@ -255,6 +256,16 @@ pub async fn set_share(
     user_id: Uuid,
     can_edit: bool,
 ) -> Result<(), sqlx::Error> {
+    let mut conn = pool.acquire().await?;
+    insert_share(&mut conn, playlist_id, user_id, can_edit).await
+}
+
+async fn insert_share(
+    conn: &mut SqliteConnection,
+    playlist_id: Uuid,
+    user_id: Uuid,
+    can_edit: bool,
+) -> Result<(), sqlx::Error> {
     sqlx::query(
         "INSERT INTO playlist_shares (playlist_id, user_id, can_edit)
          SELECT ?1, ?2, ?3 WHERE EXISTS (SELECT 1 FROM users WHERE id = ?2)
@@ -264,7 +275,7 @@ pub async fn set_share(
     .bind(playlist_id.to_string())
     .bind(user_id.to_string())
     .bind(can_edit)
-    .execute(pool)
+    .execute(conn)
     .await?;
     Ok(())
 }
@@ -282,18 +293,29 @@ pub async fn remove_share(
     Ok(())
 }
 
-/// Replaces a playlist's shares with `shares`, as Jellyfin's create and update do with `Users`.
+/// Replaces a playlist's shares with `shares`, as Jellyfin's create and update do with `Users`,
+/// in one transaction.
 pub async fn replace_shares(
     pool: &SqlitePool,
     playlist_id: Uuid,
     shares: &[PlaylistUserPermissions],
 ) -> Result<(), sqlx::Error> {
+    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+    replace_shares_on(&mut tx, playlist_id, shares).await?;
+    tx.commit().await
+}
+
+async fn replace_shares_on(
+    conn: &mut SqliteConnection,
+    playlist_id: Uuid,
+    shares: &[PlaylistUserPermissions],
+) -> Result<(), sqlx::Error> {
     sqlx::query("DELETE FROM playlist_shares WHERE playlist_id = ?1")
         .bind(playlist_id.to_string())
-        .execute(pool)
+        .execute(&mut *conn)
         .await?;
     for share in shares {
-        set_share(pool, playlist_id, share.user_id, share.can_edit).await?;
+        insert_share(conn, playlist_id, share.user_id, share.can_edit).await?;
     }
     Ok(())
 }
@@ -304,10 +326,19 @@ pub async fn set_open_access(
     playlist_id: Uuid,
     open: bool,
 ) -> Result<(), sqlx::Error> {
+    let mut conn = pool.acquire().await?;
+    set_open_access_on(&mut conn, playlist_id, open).await
+}
+
+async fn set_open_access_on(
+    conn: &mut SqliteConnection,
+    playlist_id: Uuid,
+    open: bool,
+) -> Result<(), sqlx::Error> {
     sqlx::query("UPDATE playlists SET open_access = ?1 WHERE id = ?2")
         .bind(open)
         .bind(playlist_id.to_string())
-        .execute(pool)
+        .execute(conn)
         .await?;
     Ok(())
 }
@@ -391,45 +422,70 @@ pub async fn add_items_to_playlist(
     Ok(())
 }
 
-/// Replaces a changeable playlist's items with `item_ids`, in that order (Jellyfin's update with
-/// `Ids`). Ids that name no item are skipped.
-pub async fn replace_items(
-    pool: &SqlitePool,
-    playlist_id: Uuid,
-    item_ids: &[Uuid],
-    caller: PlaylistCaller,
-) -> Result<(), sqlx::Error> {
-    let pid = playlist_id.to_string();
-    let owner = owner_filter(caller);
-    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
-    let sql = format!(
-        "SELECT 1 FROM playlists p WHERE p.id = ?1 AND {edit}",
-        edit = can_edit(2)
-    );
-    let allowed = sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(sql))
-        .bind(&pid)
-        .bind(owner.as_deref())
-        .fetch_optional(&mut *tx)
-        .await?;
-    if allowed.is_none() {
-        return Ok(());
+/// The entries of a playlist in order, every one, whatever the caller sees.
+async fn all_item_ids(conn: &mut SqliteConnection, pid: &str) -> Result<Vec<Uuid>, sqlx::Error> {
+    let ids = sqlx::query_scalar::<_, String>(
+        "SELECT item_id FROM playlist_items WHERE playlist_id = ?1 ORDER BY sort_order, rowid",
+    )
+    .bind(pid)
+    .fetch_all(conn)
+    .await?;
+    Ok(ids.iter().filter_map(|s| Uuid::parse_str(s).ok()).collect())
+}
+
+/// The entries after an update with `Ids` from a caller who doesn't see `hidden` (parental
+/// limits): the hidden entries keep their places, the other places take `wanted` in order, and
+/// the rest of `wanted` follows. So an editor's update never drops an entry they can't see.
+fn merge_keeping_hidden(current: &[Uuid], wanted: &[Uuid], hidden: &HashSet<Uuid>) -> Vec<Uuid> {
+    let mut wanted = wanted.iter().filter(|id| !hidden.contains(id));
+    let mut out = Vec::with_capacity(current.len());
+    for id in current {
+        if hidden.contains(id) {
+            out.push(*id);
+        } else if let Some(next) = wanted.next() {
+            out.push(*next);
+        }
     }
+    out.extend(wanted);
+    let mut seen = HashSet::new();
+    out.retain(|id| seen.insert(*id));
+    out
+}
+
+/// Moves the entry at `from` to `new_index` counted among the entries the caller sees (those not
+/// in `hidden`): it lands just before the visible entry now at that index, or at the end.
+fn move_among_visible(ids: &mut Vec<Uuid>, from: usize, new_index: usize, hidden: &HashSet<Uuid>) {
+    let moved = ids.remove(from);
+    let at = ids
+        .iter()
+        .enumerate()
+        .filter(|(_, id)| !hidden.contains(id))
+        .nth(new_index)
+        .map_or(ids.len(), |(i, _)| i);
+    ids.insert(at, moved);
+}
+
+/// Stores `ids` as a playlist's entries, in that order. Ids that name no item are skipped.
+async fn write_items(
+    conn: &mut SqliteConnection,
+    pid: &str,
+    ids: &[Uuid],
+) -> Result<(), sqlx::Error> {
     sqlx::query("DELETE FROM playlist_items WHERE playlist_id = ?1")
-        .bind(&pid)
-        .execute(&mut *tx)
+        .bind(pid)
+        .execute(&mut *conn)
         .await?;
-    for (i, item_id) in item_ids.iter().enumerate() {
+    for (i, item_id) in ids.iter().enumerate() {
         sqlx::query(
             "INSERT OR IGNORE INTO playlist_items (playlist_id, item_id, sort_order)
              SELECT ?1, ?2, ?3 WHERE EXISTS (SELECT 1 FROM media_items WHERE id = ?2)",
         )
-        .bind(&pid)
+        .bind(pid)
         .bind(item_id.to_string())
         .bind(i as i64)
-        .execute(&mut *tx)
+        .execute(&mut *conn)
         .await?;
     }
-    tx.commit().await?;
     Ok(())
 }
 
@@ -456,14 +512,15 @@ pub async fn remove_item_from_playlist(
     Ok(())
 }
 
-/// Move an item of a playlist the caller may change to `new_index` (clamped to the end),
-/// renumbering the entries. Returns false when the caller may not change the playlist or it
-/// doesn't hold the item.
+/// Move an item of a playlist the caller may change to `new_index`, counted among the entries the
+/// caller sees (not in `hidden`), and clamped to the end; the entries are renumbered. Returns
+/// false when the caller may not change the playlist or it doesn't hold the item.
 pub async fn move_playlist_item(
     pool: &SqlitePool,
     playlist_id: Uuid,
     item_id: Uuid,
     new_index: usize,
+    hidden: &HashSet<Uuid>,
     caller: PlaylistCaller,
 ) -> Result<bool, sqlx::Error> {
     let pid = playlist_id.to_string();
@@ -478,24 +535,25 @@ pub async fn move_playlist_item(
          ORDER BY pi.sort_order, pi.rowid",
         edit = can_edit(2),
     );
-    let mut ids = sqlx::query_scalar::<_, String>(sqlx::AssertSqlSafe(sql))
+    let mut ids: Vec<Uuid> = sqlx::query_scalar::<_, String>(sqlx::AssertSqlSafe(sql))
         .bind(&pid)
         .bind(owner.as_deref())
         .fetch_all(&mut *tx)
-        .await?;
-    let iid = item_id.to_string();
-    let Some(from) = ids.iter().position(|id| *id == iid) else {
+        .await?
+        .iter()
+        .filter_map(|s| Uuid::parse_str(s).ok())
+        .collect();
+    let Some(from) = ids.iter().position(|id| *id == item_id) else {
         return Ok(false);
     };
-    let moved = ids.remove(from);
-    ids.insert(new_index.min(ids.len()), moved);
+    move_among_visible(&mut ids, from, new_index, hidden);
     for (order, id) in ids.iter().enumerate() {
         sqlx::query(
             "UPDATE playlist_items SET sort_order = ?1 WHERE playlist_id = ?2 AND item_id = ?3",
         )
         .bind(order as i64)
         .bind(&pid)
-        .bind(id)
+        .bind(id.to_string())
         .execute(&mut *tx)
         .await?;
     }
@@ -511,23 +569,70 @@ pub async fn update_playlist(
     media_type: Option<&str>,
     caller: PlaylistCaller,
 ) -> Result<bool, sqlx::Error> {
+    let update = PlaylistUpdate {
+        name,
+        media_type,
+        ..PlaylistUpdate::default()
+    };
+    update_playlist_with(pool, id, &update, &HashSet::new(), caller).await
+}
+
+/// What an update (Jellyfin's UpdatePlaylistDto) changes; None leaves a field as it is.
+#[derive(Debug, Default)]
+pub struct PlaylistUpdate<'a> {
+    pub name: Option<&'a str>,
+    pub media_type: Option<&'a str>,
+    /// The new entries, in order (`Ids`).
+    pub item_ids: Option<&'a [Uuid]>,
+    /// The new shares (`Users`).
+    pub shares: Option<&'a [PlaylistUserPermissions]>,
+    /// Public or private (`IsPublic`).
+    pub public: Option<bool>,
+}
+
+/// Applies an update to a playlist the caller may change, in one transaction. New `item_ids` keep
+/// the entries in `hidden`, which the caller can't see (see `merge_keeping_hidden`). Returns false,
+/// changing nothing, when the caller may not change it.
+pub async fn update_playlist_with(
+    pool: &SqlitePool,
+    id: Uuid,
+    update: &PlaylistUpdate<'_>,
+    hidden: &HashSet<Uuid>,
+    caller: PlaylistCaller,
+) -> Result<bool, sqlx::Error> {
     let pid = id.to_string();
     let owner = owner_filter(caller);
+    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
     let sql = format!(
         "UPDATE playlists AS p SET name = COALESCE(?1, p.name), media_type = COALESCE(?2, p.media_type)
          WHERE p.id = ?3 AND {edit}",
         edit = can_edit(4),
     );
     let found = sqlx::query(sqlx::AssertSqlSafe(sql))
-        .bind(name)
-        .bind(media_type)
+        .bind(update.name)
+        .bind(update.media_type)
         .bind(&pid)
         .bind(owner.as_deref())
-        .execute(pool)
+        .execute(&mut *tx)
         .await?
         .rows_affected()
         > 0;
-    Ok(found)
+    if !found {
+        return Ok(false);
+    }
+    if let Some(wanted) = update.item_ids {
+        let current = all_item_ids(&mut tx, &pid).await?;
+        let ids = merge_keeping_hidden(&current, wanted, hidden);
+        write_items(&mut tx, &pid, &ids).await?;
+    }
+    if let Some(shares) = update.shares {
+        replace_shares_on(&mut tx, id, shares).await?;
+    }
+    if let Some(public) = update.public {
+        set_open_access_on(&mut tx, id, public).await?;
+    }
+    tx.commit().await?;
+    Ok(true)
 }
 
 #[cfg(test)]
@@ -709,5 +814,46 @@ mod tests {
         assert!(seen.open_access && !seen.can_edit);
         remove_share(&pool, pid, editor).await.unwrap();
         assert!(!read(editor).await.unwrap().unwrap().can_edit);
+    }
+
+    fn ids(n: u128) -> Vec<Uuid> {
+        (1..=n).map(Uuid::from_u128).collect()
+    }
+
+    #[test]
+    fn r3collections_a_move_counts_only_the_entries_the_caller_sees() {
+        let [a, b, c, d, e]: [Uuid; 5] = ids(5).try_into().unwrap();
+        let hidden: HashSet<Uuid> = [b, d].into();
+        // The caller sees a, c, e; moving e to their index 1 puts it before c.
+        let mut list = vec![a, b, c, d, e];
+        move_among_visible(&mut list, 4, 1, &hidden);
+        assert_eq!(list, vec![a, b, e, c, d]);
+        // To their index 0: before a.
+        let mut list = vec![b, a, c, d, e];
+        move_among_visible(&mut list, 2, 0, &hidden);
+        assert_eq!(list, vec![b, c, a, d, e]);
+        // Past their last entry: to the end.
+        let mut list = vec![a, b, c, d, e];
+        move_among_visible(&mut list, 0, 9, &hidden);
+        assert_eq!(list, vec![b, c, d, e, a]);
+        // Nothing hidden: the plain index.
+        let mut list = vec![a, b, c];
+        move_among_visible(&mut list, 2, 0, &HashSet::new());
+        assert_eq!(list, vec![c, a, b]);
+    }
+
+    #[test]
+    fn r3collections_an_update_with_ids_keeps_the_hidden_entries() {
+        let [a, b, c, d, e]: [Uuid; 5] = ids(5).try_into().unwrap();
+        let hidden: HashSet<Uuid> = [b].into();
+        // The caller saw a, c, d; they send d, a and a new e (c removed).
+        assert_eq!(
+            merge_keeping_hidden(&[a, b, c, d], &[d, a, e], &hidden),
+            vec![d, b, a, e]
+        );
+        // Fewer: the hidden entry stays even with nothing around it.
+        assert_eq!(merge_keeping_hidden(&[a, b, c], &[], &hidden), vec![b]);
+        // A hidden id sent again isn't doubled.
+        assert_eq!(merge_keeping_hidden(&[a, b], &[b, a], &hidden), vec![a, b]);
     }
 }

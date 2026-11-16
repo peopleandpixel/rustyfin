@@ -28962,10 +28962,11 @@ async fn b38_the_owner_keeps_full_access() {
     let (status, users) =
         send_authed(app, "GET", &format!("/Playlists/{pl}/Users"), token, None).await;
     assert_eq!((status, users), (StatusCode::OK, serde_json::json!([])));
+    // The owner has no share of their own: a 404, as Jellyfin answers it.
     let uri = format!("/Playlists/{pl}/Users/{}", w.alice.1);
     assert_eq!(
         send_authed(app, "GET", &uri, token, None).await.0,
-        StatusCode::OK
+        StatusCode::NOT_FOUND
     );
     let uri = format!("/Playlists/{pl}/Users/{}", w.bob.1);
     assert_eq!(
@@ -29123,6 +29124,7 @@ async fn r3collections_a_shared_playlist_is_read_by_readers_and_changed_by_edito
     let mv = format!("/Playlists/{pl}/Items/{entry}/Move/0");
     let one_uri = format!("/Playlists/{pl}");
     let users_uri = format!("/Playlists/{pl}/Users");
+    let alice_share = format!("/Playlists/{pl}/Users/{}", w.alice.1);
 
     // Shared to read only: bob reads it and finds it listed, but changes nothing.
     let uri = format!("{share}?CanEdit=false");
@@ -29144,13 +29146,24 @@ async fn r3collections_a_shared_playlist_is_read_by_readers_and_changed_by_edito
     );
     let (status, me) = send_authed(app, "GET", &share, bob, None).await;
     assert_eq!((status, &me["CanEdit"]), (StatusCode::OK, &false.into()));
+    // As in Jellyfin: the owner asks about anyone; the owner has no share, so a 404.
+    let (status, his) = send_authed(app, "GET", &share, alice, None).await;
+    assert_eq!((status, &his["CanEdit"]), (StatusCode::OK, &false.into()));
+    assert_eq!(
+        send_authed(app, "GET", &alice_share, alice, None).await.0,
+        StatusCode::NOT_FOUND
+    );
+    let pl_item = format!("/Items/{pl}");
     for (method, uri, body) in [
         ("POST", items.as_str(), Some(add.as_str())),
         ("DELETE", items.as_str(), Some(add.as_str())),
         ("POST", mv.as_str(), None),
         ("POST", one_uri.as_str(), Some(r#"{"Name":"Mine"}"#)),
         ("GET", users_uri.as_str(), None),
+        ("GET", alice_share.as_str(), None),
         ("DELETE", share.as_str(), None),
+        ("DELETE", one_uri.as_str(), None),
+        ("DELETE", pl_item.as_str(), None),
     ] {
         let (status, answer) = send_authed(app, method, uri, bob, body).await;
         assert_eq!(
@@ -29159,12 +29172,6 @@ async fn r3collections_a_shared_playlist_is_read_by_readers_and_changed_by_edito
             "bob {method} {uri}: {answer}"
         );
     }
-    assert_ne!(
-        send_authed(app, "DELETE", &format!("/Playlists/{pl}"), bob, None)
-            .await
-            .0,
-        StatusCode::NO_CONTENT
-    );
     assert_eq!(b38_view(app, alice, pl).await.4, m[..2].to_vec());
 
     // Shared to edit: bob adds and moves, but still may not delete it.
@@ -29189,12 +29196,18 @@ async fn r3collections_a_shared_playlist_is_read_by_readers_and_changed_by_edito
         send_authed(app, "GET", &format!("/Playlists/{pl}/Users"), bob, None).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(users[0]["CanEdit"], true);
-    assert_ne!(
-        send_authed(app, "DELETE", &format!("/Playlists/{pl}"), bob, None)
-            .await
-            .0,
-        StatusCode::NO_CONTENT
+    // An editor may ask about other users, but still may not delete it.
+    assert_eq!(
+        send_authed(app, "GET", &alice_share, bob, None).await.0,
+        StatusCode::NOT_FOUND
     );
+    for uri in [&one_uri, &pl_item] {
+        assert_eq!(
+            send_authed(app, "DELETE", uri, bob, None).await.0,
+            StatusCode::FORBIDDEN,
+            "bob DELETE {uri}"
+        );
+    }
     let (_, item) = send_authed(app, "GET", &format!("/Items/{pl}"), bob, None).await;
     assert_eq!(item["CanDelete"], false);
 
@@ -29332,6 +29345,102 @@ async fn r3collections_a_collection_of_only_hidden_items_is_hidden() {
         w.names(&w.admin, "/Items?IncludeItemTypes=BoxSet").await.1,
         2
     );
+}
+
+/// The names of a playlist's entries in order, and their PlaylistItemIds, as `token` sees them.
+async fn r3collections_entries(
+    w: &R2Parental,
+    token: &str,
+    pl: &str,
+) -> (Vec<String>, Vec<String>) {
+    let (status, list) = w.get(token, &format!("/Playlists/{pl}/Items")).await;
+    assert_eq!(status, StatusCode::OK, "{list}");
+    let items = list["Items"].as_array().unwrap();
+    let field = |key: &str| {
+        items
+            .iter()
+            .map(|i| i[key].as_str().unwrap().to_string())
+            .collect()
+    };
+    (field("Name"), field("PlaylistItemId"))
+}
+
+#[tokio::test]
+async fn r3collections_an_editor_with_parental_limits_moves_and_replaces_only_what_they_see() {
+    let w = r2parental().await;
+    w.set_policy(serde_json::json!({ "MaxParentalRating": 10 }))
+        .await;
+    let names = ["Gentle", "Rough", "Pleasant", "Edgy", "Spooky"];
+    let body = serde_json::json!({ "Name": "Shared", "Ids": names.map(|n| w.id(n)) });
+    let (status, made) = send(
+        &w.app,
+        request("POST", "/Playlists", Some(&w.admin), Some(body)),
+    )
+    .await;
+    assert!(status.is_success(), "{status} {made}");
+    let pl = made["Id"].as_str().unwrap().to_string();
+    let share = format!("/Playlists/{pl}/Users/{}?CanEdit=true", w.kid_id);
+    let (status, _) = send(&w.app, request("POST", &share, Some(&w.admin), None)).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let strs = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+
+    let (seen, entries) = r3collections_entries(&w, &w.kid, &pl).await;
+    assert_eq!(seen, strs(&["Gentle", "Pleasant", "Spooky"]));
+    // The listing counts only what the kid sees.
+    let (_, listed) = w.get(&w.kid, "/Items?IncludeItemTypes=Playlist").await;
+    assert_eq!(listed["Items"][0]["ChildCount"], 3);
+
+    // Spooky to the kid's first place: before Gentle, the hidden entries kept in place.
+    let mv = format!("/Playlists/{pl}/Items/{}/Move/0", entries[2]);
+    let (status, _) = send(&w.app, request("POST", &mv, Some(&w.kid), None)).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    assert_eq!(
+        r3collections_entries(&w, &w.kid, &pl).await.0,
+        strs(&["Spooky", "Gentle", "Pleasant"])
+    );
+    assert_eq!(
+        r3collections_entries(&w, &w.admin, &pl).await.0,
+        strs(&["Spooky", "Gentle", "Rough", "Pleasant", "Edgy"])
+    );
+    // Spooky to the kid's index 1: before Pleasant, so after the hidden Rough.
+    let (_, entries) = r3collections_entries(&w, &w.kid, &pl).await;
+    let mv = format!("/Playlists/{pl}/Items/{}/Move/1", entries[0]);
+    let (status, _) = send(&w.app, request("POST", &mv, Some(&w.kid), None)).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    assert_eq!(
+        r3collections_entries(&w, &w.kid, &pl).await.0,
+        strs(&["Gentle", "Spooky", "Pleasant"])
+    );
+    // A hidden entry can't be moved by the kid.
+    let (all, all_entries) = r3collections_entries(&w, &w.admin, &pl).await;
+    let rough = &all_entries[all.iter().position(|n| n == "Rough").unwrap()];
+    let mv = format!("/Playlists/{pl}/Items/{rough}/Move/0");
+    let (status, _) = send(&w.app, request("POST", &mv, Some(&w.kid), None)).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    // Replacing the entries with Ids keeps the ones the kid can't see.
+    let body = serde_json::json!({ "Ids": [w.id("Pleasant"), w.id("Gentle")] });
+    let (status, answer) = send(
+        &w.app,
+        request(
+            "POST",
+            &format!("/Playlists/{pl}"),
+            Some(&w.kid),
+            Some(body),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{answer}");
+    assert_eq!(
+        r3collections_entries(&w, &w.kid, &pl).await.0,
+        strs(&["Pleasant", "Gentle"])
+    );
+    let (mut kept, _) = r3collections_entries(&w, &w.admin, &pl).await;
+    assert_eq!(kept.len(), 4);
+    kept.sort();
+    assert_eq!(kept, strs(&["Edgy", "Gentle", "Pleasant", "Rough"]));
+    let (_, listed) = w.get(&w.kid, "/Items?IncludeItemTypes=Playlist").await;
+    assert_eq!(listed["Items"][0]["ChildCount"], 2);
 }
 
 // R2 collections: collections and playlists as Jellyfin clients use them
