@@ -41,19 +41,19 @@ async fn update_startup_config(
     State(state): State<AppState>,
     Json(update): Json<StartupConfigurationUpdate>,
 ) -> Result<StatusCode, ApiError> {
-    {
-        let mut config = state.config.write().await;
-        if let Some(lang) = update.preferred_metadata_language {
-            config.preferred_metadata_language = lang;
-        }
-        if let Some(country) = update.metadata_country_code {
-            config.metadata_country_code = country;
-        }
-        if let Some(culture) = update.ui_culture.filter(|c| !c.trim().is_empty()) {
-            config.ui_culture = culture;
-        }
+    let mut config = state.config.write().await;
+    let mut new_config = config.clone();
+    if let Some(lang) = update.preferred_metadata_language {
+        new_config.preferred_metadata_language = lang;
     }
-    persist_config(&state).await?;
+    if let Some(country) = update.metadata_country_code {
+        new_config.metadata_country_code = country;
+    }
+    if let Some(culture) = update.ui_culture.filter(|c| !c.trim().is_empty()) {
+        new_config.ui_culture = culture;
+    }
+    persist_config(&state, &new_config).await?;
+    *config = new_config;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -109,23 +109,25 @@ async fn complete_startup(State(state): State<AppState>) -> Result<StatusCode, A
             "Create the server owner before completing the setup.".into(),
         ));
     }
-    {
-        let mut config = state.config.write().await;
-        config.is_startup_wizard_completed = true;
-    }
-    persist_config(&state).await?;
+    let mut config = state.config.write().await;
+    let mut new_config = config.clone();
+    new_config.is_startup_wizard_completed = true;
+    persist_config(&state, &new_config).await?;
+    *config = new_config;
     Ok(StatusCode::NO_CONTENT)
 }
 
-async fn persist_config(state: &AppState) -> Result<(), ApiError> {
-    let config = state.config.read().await;
-    let config_path = state.data_dir.join("config.json");
-    let json =
-        serde_json::to_string_pretty(&*config).map_err(|e| ApiError::Internal(e.to_string()))?;
-    tokio::fs::write(&config_path, &json)
-        .await
-        .map_err(|e| ApiError::Internal(e.to_string()))?;
-    Ok(())
+/// Saves `config` to config.json in one rename. The callers hold the config's write lock from
+/// the change through the assignment, as every save does, so saves never overlap.
+async fn persist_config(state: &AppState, config: &ServerConfiguration) -> Result<(), ApiError> {
+    let path = state.data_dir.join("config.json");
+    let config = config.clone();
+    tokio::task::spawn_blocking(move || {
+        rustyfin_core::config_file::write_config_atomic(&path, &config)
+    })
+    .await
+    .map_err(|e| ApiError::Internal(e.to_string()))?
+    .map_err(|e| ApiError::Internal(e.to_string()))
 }
 
 /// GET /Startup/FirstUser - Check if first user exists

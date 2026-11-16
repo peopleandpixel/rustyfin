@@ -743,15 +743,16 @@ async fn main() {
                 loop {
                     if sig.recv().await.is_some() {
                         tracing::info!("SIGHUP received, reloading configuration");
-                        let new_config = match load_config(&data_dir) {
-                            Ok(new_config) => new_config,
+                        // The file is read under the write lock that every save holds through its
+                        // write, so a save in flight is never undone by the file it replaces
+                        let mut cfg = config.write().await;
+                        match load_config(&data_dir) {
+                            Ok(new_config) => *cfg = new_config,
                             Err(e) => {
                                 tracing::error!("{e}; the configuration in use is kept");
                                 continue;
                             }
-                        };
-                        let mut cfg = config.write().await;
-                        *cfg = new_config;
+                        }
                         changes.set_delay(std::time::Duration::from_secs(u64::from(
                             cfg.library_monitor_delay,
                         )));
