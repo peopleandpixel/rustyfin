@@ -30407,6 +30407,50 @@ async fn r3livelog_log_level_post_is_kept() {
     assert_eq!(level, serde_json::json!({ "LogLevel": "debug" }));
 }
 
+// The socket's keep-alive frames have Jellyfin's shape: ForceKeepAlive with the interval in
+// seconds first, and a KeepAlive answer to the client's KeepAlive.
+#[tokio::test]
+async fn r3livelog_keep_alive_frames_are_jellyfins() {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+
+    let state = test_state().await;
+    let app = app(state.clone());
+    let (owner, _, _, _) = g1_owner_and_viewer(&state, &app).await;
+    let addr = b17_serve(&app).await;
+    let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+    let request = format!(
+        "GET /socket?api_key={owner} HTTP/1.1\r\nHost: {addr}\r\nConnection: Upgrade\r\n\
+         Upgrade: websocket\r\nSec-WebSocket-Version: 13\r\n\
+         Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n"
+    );
+    stream.write_all(request.as_bytes()).await.unwrap();
+    let mut reader = tokio::io::BufReader::new(stream);
+    let mut line = String::new();
+    while line != "\r\n" {
+        line.clear();
+        assert_ne!(reader.read_line(&mut line).await.unwrap(), 0, "headers end");
+    }
+    let mut socket = G1cSocket(reader);
+    assert_eq!(
+        socket.next().await,
+        serde_json::json!({ "MessageType": "ForceKeepAlive", "Data": 60 })
+    );
+    assert_eq!(socket.next().await["MessageType"], "TimeSync");
+
+    r3tasks_send(&mut socket, r#"{"MessageType":"KeepAlive"}"#).await;
+    let answer = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let frame = socket.next().await;
+            if frame["MessageType"] == "KeepAlive" {
+                return frame;
+            }
+        }
+    })
+    .await
+    .expect("a KeepAlive answer within 5 s");
+    assert_eq!(answer, serde_json::json!({ "MessageType": "KeepAlive" }));
+}
+
 // The live log view's rows, level filter, cap and scrolling (tests/web/r3livelog_view.mjs).
 #[test]
 fn r3livelog_web_view() {

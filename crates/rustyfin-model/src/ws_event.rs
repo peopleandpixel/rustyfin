@@ -5,8 +5,14 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "MessageType", rename_all = "PascalCase")]
 pub enum WsEvent {
-    /// Keep-alive ping from server
-    ForceKeepAlive(i64),
+    /// The keep-alive interval, in seconds, that the server expects from the client:
+    /// `{"MessageType":"ForceKeepAlive","Data":60}`, as Jellyfin sends it on connect
+    ForceKeepAlive {
+        #[serde(rename = "Data")]
+        data: i64,
+    },
+    /// The answer to a client's KeepAlive: `{"MessageType":"KeepAlive"}`, as in Jellyfin
+    KeepAlive,
     /// Playback started on a session
     PlaybackStart {
         #[serde(flatten)]
