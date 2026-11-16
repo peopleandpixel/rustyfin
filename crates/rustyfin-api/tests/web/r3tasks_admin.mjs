@@ -8,12 +8,13 @@ import vm from 'node:vm';
 
 const src = new URL('../../../rustyfin-web/src/', import.meta.url);
 const source = fs.readFileSync(new URL('modules/admin.js', src), 'utf8');
+const dashboard = fs.readFileSync(new URL('modules/dashboard.js', src), 'utf8');
 
 // A top-level declaration, from its head to the end given
-function slice(head, end = '\n}\n') {
-    const start = source.indexOf(head);
-    assert.ok(start >= 0, `admin.js has ${head}`);
-    return source.slice(start, source.indexOf(end, start) + end.length);
+function slice(head, end = '\n}\n', text = source) {
+    const start = text.indexOf(head);
+    assert.ok(start >= 0, `the module has ${head}`);
+    return text.slice(start, text.indexOf(end, start) + end.length);
 }
 
 // A fake element with the parts the functions use.
@@ -71,7 +72,10 @@ function sandbox(answers) {
         unfollowSessions: () => {},
     });
     vm.runInContext(
-        `${slice('function getTaskStateLabel(')}
+        `${slice('const ADMIN_TABS = [', '\n];\n')}
+         ${['const TICKS_PER_MINUTE', 'const TICKS_PER_HOUR', 'const DAYS'].map(head => slice(head, ';\n', dashboard)).join('\n')}
+         ${['function timeOfDay(', 'function intervalLabel(', 'function dayName(', 'function triggerSummary('].map(head => slice(head, '\n}\n', dashboard)).join('\n')}
+         ${slice('function getTaskStateLabel(')}
          ${slice('function getTaskCategoryIcon(')}
          ${slice('function renderTaskCard(')}
          ${slice('function sortTasks(')}

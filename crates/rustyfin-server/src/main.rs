@@ -477,25 +477,34 @@ async fn main() {
     }
 
     let transcodes = state.transcode_manager.clone();
+    let state_scheduler = state.task_scheduler.clone();
+    // The pools closed at the end, so SQLite checkpoints its WAL and the files are left whole
+    let pools = (state.db.clone(), state.db_ro.clone());
     // Background task: on SIGTERM or SIGINT, or a shutdown from the API, stop every transcode
-    // first, so no ffmpeg outlives the server, then shut down. Open connections (a playing
-    // stream) would hold a graceful shutdown open for good, so the process ends after
-    // SHUTDOWN_GRACE all the same.
+    // and every image task's ffmpeg first, so no ffmpeg outlives the server, then shut down.
+    // Open connections (a playing stream) would hold a graceful shutdown open for good, so the
+    // process ends after SHUTDOWN_GRACE all the same. It ends with 0, or with
+    // RESTART_EXIT_CODE after POST /System/Restart.
     {
         let shutdown_tx = state.shutdown_tx.clone();
         let mut shutdown_rx = state.shutdown_tx.subscribe();
         let transcodes = transcodes.clone();
+        let scheduler = state.task_scheduler.clone();
+        let pools = pools.clone();
         tokio::spawn(async move {
             tokio::select! {
                 signal = shutdown_signal() => tracing::info!("{signal} received, shutting down"),
                 _ = shutdown_rx.wait_for(|v| *v) => {}
             }
+            scheduler.cancel_runs();
             // No transcode starts after this
             transcodes.shutdown().await;
             let _ = shutdown_tx.send(true);
             tokio::time::sleep(SHUTDOWN_GRACE).await;
             tracing::info!("connections still open after the shutdown grace, exiting");
-            std::process::exit(0);
+            pools.1.close().await;
+            pools.0.close().await;
+            std::process::exit(rustyfin_api::routes::exit_code());
         });
     }
 
@@ -807,8 +816,15 @@ async fn main() {
 
     // The shutdown task has stopped the transcodes and closed the manager; this is the same for
     // a shutdown that reached here first
+    state_scheduler.cancel_runs();
     transcodes.shutdown().await;
-    tracing::info!("server stopped");
+    pools.1.close().await;
+    pools.0.close().await;
+    let code = rustyfin_api::routes::exit_code();
+    tracing::info!(code, "server stopped");
+    if code != 0 {
+        std::process::exit(code);
+    }
 }
 
 /// How long a shutdown waits for open connections before the process ends anyway. Docker and
@@ -838,9 +854,16 @@ fn load_config(data_dir: &std::path::Path) -> ServerConfiguration {
     let config_path = data_dir.join("config.json");
     if config_path.exists() {
         match std::fs::read_to_string(&config_path) {
-            Ok(content) => match serde_json::from_str(&content) {
-                Ok(cfg) => {
+            Ok(content) => match serde_json::from_str::<ServerConfiguration>(&content) {
+                Ok(mut cfg) => {
                     tracing::info!("loaded configuration from {}", config_path.display());
+                    // A file from an older Rustyfin is brought up to date once, and saved so
+                    if cfg.upgrade()
+                        && let Err(e) =
+                            rustyfin_core::config_file::write_config_atomic(&config_path, &cfg)
+                    {
+                        tracing::warn!("could not save the upgraded config.json: {}", e);
+                    }
                     return cfg;
                 }
                 Err(e) => {

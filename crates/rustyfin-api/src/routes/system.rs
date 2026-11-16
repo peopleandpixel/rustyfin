@@ -411,11 +411,13 @@ fn canonical_fields(body: serde_json::Value) -> serde_json::Value {
 }
 
 /// Drops the fields that `configuration_json` works out on each GET, so a client that posts the
-/// whole configuration back doesn't store them.
+/// whole configuration back doesn't store them, and sets this build's config version.
 fn drop_computed_fields(config: &mut ServerConfiguration) {
     for field in ["TmdbApiKeySet", "OmdbApiKeySet", "FanartApiKeySet"] {
         config.other.remove(field);
     }
+    // What an admin saves now is this build's choice, never upgraded later
+    config.config_version = rustyfin_model::server_info::CONFIG_VERSION;
 }
 
 /// Jellyfin's named configuration `encoding` (`EncodingOptions`): Jellyfin 12.4.0's defaults with
@@ -540,16 +542,38 @@ async fn update_configuration(
     Ok(StatusCode::NO_CONTENT)
 }
 
+/// Set by `POST /System/Restart`: the process then ends with `RESTART_EXIT_CODE` instead of 0.
+pub static RESTART_REQUESTED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// The exit code of a restart asked for through the API. Not 0, so a supervisor that restarts on
+/// failure (Docker `on-failure`, systemd `Restart=on-failure`) starts the server again; 75 is
+/// `EX_TEMPFAIL`, "try again".
+pub const RESTART_EXIT_CODE: i32 = 75;
+
+/// The exit code the process ends with: `RESTART_EXIT_CODE` after `POST /System/Restart`, else 0.
+pub fn exit_code() -> i32 {
+    if RESTART_REQUESTED.load(std::sync::atomic::Ordering::SeqCst) {
+        RESTART_EXIT_CODE
+    } else {
+        0
+    }
+}
+
+/// POST /System/Shutdown - stops the server; the process ends with 0.
 async fn shutdown(State(state): State<AppState>) -> StatusCode {
     tracing::info!("shutdown requested via API");
     let _ = state.shutdown_tx.send(true);
     StatusCode::NO_CONTENT
 }
 
+/// POST /System/Restart - stops the server like a shutdown, but the process ends with
+/// `RESTART_EXIT_CODE`, for the supervisor (Docker, systemd) to start it again.
 async fn restart(State(state): State<AppState>) -> StatusCode {
     tracing::info!(
-        "restart requested via API (performing shutdown, external supervisor should restart)"
+        "restart requested via API: the server stops with exit code {RESTART_EXIT_CODE} for its supervisor to start it again"
     );
+    RESTART_REQUESTED.store(true, std::sync::atomic::Ordering::SeqCst);
     let _ = state.shutdown_tx.send(true);
     StatusCode::NO_CONTENT
 }

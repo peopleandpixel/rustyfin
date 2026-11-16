@@ -37,6 +37,9 @@ import {
     changeSubtitleAppearance, changeLatestLibrary, chooseProfileImage, deleteProfileImage,
 } from './modules/settings.js';
 import './modules/playback-admin.js';
+import {
+    saveGeneralSettings, addLibraryFolder, renameLibrary, addTaskTrigger, showTriggerFields,
+} from './modules/dashboard.js';
 import { refreshTasks, openAddUser, closeAddUser, submitAddUser, clearLiveLog, setLogLevel } from './modules/admin.js';
 import './modules/user-editor.js';
 import {
@@ -61,5 +64,6 @@ Object.assign(window, {
     submitLibraryOptions, openAddUser, closeAddUser,
     submitAddUser, clearLiveLog, setLogLevel, closePluginConfig, savePluginConfig, closePluginPriority,
     savePluginPriority, sessionControl, openPlayOn, playOnSession, changeUserConfig, changeUserPref, changeHomeSection,
-    changeSubtitleAppearance, changeLatestLibrary, chooseProfileImage, deleteProfileImage,
+    changeSubtitleAppearance, changeLatestLibrary, chooseProfileImage, deleteProfileImage, saveGeneralSettings,
+    addLibraryFolder, renameLibrary, addTaskTrigger, showTriggerFields,
 });

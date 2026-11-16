@@ -26,6 +26,7 @@ pub mod scheduler;
 pub mod stream_builder;
 pub mod subtitle;
 pub mod task_progress;
+pub mod task_triggers;
 pub mod tmdb_client;
 pub mod transcode;
 pub mod trickplay;

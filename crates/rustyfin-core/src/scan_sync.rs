@@ -48,6 +48,52 @@ pub async fn delete_item_in(conn: &mut SqliteConnection, id: &str) -> Result<boo
     Ok(true)
 }
 
+/// Deletes the items of the library `library_id` under `folder` (a folder taken out of the
+/// library) that no folder in `kept` holds, with their user data. A scan never reaches them, as
+/// it prunes only under the library's folders. Children go before their parents. Returns how
+/// many were deleted.
+pub async fn remove_items_under(
+    pool: &SqlitePool,
+    library_id: Uuid,
+    folder: &str,
+    kept: &[String],
+) -> Result<u32, sqlx::Error> {
+    let under = |path: &str, root: &str| {
+        let root = root.trim_end_matches('/');
+        path == root || path.starts_with(&format!("{root}/"))
+    };
+    let root = folder.trim_end_matches('/');
+    let mut removed = 0;
+    loop {
+        // The items with no children left, under the folder
+        let rows: Vec<(String, String)> = sqlx::query_as(
+            "SELECT id, path FROM media_items m WHERE library_id = ?1 \
+             AND (path = ?2 OR substr(path, 1, length(?3)) = ?3) \
+             AND NOT EXISTS (SELECT 1 FROM media_items c WHERE c.parent_id = m.id)",
+        )
+        .bind(library_id.to_string())
+        .bind(root)
+        .bind(format!("{root}/"))
+        .fetch_all(pool)
+        .await?;
+        let gone: Vec<String> = rows
+            .into_iter()
+            .filter(|(_, path)| under(path, folder) && !kept.iter().any(|k| under(path, k)))
+            .map(|(id, _)| id)
+            .collect();
+        let mut deleted = 0;
+        for id in &gone {
+            if delete_item(pool, id).await? {
+                deleted += 1;
+            }
+        }
+        removed += deleted;
+        if deleted == 0 {
+            return Ok(removed);
+        }
+    }
+}
+
 /// Deletes the items of `library` whose path is in `scope` that the scan did not collect, and returns how
 /// many were deleted. `PathScope::All` covers the whole library.
 ///
