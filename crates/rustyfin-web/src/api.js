@@ -548,21 +548,31 @@ const API = {
                 ac3: 'audio/mp4; codecs="ac-3"',
                 eac3: 'audio/mp4; codecs="ec-3"',
             }),
+            // HEVC Main 10, which most HEVC films are; the server copies 10-bit HEVC only when told
+            hevcMain10: canPlay('video/mp4; codecs="hvc1.2.4.L120.90"'),
+            // The highest HEVC level the browser says it plays, up to 4.1 (1080p): browsers answer
+            // yes too readily, so 4K levels are never claimed
+            hevcLevel: [123, 120, 93].find(level => canPlay(`video/mp4; codecs="hvc1.1.6.L${level}.90"`)) || 93,
         };
         return this._playableCodecs;
     },
-    // Universal endpoint returns the optimal playback URL
+    // Universal endpoint returns the optimal playback URL. No PlaySessionId is sent: the server
+    // keeps a client's id, and one fixed per device would tie every load to the last one stopped.
     async getUniversalVideoUrl(itemId, params = {}) {
         // No maxBitrate (the player's Auto) sends no limit, so any source the browser plays can play directly
         const q = new URLSearchParams({
             EnableDirectPlay: params.enableDirectPlay !== false ? 'true' : 'false',
             EnableDirectStream: params.enableDirectStream !== false ? 'true' : 'false',
-            PlaySessionId: 'web-' + (localStorage.getItem('rustyfin_device_id') || 'browser'),
         });
         if (params.maxBitrate > 0) q.set('MaxStreamingBitrate', params.maxBitrate);
         const codecs = this.playableCodecs();
         q.set('VideoCodecs', codecs.video.join(','));
         q.set('AudioCodecs', codecs.audio.join(','));
+        // Jellyfin's codec condition: the HEVC bit depth this browser decodes
+        if (codecs.video.includes('hevc')) {
+            q.set('hevc-videobitdepth', codecs.hevcMain10 ? '10' : '8');
+            q.set('hevc-level', String(codecs.hevcLevel || 93));
+        }
         if (params.startTimeTicks > 0) q.set('StartTimeTicks', params.startTimeTicks);
         if (params.mediaSourceId) q.set('MediaSourceId', params.mediaSourceId);
         if (params.audioStreamIndex != null) q.set('AudioStreamIndex', params.audioStreamIndex);

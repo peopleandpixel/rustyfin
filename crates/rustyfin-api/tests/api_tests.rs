@@ -95,6 +95,7 @@ async fn test_state() -> AppState {
         oidc: rustyfin_api::oidc::OidcState::new(),
         jellyfin_import: Default::default(),
         directory_listings: Default::default(),
+        file_guard: Default::default(),
     }
 }
 
@@ -18568,6 +18569,99 @@ async fn w1filters_genres_ratings_and_years_are_lists() {
     }
 }
 
+// R3 playback: /Items filters by Jellyfin's SubtitleLanguages, and a code matches in both its
+// ISO 639-2 spellings, as the streams report "deu" for the "ger" a file stores
+#[tokio::test]
+async fn r3playback_subtitle_languages_filter_matches_both_iso_codes() {
+    let state = test_state().await;
+    let (token, _) = admin_session(&state).await;
+    let folder = std::path::PathBuf::from(media_folder(&state, "r3langs"));
+    let mut ids = Vec::new();
+    for (name, subtitle, audio) in [
+        ("R3 German.mkv", "ger", "eng"),
+        ("R3 English.mkv", "eng", "ger"),
+        ("R3 French.mkv", "fra", "fre"),
+    ] {
+        let file = folder.join(name);
+        std::fs::write(&file, b"r3").unwrap();
+        let id = g4_insert_item(&state, "Movie", &file).await;
+        let source: rustyfin_model::media_source::MediaSourceResponse =
+            serde_json::from_value(serde_json::json!({
+                "Id": uuid::Uuid::new_v4().to_string(),
+                "Uid": uuid::Uuid::new_v4().to_string(),
+                "Container": "mkv",
+                "Protocol": "File",
+                "Path": file.to_str().unwrap(),
+                "MediaStreams": [
+                    { "Index": 0, "Codec": "h264", "CodecType": "video" },
+                    { "Index": 1, "Codec": "ac3", "CodecType": "audio", "Language": audio },
+                    { "Index": 2, "Codec": "subrip", "CodecType": "subtitle", "Language": subtitle },
+                ],
+            }))
+            .unwrap();
+        rustyfin_db::repo_media_source::insert_media_source_with_streams(&state.db, &id, &source)
+            .await
+            .unwrap();
+        ids.push(id.to_string());
+    }
+    let (german, english, french) = (&ids[0], &ids[1], &ids[2]);
+    let app = app(state);
+
+    let found = |query: &'static str| {
+        let app = app.clone();
+        let token = token.clone();
+        async move {
+            let uri = format!("/Items?Recursive=true&IncludeItemTypes=Movie&{query}");
+            let (status, body) = send(&app, request("GET", &uri, Some(&token), None)).await;
+            assert_eq!(status, StatusCode::OK, "{uri}");
+            let mut ids: Vec<String> = body["Items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|item| item["Id"].as_str().unwrap().to_string())
+                .collect();
+            ids.sort();
+            ids
+        }
+    };
+    let sorted = |list: &[&String]| {
+        let mut list: Vec<String> = list.iter().map(|s| s.to_string()).collect();
+        list.sort();
+        list
+    };
+    // The stored "ger" is found by the "deu" the API reports, and by itself; audio doesn't count
+    assert_eq!(found("SubtitleLanguages=deu").await, sorted(&[german]));
+    assert_eq!(found("SubtitleLanguages=ger").await, sorted(&[german]));
+    assert_eq!(found("subtitleLanguages=DEU").await, sorted(&[german]));
+    // The stored "fra" is found by "fre"; a list takes any of its languages
+    assert_eq!(found("SubtitleLanguages=fre").await, sorted(&[french]));
+    assert_eq!(
+        found("SubtitleLanguages=eng,fre").await,
+        sorted(&[english, french])
+    );
+    assert_eq!(
+        found("SubtitleLanguages=eng&SubtitleLanguages=ger").await,
+        sorted(&[german, english])
+    );
+    // Rustyfin's older single SubtitleLanguage still filters
+    assert_eq!(found("SubtitleLanguage=deu").await, sorted(&[german]));
+    assert!(found("SubtitleLanguages=spa").await.is_empty());
+    // A list longer than SQLite binds in one query still finds its languages
+    let mut many: Vec<String> = (0..1500).map(|i| format!("q{i:04}")).collect();
+    many.push("deu".to_string());
+    let uri = format!(
+        "/Items?Recursive=true&IncludeItemTypes=Movie&SubtitleLanguages={}",
+        many.join(",")
+    );
+    let (status, body) = send(&app, request("GET", &uri, Some(&token), None)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["Items"][0]["Id"].as_str(), Some(german.as_str()));
+    assert_eq!(body["Items"].as_array().unwrap().len(), 1);
+    // Without the filter, or with a blank one, all three
+    assert_eq!(found("SubtitleLanguages=").await.len(), 3);
+    assert_eq!(found("Fields=Path").await.len(), 3);
+}
+
 #[tokio::test]
 async fn w1filters_series_status_maps_provider_words() {
     let (app, token, library) = w1filters_seed().await;
@@ -33374,6 +33468,302 @@ async fn r1play_media_in_the_data_dir_plays_owned_files_are_refused() {
     }
 }
 
+// R3 playback: the HLS input, subtitle and image routes read a stored path only when it passes
+// the checks the direct streams use; pictures, which live outside the libraries too, only when
+// they are pictures and not the server's own files
+
+/// GETs `uri` with a bearer token; returns the status and the body.
+async fn r3playback_get(app: &axum::Router, uri: &str, token: &str) -> (StatusCode, Vec<u8>) {
+    let req = Request::builder()
+        .uri(uri)
+        .header("Authorization", format!("Bearer {token}"))
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    let status = resp.status();
+    let body = resp
+        .into_body()
+        .collect()
+        .await
+        .unwrap()
+        .to_bytes()
+        .to_vec();
+    (status, body)
+}
+
+/// A movie library at `lib_dir` with one movie item whose stored path is `file`, which need not
+/// lie in the library.
+async fn r3playback_insert_item(
+    state: &AppState,
+    lib_dir: &std::path::Path,
+    file: &str,
+) -> uuid::Uuid {
+    let lib = rustyfin_model::library::Library {
+        id: uuid::Uuid::new_v4(),
+        name: format!("R3 {}", uuid::Uuid::new_v4().simple()),
+        content_type: rustyfin_model::library::LibraryContentType::Movies,
+        paths: vec![lib_dir.to_str().unwrap().to_string()],
+    };
+    rustyfin_db::repo_library::create_library(&state.db, &lib)
+        .await
+        .unwrap();
+    let item_id = uuid::Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO media_items (id, library_id, name, media_type, path) VALUES (?, ?, ?, 'Movie', ?)",
+    )
+    .bind(item_id.to_string())
+    .bind(lib.id.to_string())
+    .bind("R3 Film")
+    .bind(file)
+    .execute(&state.db)
+    .await
+    .unwrap();
+    item_id
+}
+
+#[tokio::test]
+async fn r3playback_hls_input_outside_the_library_is_refused() {
+    let state = test_state().await;
+    let (token, _) = admin_session(&state).await;
+    let lib = std::path::PathBuf::from(media_folder(&state, "r3hls"));
+    let outside = state.data_dir.join("r3-outside");
+    std::fs::create_dir_all(&outside).unwrap();
+    let film = outside.join("Film.mkv");
+    std::fs::write(&film, vec![7u8; 500]).unwrap();
+    let db = state.data_dir.join("test.db");
+    std::os::unix::fs::symlink(&db, lib.join("Linked.mkv")).unwrap();
+    // A link that sits in the library but points out of every library
+    std::os::unix::fs::symlink(&film, lib.join("Out.mkv")).unwrap();
+    let s = |p: &std::path::Path| p.to_str().unwrap().to_string();
+    let out_id = r3playback_insert_item(&state, &lib, &s(&lib.join("Out.mkv"))).await;
+    let mut ids = Vec::new();
+    for path in [
+        s(&film),
+        s(&db),
+        s(&lib.join("Linked.mkv")),
+        format!("{}/../r3-outside/Film.mkv", lib.display()),
+    ] {
+        ids.push(r3playback_insert_item(&state, &lib, &path).await);
+    }
+    // A file of its own in the library passes the check (ffmpeg then fails on its bytes)
+    let inside = lib.join("In.mkv");
+    std::fs::write(&inside, vec![7u8; 500]).unwrap();
+    let inside_id = r3playback_insert_item(&state, &lib, &s(&inside)).await;
+    let manager = state.transcode_manager.clone();
+    let app = app(state);
+
+    for id in ids {
+        let uri = format!("/Videos/{id}/main.m3u8?PlaySessionId=r3-{id}");
+        let (status, _) = r3playback_get(&app, &uri, &token).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{id}");
+        assert!(!manager.is_active(id).await, "{id}: ffmpeg started");
+        // The direct stream refuses the same paths
+        let uri = format!("/Videos/{id}/stream?Static=true");
+        let (status, _) = r3playback_get(&app, &uri, &token).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{id}: stream");
+    }
+    let uri = format!("/Videos/{inside_id}/main.m3u8?PlaySessionId=r3-inside");
+    let (status, body) = r3playback_get(&app, &uri, &token).await;
+    assert_ne!(
+        status,
+        StatusCode::NOT_FOUND,
+        "{}",
+        String::from_utf8_lossy(&body)
+    );
+    let uri = format!("/Videos/{inside_id}/stream?Static=true");
+    let (status, _) = r3playback_get(&app, &uri, &token).await;
+    assert_eq!(status, StatusCode::OK);
+
+    // The link out of every library plays by default, as Jellyfin follows links
+    let out = format!("/Videos/{out_id}/stream?Static=true");
+    let (status, _) = r3playback_get(&app, &out, &token).await;
+    assert_eq!(status, StatusCode::OK, "default");
+    // RefuseLinksOutOfLibraries round-trips through /System/Configuration and refuses it
+    let (_, mut config) = send(
+        &app,
+        request("GET", "/System/Configuration", Some(&token), None),
+    )
+    .await;
+    assert_eq!(config["RefuseLinksOutOfLibraries"], false);
+    config["RefuseLinksOutOfLibraries"] = serde_json::json!(true);
+    let (status, _) = send(
+        &app,
+        request("POST", "/System/Configuration", Some(&token), Some(config)),
+    )
+    .await;
+    assert!(status.is_success(), "{status}");
+    let (_, config) = send(
+        &app,
+        request("GET", "/System/Configuration", Some(&token), None),
+    )
+    .await;
+    assert_eq!(config["RefuseLinksOutOfLibraries"], true);
+    let (status, _) = r3playback_get(&app, &out, &token).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "on");
+    let uri = format!("/Videos/{out_id}/main.m3u8?PlaySessionId=r3-out");
+    let (status, _) = r3playback_get(&app, &uri, &token).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "on: hls");
+    assert!(!manager.is_active(out_id).await);
+    // A file of its own in the library still plays with it on
+    let uri = format!("/Videos/{inside_id}/stream?Static=true");
+    let (status, _) = r3playback_get(&app, &uri, &token).await;
+    assert_eq!(status, StatusCode::OK, "on: own file");
+    manager.stop_all().await;
+}
+
+#[tokio::test]
+async fn r3playback_subtitle_routes_refuse_files_out_of_the_library() {
+    let state = test_state().await;
+    let (token, _) = admin_session(&state).await;
+    let srt = "1\n00:00:01,000 --> 00:00:02,000\nR3 hello\n";
+    // A subtitle file of its own beside the film
+    let good = std::path::PathBuf::from(media_folder(&state, "r3subs-good"));
+    std::fs::write(good.join("Film.mkv"), vec![7u8; 500]).unwrap();
+    std::fs::write(good.join("Film.en.srt"), srt).unwrap();
+    // A subtitle link beside the film to the database
+    let linked = std::path::PathBuf::from(media_folder(&state, "r3subs-linked"));
+    std::fs::write(linked.join("Film.mkv"), vec![7u8; 500]).unwrap();
+    std::os::unix::fs::symlink(state.data_dir.join("test.db"), linked.join("Film.en.srt")).unwrap();
+    // A film stored outside its library, with a subtitle file beside it
+    let outside = state.data_dir.join("r3-subs-outside");
+    std::fs::create_dir_all(&outside).unwrap();
+    std::fs::write(outside.join("Film.mkv"), vec![7u8; 500]).unwrap();
+    std::fs::write(outside.join("Film.en.srt"), srt).unwrap();
+
+    let s = |p: std::path::PathBuf| p.to_str().unwrap().to_string();
+    let good_id = r3playback_insert_item(&state, &good, &s(good.join("Film.mkv"))).await;
+    let linked_id = r3playback_insert_item(&state, &linked, &s(linked.join("Film.mkv"))).await;
+    let outside_id = r3playback_insert_item(&state, &good, &s(outside.join("Film.mkv"))).await;
+    for (id, dir) in [
+        (good_id, &good),
+        (linked_id, &linked),
+        (outside_id, &outside),
+    ] {
+        g4_insert_source(
+            &state,
+            id,
+            "mkv",
+            &dir.join("Film.mkv"),
+            &[("video", "h264")],
+        )
+        .await;
+    }
+    let app = app(state);
+
+    // The subtitle beside the film is served by all three routes
+    let routes = |id: uuid::Uuid| {
+        [
+            format!("/Videos/{id}/Subtitles/0/Stream"),
+            format!("/Videos/{id}/Subtitles/0?Format=vtt"),
+            format!("/Videos/{id}/{id}/Subtitles/1/Stream.vtt"),
+        ]
+    };
+    for uri in routes(good_id) {
+        let (status, body) = r3playback_get(&app, &uri, &token).await;
+        assert_eq!(status, StatusCode::OK, "{uri}");
+        assert!(String::from_utf8_lossy(&body).contains("R3 hello"), "{uri}");
+    }
+    // A link to the database and a film outside its library are refused before anything is read
+    for id in [linked_id, outside_id] {
+        for uri in routes(id) {
+            let (status, body) = r3playback_get(&app, &uri, &token).await;
+            assert_eq!(status, StatusCode::NOT_FOUND, "{uri}");
+            assert!(!body.starts_with(b"SQLite format"), "{uri}: database bytes");
+            assert!(
+                !String::from_utf8_lossy(&body).contains("R3 hello"),
+                "{uri}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn r3playback_image_routes_serve_pictures_only() {
+    let state = test_state().await;
+    let (token, _) = admin_session(&state).await;
+    let lib = std::path::PathBuf::from(media_folder(&state, "r3images"));
+    std::fs::write(lib.join("Film.mkv"), vec![7u8; 500]).unwrap();
+    let id = r3playback_insert_item(&state, &lib, lib.join("Film.mkv").to_str().unwrap()).await;
+
+    let db = state.data_dir.join("test.db");
+    std::fs::write(lib.join("poster.png"), TINY_PNG).unwrap();
+    std::os::unix::fs::symlink(&db, lib.join("backdrop.jpg")).unwrap();
+    std::fs::write(lib.join("notes.jpg"), b"not a picture at all").unwrap();
+    // An MP4 renamed .jpg: an ISO media file without a picture brand
+    let mut mp4 = b"\x00\x00\x00\x20ftypisom\x00\x00\x02\x00isomiso2avc1mp41".to_vec();
+    mp4.extend(vec![0u8; 64]);
+    std::fs::write(lib.join("clip.jpg"), &mp4).unwrap();
+    std::fs::write(state.data_dir.join("logs").join("logo.png"), TINY_PNG).unwrap();
+    std::fs::create_dir_all(state.data_dir.join("metadata")).unwrap();
+    std::fs::write(state.data_dir.join("metadata").join("art.png"), TINY_PNG).unwrap();
+
+    use rustyfin_model::image::ImageType;
+    let s = |p: std::path::PathBuf| p.to_str().unwrap().to_string();
+    let cases = [
+        (
+            ImageType::Primary,
+            s(lib.join("poster.png")),
+            StatusCode::OK,
+        ),
+        (
+            ImageType::Art,
+            s(state.data_dir.join("metadata").join("art.png")),
+            StatusCode::OK,
+        ),
+        (
+            ImageType::Backdrop,
+            s(lib.join("backdrop.jpg")),
+            StatusCode::NOT_FOUND,
+        ),
+        (ImageType::Thumb, s(db.clone()), StatusCode::NOT_FOUND),
+        (
+            ImageType::Screenshot,
+            s(lib.join("clip.jpg")),
+            StatusCode::NOT_FOUND,
+        ),
+        (
+            ImageType::Banner,
+            s(lib.join("notes.jpg")),
+            StatusCode::NOT_FOUND,
+        ),
+        (
+            ImageType::Logo,
+            s(state.data_dir.join("logs").join("logo.png")),
+            StatusCode::NOT_FOUND,
+        ),
+        (
+            ImageType::Disc,
+            format!("{}/../r3images/poster.png", lib.display()),
+            StatusCode::NOT_FOUND,
+        ),
+    ];
+    for (image_type, path, _) in &cases {
+        let img = rustyfin_model::image::ItemImage {
+            item_id: id,
+            image_type: *image_type,
+            image_index: 0,
+            path: path.clone(),
+            provider: "local".to_string(),
+            width: None,
+            height: None,
+            blurhash: None,
+            stamp: None,
+        };
+        rustyfin_db::repo_image::upsert_image(&state.db, &img)
+            .await
+            .unwrap();
+    }
+    let app = app(state);
+
+    for (image_type, path, expected) in cases {
+        let uri = format!("/Items/{id}/Images/{}", image_type.as_str());
+        let (status, body) = r3playback_get(&app, &uri, &token).await;
+        assert_eq!(status, expected, "{uri} ({path})");
+        assert!(!body.starts_with(b"SQLite format"), "{uri}: database bytes");
+        assert!(!body.starts_with(b"not a picture"), "{uri}: text bytes");
+    }
+}
+
 #[tokio::test]
 async fn g4_unsatisfiable_ranges_get_416() {
     let state = test_state().await;
@@ -33528,6 +33918,136 @@ async fn g4_insert_source(
     rustyfin_db::repo_media_source::insert_media_source_with_streams(&state.db, &item, &source)
         .await
         .unwrap();
+}
+
+// R3 playback: Universal keeps the client's PlaySessionId, as Jellyfin does, so the client stops
+// its transcode with the id it sent; without one the server makes one per call
+#[tokio::test]
+async fn r3playback_universal_keeps_the_clients_play_session_id() {
+    let state = test_state().await;
+    let (token, _) = admin_session(&state).await;
+    let folder = std::path::PathBuf::from(media_folder(&state, "r3universal"));
+    let file = folder.join("R3 Film.mkv");
+    std::fs::write(&file, b"r3").unwrap();
+    let id = g4_insert_item(&state, "Movie", &file).await;
+    g4_insert_source(
+        &state,
+        id,
+        "mkv",
+        &file,
+        &[("Video", "hevc"), ("Audio", "ac3")],
+    )
+    .await;
+    let audio_file = folder.join("R3 Song.flac");
+    std::fs::write(&audio_file, b"r3").unwrap();
+    let song = g4_insert_item(&state, "Audio", &audio_file).await;
+    g4_insert_source(&state, song, "flac", &audio_file, &[("Audio", "flac")]).await;
+    let app = app(state);
+
+    let lists = "VideoCodecs=h264&AudioCodecs=aac";
+    for (sent, expected_in_url) in [
+        ("client-1", "PlaySessionId=client-1"),
+        ("%20%20client-2%20", "PlaySessionId=client-2"),
+        (
+            "a%26VideoCodec%3Dhevc",
+            "PlaySessionId=a%26VideoCodec%3Dhevc",
+        ),
+    ] {
+        let uri = format!("/Videos/{id}/Universal?{lists}&PlaySessionId={sent}");
+        let (status, body) = send(&app, request("GET", &uri, Some(&token), None)).await;
+        assert_eq!(status, StatusCode::OK, "{uri}");
+        let url = body["Url"].as_str().unwrap();
+        assert!(url.contains("main.m3u8"), "{url}");
+        assert!(url.ends_with(expected_in_url), "{url}");
+        let decoded: String = form_urlencoded::parse(sent.as_bytes())
+            .map(|(k, _)| k.into_owned())
+            .collect();
+        assert_eq!(body["PlaySessionId"], decoded.trim(), "{uri}");
+        // The name matches without case, as ASP.NET binds it
+        let lower = format!("/Videos/{id}/Universal?{lists}&playSessionId={sent}");
+        let (_, body) = send(&app, request("GET", &lower, Some(&token), None)).await;
+        assert_eq!(body["PlaySessionId"], decoded.trim(), "{lower}");
+    }
+    let uri = format!("/Audio/{song}/universal?PlaySessionId=client-audio");
+    let (status, body) = send(&app, request("GET", &uri, Some(&token), None)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["PlaySessionId"], "client-audio");
+
+    // No id, or a blank one: a new id each call
+    let mut ids = std::collections::HashSet::new();
+    for query in [lists.to_string(), format!("{lists}&PlaySessionId=%20")] {
+        let uri = format!("/Videos/{id}/Universal?{query}");
+        let (_, body) = send(&app, request("GET", &uri, Some(&token), None)).await;
+        let sent = body["PlaySessionId"].as_str().unwrap().to_string();
+        assert!(uuid::Uuid::parse_str(&sent).is_ok(), "{sent}");
+        assert!(
+            body["Url"]
+                .as_str()
+                .unwrap()
+                .ends_with(&format!("PlaySessionId={sent}"))
+        );
+        ids.insert(sent);
+    }
+    assert_eq!(ids.len(), 2);
+}
+
+// R3 playback: Universal passes what the client states about HEVC on to the transcode URL, so a
+// Matroska HEVC film is copied for a client that lists HEVC rather than encoded
+#[tokio::test]
+async fn r3playback_universal_passes_the_hevc_limits_on() {
+    let state = test_state().await;
+    let (token, _) = admin_session(&state).await;
+    let folder = std::path::PathBuf::from(media_folder(&state, "r3hevc"));
+    let file = folder.join("R3 HEVC.mkv");
+    std::fs::write(&file, b"r3").unwrap();
+    let id = g4_insert_item(&state, "Movie", &file).await;
+    g4_insert_source(
+        &state,
+        id,
+        "mkv",
+        &file,
+        &[("Video", "hevc"), ("Audio", "dts")],
+    )
+    .await;
+    let app = app(state);
+
+    let uri = format!(
+        "/Videos/{id}/Universal?VideoCodecs=h264,hevc&AudioCodecs=aac\
+         &hevc-videobitdepth=10&hevc-profile=main,main%2010&MaxVideoBitDepth=10\
+         &hevc-level=123&hevc-rangetype=SDR,HDR10"
+    );
+    let (status, body) = send(&app, request("GET", &uri, Some(&token), None)).await;
+    assert_eq!(status, StatusCode::OK);
+    let url = body["Url"].as_str().unwrap();
+    assert!(url.contains("/main.m3u8?"), "{url}");
+    for part in [
+        "VideoCodec=h264,hevc",
+        "MaxVideoBitDepth=10",
+        "hevc-videobitdepth=10",
+        "hevc-profile=main%2Cmain+10",
+        "hevc-level=123",
+        "hevc-rangetype=SDR%2CHDR10",
+    ] {
+        assert!(url.contains(part), "{part} in {url}");
+    }
+    // A client that states none of them gets none in its URL
+    let uri = format!("/Videos/{id}/Universal?VideoCodecs=h264&AudioCodecs=aac");
+    let (_, body) = send(&app, request("GET", &uri, Some(&token), None)).await;
+    let url = body["Url"].as_str().unwrap();
+    assert!(
+        !url.contains("hevc-") && !url.contains("MaxVideoBitDepth"),
+        "{url}"
+    );
+}
+
+#[test]
+fn r3playback_web_session_id() {
+    b124_node_test("r3playback_session_id.mjs");
+}
+
+#[test]
+fn r3playback_web_link_setting() {
+    b124_node_test("r3playback_link_setting.mjs");
 }
 
 #[tokio::test]
@@ -34853,6 +35373,84 @@ async fn b22_universal_sends_other_tracks_to_a_transcode() {
         "{url}"
     );
     assert!(url.contains("&AudioStreamIndex=2"), "{url}");
+}
+
+// R3 playback: an item's MediaStreams list the subtitle files beside its file, as Jellyfin's do,
+// with the same index PlaybackInfo gives them
+#[tokio::test]
+async fn r3playback_item_streams_list_external_subtitle_files() {
+    let state = test_state().await;
+    let (token, user_id) = admin_session(&state).await;
+    let folder = std::path::PathBuf::from(media_folder(&state, "r3external"));
+    let file = folder.join("R3 Film.mkv");
+    std::fs::write(&file, b"r3").unwrap();
+    std::fs::write(
+        folder.join("R3 Film.en.srt"),
+        "1\n00:00:01,000 --> 00:00:02,000\nHi\n",
+    )
+    .unwrap();
+    let id = g4_insert_item(&state, "Movie", &file).await;
+    g4_insert_source(
+        &state,
+        id,
+        "mkv",
+        &file,
+        &[("video", "h264"), ("audio", "aac"), ("subtitle", "subrip")],
+    )
+    .await;
+    let app = app(state);
+
+    let external = |streams: &serde_json::Value| -> Vec<(i64, String)> {
+        streams
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|s| s["IsExternal"] == true)
+            .map(|s| {
+                (
+                    s["Index"].as_i64().unwrap(),
+                    s["Path"].as_str().unwrap().to_string(),
+                )
+            })
+            .collect()
+    };
+    let srt = folder.join("R3 Film.en.srt").to_str().unwrap().to_string();
+    let expected = vec![(3, srt)];
+
+    for uri in [
+        format!("/Items/{id}"),
+        format!("/Users/{user_id}/Items/{id}"),
+    ] {
+        let (status, item) = send(&app, request("GET", &uri, Some(&token), None)).await;
+        assert_eq!(status, StatusCode::OK, "{uri}");
+        assert_eq!(
+            external(&item["MediaStreams"]),
+            expected,
+            "{uri}: MediaStreams"
+        );
+        assert_eq!(
+            external(&item["MediaSources"][0]["MediaStreams"]),
+            expected,
+            "{uri}: MediaSources"
+        );
+        let subtitle = item["MediaStreams"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|s| s["IsExternal"] == true)
+            .unwrap();
+        assert_eq!(subtitle["Type"], "Subtitle", "{uri}");
+    }
+    let uri = format!("/Items?Ids={id}&Fields=MediaSources");
+    let (_, list) = send(&app, request("GET", &uri, Some(&token), None)).await;
+    assert_eq!(
+        external(&list["Items"][0]["MediaSources"][0]["MediaStreams"]),
+        expected
+    );
+    // PlaybackInfo gives the file the same index
+    let uri = format!("/Items/{id}/PlaybackInfo?UserId={user_id}");
+    let (_, info) = send(&app, request("GET", &uri, Some(&token), None)).await;
+    assert_eq!(external(&info["MediaSources"][0]["MediaStreams"]), expected);
 }
 
 #[tokio::test]
@@ -42193,6 +42791,40 @@ async fn j2_audio_items_use_the_audio_profiles() {
     );
     assert!(url.contains("&AudioCodec=aac&"), "{url}");
     assert!(url.ends_with("&AudioOnly=true"), "{url}");
+}
+
+// R3 playback: POST /Sessions/Capabilities takes Jellyfin's query parameters with no body, and
+// answers 204 as Jellyfin does
+#[tokio::test]
+async fn r3playback_capabilities_take_query_parameters_without_a_body() {
+    let state = test_state().await;
+    let (token, _) = admin_session(&state).await;
+    let app = app(state);
+
+    let uri = "/Sessions/Capabilities?playableMediaTypes=Video,Audio&supportedCommands=Play\
+               &supportsMediaControl=true&supportsPersistentIdentifier=false";
+    let (status, _) = send(&app, request("POST", uri, Some(&token), None)).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let (status, _) = send(
+        &app,
+        request("POST", "/Sessions/Capabilities", Some(&token), None),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    // The JSON body Rustyfin took before still works
+    let body = serde_json::json!({ "PlayableMediaTypes": ["Audio"] });
+    let (status, _) = send(
+        &app,
+        request("POST", "/Sessions/Capabilities", Some(&token), Some(body)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    // A value that is no boolean is refused, and a request without a token too
+    let uri = "/Sessions/Capabilities?supportsMediaControl=maybe";
+    let (status, _) = send(&app, request("POST", uri, Some(&token), None)).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let (status, _) = send(&app, request("POST", "/Sessions/Capabilities", None, None)).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
 }
 
 #[tokio::test]

@@ -42,6 +42,12 @@ async fn populate_media_sources(
             .unwrap_or_default();
         item.media_sources = sources;
     }
+    // The subtitle files beside each source, each folder read once
+    let mut sources: Vec<_> = items
+        .iter_mut()
+        .flat_map(|item| item.media_sources.iter_mut())
+        .collect();
+    crate::routes::subtitle::add_external_streams(&mut sources).await;
     Ok(())
 }
 
@@ -52,6 +58,8 @@ async fn populate_media_source_single(
 ) -> Result<(), ApiError> {
     let sources = rustyfin_db::repo_media_source::get_media_sources(pool, &item.id).await?;
     item.media_sources = sources;
+    let mut sources: Vec<_> = item.media_sources.iter_mut().collect();
+    crate::routes::subtitle::add_external_streams(&mut sources).await;
     Ok(())
 }
 
@@ -2002,6 +2010,10 @@ struct ItemsQuery {
     subtitle_language: Option<String>,
     #[serde(rename = "subtitleLanguage")]
     subtitle_language_lower: Option<String>,
+    /// Jellyfin's SubtitleLanguages: the items with a subtitle in one of these languages
+    subtitle_languages: Option<String>,
+    #[serde(rename = "subtitleLanguages")]
+    subtitle_languages_lower: Option<String>,
     enable_auto_hide: Option<bool>,
     #[serde(rename = "enableAutoHide")]
     enable_auto_hide_lower: Option<bool>,
@@ -2247,10 +2259,22 @@ impl ItemsQuery {
     fn has_special_feature(&self) -> Option<bool> {
         self.has_special_feature.or(self.has_special_feature_lower)
     }
-    fn subtitle_language(&self) -> Option<&str> {
-        self.subtitle_language
+    /// The subtitle languages to filter by: Jellyfin's comma list `SubtitleLanguages`, else the
+    /// single `SubtitleLanguage` Rustyfin took before. Each code is matched in all its spellings,
+    /// so `ger` and `deu` find the same items.
+    fn subtitle_languages(&self) -> Option<Vec<String>> {
+        let list = self
+            .subtitle_languages
             .as_deref()
-            .or(self.subtitle_language_lower.as_deref())
+            .or(self.subtitle_languages_lower.as_deref())
+            .or(self.subtitle_language.as_deref())
+            .or(self.subtitle_language_lower.as_deref())?;
+        let forms: Vec<String> = list
+            .split(',')
+            .filter(|code| !code.trim().is_empty())
+            .flat_map(rustyfin_model::media_source::language_forms)
+            .collect();
+        (!forms.is_empty()).then_some(forms)
     }
     fn enable_auto_hide(&self) -> bool {
         self.enable_auto_hide
@@ -2416,6 +2440,12 @@ async fn get_items(
     if let Some(statuses) = query.series_status() {
         let statuses: Vec<&str> = statuses.split(',').map(str::trim).collect();
         let ids = rustyfin_db::repo_media::series_ids_with_status(&state.db_ro, &statuses).await?;
+        item_ids = Some(narrow_ids(item_ids, ids));
+    }
+    if let Some(languages) = query.subtitle_languages() {
+        let ids =
+            rustyfin_db::repo_media::item_ids_with_subtitle_language(&state.db_ro, &languages)
+                .await?;
         item_ids = Some(narrow_ids(item_ids, ids));
     }
     let hidden = HiddenItems::for_caller(&state, &claims).await?;

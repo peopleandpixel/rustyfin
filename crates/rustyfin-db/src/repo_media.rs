@@ -1946,6 +1946,38 @@ pub async fn resumable_item_ids(
 /// The ids of the series whose status is one of Jellyfin's `SeriesStatus` values (`Continuing`,
 /// `Ended`, `Unreleased`). Metadata providers store their own words, so TMDb's map onto them as
 /// Jellyfin's TMDb provider maps them.
+/// How many languages one query of `item_ids_with_subtitle_language` binds, well under
+/// SQLite's limit of bound parameters.
+const LANGUAGES_PER_QUERY: usize = 200;
+
+/// The ids of the items with a subtitle stream whose language is one of `languages`, compared
+/// without ASCII case. The caller passes every spelling it accepts (see
+/// `rustyfin_model::media_source::language_forms`). A long list is asked in chunks.
+pub async fn item_ids_with_subtitle_language(
+    pool: &SqlitePool,
+    languages: &[String],
+) -> Result<Vec<String>, sqlx::Error> {
+    let mut languages: Vec<String> = languages.iter().map(|l| l.to_ascii_lowercase()).collect();
+    languages.sort();
+    languages.dedup();
+    let mut ids = std::collections::BTreeSet::new();
+    for chunk in languages.chunks(LANGUAGES_PER_QUERY) {
+        let mut qb: QueryBuilder<Sqlite> = QueryBuilder::new(
+            "SELECT DISTINCT ms.item_id FROM media_streams mst \
+             JOIN media_sources ms ON ms.id = mst.source_id \
+             WHERE LOWER(mst.codec_type) = 'subtitle' AND LOWER(mst.language) IN (",
+        );
+        let mut list = qb.separated(", ");
+        for language in chunk {
+            list.push_bind(language.clone());
+        }
+        qb.push(")");
+        let found: Vec<String> = qb.build_query_scalar().fetch_all(pool).await?;
+        ids.extend(found);
+    }
+    Ok(ids.into_iter().collect())
+}
+
 pub async fn series_ids_with_status(
     pool: &SqlitePool,
     statuses: &[&str],

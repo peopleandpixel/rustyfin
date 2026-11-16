@@ -65,6 +65,10 @@ async function renderSettings(data) {
                             ${config.FanartApiKeySet ? `<label class="flex items-center gap-2 mt-1 text-xs text-white/70"><input id="cfg-fanart-clear" type="checkbox" class="checkbox checkbox-xs"> ${t('settings.key_clear')}</label>` : ''}
                         </div>
                     </div>
+                    <label class="flex items-start gap-2 text-xs text-white/70">
+                        <input id="cfg-refuse-links" type="checkbox" class="checkbox checkbox-xs mt-0.5" ${config.RefuseLinksOutOfLibraries ? 'checked' : ''}>
+                        <span><span class="font-semibold text-white/80">${t('settings.refuse_links_out')}</span><br>${t('settings.refuse_links_out_help')}</span>
+                    </label>
                     <div class="pt-2">
                         <button type="submit" class="jf-btn-primary text-xs">${t('settings.save_config')}</button>
                     </div>
@@ -451,6 +455,7 @@ async function handleSaveConfig(e) {
         ServerName: $('cfg-server-name')?.value || 'Rustyfin',
         PreferredMetadataLanguage: $('cfg-meta-lang')?.value || 'de',
         PublicPort: parseInt($('cfg-port')?.value) || 8096,
+        RefuseLinksOutOfLibraries: Boolean($('cfg-refuse-links')?.checked),
         IsStartupWizardCompleted: true
     };
     const keys = {

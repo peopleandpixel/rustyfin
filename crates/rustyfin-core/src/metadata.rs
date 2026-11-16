@@ -144,7 +144,7 @@ pub async fn refresh_item_metadata_with(
         apply_metadata_to_item(pool, &mut working, &meta, false).await?;
 
         // Batch-store image URLs from NFO, skipping types that already exist
-        store_images_batch(pool, item.id, &meta.image_urls, "nfo").await?;
+        store_images_batch(pool, item.id, &item.path, &meta.image_urls, "nfo").await?;
     }
     let replace_name = !name_locked && !nfo_named;
 
@@ -413,14 +413,28 @@ async fn refresh_from_providers(
 
         if let Some(meta) = meta {
             apply_metadata_to_item(pool, working, &meta, replace_name).await?;
-            store_images_batch(pool, working.id, &meta.image_urls, &provider.provider_name).await?;
+            store_images_batch(
+                pool,
+                working.id,
+                &working.path,
+                &meta.image_urls,
+                &provider.provider_name,
+            )
+            .await?;
         }
 
         // Fetch additional images from this provider
         let images =
             (provider.get_images)(client, working.tmdb_id, working.tvdb_id, media_type).await;
         if !images.is_empty() {
-            store_images_batch(pool, working.id, &images, &provider.provider_name).await?;
+            store_images_batch(
+                pool,
+                working.id,
+                &working.path,
+                &images,
+                &provider.provider_name,
+            )
+            .await?;
         }
     }
     Ok(ProvidersAnswer {
@@ -564,7 +578,7 @@ async fn apply_season(
     };
     let meta = &meta;
     apply_metadata_to_item(pool, working, meta, replace_name).await?;
-    store_images_batch(pool, working.id, &meta.image_urls, provider).await
+    store_images_batch(pool, working.id, &working.path, &meta.image_urls, provider).await
 }
 
 /// After a series is identified, fill its seasons and episodes: one season lookup per season.
@@ -1006,15 +1020,54 @@ pub fn clean_filename_for_search(path: &str) -> String {
     cleaned
 }
 
+/// How a provider image is stored: a web URL as it is; a local path (absolute, or relative to the
+/// item's folder) only when it resolves inside that folder, as the resolved path. An NFO's
+/// `<thumb>` can name any file, and the image routes would read it; a path outside the item's
+/// folder, a missing file or any other scheme is dropped.
+fn storable_image_path(url: &str, item_path: &Path) -> Option<String> {
+    let lower = url.to_ascii_lowercase();
+    if lower.starts_with("http://") || lower.starts_with("https://") {
+        return Some(url.to_string());
+    }
+    let path = url.strip_prefix("file://").unwrap_or(url);
+    if path.is_empty() || lower.contains("://") {
+        return None;
+    }
+    // The folder an NFO sits in: the item's own folder, or a series' folder
+    let folder = if item_path.is_dir() {
+        item_path
+    } else {
+        item_path.parent()?
+    };
+    let folder = folder.canonicalize().ok()?;
+    let resolved = folder.join(path).canonicalize().ok()?;
+    (resolved.starts_with(&folder) && resolved.is_file())
+        .then(|| resolved.to_string_lossy().into_owned())
+}
+
 /// Batch-store provider images, merging all sources.
 /// Each provider's images get their own image_index slot so multiple providers
 /// can contribute images of the same type (e.g. multiple backdrops from tmdb, fanart, etc.).
 async fn store_images_batch(
     pool: &SqlitePool,
     item_id: Uuid,
+    item_path: &str,
     images: &[rustyfin_model::metadata::MetadataImage],
     provider: &str,
 ) -> Result<(), String> {
+    // A local picture (an NFO's <thumb>) is kept only inside the item's folder, by its resolved
+    // path; a web URL as it is
+    let images: Vec<rustyfin_model::metadata::MetadataImage> = images
+        .iter()
+        .filter_map(|image| {
+            let url = storable_image_path(&image.url, Path::new(item_path))?;
+            Some(rustyfin_model::metadata::MetadataImage {
+                url,
+                ..image.clone()
+            })
+        })
+        .collect();
+    let images = images.as_slice();
     // Group images by base type to assign proper indices
     // Parse image_type strings like "Primary", "Primary_1", "Backdrop", "Backdrop_2"
     let mut type_counts: std::collections::HashMap<
@@ -1149,6 +1202,48 @@ async fn store_studios(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn r3playback_nfo_thumbs_stay_in_the_items_folder() {
+        let root = std::env::temp_dir().join(format!("rustyfin-r3thumb-{}", Uuid::new_v4()));
+        let film = root.join("lib").join("Film");
+        let outside = root.join("secret");
+        std::fs::create_dir_all(&film).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(film.join("Film.mkv"), b"x").unwrap();
+        std::fs::write(film.join("poster.jpg"), b"x").unwrap();
+        std::fs::write(outside.join("key.pem"), b"x").unwrap();
+        std::os::unix::fs::symlink(outside.join("key.pem"), film.join("linked.jpg")).unwrap();
+        let media = film.join("Film.mkv");
+        let poster = film.join("poster.jpg").canonicalize().unwrap();
+        let poster = poster.to_str().unwrap();
+
+        // Inside the folder: relative or absolute, stored resolved; web URLs as they are
+        assert_eq!(
+            storable_image_path("poster.jpg", &media).as_deref(),
+            Some(poster)
+        );
+        assert_eq!(storable_image_path(poster, &media).as_deref(), Some(poster));
+        let url = "https://image.tmdb.org/t/p/original/x.jpg";
+        assert_eq!(storable_image_path(url, &media).as_deref(), Some(url));
+        // A series folder is its own folder
+        assert_eq!(
+            storable_image_path("poster.jpg", &film).as_deref(),
+            Some(poster)
+        );
+        // Outside, through `..`, through a link, missing, or another scheme: ignored
+        for thumb in [
+            outside.join("key.pem").to_str().unwrap().to_string(),
+            "../../secret/key.pem".to_string(),
+            "linked.jpg".to_string(),
+            "missing.jpg".to_string(),
+            "smb://nas/poster.jpg".to_string(),
+            String::new(),
+        ] {
+            assert_eq!(storable_image_path(&thumb, &media), None, "{thumb}");
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
 
     // ── clean_filename_for_search ──
 

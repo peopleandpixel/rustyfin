@@ -130,6 +130,12 @@ pub struct ServerConfiguration {
     /// Values below 1 count as 1.
     #[serde(default = "default_library_monitor_poll_interval")]
     pub library_monitor_poll_interval: u32,
+    /// Refuse to read a media, subtitle or picture-subtitle file whose links lead out of every
+    /// library. Off: a link inside a library may point anywhere but at the server's own files
+    /// (link folders from download tools keep playing). On: the resolved file must lie in a
+    /// library too. Rustyfin's own setting; Jellyfin has none.
+    #[serde(default)]
+    pub refuse_links_out_of_libraries: bool,
     /// The language of the server's own messages, as a culture code (Jellyfin's `UICulture`).
     #[serde(rename = "UICulture", default = "default_ui_culture")]
     pub ui_culture: String,
@@ -314,6 +320,7 @@ impl Default for ServerConfiguration {
             fanart_api_key: None,
             library_monitor_delay: 60,
             library_monitor_poll_interval: 60,
+            refuse_links_out_of_libraries: false,
             ui_culture: default_ui_culture(),
             other: serde_json::Map::new(),
         }

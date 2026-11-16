@@ -374,18 +374,54 @@ async fn update_user_capabilities(
     Ok(())
 }
 
+/// The capabilities of a `POST /Sessions/Capabilities`. Jellyfin binds them from the query
+/// (`playableMediaTypes`, `supportedCommands`, `supportsMediaControl`,
+/// `supportsPersistentIdentifier`) and the request has no body. A JSON body, as Rustyfin took
+/// before, is still read; the query fills what it leaves out.
+fn capabilities_from_query(
+    params: &[(String, String)],
+    body: &[u8],
+) -> Result<ClientCapabilities, ApiError> {
+    use crate::query::{bool_param, list_values};
+
+    let mut req: SessionCapabilitiesRequest = if body.iter().all(u8::is_ascii_whitespace) {
+        SessionCapabilitiesRequest::default()
+    } else {
+        serde_json::from_slice(body)
+            .map_err(|e| ApiError::BadRequest(format!("Invalid capabilities: {e}")))?
+    };
+    let list = |key| Some(list_values(params, key, ',')).filter(|values| !values.is_empty());
+    if req.playable_media_types.is_none() {
+        req.playable_media_types = list("PlayableMediaTypes");
+    }
+    if req.supported_commands.is_none() {
+        req.supported_commands = list("SupportedCommands");
+    }
+    let mut caps = build_capabilities_from_request(&req);
+    if let Some(control) = bool_param(params, "SupportsMediaControl")? {
+        caps.supports_media_control = Some(control);
+        caps.supports_remote_control = Some(control);
+    }
+    if let Some(persistent) = bool_param(params, "SupportsPersistentIdentifier")? {
+        caps.supports_persistent_identifier = Some(persistent);
+    }
+    Ok(caps)
+}
+
 /// POST /Sessions/Capabilities
-/// Clients report their capabilities so the server knows what features they support.
+/// Clients report their capabilities so the server knows what features they support. 204, as
+/// Jellyfin answers.
 async fn session_capabilities(
     State(state): State<AppState>,
     Extension(claims): Extension<Claims>,
     token: Option<Extension<rustyfin_auth::RequestToken>>,
-    Json(req): Json<SessionCapabilitiesRequest>,
-) -> Result<Json<serde_json::Value>, ApiError> {
-    let caps = build_capabilities_from_request(&req);
+    Query(params): Query<Vec<(String, String)>>,
+    body: axum::body::Bytes,
+) -> Result<StatusCode, ApiError> {
+    let caps = capabilities_from_query(&params, &body)?;
     let token = token.as_ref().map(|Extension(rt)| rt.0.as_str());
     update_user_capabilities(&state, claims.sub, token, &caps).await?;
-    Ok(Json(serde_json::json!({})))
+    Ok(StatusCode::NO_CONTENT)
 }
 
 /// POST /Sessions/Capabilities/Full
@@ -400,4 +436,63 @@ async fn session_capabilities_full(
     let token = token.as_ref().map(|Extension(rt)| rt.0.as_str());
     update_user_capabilities(&state, claims.sub, token, &caps).await?;
     Ok(Json(serde_json::json!({})))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn params(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn r3playback_capabilities_come_from_the_query_without_a_body() {
+        let query = params(&[
+            ("playableMediaTypes", "Video,Audio"),
+            ("supportedCommands", "Play"),
+            ("supportedCommands", "Seek"),
+            ("supportsMediaControl", "true"),
+            ("SUPPORTSPERSISTENTIDENTIFIER", "false"),
+        ]);
+        for body in [b"".as_slice(), b"  \n".as_slice()] {
+            let caps = capabilities_from_query(&query, body).unwrap();
+            assert_eq!(
+                caps.playable_media_types,
+                Some(vec!["Video".to_string(), "Audio".to_string()])
+            );
+            assert_eq!(
+                caps.supported_commands,
+                Some(vec!["Play".to_string(), "Seek".to_string()])
+            );
+            assert_eq!(caps.supports_media_control, Some(true));
+            assert_eq!(caps.supports_remote_control, Some(true));
+            assert_eq!(caps.supports_persistent_identifier, Some(false));
+            assert_eq!(caps.supports_video_playback, Some(true));
+        }
+        // Nothing at all is an empty report, not an error
+        let caps = capabilities_from_query(&[], b"").unwrap();
+        assert_eq!(caps.playable_media_types, None);
+        assert_eq!(caps.supports_media_control, None);
+    }
+
+    #[test]
+    fn r3playback_a_json_body_is_still_read_and_the_query_fills_the_rest() {
+        let body = br#"{"PlayableMediaTypes":["Audio"]}"#;
+        let caps =
+            capabilities_from_query(&params(&[("SupportedCommands", "Play")]), body).unwrap();
+        assert_eq!(caps.playable_media_types, Some(vec!["Audio".to_string()]));
+        assert_eq!(caps.supported_commands, Some(vec!["Play".to_string()]));
+        assert!(matches!(
+            capabilities_from_query(&[], b"{not json"),
+            Err(ApiError::BadRequest(_))
+        ));
+        assert!(matches!(
+            capabilities_from_query(&params(&[("SupportsMediaControl", "maybe")]), b""),
+            Err(ApiError::BadRequest(_))
+        ));
+    }
 }

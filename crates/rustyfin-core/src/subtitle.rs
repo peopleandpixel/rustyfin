@@ -66,33 +66,47 @@ pub struct ExternalSubtitle {
 /// Looks for files matching `<basename>.<ext>` and `<basename>.<lang>.<ext>`
 /// where `<ext>` is one of srt, ass, ssa, vtt.
 pub fn discover_external_subtitles(media_path: &Path) -> Vec<ExternalSubtitle> {
-    let parent = match media_path.parent() {
-        Some(p) => p,
-        None => return vec![],
+    match media_path.parent() {
+        Some(parent) => external_subtitles_among(media_path, &subtitle_files_in(parent)),
+        None => vec![],
+    }
+}
+
+/// The subtitle files (srt, ass, ssa, vtt) in `dir`; none when it can't be read. A caller that
+/// looks for several media files' subtitles in one folder reads it once with this.
+pub fn subtitle_files_in(dir: &Path) -> Vec<PathBuf> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return vec![];
     };
-    let stem = match media_path.file_stem().and_then(|s| s.to_str()) {
-        Some(s) => s,
-        None => return vec![],
+    entries
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.extension()
+                .and_then(|e| e.to_str())
+                .is_some_and(|ext| SUBTITLE_EXTENSIONS.contains(&ext.to_lowercase().as_str()))
+                && path.is_file()
+        })
+        .collect()
+}
+
+/// The external subtitles of `media_path` among `files`, the subtitle files of its folder (see
+/// `subtitle_files_in`), numbered as `discover_external_subtitles` numbers them.
+pub fn external_subtitles_among(media_path: &Path, files: &[PathBuf]) -> Vec<ExternalSubtitle> {
+    let Some(stem) = media_path.file_stem().and_then(|s| s.to_str()) else {
+        return vec![];
     };
 
     let mut results = Vec::new();
-    let entries = match std::fs::read_dir(parent) {
-        Ok(e) => e,
-        Err(_) => return vec![],
-    };
-
-    for entry in entries.flatten() {
-        let path = entry.path();
-        let ext = match path.extension().and_then(|e| e.to_str()) {
-            Some(e) => e.to_lowercase(),
-            None => continue,
+    for path in files {
+        let path = path.clone();
+        let Some(ext) = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(str::to_lowercase)
+        else {
+            continue;
         };
-        if !SUBTITLE_EXTENSIONS.contains(&ext.as_str()) {
-            continue;
-        }
-        if !path.is_file() {
-            continue;
-        }
         let file_stem_full = match path.file_stem().and_then(|s| s.to_str()) {
             Some(s) => s,
             None => continue,
