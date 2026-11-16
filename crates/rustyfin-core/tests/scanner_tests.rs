@@ -397,7 +397,10 @@ fn names(items: &[ItemState]) -> Vec<Names> {
 
 /// The names that a scan gives the movie at `path` titled `title`.
 fn titled(path: &str, title: &str, year: Option<i64>) -> Names {
-    let sort_name = Some(title.to_lowercase());
+    let sort_name = Some(rustyfin_model::sort_name::create_sort_name(
+        title,
+        &Default::default(),
+    ));
     (path.to_string(), title.to_string(), sort_name, year)
 }
 
@@ -584,7 +587,10 @@ fn tv_fields(items: &[ItemState]) -> Vec<TvFields> {
 /// The Series at `path`, as a scan names it.
 fn series_row(path: &str) -> TvFields {
     let name = path.to_string();
-    let sort_name = Some(path.to_lowercase());
+    let sort_name = Some(rustyfin_model::sort_name::create_sort_name(
+        path,
+        &Default::default(),
+    ));
     (
         "Series".into(),
         path.into(),
@@ -616,7 +622,13 @@ fn episode_row(path: &str, index: Option<i64>, season: i64, season_path: &str) -
         "Episode".into(),
         path.into(),
         stem.into(),
-        Some(stem.to_lowercase()),
+        Some(rustyfin_model::sort_name::item_sort_name(
+            rustyfin_model::media::MediaType::Episode,
+            stem,
+            Some(season as i32),
+            index.map(|i| i as i32),
+            &Default::default(),
+        )),
         index,
         Some(season),
         Some(season_path.into()),
@@ -9535,7 +9547,7 @@ async fn b32_series_folders_give_a_name_a_year_and_their_tvshow_nfo() {
     );
     assert_eq!(
         shown("1923 (2022)").await,
-        B32Shown::plain("1923", "1923", Some(2022))
+        B32Shown::plain("1923", "0000001923", Some(2022))
     );
     assert_eq!(
         shown("Plain Show").await,

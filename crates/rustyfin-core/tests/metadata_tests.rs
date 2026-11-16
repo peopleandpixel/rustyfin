@@ -775,6 +775,114 @@ async fn r1scan_locked_or_nfo_name_stays() {
     assert_eq!(stored(pool, from_nfo.id).await.name, "Nfo Movie");
 }
 
+// R3: sort names
+
+/// A refresh gives the provider's title Jellyfin's sort name and takes an NFO's `<sorttitle>` as
+/// the forced sort name when there is none. As in Jellyfin, a lock keeps the name, and the sort
+/// name follows it; a lock on the item, Name or SortName keeps an NFO from forcing one, and an
+/// admin's forced sort name stays over the NFO's.
+#[tokio::test]
+async fn r3sortname_refresh_makes_sort_names_from_names_and_reads_sorttitle() {
+    let fx = Fixture::new().await;
+    let pool = &fx.pool;
+    let (pm, _) = r1scan_manager().await;
+    let client = reqwest::Client::new();
+
+    let free = fx.movie("The Free Film", None).await;
+    let sort_locked = fx.movie("The Sort Lock", None).await;
+    let name_locked = fx.movie("The Name Lock", None).await;
+    let whole_locked = fx.movie("The Whole Lock", None).await;
+    for (item, fields, lock_data) in [
+        (&sort_locked, "SortName", "0"),
+        (&name_locked, "Name", "0"),
+        (&whole_locked, "", "1"),
+    ] {
+        exec(
+            pool,
+            "INSERT INTO item_metadata_extras (item_id, locked_fields, lock_data) \
+             VALUES (?1, ?2, ?3)",
+            &[&item.id.to_string(), fields, lock_data],
+        )
+        .await;
+    }
+    let nfo = fx
+        .movie(
+            "Sorted",
+            Some(
+                "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<movie>\n  <title>Sorted</title>\n  \
+                 <sorttitle>Zz Part 2</sorttitle>\n</movie>\n",
+            ),
+        )
+        .await;
+    const NFO_SORT: &str = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<movie>\n  \
+                            <sorttitle>Nfo Sort</sorttitle>\n</movie>\n";
+    let admin_forced = fx.movie("Admin Forced", Some(NFO_SORT)).await;
+    rustyfin_db::repo_media::set_forced_sort_name(pool, admin_forced.id, Some("Admin Pick"))
+        .await
+        .unwrap();
+    let locked_nfo = fx.movie("Locked Nfo", Some(NFO_SORT)).await;
+    exec(
+        pool,
+        "INSERT INTO item_metadata_extras (item_id, locked_fields) VALUES (?1, 'Name')",
+        &[&locked_nfo.id.to_string()],
+    )
+    .await;
+    for item in [
+        &free,
+        &sort_locked,
+        &name_locked,
+        &whole_locked,
+        &nfo,
+        &admin_forced,
+        &locked_nfo,
+    ] {
+        rustyfin_core::metadata::refresh_item_metadata(pool, &client, item, &pm)
+            .await
+            .unwrap();
+    }
+
+    let after = stored(pool, free.id).await;
+    assert_eq!(after.name, "Mission: Impossible");
+    assert_eq!(after.sort_name.as_deref(), Some("mission: impossible"));
+    for (item, sort) in [
+        // Its name isn't locked, so it takes the provider's title
+        (&sort_locked, "mission: impossible"),
+        (&name_locked, "name lock"),
+        (&whole_locked, "whole lock"),
+        (&admin_forced, "admin pick"),
+        (&locked_nfo, "locked nfo"),
+    ] {
+        assert_eq!(
+            stored(pool, item.id).await.sort_name.as_deref(),
+            Some(sort),
+            "{}",
+            item.name
+        );
+    }
+    assert_eq!(
+        stored(pool, nfo.id).await.sort_name.as_deref(),
+        Some("zz part 0000000002")
+    );
+    assert_eq!(
+        rustyfin_db::repo_media::forced_sort_name(pool, nfo.id)
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("Zz Part 2")
+    );
+    for (item, forced) in [(&admin_forced, Some("Admin Pick")), (&locked_nfo, None)] {
+        assert_eq!(
+            rustyfin_db::repo_media::forced_sort_name(pool, item.id)
+                .await
+                .unwrap()
+                .as_deref(),
+            forced,
+            "{}",
+            item.name
+        );
+    }
+}
+
 /// E0-scan-3, B147: a series search sends the folder year; the identified series fills its
 /// season and episode from one season lookup; an episode refreshed on its own asks the same
 /// season.
