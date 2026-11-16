@@ -26870,6 +26870,112 @@ fn r3settings_home() {
     b124_node_test("r3settings_home.mjs");
 }
 
+// R3 photos and home: the photo library's folders, the viewer and slideshow, and the home layout
+// settings (homesection0..n, OrderedViews, MyMediaExcludes, LatestItemsExcludes)
+#[test]
+fn r3photos_web() {
+    b124_node_test("r3photos_library.mjs");
+    b124_node_test("r3photos_home.mjs");
+}
+
+/// The names `uri` lists as views, in order
+async fn r3photos_view_names(app: &axum::Router, token: &str, uri: &str) -> Vec<String> {
+    let (status, views) = send_authed(app, "GET", uri, token, None).await;
+    assert_eq!(status, StatusCode::OK, "{uri}: {views}");
+    let items = views["Items"].as_array().unwrap();
+    assert_eq!(views["TotalRecordCount"], items.len(), "{uri}");
+    items
+        .iter()
+        .map(|v| v["Name"].as_str().unwrap().to_string())
+        .collect()
+}
+
+#[tokio::test]
+async fn r3photos_home_settings_round_trip() {
+    let state = test_state().await;
+    let app = app(state.clone());
+    let (token, user) = admin_session(&state).await;
+    let a = create_library_via_api(&app, &state, &token, "R3PA", "Movies").await;
+    let b = create_library_via_api(&app, &state, &token, "R3PB", "Photos").await;
+    // UserConfiguration's library lists come back as saved, ids in Jellyfin's dashed form
+    let (_, me) = send_authed(&app, "GET", &format!("/Users/{user}"), &token, None).await;
+    let mut config = me["Configuration"].clone();
+    config["OrderedViews"] = serde_json::json!([b, a]);
+    config["LatestItemsExcludes"] = serde_json::json!([b]);
+    config["MyMediaExcludes"] = serde_json::json!([a]);
+    let (status, _) = send_authed(
+        &app,
+        "POST",
+        &format!("/Users/{user}/Configuration"),
+        &token,
+        Some(&config.to_string()),
+    )
+    .await;
+    assert!(status.is_success(), "{status}");
+    let (_, me) = send_authed(&app, "GET", &format!("/Users/{user}"), &token, None).await;
+    for key in ["OrderedViews", "LatestItemsExcludes", "MyMediaExcludes"] {
+        assert_eq!(me["Configuration"][key], config[key], "{key}");
+    }
+
+    // The usersettings CustomPrefs come back from a body with only some fields, and a null value
+    // (a cleared setting in Jellyfin Web) is dropped
+    let prefs = format!("/DisplayPreferences/usersettings?userId={user}&client=emby");
+    let body = r#"{"Id":"usersettings","CustomPrefs":{"homesection0":"latestmedia","homesection1":"none","homesection2":null}}"#;
+    let (status, _) = send_authed(&app, "POST", &prefs, &token, Some(body)).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let (_, got) = send_authed(&app, "GET", &prefs, &token, None).await;
+    assert_eq!(
+        got["CustomPrefs"],
+        serde_json::json!({"homesection0": "latestmedia", "homesection1": "none"})
+    );
+    assert_eq!(got["Client"], "emby");
+    assert_eq!(got["SortBy"], "SortName");
+}
+
+#[tokio::test]
+async fn r3photos_user_views_follow_order_and_my_media() {
+    let state = test_state().await;
+    let app = app(state.clone());
+    let (token, user) = admin_session(&state).await;
+    let mut ids = Vec::new();
+    for name in ["R3VA", "R3VB", "R3VC"] {
+        ids.push(create_library_via_api(&app, &state, &token, name, "Movies").await);
+    }
+    let all = r3photos_view_names(&app, &token, "/UserViews").await;
+    let own: Vec<_> = all
+        .iter()
+        .filter(|n| n.starts_with("R3V"))
+        .cloned()
+        .collect();
+    assert_eq!(own, ["R3VA", "R3VB", "R3VC"]);
+
+    // OrderedViews puts C then A first (dashless, upper-case ids match too); B, unnamed, follows.
+    // MyMediaExcludes hides B unless includeHidden.
+    let (_, me) = send_authed(&app, "GET", &format!("/Users/{user}"), &token, None).await;
+    let mut config = me["Configuration"].clone();
+    config["OrderedViews"] =
+        serde_json::json!([ids[2].simple().to_string().to_uppercase(), ids[0]]);
+    config["MyMediaExcludes"] = serde_json::json!([ids[1]]);
+    let uri = format!("/Users/{user}/Configuration");
+    let (status, _) = send_authed(&app, "POST", &uri, &token, Some(&config.to_string())).await;
+    assert!(status.is_success(), "{status}");
+
+    let shown = r3photos_view_names(&app, &token, "/UserViews").await;
+    assert_eq!(&shown[..2], ["R3VC", "R3VA"]);
+    assert!(!shown.contains(&"R3VB".to_string()), "{shown:?}");
+    let per_user = r3photos_view_names(&app, &token, &format!("/Users/{user}/Views")).await;
+    assert_eq!(per_user, shown);
+    let hidden = r3photos_view_names(&app, &token, "/UserViews?includeHidden=true").await;
+    assert_eq!(&hidden[..3], ["R3VC", "R3VA", "R3VB"]);
+    let hidden = r3photos_view_names(
+        &app,
+        &token,
+        &format!("/Users/{user}/Views?IncludeHidden=true"),
+    )
+    .await;
+    assert_eq!(&hidden[..3], ["R3VC", "R3VA", "R3VB"]);
+}
+
 // R3 settings: the settings page saves each setting where Jellyfin keeps it
 #[test]
 fn r3settings_page() {

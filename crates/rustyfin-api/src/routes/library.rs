@@ -135,25 +135,75 @@ pub(crate) fn libraries_to_views(libs: &[Library], server_id: &str) -> Value {
     })
 }
 
+/// Jellyfin's `includeHidden`: also list the libraries the user hid from "My Media".
+#[derive(Deserialize, Default)]
+struct UserViewsQuery {
+    #[serde(default, rename = "includeHidden", alias = "IncludeHidden")]
+    include_hidden: bool,
+}
+
 async fn get_user_views(
     State(state): State<AppState>,
     Extension(claims): Extension<Claims>,
     Path(user_id): Path<Uuid>,
+    Query(q): Query<UserViewsQuery>,
 ) -> Result<Json<Value>, ApiError> {
     // An administrator may look at another user's views; anyone else gets their own.
     let user = if claims.is_admin { user_id } else { claims.sub };
-    Ok(Json(views_for(&state, user).await?))
+    Ok(Json(views_for(&state, user, q.include_hidden).await?))
 }
 
 async fn get_user_views_no_user(
     State(state): State<AppState>,
     Extension(claims): Extension<Claims>,
+    Query(q): Query<UserViewsQuery>,
 ) -> Result<Json<Value>, ApiError> {
-    Ok(Json(views_for(&state, claims.sub).await?))
+    Ok(Json(views_for(&state, claims.sub, q.include_hidden).await?))
 }
 
-/// Every library as a view (cached for all users), less those `user`'s library access leaves out.
-async fn views_for(state: &AppState, user: Uuid) -> Result<Value, ApiError> {
+/// Orders and hides `views` by the user's configuration, as Jellyfin's `UserViewManager`: those in
+/// `MyMediaExcludes` are left out unless `include_hidden`, and the rest are listed in
+/// `OrderedViews` order, the libraries it doesn't name after them in their own order.
+fn arrange_views(views: &mut Value, config: &Value, include_hidden: bool) {
+    let ids = |key: &str| -> Vec<String> {
+        config[key]
+            .as_array()
+            .map(|ids| {
+                ids.iter()
+                    .filter_map(Value::as_str)
+                    .map(|id| id.replace('-', "").to_lowercase())
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let key = |view: &Value| {
+        view["Id"]
+            .as_str()
+            .unwrap_or("")
+            .replace('-', "")
+            .to_lowercase()
+    };
+    let (hidden, order) = (ids("MyMediaExcludes"), ids("OrderedViews"));
+    let Some(items) = views.get_mut("Items").and_then(Value::as_array_mut) else {
+        return;
+    };
+    if !include_hidden {
+        items.retain(|view| !hidden.contains(&key(view)));
+    }
+    // A stable sort keeps the libraries `OrderedViews` doesn't name in their own order.
+    items.sort_by_key(|view| {
+        order
+            .iter()
+            .position(|id| *id == key(view))
+            .unwrap_or(usize::MAX)
+    });
+    let count = items.len();
+    views["TotalRecordCount"] = count.into();
+}
+
+/// Every library as a view (cached for all users), less those `user`'s library access leaves out,
+/// arranged by the user's `OrderedViews` and `MyMediaExcludes`.
+async fn views_for(state: &AppState, user: Uuid, include_hidden: bool) -> Result<Value, ApiError> {
     let mut views = match state.cache.library_views.get("views") {
         Some(cached) => cached,
         None => {
@@ -174,6 +224,11 @@ async fn views_for(state: &AppState, user: Uuid) -> Result<Value, ApiError> {
         let count = items.len();
         views["TotalRecordCount"] = count.into();
     }
+    let config = rustyfin_db::repo_user::get_user_by_id(&state.db_ro, user)
+        .await?
+        .map(|user| rustyfin_model::user::jellyfin_configuration(&user.configuration))
+        .unwrap_or_default();
+    arrange_views(&mut views, &config, include_hidden);
     Ok(views)
 }
 

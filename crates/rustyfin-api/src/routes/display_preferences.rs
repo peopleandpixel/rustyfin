@@ -24,15 +24,19 @@ struct DisplayPrefsQuery {
     client: Option<String>,
 }
 
+/// A field the client leaves out keeps its default, as Jellyfin's model binding does, so a partial
+/// body is still read back with its `CustomPrefs`.
 #[derive(Debug, Serialize, Deserialize)]
-#[serde(rename_all = "PascalCase")]
+#[serde(rename_all = "PascalCase", default)]
 struct DisplayPreferencesDto {
     id: String,
     view_type: Option<String>,
     sort_by: Option<String>,
     sort_order: Option<String>,
     client: String,
-    /// Custom prefs map (string -> string). Jellyfin web uses this for home sections.
+    /// Custom prefs map (string -> string). Jellyfin web uses this for home sections. A null value
+    /// (Jellyfin Web sends one for a cleared setting) is dropped.
+    #[serde(deserialize_with = "custom_prefs_without_nulls")]
     custom_prefs: HashMap<String, String>,
     remember_indexing: bool,
     remember_sorting: bool,
@@ -41,6 +45,24 @@ struct DisplayPreferencesDto {
     show_backdrop: bool,
     show_sidebar: bool,
     scroll_direction: String,
+}
+
+fn custom_prefs_without_nulls<'de, D>(deserializer: D) -> Result<HashMap<String, String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let prefs = Option::<HashMap<String, Option<String>>>::deserialize(deserializer)?;
+    Ok(prefs
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|(key, value)| value.map(|value| (key, value)))
+        .collect())
+}
+
+impl Default for DisplayPreferencesDto {
+    fn default() -> Self {
+        Self::default_for(String::new(), "emby".to_string())
+    }
 }
 
 impl DisplayPreferencesDto {
