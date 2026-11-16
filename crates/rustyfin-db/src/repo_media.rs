@@ -676,6 +676,7 @@ pub async fn get_latest_items(
     limit: i64,
     media_type: Option<&str>,
     library_id: Option<Uuid>,
+    hidden_ids_json: Option<&str>,
 ) -> Result<Vec<MediaItem>, sqlx::Error> {
     let rows = sqlx::query_as::<_, MediaItemRow>(
         "SELECT id, name, sort_name, overview, media_type, path, parent_id, library_id, \
@@ -686,11 +687,13 @@ pub async fn get_latest_items(
          FROM media_items \
          WHERE (?1 IS NULL OR media_type = ?1) \
          AND (?2 IS NULL OR library_id = ?2) \
+         AND (?4 IS NULL OR id NOT IN (SELECT value FROM json_each(?4))) \
          ORDER BY date_created DESC LIMIT ?3",
     )
     .bind(media_type)
     .bind(library_id.map(|u| u.to_string()))
     .bind(limit)
+    .bind(hidden_ids_json)
     .fetch_all(pool)
     .await?;
 
@@ -1099,6 +1102,7 @@ fn build_filtered_query(
         AND (? IS NULL OR runtime_ticks >= ?)
         AND (? IS NULL OR runtime_ticks <= ?)
         AND (? IS NULL OR id IN (SELECT value FROM json_each(?)))
+        AND (? IS NULL OR id NOT IN (SELECT value FROM json_each(?)))
     ";
 
     // Combine base WHERE with array filter WHERE parts
@@ -1209,6 +1213,7 @@ pub async fn get_items_filtered(
     runtime: Option<(i32, i32)>,
     user_id: Option<Uuid>,
     item_ids: Option<&[String]>,
+    hidden_ids_json: Option<&str>,
 ) -> Result<(Vec<MediaItem>, i64), sqlx::Error> {
     // Convert options to strings for the (? IS NULL OR ? = '' OR col = ?) pattern
     let pid_str = parent_id.map(|u| u.to_string()).unwrap_or_default();
@@ -1328,7 +1333,9 @@ pub async fn get_items_filtered(
         .bind(&max_ticks)
         .bind(&max_ticks)
         .bind(&item_ids_json)
-        .bind(&item_ids_json);
+        .bind(&item_ids_json)
+        .bind(hidden_ids_json)
+        .bind(hidden_ids_json);
 
     // Array filter params
     if let Some(types) = media_types {
@@ -1445,7 +1452,9 @@ pub async fn get_items_filtered(
         .bind(&max_ticks)
         .bind(&max_ticks)
         .bind(&item_ids_json)
-        .bind(&item_ids_json);
+        .bind(&item_ids_json)
+        .bind(hidden_ids_json)
+        .bind(hidden_ids_json);
 
     // Array filter params (same order as count query)
     if let Some(types) = media_types {
@@ -1855,28 +1864,9 @@ pub async fn get_filters(
     parent_id: Option<Uuid>,
     item_types: &[String],
 ) -> Result<(Vec<String>, Vec<i32>, Vec<String>), sqlx::Error> {
-    let scope = match parent_id.map(|id| id.to_string()) {
-        None => FilterScope::All,
-        Some(id) => {
-            let (library, item): (bool, bool) = sqlx::query_as(
-                "SELECT EXISTS (SELECT 1 FROM libraries WHERE id = ?1),
-                        EXISTS (SELECT 1 FROM media_items WHERE id = ?1)
-                     OR EXISTS (SELECT 1 FROM collections WHERE id = ?1)",
-            )
-            .bind(&id)
-            .fetch_one(pool)
-            .await?;
-            if library {
-                FilterScope::Library(id)
-            } else if item {
-                FilterScope::Under(id)
-            } else {
-                FilterScope::All
-            }
-        }
-    };
+    let scope = filter_scope(pool, parent_id).await?;
     if !matches!(scope, FilterScope::All) || !item_types.is_empty() {
-        return get_filters_distinct(pool, &scope, item_types).await;
+        return get_filters_distinct(pool, &scope, item_types, None).await;
     }
     // Try materialized index tables first
     let genre_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM filter_genre_index")
@@ -1904,8 +1894,48 @@ pub async fn get_filters(
         Ok((genres, years, ratings))
     } else {
         // Fallback to DISTINCT queries
-        get_filters_distinct(pool, &scope, item_types).await
+        get_filters_distinct(pool, &scope, item_types, None).await
     }
+}
+
+/// The filter values of the items a user may see: `get_filters` without the items whose ids are
+/// in `hidden_ids_json` (a JSON array). The materialized indexes cover every item, so this always
+/// runs the DISTINCT queries.
+pub async fn get_filters_hiding(
+    pool: &SqlitePool,
+    parent_id: Option<Uuid>,
+    item_types: &[String],
+    hidden_ids_json: &str,
+) -> Result<(Vec<String>, Vec<i32>, Vec<String>), sqlx::Error> {
+    let scope = filter_scope(pool, parent_id).await?;
+    get_filters_distinct(pool, &scope, item_types, Some(hidden_ids_json)).await
+}
+
+/// The scope of a `parent_id`: a library, an item or collection, or (none, or an unknown id) all.
+async fn filter_scope(
+    pool: &SqlitePool,
+    parent_id: Option<Uuid>,
+) -> Result<FilterScope, sqlx::Error> {
+    Ok(match parent_id.map(|id| id.to_string()) {
+        None => FilterScope::All,
+        Some(id) => {
+            let (library, item): (bool, bool) = sqlx::query_as(
+                "SELECT EXISTS (SELECT 1 FROM libraries WHERE id = ?1),
+                        EXISTS (SELECT 1 FROM media_items WHERE id = ?1)
+                     OR EXISTS (SELECT 1 FROM collections WHERE id = ?1)",
+            )
+            .bind(&id)
+            .fetch_one(pool)
+            .await?;
+            if library {
+                FilterScope::Library(id)
+            } else if item {
+                FilterScope::Under(id)
+            } else {
+                FilterScope::All
+            }
+        }
+    })
 }
 
 /// Original DISTINCT-based filter query (fallback when materialized indexes are empty).
@@ -1913,9 +1943,11 @@ async fn get_filters_distinct(
     pool: &SqlitePool,
     scope: &FilterScope,
     item_types: &[String],
+    hidden_ids_json: Option<&str>,
 ) -> Result<(Vec<String>, Vec<i32>, Vec<String>), sqlx::Error> {
     // `SELECT DISTINCT <column> FROM media_items WHERE <column> IS NOT NULL`, in the scope and of
-    // the types when given. Descendants are walked down parent_id (indexed).
+    // the types when given, without the hidden ids when given. Descendants are walked down
+    // parent_id (indexed).
     let distinct = |column: &str| {
         let mut qb: QueryBuilder<Sqlite> = QueryBuilder::new("");
         if let FilterScope::Under(id) = scope {
@@ -1944,6 +1976,11 @@ async fn get_filters_distinct(
                 list.push_bind(item_type.clone());
             }
             qb.push(")");
+        }
+        if let Some(hidden) = hidden_ids_json {
+            qb.push(" AND id NOT IN (SELECT value FROM json_each(")
+                .push_bind(hidden.to_string())
+                .push("))");
         }
         qb
     };
@@ -2235,6 +2272,8 @@ pub struct ResumeFilter {
     pub parent_id: Option<Uuid>,
     pub start_index: i64,
     pub limit: Option<i64>,
+    /// Ids, as a JSON array, that the user's parental limits hide; `None` hides nothing.
+    pub hidden_ids_json: Option<String>,
 }
 
 /// The user's resumable items (a resume point above 0), newest play first, as Jellyfin's
@@ -2248,19 +2287,23 @@ pub async fn get_user_resume_items(
     let parent = filter.parent_id.map(|p| p.to_string());
     let include = serde_json::to_string(&filter.include_types).unwrap_or_default();
     let exclude = serde_json::to_string(&filter.exclude_types).unwrap_or_default();
-    // ?1 user, ?2 parent, ?3 include list, ?4 exclude list (JSON arrays; empty means no filter).
+    // ?1 user, ?2 parent, ?3 include list, ?4 exclude list (JSON arrays; empty means no filter),
+    // ?5 the hidden ids (NULL for none).
     let from = "FROM media_items m \
          INNER JOIN user_item_data u ON u.item_id = m.id AND u.user_id = ?1 \
          WHERE u.playback_position_ticks > 0 \
          AND (?2 IS NULL OR m.library_id = ?2 OR m.parent_id = ?2 \
               OR m.parent_id IN (SELECT id FROM media_items WHERE parent_id = ?2)) \
          AND (json_array_length(?3) = 0 OR m.media_type IN (SELECT value FROM json_each(?3))) \
-         AND m.media_type NOT IN (SELECT value FROM json_each(?4))";
+         AND m.media_type NOT IN (SELECT value FROM json_each(?4)) \
+         AND (?5 IS NULL OR m.id NOT IN (SELECT value FROM json_each(?5)))";
+    let hidden = filter.hidden_ids_json.as_deref();
     let total: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!("SELECT COUNT(*) {from}")))
         .bind(&uid)
         .bind(parent.as_deref())
         .bind(&include)
         .bind(&exclude)
+        .bind(hidden)
         .fetch_one(pool)
         .await?;
     let rows = sqlx::query_as::<_, MediaItemRow>(sqlx::AssertSqlSafe(format!(
@@ -2269,12 +2312,13 @@ pub async fn get_user_resume_items(
          m.premiere_date, m.runtime_ticks, m.index_number, m.parent_index_number, m.index_number_end, m.location_type, m.tmdb_id, m.tvdb_id, \
          m.tags, m.status, m.original_language, m.tagline, m.production_countries, m.budget, m.revenue, \
          m.homepage, m.end_date, m.vote_count, m.popularity \
-         {from} ORDER BY u.last_played_date DESC, m.sort_name LIMIT ?5 OFFSET ?6"
+         {from} ORDER BY u.last_played_date DESC, m.sort_name LIMIT ?6 OFFSET ?7"
     )))
     .bind(&uid)
     .bind(parent.as_deref())
     .bind(&include)
     .bind(&exclude)
+    .bind(hidden)
     .bind(filter.limit.unwrap_or(-1))
     .bind(filter.start_index.max(0))
     .fetch_all(pool)

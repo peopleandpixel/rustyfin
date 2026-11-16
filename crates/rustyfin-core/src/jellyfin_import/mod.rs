@@ -27,7 +27,7 @@ use rustyfin_db::repo_jellyfin_import::{
 };
 use rustyfin_model::user::User;
 use serde::{Deserialize, Serialize};
-use source::{JfItem, JfStream, JfUserData, StreamKind};
+use source::{JfItem, JfStream, JfUser, JfUserData, StreamKind};
 use sqlx::SqlitePool;
 use uuid::Uuid;
 
@@ -162,6 +162,25 @@ pub struct UserRow {
     pub match_kind: Option<MatchKind>,
     /// The caller's account facts on the `IntoMyAccount` row; null otherwise.
     pub target_account: Option<SuggestedMatch>,
+    /// What becomes of the user's Jellyfin parental limits.
+    pub parental_limits: ParentalLimits,
+}
+
+/// What an import does with a Jellyfin user's parental limits (rating maximum, blocked unrated
+/// kinds, blocked and allowed tags).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+pub enum ParentalLimits {
+    /// The user had none.
+    #[default]
+    None,
+    /// The account the import creates gets them.
+    Carried,
+    /// The data goes to an existing account, whose own limits are left as they are; an
+    /// administrator sets them by hand.
+    NotCarried,
+    /// The Jellyfin database doesn't keep them in a form the import reads, so whether the user
+    /// had any is unknown.
+    Unknown,
 }
 
 /// The existing account a Jellyfin user's name matches.
@@ -437,6 +456,7 @@ async fn plan_report(
     if let Some(handle) = handle {
         create_users(db, &mut users, rustyfin_users, handle).await?;
     }
+    carry_parental_limits(db, &mut users, &prepared.snapshot.users, handle.is_some()).await?;
     let importing: HashSet<Uuid> = users
         .iter()
         .filter(|user| matches!(user.action, UserAction::Match | UserAction::Create))
@@ -752,6 +772,43 @@ impl TrackMapper<'_> {
             .find(|row| row.index == index)
             .map(|row| (index, row.identity().key())))
     }
+}
+
+/// Sets each row's `parental_limits`, and in a run gives each account the run created its
+/// Jellyfin user's limits. An existing account is never changed: its limits may be its own, and
+/// the caller's account must not be limited by an import.
+async fn carry_parental_limits(
+    db: &SqlitePool,
+    users: &mut [UserRow],
+    jf_users: &[JfUser],
+    run: bool,
+) -> Result<(), ImportError> {
+    for row in users.iter_mut() {
+        let Some(user) = jf_users.iter().find(|user| user.id == row.jellyfin_id) else {
+            continue;
+        };
+        // A run marks the accounts it created with their one-time code.
+        let created = if run {
+            row.code.is_some()
+        } else {
+            row.action == UserAction::Create
+        };
+        row.parental_limits = match &user.parental {
+            None => ParentalLimits::Unknown,
+            Some(policy) if !policy.is_restricted() => ParentalLimits::None,
+            Some(_) if created => ParentalLimits::Carried,
+            Some(_) => ParentalLimits::NotCarried,
+        };
+        if run
+            && row.parental_limits == ParentalLimits::Carried
+            && let (Some(policy), Some(account)) = (&user.parental, row.user_id)
+        {
+            rustyfin_db::repo_parental::set_policy(db, account, policy)
+                .await
+                .map_err(ImportError::Db)?;
+        }
+    }
+    Ok(())
 }
 
 /// The Users stage of a run (spec 2.7, 2.26): each row to create is matched again against

@@ -4,6 +4,8 @@ use unicase::UniCase;
 use unicode_normalization::UnicodeNormalization;
 use uuid::Uuid;
 
+use crate::parental::ParentalPolicy;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "PascalCase")]
 pub struct User {
@@ -47,12 +49,14 @@ pub struct UserDto {
     pub enable_auto_login: bool,
     pub last_login_date: Option<DateTime<Utc>>,
     pub configuration: serde_json::Value,
+    /// Jellyfin's `UserPolicy` (`jellyfin_policy`).
     #[serde(default)]
     pub policy: serde_json::Value,
 }
 
 impl UserDto {
-    pub fn new(u: User, flags: UserFlags, server_id: &str) -> Self {
+    /// The account `u` with its flags and its parental limits, which only `Policy` carries.
+    pub fn new(u: User, flags: UserFlags, server_id: &str, parental: &ParentalPolicy) -> Self {
         let has_password = !u.password_hash.is_empty();
         Self {
             id: u.id,
@@ -67,7 +71,7 @@ impl UserDto {
             enable_auto_login: false,
             last_login_date: u.last_login_date,
             configuration: jellyfin_configuration(&u.configuration),
-            policy: jellyfin_policy(u.is_administrator, flags.is_disabled),
+            policy: jellyfin_policy(u.is_administrator, flags.is_disabled, parental),
         }
     }
 }
@@ -75,9 +79,15 @@ impl UserDto {
 /// Jellyfin's `UserPolicy` for an account. Rustyfin has no per-user library, device or feature
 /// restrictions, so every access flag is on but downloading, which Rustyfin has no route for; the
 /// flags for what only administrators may do here (deleting items, managing collections and
-/// subtitles, controlling others' sessions) follow `is_admin`. Only `IsAdministrator` and
-/// `IsDisabled` are read back by `POST /Users/{id}/Policy`.
-pub fn jellyfin_policy(is_admin: bool, is_disabled: bool) -> serde_json::Value {
+/// subtitles, controlling others' sessions) follow `is_admin`. The parental fields
+/// (`MaxParentalRating`, `MaxParentalSubRating`, `BlockUnratedItems`, `BlockedTags`,
+/// `AllowedTags`) come from `parental`. `POST /Users/{id}/Policy` reads back `IsAdministrator`,
+/// `IsDisabled` and those parental fields.
+pub fn jellyfin_policy(
+    is_admin: bool,
+    is_disabled: bool,
+    parental: &ParentalPolicy,
+) -> serde_json::Value {
     // Two literals: one is past serde_json::json!'s macro recursion limit.
     let mut policy = serde_json::json!({
         "IsAdministrator": is_admin,
@@ -86,11 +96,8 @@ pub fn jellyfin_policy(is_admin: bool, is_disabled: bool) -> serde_json::Value {
         "EnableSubtitleManagement": is_admin,
         "EnableLyricManagement": is_admin,
         "IsDisabled": is_disabled,
-        "BlockedTags": [],
-        "AllowedTags": [],
         "EnableUserPreferenceAccess": true,
         "AccessSchedules": [],
-        "BlockUnratedItems": [],
         "EnableRemoteControlOfOtherUsers": is_admin,
         "EnableSharedDeviceControl": true,
         "EnableRemoteAccess": true,
@@ -128,6 +135,7 @@ pub fn jellyfin_policy(is_admin: bool, is_disabled: bool) -> serde_json::Value {
     });
     if let (Some(policy), serde_json::Value::Object(rest)) = (policy.as_object_mut(), rest) {
         policy.extend(rest);
+        parental.write_policy_fields(policy);
     }
     policy
 }
@@ -196,6 +204,28 @@ pub struct ChangePasswordRequest {
 pub struct UpdatePolicyRequest {
     pub is_administrator: Option<bool>,
     pub is_disabled: Option<bool>,
+    /// The parental fields: absent leaves the stored value, null clears it.
+    #[serde(default, deserialize_with = "present")]
+    pub max_parental_rating: Option<Option<i32>>,
+    #[serde(default, deserialize_with = "present")]
+    pub max_parental_sub_rating: Option<Option<i32>>,
+    #[serde(default, deserialize_with = "present")]
+    pub block_unrated_items: Option<Option<Vec<String>>>,
+    #[serde(default, deserialize_with = "present")]
+    pub blocked_tags: Option<Option<Vec<String>>>,
+    #[serde(default, deserialize_with = "present")]
+    pub allowed_tags: Option<Option<Vec<String>>>,
+    #[serde(default)]
+    pub access_schedules: Option<Vec<serde_json::Value>>,
+}
+
+/// A field that is present, null or not: `Some(None)` for null, while an absent field stays `None`.
+fn present<'de, D, T>(d: D) -> Result<Option<Option<T>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<T>::deserialize(d).map(Some)
 }
 
 #[derive(Debug, Deserialize)]

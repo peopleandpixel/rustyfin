@@ -522,7 +522,12 @@ impl TranscodeManager {
 
     /// Get the path to a segment for the legacy `/hls/{segment}` route: the item's most recently
     /// used session if it has the file (touched), else the item's old per-item directory.
+    /// A session's playback id in place of the item id finds nothing: session directories are
+    /// named by playback id too, and serving one here would bypass the item and its owner.
     pub fn legacy_segment_path(&self, item_id: Uuid, segment_name: &str) -> Option<PathBuf> {
+        if self.sessions.contains_key(&item_id) {
+            return None;
+        }
         let latest = self
             .sessions
             .iter()
@@ -1009,6 +1014,36 @@ pub enum TranscodeError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn r2parental_legacy_segment_refuses_a_playback_id() {
+        let data = std::env::temp_dir().join(format!("rustyfin_r2parental_{}", Uuid::new_v4()));
+        let manager = TranscodeManager::new(&data);
+        let (item, playback) = (Uuid::new_v4(), Uuid::new_v4());
+        let output_dir = manager.cache_root.join(playback.to_string());
+        std::fs::create_dir_all(&output_dir).unwrap();
+        std::fs::write(output_dir.join("main.m3u8"), "#EXTM3U").unwrap();
+        manager.sessions.insert(
+            playback,
+            TranscodeSession {
+                item_id: item,
+                playback_id: playback,
+                input_path: String::new(),
+                play_session_id: String::new(),
+                device_id: String::new(),
+                output_dir,
+                child: None,
+                stderr_task: None,
+                stderr_tail: Arc::new(std::sync::Mutex::new(VecDeque::new())),
+                last_access: Instant::now(),
+                profile: TranscodeProfile::default(),
+            },
+        );
+        // By the item's id the session's file is served; by the playback id it isn't.
+        assert!(manager.legacy_segment_path(item, "main.m3u8").is_some());
+        assert_eq!(manager.legacy_segment_path(playback, "main.m3u8"), None);
+        std::fs::remove_dir_all(&data).ok();
+    }
 
     #[test]
     fn test_default_profile() {
