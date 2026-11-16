@@ -137,7 +137,26 @@ pub async fn extract_for_libraries(
     library_ids: &[String],
     cancel: &Cancel,
 ) -> Result<u32, String> {
+    let progress = crate::task_progress::TaskProgress::new();
+    extract_for_libraries_with_progress(pool, data_dir, library_ids, cancel, &progress).await
+}
+
+/// `extract_for_libraries`, reporting the share of the videos missing chapter images at the
+/// start that it has looked at on `progress`.
+pub async fn extract_for_libraries_with_progress(
+    pool: &SqlitePool,
+    data_dir: &Path,
+    library_ids: &[String],
+    cancel: &Cancel,
+    progress: &crate::task_progress::TaskProgress,
+) -> Result<u32, String> {
     let mut made = 0;
+    let total = rustyfin_db::repo_chapter::items_missing_chapter_images(pool, library_ids, -1)
+        .await
+        .map_err(|e| format!("could not list videos: {e}"))?
+        .len();
+    let mut done = 0usize;
+    progress.report_count(0, total);
     loop {
         let batch = rustyfin_db::repo_chapter::items_missing_chapter_images(pool, library_ids, 20)
             .await
@@ -149,6 +168,9 @@ pub async fn extract_for_libraries(
             if cancel.is_cancelled() {
                 return Ok(made);
             }
+            // Videos added during the run can take it past the total counted at the start
+            progress.report_count(done.min(total), total);
+            done += 1;
             // Every chapter is marked, made or failed, so the loop moves on.
             match extract_for_item(pool, data_dir, item_id, &path, cancel).await {
                 Ok(n) => made += n,

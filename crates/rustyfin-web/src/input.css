@@ -1046,6 +1046,25 @@ img.jf-thumb-img {
   100% { background-position: -200% 0; }
 }
 
+/* A progress bar whose percent is not known: a stripe that slides across */
+.jf-progress-indeterminate {
+  width: 40%;
+  animation: jfIndeterminate 1.4s ease-in-out infinite;
+}
+
+@keyframes jfIndeterminate {
+  0% { transform: translateX(-100%); }
+  100% { transform: translateX(250%); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .jf-progress-indeterminate {
+    width: 100%;
+    opacity: 0.5;
+    animation: none;
+  }
+}
+
 /* Skeleton text placeholders */
 @keyframes jfPulse {
   0%, 100% { opacity: 0.05; }

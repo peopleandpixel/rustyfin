@@ -375,8 +375,14 @@ const API = {
     },
     validatePath(path) { return this.post('/Environment/ValidatePath', { Path: path, ValidateWritable: false }); },
     deleteLibrary(id) { return this.del(`/Library/VirtualFolders/${id}`); },
-    getLibraryOptions(id) { return this.get(`/Library/${id}/Options`); },
-    saveLibraryOptions(id, options) { return this.post(`/Library/${id}/Options`, options); },
+    // Read fresh each time, never from a cache, so a dialog edits what is stored now
+    getLibraryOptions(id) { return this.get(`/Library/${id}/Options`, { cache: 'no-store' }); },
+    // Jellyfin's route: the library's whole options, answered with 204. Only Rustyfin's names are
+    // sent: Jellyfin's other names for the same settings are dropped, so no stale copy rides along.
+    saveLibraryOptions(id, options) {
+        const { EnableTrickplayImageExtraction, EnableChapterImageExtraction, ...own } = options;
+        return this.post('/Library/VirtualFolders/LibraryOptions', { Id: id, LibraryOptions: own });
+    },
     scanLibrary(id) { 
         this.invalidateCache('/Items');
         return this.post(`/Library/VirtualFolders/${id}/Refresh`); 

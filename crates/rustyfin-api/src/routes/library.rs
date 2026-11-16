@@ -4,7 +4,9 @@ use axum::http::StatusCode;
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use rustyfin_core::scan_progress::ScanTicket;
-use rustyfin_model::library::{CreateLibraryRequest, Library, LibraryOptions};
+use rustyfin_model::library::{
+    CreateLibraryRequest, Library, LibraryOptions, LibraryOptionsUpdate,
+};
 use rustyfin_model::ws_event::WsEvent;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -38,6 +40,10 @@ pub fn setup_routes() -> Router<AppState> {
         .route(
             "/Library/{id}/Options",
             get(get_library_options).post(update_library_options),
+        )
+        .route(
+            "/Library/VirtualFolders/LibraryOptions",
+            post(update_virtual_folder_options),
         )
 }
 
@@ -572,19 +578,65 @@ async fn get_library_options(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<LibraryOptions>, ApiError> {
-    let options = rustyfin_db::repo_library::get_library_options(&state.db_ro, id).await?;
-    Ok(Json(options))
+    // An unreadable row reads as the defaults (and is logged), so it can be saved over
+    Ok(Json(stored_options(&state, id).await))
 }
 
 /// POST /Library/{id}/Options — Update library options.
 async fn update_library_options(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
-    Json(options): Json<LibraryOptions>,
+    Json(update): Json<LibraryOptionsUpdate>,
 ) -> Result<Json<Value>, ApiError> {
+    let options = update.resolve(&stored_options(&state, id).await);
     rustyfin_db::repo_library::set_library_options(&state.db, id, &options).await?;
     state.task_scheduler.watcher().libraries_changed();
     Ok(Json(json!({ "status": "ok" })))
+}
+
+/// Jellyfin's `UpdateLibraryOptionsDto`: the library and its new options.
+#[derive(Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct UpdateLibraryOptionsBody {
+    id: Uuid,
+    #[serde(default)]
+    library_options: Option<LibraryOptionsUpdate>,
+}
+
+/// The options stored for a library, against which a save that sends a setting under both its
+/// names is read. A row that can't be read counts as the defaults, since the save replaces it.
+async fn stored_options(state: &AppState, id: Uuid) -> LibraryOptions {
+    match rustyfin_db::repo_library::get_library_options(&state.db, id).await {
+        Ok(options) => options,
+        Err(e) => {
+            tracing::warn!(library = %id, error = %e, "stored library options unreadable; replacing them");
+            LibraryOptions::default()
+        }
+    }
+}
+
+/// POST /Library/VirtualFolders/LibraryOptions — Jellyfin's route for saving a library's options:
+/// `{Id, LibraryOptions}` replaces them and answers 204. An unknown library is 404.
+async fn update_virtual_folder_options(
+    State(state): State<AppState>,
+    Json(body): Json<UpdateLibraryOptionsBody>,
+) -> Result<StatusCode, ApiError> {
+    if rustyfin_db::repo_library::get_library_by_id(&state.db, body.id)
+        .await?
+        .is_none()
+    {
+        return Err(ApiError::NotFound(format!(
+            "library '{}' not found",
+            body.id
+        )));
+    }
+    let options = match body.library_options {
+        Some(update) => update.resolve(&stored_options(&state, body.id).await),
+        None => LibraryOptions::default(),
+    };
+    rustyfin_db::repo_library::set_library_options(&state.db, body.id, &options).await?;
+    state.task_scheduler.watcher().libraries_changed();
+    Ok(StatusCode::NO_CONTENT)
 }
 
 /// DELETE /Library/VirtualFolders/Paths - Remove library paths

@@ -66,6 +66,8 @@ function openAddLibrary() {
     if (!dlg) return;
     const form = $('add-library-form');
     if (form) form.reset();
+    const images = $('add-lib-image-options');
+    if (images) images.innerHTML = libraryImageOptionsHtml('add-lib');
     dlg.classList.add('modal-open');
     if (typeof dlg.showModal === 'function') {
         try { dlg.showModal(); } catch { dlg.setAttribute('open', ''); }
@@ -113,6 +115,85 @@ async function toggleRealtimeMonitor(el) {
     }
 }
 
+// The image options of the library dialogs: the library option, its label and its help, as Jellyfin
+// names them. Both kinds are off by default, and their nightly tasks only work on the libraries that
+// turn them on.
+const LIBRARY_IMAGE_OPTIONS = [
+    ['EnableTrickplay', 'library.enable_trickplay', 'library.enable_trickplay_help'],
+    ['ExtractTrickplayImagesDuringLibraryScan', 'library.trickplay_during_scan', 'library.trickplay_during_scan_help'],
+    ['EnableChapterExtraction', 'library.enable_chapter_images', 'library.enable_chapter_images_help'],
+    ['ExtractChapterImagesDuringLibraryScan', 'library.chapter_images_during_scan', 'library.chapter_images_during_scan_help'],
+];
+
+// The image option checkboxes, ticked as `options` has them; `prefix` keeps the ids apart per dialog.
+function libraryImageOptionsHtml(prefix, options = {}) {
+    return LIBRARY_IMAGE_OPTIONS.map(([option, label, help]) => `
+        <div>
+            <div class="flex items-center gap-3">
+                <input type="checkbox" name="${option}" id="${prefix}-${option}" ${options[option] === true ? 'checked' : ''} aria-describedby="${prefix}-${option}-hint" class="w-4 h-4 rounded bg-white/10 border-white/20 text-[#00a4dc]">
+                <label for="${prefix}-${option}" class="text-sm text-white/70">${escapeHtml(t(label))}</label>
+            </div>
+            <p id="${prefix}-${option}-hint" class="text-[11px] text-white/30 mt-1">${escapeHtml(t(help))}</p>
+        </div>`).join('');
+}
+
+// The image options as the form's checkboxes have them.
+function readLibraryImageOptions(form) {
+    return Object.fromEntries(LIBRARY_IMAGE_OPTIONS.map(([option]) => [option, !!form.elements[option]?.checked]));
+}
+
+// Opens the options dialog of an existing library, with its saved image options.
+async function openLibraryOptions(id, name) {
+    const dlg = $('library-options-modal');
+    const form = $('library-options-form');
+    if (!dlg || !form) return;
+    let options;
+    try {
+        options = await API.getLibraryOptions(id);
+    } catch (err) {
+        toast(t('library.options_load_failed', { message: err.message }), 'error');
+        return;
+    }
+    form.elements.libraryId.value = id;
+    $('library-options-title').textContent = t('library.options_title', { name });
+    $('library-options-images').innerHTML = libraryImageOptionsHtml('lib-opt', options);
+    if (typeof dlg.showModal === 'function') {
+        try { dlg.showModal(); } catch { dlg.setAttribute('open', ''); }
+    } else {
+        dlg.setAttribute('open', '');
+    }
+}
+
+function closeLibraryOptions() {
+    const dlg = $('library-options-modal');
+    if (!dlg) return;
+    if (typeof dlg.close === 'function') {
+        try { dlg.close(); } catch { dlg.removeAttribute('open'); }
+    } else {
+        dlg.removeAttribute('open');
+    }
+}
+
+// Saves the dialog's image options over the library's other saved options.
+async function submitLibraryOptions(e) {
+    e.preventDefault();
+    const form = e.target;
+    const id = form.elements.libraryId.value;
+    const submitBtn = $('library-options-submit');
+    if (submitBtn) submitBtn.disabled = true;
+    try {
+        const options = await API.getLibraryOptions(id);
+        await API.saveLibraryOptions(id, { ...options, ...readLibraryImageOptions(form) });
+    } catch (err) {
+        toast(t('library.options_save_failed', { message: err.message }), 'error');
+        return;
+    } finally {
+        if (submitBtn) submitBtn.disabled = false;
+    }
+    toast(t('library.options_saved'));
+    closeLibraryOptions();
+}
+
 // Shows a message inside the add-library dialog; an empty message hides the box
 function setAddLibraryError(message) {
     const el = $('add-lib-error');
@@ -137,7 +218,10 @@ async function submitAddLibrary(e) {
     let lib;
     if (submitBtn) submitBtn.disabled = true;
     try {
-        lib = await API.createLibrary(name, type, paths, { EnableRealtimeMonitor: f.realtimeMonitor.checked });
+        lib = await API.createLibrary(name, type, paths, {
+            EnableRealtimeMonitor: f.realtimeMonitor.checked,
+            ...readLibraryImageOptions(f),
+        });
     } catch (err) {
         setAddLibraryError(t('library.create_failed', { message: err.message }));
         return;
@@ -481,4 +565,5 @@ export {
     scanStatuses, loadSidebar, openAddLibrary, closeAddLibrary, deleteLibraryFromAdmin, toggleRealtimeMonitor,
     submitAddLibrary, openFolderBrowser, folderBrowserLoad, folderBrowserUp, folderBrowserSelect, closeFolderBrowser,
     addLibraryPathRow, removeLibraryPathRow, initScanProgressWebSocket, stopScanProgressWebSocket,
+    openLibraryOptions, closeLibraryOptions, submitLibraryOptions,
 };

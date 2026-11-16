@@ -29839,6 +29839,346 @@ async fn b17_scheduler_scan_reports_progress_without_task_events() {
     );
 }
 
+// R3 tasks: a running task's state and progress in /ScheduledTasks and on the socket
+
+// Turning trickplay on in the web client's Options dialog takes effect whatever was stored before
+// and whoever wrote it: no row (as the Jellyfin import leaves a library), Rustyfin's name off,
+// Jellyfin's name off, both names disagreeing, or a row that can't be read. The dialog reads the
+// options, ticks the four image toggles and saves `{Id, LibraryOptions}` with Rustyfin's names only
+// (api.js saveLibraryOptions), and the trickplay task then works on the library.
+#[tokio::test]
+async fn r3tasks_dialog_turns_trickplay_on_over_any_stored_options() {
+    let priors: [(&str, Option<&str>); 5] = [
+        ("none", None),
+        (
+            "rustyfin off",
+            Some(r#"{"EnableTrickplay":false,"EnableRealtimeMonitor":false}"#),
+        ),
+        (
+            "jellyfin off",
+            Some(r#"{"EnableTrickplayImageExtraction":false}"#),
+        ),
+        (
+            "both names",
+            Some(
+                r#"{"EnableTrickplay":false,"EnableTrickplayImageExtraction":false,"EnableChapterImageExtraction":true}"#,
+            ),
+        ),
+        ("unreadable", Some("not json")),
+    ];
+    for (prior, stored) in priors {
+        let state = test_state().await;
+        let app = app(state.clone());
+        let (owner, _, _, _) = g1_owner_and_viewer(&state, &app).await;
+        let lib = create_library_via_api(&app, &state, &owner, "R3 Tasks Dialog", "Movies").await;
+        let key = format!("library_options_{lib}");
+        sqlx::query("DELETE FROM configuration WHERE key = ?1")
+            .bind(&key)
+            .execute(&state.db)
+            .await
+            .unwrap();
+        if let Some(stored) = stored {
+            sqlx::query("INSERT INTO configuration (key, value) VALUES (?1, ?2)")
+                .bind(&key)
+                .bind(stored)
+                .execute(&state.db)
+                .await
+                .unwrap();
+        }
+
+        // The dialog: read the options, set the four toggles, drop Jellyfin's names, save.
+        let (status, mut options) = send_authed(
+            &app,
+            "GET",
+            &format!("/Library/{lib}/Options"),
+            &owner,
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{prior}: {options}");
+        let fields = options.as_object_mut().unwrap();
+        fields.insert("EnableTrickplay".into(), true.into());
+        fields.insert(
+            "ExtractTrickplayImagesDuringLibraryScan".into(),
+            false.into(),
+        );
+        fields.insert("EnableChapterExtraction".into(), false.into());
+        fields.insert("ExtractChapterImagesDuringLibraryScan".into(), false.into());
+        fields.remove("EnableTrickplayImageExtraction");
+        fields.remove("EnableChapterImageExtraction");
+        let body = serde_json::json!({ "Id": lib, "LibraryOptions": options }).to_string();
+        let uri = "/Library/VirtualFolders/LibraryOptions";
+        let (status, answer) = send_authed(&app, "POST", uri, &owner, Some(&body)).await;
+        assert_eq!(status, StatusCode::NO_CONTENT, "{prior}: {answer}");
+
+        // Stored once, under Rustyfin's name only
+        let row: String = sqlx::query_scalar("SELECT value FROM configuration WHERE key = ?1")
+            .bind(&key)
+            .fetch_one(&state.db)
+            .await
+            .unwrap();
+        let row: serde_json::Value = serde_json::from_str(&row).unwrap();
+        assert_eq!(row["EnableTrickplay"], true, "{prior}: {row}");
+        assert!(
+            row.get("EnableTrickplayImageExtraction").is_none(),
+            "{prior}: {row}"
+        );
+
+        // The trickplay task works on the library now
+        let (status, _) = send_authed(
+            &app,
+            "POST",
+            "/ScheduledTasks/Running/RefreshTrickplayImages",
+            &owner,
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        let mut result = serde_json::Value::Null;
+        for _ in 0..500 {
+            let (_, task) = send_authed(
+                &app,
+                "GET",
+                "/ScheduledTasks/RefreshTrickplayImages",
+                &owner,
+                None,
+            )
+            .await;
+            if task["State"] == "Idle" && !task["LastExecutionResult"].is_null() {
+                result = task["LastExecutionResult"].clone();
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(result["Status"], "Completed", "{prior}: {result}");
+        assert_eq!(
+            result["ErrorMessage"], "Made the trickplay images of 0 videos",
+            "{prior}: the task found the library on"
+        );
+    }
+}
+
+// Jellyfin's POST /Library/VirtualFolders/LibraryOptions saves a library's options: 204, and the
+// options read back, under Jellyfin's names or Rustyfin's.
+#[tokio::test]
+async fn r3tasks_virtual_folder_library_options_saves_as_jellyfin() {
+    let state = test_state().await;
+    let app = app(state.clone());
+    let (owner, _, viewer, _) = g1_owner_and_viewer(&state, &app).await;
+    let lib = create_library_via_api(&app, &state, &owner, "R3 Tasks Options", "Movies").await;
+    let uri = "/Library/VirtualFolders/LibraryOptions";
+    let options = |id: uuid::Uuid, body: serde_json::Value| {
+        serde_json::json!({ "Id": id, "LibraryOptions": body }).to_string()
+    };
+
+    // Jellyfin Web's names
+    let body = options(
+        lib,
+        serde_json::json!({
+            "EnableRealtimeMonitor": false,
+            "EnableTrickplayImageExtraction": true,
+            "ExtractTrickplayImagesDuringLibraryScan": true,
+            "EnableChapterImageExtraction": true,
+            "SomeOtherJellyfinOption": 1,
+        }),
+    );
+    let (status, answer) = send_authed(&app, "POST", uri, &owner, Some(&body)).await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{answer}");
+    let (_, saved) = send_authed(
+        &app,
+        "GET",
+        &format!("/Library/{lib}/Options"),
+        &owner,
+        None,
+    )
+    .await;
+    assert_eq!(saved["EnableRealtimeMonitor"], false, "{saved}");
+    assert_eq!(saved["EnableTrickplay"], true, "{saved}");
+    assert_eq!(
+        saved["ExtractTrickplayImagesDuringLibraryScan"], true,
+        "{saved}"
+    );
+    assert_eq!(saved["EnableChapterExtraction"], true, "{saved}");
+    assert_eq!(
+        saved["ExtractChapterImagesDuringLibraryScan"], false,
+        "{saved}"
+    );
+
+    // Rustyfin's names, as its web client sends them; the options are replaced
+    let body = options(lib, serde_json::json!({ "EnableChapterExtraction": false }));
+    let (status, _) = send_authed(&app, "POST", uri, &owner, Some(&body)).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let (_, saved) = send_authed(
+        &app,
+        "GET",
+        &format!("/Library/{lib}/Options"),
+        &owner,
+        None,
+    )
+    .await;
+    assert_eq!(saved["EnableChapterExtraction"], false, "{saved}");
+    assert_eq!(saved["EnableTrickplay"], false, "{saved}");
+
+    // An unknown library, and a user who isn't an administrator
+    let unknown = options(uuid::Uuid::new_v4(), serde_json::json!({}));
+    let (status, _) = send_authed(&app, "POST", uri, &owner, Some(&unknown)).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let body = options(lib, serde_json::json!({ "EnableTrickplay": true }));
+    let (status, _) = send_authed(&app, "POST", uri, &viewer, Some(&body)).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let (_, saved) = send_authed(
+        &app,
+        "GET",
+        &format!("/Library/{lib}/Options"),
+        &owner,
+        None,
+    )
+    .await;
+    assert_eq!(saved["EnableTrickplay"], false, "{saved}");
+}
+
+// The library dialogs' trickplay and chapter image options (tests/web/r3tasks_library_options.mjs).
+#[test]
+fn r3tasks_web_library_image_options() {
+    b124_node_test("r3tasks_library_options.mjs");
+}
+
+// The admin tasks tab's cards and polling (tests/web/r3tasks_admin.mjs).
+#[test]
+fn r3tasks_web_task_cards_and_polling() {
+    b124_node_test("r3tasks_admin.mjs");
+}
+
+/// Sends a text frame on `socket`. Client frames are masked; a zero mask leaves the text as is.
+async fn r3tasks_send(socket: &mut G1cSocket, text: &str) {
+    use tokio::io::AsyncWriteExt;
+    assert!(text.len() < 126, "a short frame");
+    let mut frame = vec![0x81, 0x80 | text.len() as u8, 0, 0, 0, 0];
+    frame.extend_from_slice(text.as_bytes());
+    socket.0.get_mut().write_all(&frame).await.unwrap();
+}
+
+/// The library scan task's entry in `GET /ScheduledTasks`, after checking that every entry has
+/// Jellyfin's `State` and a `CurrentProgressPercentage` that is a number or null.
+async fn r3tasks_scan_entry(app: &axum::Router, token: &str) -> serde_json::Value {
+    let (status, tasks) = send_authed(app, "GET", "/ScheduledTasks", token, None).await;
+    assert_eq!(status, StatusCode::OK, "{tasks}");
+    for task in tasks.as_array().unwrap() {
+        let state = task["State"].as_str().unwrap_or_default();
+        assert!(["Idle", "Running", "Cancelling"].contains(&state), "{task}");
+        let percent = &task["CurrentProgressPercentage"];
+        assert!(percent.is_number() || percent.is_null(), "{task}");
+        if state == "Idle" {
+            assert!(percent.is_null(), "an idle task has no progress: {task}");
+        }
+    }
+    tasks
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["Key"] == "LibraryScan" || t["Id"] == "LibraryScan")
+        .cloned()
+        .expect("the library scan task is listed")
+}
+
+#[tokio::test]
+async fn r3tasks_running_scan_shows_its_progress_and_clears_it_after() {
+    let state = test_state().await;
+    let app = app(state.clone());
+    let (owner, _, viewer, _) = g1_owner_and_viewer(&state, &app).await;
+    create_library_via_api(&app, &state, &owner, "R3 Tasks First", "Movies").await;
+    create_library_via_api(&app, &state, &owner, "R3 Tasks Second", "Movies").await;
+    b17_movies(&media_folder(&state, "r3 tasks first"), 2);
+    b17_movies(&media_folder(&state, "r3 tasks second"), 2);
+    let addr = b17_serve(&app).await;
+
+    // The scan waits for the scan lock in its first library, so the task stays running.
+    let lock = rustyfin_core::scanner::SCAN_LOCK.lock().await;
+    let uri = "/ScheduledTasks/Running/LibraryScan";
+    let (status, body) = send_authed(&app, "POST", uri, &owner, None).await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+    let mut running = serde_json::Value::Null;
+    for _ in 0..200 {
+        running = r3tasks_scan_entry(&app, &owner).await;
+        if running["State"] == "Running" && running["CurrentProgressPercentage"].is_number() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert_eq!(running["State"], "Running", "{running}");
+    assert_eq!(running["CurrentProgressPercentage"], 0.0, "{running}");
+
+    // An administrator's socket gets the tasks after ScheduledTasksInfoStart, as in Jellyfin.
+    let mut socket = G1cSocket::open(addr, &owner).await;
+    r3tasks_send(
+        &mut socket,
+        r#"{"MessageType":"ScheduledTasksInfoStart","Data":"0,500"}"#,
+    )
+    .await;
+    let info = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let frame = socket.next().await;
+            if frame["MessageType"] == "ScheduledTasksInfo" {
+                return frame;
+            }
+        }
+    })
+    .await
+    .expect("a ScheduledTasksInfo frame");
+    let scan = info["Data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["Id"] == "LibraryScan")
+        .cloned()
+        .unwrap();
+    assert_eq!(scan["State"], "Running", "{scan}");
+    assert!(scan["CurrentProgressPercentage"].is_number(), "{scan}");
+
+    // A viewer's socket gets none.
+    let mut other = G1cSocket::open(addr, &viewer).await;
+    r3tasks_send(
+        &mut other,
+        r#"{"MessageType":"ScheduledTasksInfoStart","Data":"0,500"}"#,
+    )
+    .await;
+    let marker = WsEvent::LibraryChanged {
+        data: serde_json::json!({ "LibraryName": "g1c-end" }),
+    };
+    tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
+    state.ws_broadcast.send(marker).unwrap();
+    let frames = other.until_end().await;
+    assert!(
+        !frames.iter().any(|f| f.starts_with("ScheduledTasksInfo")),
+        "{frames:?}"
+    );
+
+    // Once the scan runs, its percent only rises, and the ended task has none.
+    drop(lock);
+    let mut seen = vec![0.0];
+    let mut ended = serde_json::Value::Null;
+    for _ in 0..1000 {
+        ended = r3tasks_scan_entry(&app, &owner).await;
+        if ended["State"] == "Idle" {
+            break;
+        }
+        if let Some(p) = ended["CurrentProgressPercentage"].as_f64() {
+            seen.push(p);
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert_eq!(ended["State"], "Idle", "{ended}");
+    assert!(ended["CurrentProgressPercentage"].is_null(), "{ended}");
+    assert_eq!(
+        ended["LastExecutionResult"]["Status"], "Completed",
+        "{ended}"
+    );
+    assert!(
+        seen.windows(2).all(|w| w[0] <= w[1]) && seen.iter().all(|p| (0.0..=100.0).contains(p)),
+        "{seen:?}"
+    );
+}
+
 #[tokio::test]
 async fn b17_new_socket_lists_the_scans_in_progress() {
     let state = test_state().await;

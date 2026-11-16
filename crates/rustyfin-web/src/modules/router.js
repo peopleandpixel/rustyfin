@@ -17,7 +17,7 @@ import {
     startTaskAction, stopTaskAction,
 } from './admin.js';
 import {
-    loadSidebar, deleteLibraryFromAdmin, toggleRealtimeMonitor, openFolderBrowser, folderBrowserLoad, folderBrowserUp,
+    loadSidebar, deleteLibraryFromAdmin, toggleRealtimeMonitor, openLibraryOptions, openFolderBrowser, folderBrowserLoad, folderBrowserUp,
     folderBrowserSelect, closeFolderBrowser, addLibraryPathRow, removeLibraryPathRow, initScanProgressWebSocket,
 } from './library-admin.js';
 import { openPluginConfig, openPluginPriority } from './plugins.js';
@@ -149,6 +149,7 @@ const clickActions = {
     'set-user-disabled': el => setUserPolicy(el, { IsDisabled: el.checked }),
     'delete-library': el => deleteLibraryFromAdmin(el.dataset.id),
     'toggle-realtime-monitor': el => toggleRealtimeMonitor(el),
+    'library-options': el => openLibraryOptions(el.dataset.id, el.dataset.name),
     'start-task': el => startTaskAction(el.dataset.id, el.dataset.name),
     'stop-task': el => stopTaskAction(el.dataset.id, el.dataset.name),
     'browse-path': el => openFolderBrowser(el.closest('.path-field').querySelector('[data-path-field]')),

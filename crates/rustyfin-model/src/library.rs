@@ -34,7 +34,7 @@ pub struct CreateLibraryRequest {
 
 /// Library options for per-library metadata and image providers.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "PascalCase", from = "LibraryOptionsIn")]
+#[serde(rename_all = "PascalCase", from = "LibraryOptionsUpdate")]
 pub struct LibraryOptions {
     /// Metadata provider (e.g., "TMDb", "TheMovieDb", "TheOpenMovieDatabase")
     #[serde(default)]
@@ -81,11 +81,13 @@ impl Default for LibraryOptions {
     }
 }
 
-/// `LibraryOptions` as a request sends it: chapter images and trickplay under Rustyfin's name,
-/// Jellyfin's, or both. Jellyfin's name wins when both are sent, since Jellyfin clients set it.
+/// `LibraryOptions` as a request sends it: chapter images and trickplay under Rustyfin's name
+/// (`EnableChapterExtraction`, `EnableTrickplay`, the one stored and returned), Jellyfin's
+/// (`EnableChapterImageExtraction`, `EnableTrickplayImageExtraction`), or both. See `resolve` for
+/// how both are read.
 #[derive(Deserialize)]
 #[serde(rename_all = "PascalCase")]
-struct LibraryOptionsIn {
+pub struct LibraryOptionsUpdate {
     #[serde(default)]
     metadata_provider: String,
     #[serde(default)]
@@ -110,27 +112,57 @@ struct LibraryOptionsIn {
     enable_realtime_monitor: bool,
 }
 
-impl From<LibraryOptionsIn> for LibraryOptions {
-    fn from(o: LibraryOptionsIn) -> Self {
-        Self {
+/// One setting sent under two names. When both are sent and disagree, one of them is the value
+/// stored now (a copy the client kept) and the other is the change, so the one that differs from
+/// `stored` wins: a stale value under either name never overrides a fresh one under the other.
+fn pick(ours: Option<bool>, jellyfin: Option<bool>, stored: bool) -> bool {
+    match (ours, jellyfin) {
+        (Some(a), Some(b)) if a != b => {
+            if a != stored {
+                a
+            } else {
+                b
+            }
+        }
+        (Some(a), _) => a,
+        (None, Some(b)) => b,
+        (None, None) => false,
+    }
+}
+
+impl LibraryOptionsUpdate {
+    /// The options this update saves over `stored`. The update replaces them, as Jellyfin's does;
+    /// `stored` only settles a setting sent under both its names with two values.
+    pub fn resolve(self, stored: &LibraryOptions) -> LibraryOptions {
+        let o = self;
+        LibraryOptions {
             metadata_provider: o.metadata_provider,
             image_provider: o.image_provider,
             skip_subfolders: o.skip_subfolders,
-            enable_chapter_extraction: o
-                .enable_chapter_image_extraction
-                .or(o.enable_chapter_extraction)
-                .unwrap_or(false),
+            enable_chapter_extraction: pick(
+                o.enable_chapter_extraction,
+                o.enable_chapter_image_extraction,
+                stored.enable_chapter_extraction,
+            ),
             extract_chapter_images_during_library_scan: o
                 .extract_chapter_images_during_library_scan,
-            enable_trickplay: o
-                .enable_trickplay_image_extraction
-                .or(o.enable_trickplay)
-                .unwrap_or(false),
+            enable_trickplay: pick(
+                o.enable_trickplay,
+                o.enable_trickplay_image_extraction,
+                stored.enable_trickplay,
+            ),
             extract_trickplay_images_during_library_scan: o
                 .extract_trickplay_images_during_library_scan,
             enable_intro_detection: o.enable_intro_detection,
             enable_realtime_monitor: o.enable_realtime_monitor,
         }
+    }
+}
+
+impl From<LibraryOptionsUpdate> for LibraryOptions {
+    /// Options read with nothing stored before (a new library, or the stored row itself).
+    fn from(o: LibraryOptionsUpdate) -> Self {
+        o.resolve(&LibraryOptions::default())
     }
 }
 
@@ -174,18 +206,81 @@ mod tests {
         let o =
             read(r#"{"EnableChapterImageExtraction":true,"EnableTrickplayImageExtraction":true}"#);
         assert!(o.enable_chapter_extraction && o.enable_trickplay);
-        // Both names in one body: no "duplicate field", and Jellyfin's wins.
+        // Both names in one body: no "duplicate field", and with nothing stored the one that
+        // turns the setting on is the change (see r3tasks_both_names_the_change_wins).
         let o = read(
             r#"{"EnableChapterExtraction":false,"EnableChapterImageExtraction":true,
                 "EnableTrickplay":true,"EnableTrickplayImageExtraction":false}"#,
         );
         assert!(o.enable_chapter_extraction);
-        assert!(!o.enable_trickplay);
+        assert!(o.enable_trickplay);
         let o = read("{}");
         assert!(!o.enable_trickplay && o.enable_realtime_monitor);
         // What is stored reads back the same.
         let back = read(&serde_json::to_string(&o).unwrap());
         assert_eq!(back.enable_realtime_monitor, o.enable_realtime_monitor);
+    }
+
+    #[test]
+    fn r3tasks_both_names_the_change_wins() {
+        let update = |json: &str| serde_json::from_str::<LibraryOptionsUpdate>(json).unwrap();
+        let on = LibraryOptions {
+            enable_trickplay: true,
+            enable_chapter_extraction: true,
+            ..Default::default()
+        };
+        let off = LibraryOptions::default();
+        // A stale copy under either name never overrides the change under the other.
+        for (json, stored, want) in [
+            (
+                r#"{"EnableTrickplay":true,"EnableTrickplayImageExtraction":false}"#,
+                &off,
+                true,
+            ),
+            (
+                r#"{"EnableTrickplay":false,"EnableTrickplayImageExtraction":true}"#,
+                &off,
+                true,
+            ),
+            (
+                r#"{"EnableTrickplay":false,"EnableTrickplayImageExtraction":true}"#,
+                &on,
+                false,
+            ),
+            (
+                r#"{"EnableTrickplay":true,"EnableTrickplayImageExtraction":false}"#,
+                &on,
+                false,
+            ),
+            (
+                r#"{"EnableTrickplay":true,"EnableTrickplayImageExtraction":true}"#,
+                &off,
+                true,
+            ),
+            (r#"{"EnableTrickplay":true}"#, &off, true),
+            (r#"{"EnableTrickplayImageExtraction":false}"#, &on, false),
+            (r#"{}"#, &on, false),
+        ] {
+            assert_eq!(
+                update(json).resolve(stored).enable_trickplay,
+                want,
+                "{json}"
+            );
+        }
+        let o = update(r#"{"EnableChapterExtraction":true,"EnableChapterImageExtraction":false}"#)
+            .resolve(&off);
+        assert!(o.enable_chapter_extraction);
+        // Only the canonical names are stored.
+        let stored = serde_json::to_value(&o).unwrap();
+        assert!(
+            stored.get("EnableTrickplayImageExtraction").is_none(),
+            "{stored}"
+        );
+        assert!(
+            stored.get("EnableChapterImageExtraction").is_none(),
+            "{stored}"
+        );
+        assert_eq!(stored["EnableChapterExtraction"], true);
     }
 
     // ── LibraryContentType::default_media_type ──

@@ -161,6 +161,7 @@ async function renderAdmin(tab) {
                                 <td class="py-3"><input type="checkbox" data-action="toggle-realtime-monitor" data-id="${escapeHtml(l.id || l.Id)}" aria-label="${escapeHtml(t('admin.realtime_monitor_for', { name: l.name || l.Name }))}" ${(l.LibraryOptions || {}).EnableRealtimeMonitor === false ? '' : 'checked'} class="w-4 h-4 rounded bg-white/10 border-white/20 text-[#00a4dc]"></td>
                                 <td class="py-3 text-right space-x-2">
                                     <button class="text-[#00a4dc] hover:text-[#38bdf8]" data-action="scan-library-admin" data-id="${escapeHtml(l.id || l.Id)}">${t('admin.scan')}</button>
+                                    <button class="text-[#00a4dc] hover:text-[#38bdf8]" data-action="library-options" data-id="${escapeHtml(l.id || l.Id)}" data-name="${escapeHtml(l.name || l.Name)}" aria-label="${escapeHtml(t('library.options_for', { name: l.name || l.Name }))}">${t('library.options_button')}</button>
                                     <button class="text-red-400 hover:text-red-300" data-action="delete-library" data-id="${escapeHtml(l.id || l.Id)}">${t('common.delete')}</button>
                                 </td>
                             </tr>`).join('')}
@@ -176,7 +177,7 @@ async function renderAdmin(tab) {
                     <button class="jf-btn-ghost !py-1.5 !px-3 text-xs inline-flex items-center gap-1.5" onclick="refreshTasks()">${icon('RefreshCw', { size: 14 })}${t('admin.refresh')}</button>
                 </div>
                 <div id="admin-tasks-list" class="grid gap-3">
-                    ${tasks.map(task => renderTaskCard(task)).join('')}
+                    ${sortTasks(tasks).map(task => renderTaskCard(task)).join('')}
                 </div>
             </div>
 
@@ -300,6 +301,8 @@ function showAdminTab(btn, tabId) {
         if (el) el.classList.toggle('hidden', id !== tabId);
     });
 
+    if (tabId === 'admin-tasks') refreshTasks(true);
+    else stopTaskPolling();
     if (tabId === 'admin-activity') loadActivityLog();
     if (tabId === 'admin-livelog') initLiveLog();
     if (tabId === 'admin-signin') loadOidcAdminTab();
@@ -524,7 +527,7 @@ function renderTaskCard(task) {
     const name = task.Name || task.name || id;
     const description = task.Description || task.description || '';
     const state = task.State || task.state || 'Idle';
-    const progress = task.CurrentProgressPercentage || task.current_progress_percentage;
+    const progress = task.CurrentProgressPercentage ?? task.current_progress_percentage;
     const category = task.Category || task.category || '';
     const lastResult = task.LastExecutionResult || task.last_execution_result;
     const triggers = task.Triggers || task.triggers || [];
@@ -546,26 +549,35 @@ function renderTaskCard(task) {
         };
         const statusColor = statusColors[(status || '').toLowerCase()] || 'text-white/40';
         const timeStr = endTime ? new Date(endTime).toLocaleString(uiLocale(), { day: '2-digit', month: '2-digit', year: '2-digit', hour: '2-digit', minute: '2-digit' }) : '–';
-        lastExecHtml = `<span class="${statusColor}">${escapeHtml(status || '–')}</span> <span class="text-white/30">(${timeStr})</span>`;
+        // The task's message says what it did, or why it did nothing. It belongs to the last run,
+        // so it is left out while a new run goes, which could be read as that run's outcome.
+        const message = isRunning || isCancelling ? '' : lastResult.ErrorMessage || lastResult.error_message;
+        const messageHtml = message ? ` <span class="text-white/50" data-task-message>· ${escapeHtml(message)}</span>` : '';
+        lastExecHtml = `<span class="${statusColor}">${escapeHtml(status || '–')}</span> <span class="text-white/30">(${timeStr})</span>${messageHtml}`;
     }
 
     // Trigger info
     let triggerHtml = '';
     if (triggers.length) {
+        // Trigger times are .NET ticks: 10,000,000 a second
+        const TICKS_PER_MINUTE = 600000000;
+        const TICKS_PER_HOUR = 60 * TICKS_PER_MINUTE;
         const triggerTypes = triggers.map(tr => {
             const type = tr.Type || tr.type || '';
             if (type.includes('Interval')) {
                 const ticks = tr.IntervalTicks || tr.interval_ticks;
                 if (ticks) {
-                    const hours = Math.round(ticks / 3600000);
+                    const hours = Math.round(ticks / TICKS_PER_HOUR);
                     return t('admin.every_hours', { count: hours });
                 }
             }
-            if (type.includes('TimeOfDay')) {
-                const ticks = tr.TimeOfDayTicks || tr.time_of_day_ticks;
-                if (ticks) {
-                    const hour = Math.floor(ticks / 3600000) % 24;
-                    return `${hour.toString().padStart(2, '0')}:00`;
+            // Jellyfin's DailyTrigger and WeeklyTrigger carry the time of day
+            if (type.includes('TimeOfDay') || type.includes('Daily') || type.includes('Weekly')) {
+                const ticks = tr.TimeOfDayTicks ?? tr.time_of_day_ticks;
+                if (typeof ticks === 'number') {
+                    const hour = Math.floor(ticks / TICKS_PER_HOUR) % 24;
+                    const minute = Math.floor(ticks / TICKS_PER_MINUTE) % 60;
+                    return `${hour.toString().padStart(2, '0')}:${minute.toString().padStart(2, '0')}`;
                 }
             }
             return escapeHtml(type);
@@ -573,18 +585,26 @@ function renderTaskCard(task) {
         triggerHtml = `<span class="text-white/40 text-[10px]">${icon('Clock', { size: 10, class: 'inline-block align-[-1px]' })} ${triggerTypes.join(', ')}</span>`;
     }
 
-    // Progress bar
+    // Progress bar: the percent when the task reports one, else a sliding stripe
     let progressHtml = '';
-    if (isRunning && progress !== undefined && progress !== null) {
-        const pct = Math.round(progress);
+    if (isRunning || isCancelling) {
+        const known = typeof progress === 'number' && Number.isFinite(progress);
+        // The bar takes the exact percent; the label one decimal below 10% and whole numbers from
+        // there, both rounded down, so a running task never reads 10.0% early or 100% before it ends
+        const exact = known ? Math.max(0, Math.min(100, progress)) : null;
+        const pct = !known ? null : exact < 10 ? (Math.floor(exact * 10) / 10).toFixed(1) : String(Math.floor(exact));
+        const bar = known
+            ? `<div class="h-full bg-gradient-to-r from-[#00a4dc] to-[#38bdf8] rounded-full transition-all duration-500" style="width:${exact}%"></div>`
+            : '<div class="h-full bg-gradient-to-r from-[#00a4dc] to-[#38bdf8] rounded-full jf-progress-indeterminate"></div>';
+        const aria = known ? `aria-valuemin="0" aria-valuemax="100" aria-valuenow="${exact}" aria-valuetext="${pct}%"` : '';
         progressHtml = `
-        <div class="mt-3">
+        <div class="mt-3" data-task-progress="${known ? pct : 'indeterminate'}">
             <div class="flex justify-between text-[10px] text-white/40 mb-1">
                 <span>${t('admin.progress')}</span>
-                <span>${pct}%</span>
+                <span>${known ? `${pct}%` : ''}</span>
             </div>
-            <div class="w-full h-1.5 bg-white/10 rounded-full overflow-hidden">
-                <div class="h-full bg-gradient-to-r from-[#00a4dc] to-[#38bdf8] rounded-full transition-all duration-500" style="width:${pct}%"></div>
+            <div class="w-full h-1.5 bg-white/10 rounded-full overflow-hidden" role="progressbar" aria-label="${escapeHtml(t('admin.progress'))}" ${aria}>
+                ${bar}
             </div>
         </div>`;
     }
@@ -607,7 +627,7 @@ function renderTaskCard(task) {
                 ${progressHtml}
                 <div class="flex items-center gap-2 mt-3">
                     ${isRunning || isCancelling ? `
-                        <button class="jf-btn-danger text-xs !py-1.5 !px-3 inline-flex items-center gap-1.5" data-action="stop-task" data-id="${escapeHtml(id)}" data-name="${escapeHtml(name)}">
+                        <button class="jf-btn-danger text-xs !py-1.5 !px-3 inline-flex items-center gap-1.5" data-action="stop-task" data-id="${escapeHtml(id)}" data-name="${escapeHtml(name)}"${isCancelling ? ' disabled' : ''}>
                             ${icon('Square', { size: 12, class: 'fill-current' })}${t('admin.stop')}
                         </button>
                     ` : `
@@ -644,17 +664,66 @@ async function stopTaskAction(id, name) {
     }
 }
 
-async function refreshTasks() {
+// The tasks in a steady order, by category and then name, so that cards don't move between reloads.
+function sortTasks(tasks) {
+    const key = task => [task.Category || task.category || '', task.Name || task.name || ''];
+    return [...tasks].sort((a, b) => {
+        const [ca, na] = key(a);
+        const [cb, nb] = key(b);
+        return ca.localeCompare(cb) || na.localeCompare(nb);
+    });
+}
+
+// While the tasks tab is open its list reloads: often while a task runs or stops, slowly otherwise.
+const TASK_POLL_BUSY_MS = 1500;
+const TASK_POLL_IDLE_MS = 10000;
+let taskPollTimer = null;
+
+function tasksBusy(tasks) {
+    return tasks.some(task => (task.State || task.state || 'Idle').toLowerCase() !== 'idle');
+}
+
+// Whether the tasks tab is on screen: it is on the page and not hidden.
+function tasksTabOpen() {
+    const tab = $('admin-tasks');
+    return !!tab && tab.isConnected && !tab.classList.contains('hidden');
+}
+
+function stopTaskPolling() {
+    clearTimeout(taskPollTimer);
+    taskPollTimer = null;
+}
+
+// Plans the next reload, unless the tab has been left.
+function scheduleTaskPoll(busy) {
+    stopTaskPolling();
+    if (!tasksTabOpen()) return;
+    taskPollTimer = setTimeout(() => {
+        taskPollTimer = null;
+        if (tasksTabOpen()) refreshTasks(true);
+    }, busy ? TASK_POLL_BUSY_MS : TASK_POLL_IDLE_MS);
+}
+
+// Reloads the task list. A reload by the timer (quiet) shows no error toast; it tries again later.
+async function refreshTasks(quiet = false) {
+    let busy = false;
     try {
         const tasks = await API.getTasks();
+        busy = tasksBusy(tasks);
         const list = $('admin-tasks-list');
         if (list) {
-            list.innerHTML = tasks.map(task => renderTaskCard(task)).join('');
+            list.innerHTML = sortTasks(tasks).map(task => renderTaskCard(task)).join('');
         }
     } catch (e) {
-        toast(t('admin.tasks_load_failed', { message: e.message }), 'error');
+        if (quiet !== true) toast(t('admin.tasks_load_failed', { message: e.message }), 'error');
     }
+    scheduleTaskPoll(busy);
 }
+
+// Leaving the page stops the reloads.
+window.addEventListener('hashchange', () => {
+    if (!tasksTabOpen()) stopTaskPolling();
+});
 
 async function loadActivityLog() {
     try {

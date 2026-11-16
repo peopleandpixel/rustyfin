@@ -384,12 +384,32 @@ pub async fn generate_for_libraries(
     library_ids: &[String],
     cancel: &Cancel,
 ) -> Result<u32, String> {
+    let progress = crate::task_progress::TaskProgress::new();
+    generate_for_libraries_with_progress(pool, data_dir, library_ids, cancel, &progress).await
+}
+
+/// `generate_for_libraries`, reporting the share of the videos missing tiles at the start that
+/// it has looked at on `progress`.
+pub async fn generate_for_libraries_with_progress(
+    pool: &SqlitePool,
+    data_dir: &Path,
+    library_ids: &[String],
+    cancel: &Cancel,
+    progress: &crate::task_progress::TaskProgress,
+) -> Result<u32, String> {
     use rustyfin_db::repo_trickplay::{
         clear_failure, get_failure, record_failure, set_image_version,
     };
     // Videos this run won't try (again): failed now, or before on the same file
     let mut failed: Vec<Uuid> = Vec::new();
     let mut made = 0u32;
+    let total =
+        rustyfin_db::repo_trickplay::items_missing_trickplay(pool, library_ids, WIDTH, &[], -1)
+            .await
+            .map_err(|e| format!("could not list videos: {e}"))?
+            .len();
+    let mut done = 0usize;
+    progress.report_count(0, total);
     loop {
         let batch = rustyfin_db::repo_trickplay::items_missing_trickplay(
             pool,
@@ -407,6 +427,9 @@ pub async fn generate_for_libraries(
             if cancel.is_cancelled() {
                 return Ok(made);
             }
+            // Videos added during the run can take it past the total counted at the start
+            progress.report_count(done.min(total), total);
+            done += 1;
             let version = file_version(&path).await;
             let db = |e: sqlx::Error| format!("could not record a failure: {e}");
             if get_failure(pool, item_id, FAILURE_KIND).await.map_err(db)? == Some(version) {
