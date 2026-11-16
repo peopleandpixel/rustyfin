@@ -66,6 +66,11 @@ function sandbox({ episodes = SERIES, me = { Id: 'u1', Configuration: {} }, segm
         queueNeighbours: () => null,
         playQueueStep: () => false,
         setMediaSessionHandler: () => {},
+        // The still-watching prompt is off (r3playercore_still_watching.mjs covers it)
+        stillWatchingSetting: () => 'disabled',
+        stillWatchingDue: () => false,
+        watchRun: { start: 0, played: new Set() },
+        lastInput: 0,
     });
     vm.runInContext(
         `var activePlayback = null; let episodeNav = null; let upNext = null; const UP_NEXT_SECONDS = 10;

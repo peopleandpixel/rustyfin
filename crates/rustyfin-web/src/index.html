@@ -619,6 +619,15 @@
                                         <option value="fill" data-i18n="player.aspect_fill">Stretch</option>
                                     </select>
                                 </label>
+                                <label class="jf-player-menu-row"><span data-i18n="player.still_watching">Ask if still watching</span>
+                                    <select id="player-still-watching" class="jf-player-menu-select" onchange="changeStillWatching(this.value)">
+                                        <option value="disabled" data-i18n="player.still_watching_off">Never</option>
+                                        <option value="short" data-i18n="player.still_watching_short">2 episodes or 1 h idle</option>
+                                        <option value="default" data-i18n="player.still_watching_default">3 episodes or 1.5 h idle</option>
+                                        <option value="long" data-i18n="player.still_watching_long">5 episodes or 2.5 h idle</option>
+                                        <option value="veryLong" data-i18n="player.still_watching_very_long">8 episodes or 4 h idle</option>
+                                    </select>
+                                </label>
                                 <button id="player-stats-toggle" type="button" class="jf-player-menu-btn w-full text-left !py-1.5" onclick="togglePlaybackStats()" data-i18n="player.playback_info">Playback info</button>
                             </section>
                             <section id="player-settings-segments" class="space-y-2">
@@ -958,6 +967,17 @@
         </form>
     </div>
     <form method="dialog" class="modal-backdrop"><button data-i18n="common.backdrop_close">close</button></form>
+</dialog>
+
+<!-- Are you still watching? Before the next episode, after a long run (the player's settings menu turns it on) -->
+<dialog id="still-watching" class="modal bg-black/70 backdrop-blur-md">
+    <div class="modal-box max-w-xs jf-menu rounded-2xl p-5">
+        <h3 class="text-base font-bold text-white mb-4" data-i18n="player.still_watching_question">Are you still watching?</h3>
+        <form method="dialog" class="flex flex-col gap-2">
+            <button value="continue" class="jf-btn-primary w-full text-sm" autofocus data-i18n="player.still_watching_continue">Continue watching</button>
+            <button value="stop" class="jf-btn-ghost w-full text-sm" data-i18n="player.still_watching_stop">Stop watching</button>
+        </form>
+    </div>
 </dialog>
 
 <!-- Toast notification container -->

@@ -8,7 +8,8 @@ import { clearQueue, queueNeighbours, playQueueStep } from './queue.js';
 import {
     trackPrefs, defaultTracks, defaultSubtitleIndex as preferredSubtitleIndex, subtitleAppearance, saveSubtitleAppearance,
     subtitleCss, stepSubtitleOffset, qualityOptions, bitrateLabel, maxStreamingBitrate, setMaxStreamingBitrate,
-    AUTO_BITRATE, aspectRatio, setAspectRatio, SEGMENT_TYPES, segmentAction, setSegmentAction,
+    AUTO_BITRATE, aspectRatio, setAspectRatio, SEGMENT_TYPES, segmentAction, setSegmentAction, stillWatchingSetting,
+    setStillWatchingSetting, stillWatchingDue,
 } from './playerprefs.js';
 let playerReportInterval = null;
 let playerBars = null;
@@ -637,6 +638,8 @@ async function playItem(itemId, streamType = 'Videos', title = '', { fromStart =
     if (!modal.open || request !== playRequest) return; // closed or replaced while loading
     const prefs = trackPrefs(me?.Configuration);
     if (!title && item?.Name) $('player-title').textContent = item.Name;
+    // An episode the user started begins a new run; one played on from the last (with its tracks) adds to it
+    trackStillWatching(item, !!carry);
 
     const startTicks = selection?.startTicks ?? ((streamType !== 'Videos' || fromStart) ? 0 : resumePositionTicks(item));
     const runtimeTicks = item?.RunTimeTicks || 0;
@@ -1043,6 +1046,17 @@ function updateEpisodeButtons() {
 // Plays a neighbour from its start with this item's track languages; finished reports this one as watched.
 // In a queue the neighbour is the queue's previous or next item.
 function playEpisode(session, episode, { finished = false } = {}) {
+    if (session.streamType !== 'Audio' && episode?.Type === 'Episode' && stillWatchingDue(stillWatchingSetting(),
+        { now: Date.now(), sessionStart: watchRun.start, lastInput, played: watchRun.played.size })) {
+        $('video-player')?.pause();
+        askStillWatching().then(keepWatching => {
+            if (!keepWatching) return closePlayer();
+            watchRun = { start: Date.now(), played: new Set() };
+            lastInput = Date.now();
+            playEpisode(session, episode, { finished });
+        });
+        return;
+    }
     const carry = session.streamType !== 'Audio' ? episodeTrackCarry(session) : null;
     if (finished) session.finished = true;
     const nav = episodeNav;
@@ -1299,6 +1313,36 @@ function playerKeyAction(e) {
     case 'h': return () => changeSubtitleOffset(1);
     default: return null;
     }
+}
+
+// --- Are you still watching? Jellyfin Web's prompt before the next episode, off unless the user turns it on.
+// The run starts with an episode the user plays; it counts the episodes played on from there. ---
+let watchRun = { start: Date.now(), played: new Set() };
+// The last key, pointer or wheel input, in ms
+let lastInput = Date.now();
+for (const type of ['pointerdown', 'pointermove', 'keydown', 'wheel', 'touchstart']) {
+    document.addEventListener(type, () => { lastInput = Date.now(); }, { capture: true, passive: true });
+}
+
+function trackStillWatching(item, continued) {
+    if (item?.Type !== 'Episode') return;
+    if (!continued) watchRun = { start: Date.now(), played: new Set() };
+    watchRun.played.add(item.Id);
+}
+
+// Resolves true for Continue watching, false for Stop watching (Escape too)
+function askStillWatching() {
+    const dialog = $('still-watching');
+    if (!dialog) return Promise.resolve(true);
+    dialog.returnValue = '';
+    return new Promise(resolve => {
+        dialog.addEventListener('close', () => resolve(dialog.returnValue === 'continue'), { once: true });
+        dialog.showModal();
+    });
+}
+
+function changeStillWatching(value) {
+    setStillWatchingSetting(value);
 }
 
 // --- Playback info: Jellyfin Web's player stats overlay, refreshed every second while it shows ---
@@ -1736,6 +1780,8 @@ function renderPlayerSettings(open) {
     applySubtitleAppearance();
     renderPlaybackSettings(activePlayback);
     renderSegmentSettings();
+    const still = $('player-still-watching');
+    if (still) still.value = stillWatchingSetting();
 }
 
 // --- Quality, version and aspect ratio: the menu's Playback section ---
@@ -1885,7 +1931,7 @@ export {
     playUpNextNow, cancelUpNext, togglePlayPause, setVolume, toggleMute, setPlaybackRate, toggleFullscreen,
     togglePictureInPicture, skipSegment, hoverSeek, hideTrickplay, renderPlayerSettings, setSubtitleAppearance,
     changeSubtitleOffset, changeQuality, changeVersion, changeAspectRatio, renderChapterMenu, changeSegmentAction,
-    togglePlaybackStats,
+    togglePlaybackStats, changeStillWatching,
 };
 
 // Shared state that inline handlers or other modules assign: reached through window
