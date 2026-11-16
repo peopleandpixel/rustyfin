@@ -3,11 +3,15 @@
 import { $, icon, escapeHtml } from './util.js';
 import { sectionRow } from './cards.js';
 
-// Jellyfin Web's genre rows: up to 25 titles each, in a random order, a few rows asked at a time
+// Jellyfin Web's genre rows: up to 25 titles each, in a random order, a few rows asked at a time,
+// each when it comes near the screen
 const GENRE_ROW_LIMIT = 25;
 const GENRE_ROWS_AT_ONCE = 4;
+const GENRE_ROW_MARGIN = '600px';
 // Drops the rows of a tab that was left meanwhile
 let genreGen = 0;
+// Watches the open tab's rows that are not asked for yet
+let genreObserver = null;
 
 function genreItemType(contentType) {
     return contentType === 'TvShows' ? 'Series' : 'Movie';
@@ -44,6 +48,8 @@ async function genreNameOf(libId, contentType, genreId) {
 async function renderGenreRows(libId, libName, contentType, tabBar) {
     const session = API.token;
     const gen = ++genreGen;
+    genreObserver?.disconnect();
+    genreObserver = null;
     const page = $('page-library');
     const headerIcon = contentType === 'TvShows' ? 'Tv' : 'Film';
     page.classList.remove('jf-with-rail');
@@ -75,25 +81,50 @@ async function renderGenreRows(libId, libName, contentType, tabBar) {
         $('genre-rows').innerHTML = `<div class="text-center py-20 text-white/40">${t('library.empty')}</div>`;
         return;
     }
-    // A slot per genre in order, filled as its row arrives; a genre with no titles stays empty
-    $('genre-rows').innerHTML = genres.map((_, i) => `<div data-genre-row="${i}"></div>`).join('');
-    let next = 0;
-    const worker = async () => {
-        while (next < genres.length) {
-            const i = next++;
-            const genre = genres[i];
-            let items = [];
-            try {
-                items = (await API.cachedGet(genreRowUrl(libId, contentType, genre.Id))).Items || [];
-            } catch (e) {
-                console.warn('Genre row failed', genre.Name, e);
-            }
-            if (stale()) return;
-            const slot = document.querySelector(`#genre-rows [data-genre-row="${i}"]`);
-            if (slot) slot.innerHTML = sectionRow(genre.Name || '', items, { page: 'library', data: `${libId}/genres/${genre.Id}` });
+    // A slot per genre in order, with a row's height reserved, filled when it nears the screen; a
+    // genre with no titles ends up empty. The random rows are asked fresh on every visit.
+    $('genre-rows').innerHTML = genres.map((_, i) => `<div data-genre-row="${i}" class="jf-genre-slot"></div>`).join('');
+    const queue = [];
+    let running = 0;
+    const loadRow = async i => {
+        const genre = genres[i];
+        let items = [];
+        try {
+            items = (await API.get(genreRowUrl(libId, contentType, genre.Id))).Items || [];
+        } catch (e) {
+            console.warn('Genre row failed', genre.Name, e);
+        }
+        if (stale()) return;
+        const slot = document.querySelector(`#genre-rows [data-genre-row="${i}"]`);
+        if (slot) {
+            slot.classList.remove('jf-genre-slot');
+            slot.innerHTML = sectionRow(genre.Name || '', items, { page: 'library', data: `${libId}/genres/${genre.Id}` });
         }
     };
-    await Promise.all(Array.from({ length: GENRE_ROWS_AT_ONCE }, worker));
+    const pump = async () => {
+        while (queue.length && running < GENRE_ROWS_AT_ONCE && !stale()) {
+            running++;
+            loadRow(queue.shift()).finally(() => {
+                running--;
+                pump();
+            });
+        }
+    };
+    const slots = [...document.querySelectorAll('#genre-rows [data-genre-row]')];
+    genreObserver = new IntersectionObserver(entries => {
+        if (stale()) {
+            genreObserver?.disconnect();
+            return;
+        }
+        for (const entry of entries) {
+            if (!entry.isIntersecting) continue;
+            genreObserver.unobserve(entry.target);
+            queue.push(Number(entry.target.dataset.genreRow));
+        }
+        queue.sort((a, b) => a - b);
+        pump();
+    }, { rootMargin: `${GENRE_ROW_MARGIN} 0px` });
+    for (const slot of slots) genreObserver.observe(slot);
 }
 
 export { genresUrl, genreRowUrl, genreNameOf, renderGenreRows };

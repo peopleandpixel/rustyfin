@@ -179,11 +179,27 @@ test('the view menu and the tab bars', () => {
     assert.match(films, /library.tab_movies/);
 });
 
-test("the genres tab: a row per genre, in order, each opening that genre's list", async () => {
+test("the genres tab: a row per genre, loaded as it nears the screen, each opening that genre's list", async () => {
     const slots = new Map();
     const gets = [];
+    const cached = [];
     const page = { innerHTML: '', classList: { remove() {} } };
-    const elements = { 'page-library': page, 'genre-rows': { set innerHTML(html) { for (const m of html.matchAll(/data-genre-row="(\d+)"/g)) slots.set(m[1], { innerHTML: '' }); } }, 'genre-count': { textContent: '' } };
+    const slot = i => ({ innerHTML: '', dataset: { genreRow: i }, classList: { remove() {} } });
+    const elements = { 'page-library': page, 'genre-rows': { set innerHTML(html) { for (const m of html.matchAll(/data-genre-row="(\d+)"/g)) slots.set(m[1], slot(m[1])); } }, 'genre-count': { textContent: '' } };
+    // A stand-in observer: the test says which slots come into view
+    let observer = null;
+    class IntersectionObserver {
+        constructor(callback, options) { this.callback = callback; this.options = options; this.watched = new Set(); observer = this; }
+        observe(el) { this.watched.add(el); }
+        unobserve(el) { this.watched.delete(el); }
+        disconnect() { this.watched.clear(); }
+        show(...ids) { this.callback(ids.map(id => ({ isIntersecting: true, target: slots.get(id) }))); }
+    }
+    const answer = url => {
+        if (url.startsWith('/Genres?')) return { Items: [{ Id: 'g1', Name: 'Action' }, { Id: 'g2', Name: 'Drama' }, { Id: 'g3', Name: 'Empty' }] };
+        const genre = new URLSearchParams(url.split('?')[1]).get('GenreIds');
+        return { Items: genre === 'g3' ? [] : [{ Id: `${genre}-a` }, { Id: `${genre}-b` }] };
+    };
     const context = vm.createContext({
         URLSearchParams,
         t: (key, opts) => (opts ? `${key}|${JSON.stringify(opts)}` : key),
@@ -192,22 +208,35 @@ test("the genres tab: a row per genre, in order, each opening that genre's list"
         console,
         $: id => elements[id] || null,
         sectionRow: (title, items, more) => (items.length ? `row:${title}:${items.map(i => i.Id).join(',')}:${more.data}` : ''),
-        document: { querySelector: sel => slots.get(sel.match(/"(\d+)"/)[1]) },
+        IntersectionObserver,
+        document: {
+            querySelector: sel => slots.get(sel.match(/"(\d+)"/)[1]),
+            querySelectorAll: () => [...slots.values()],
+        },
         API: {
             token: 'tok',
-            async cachedGet(url) {
-                gets.push(url);
-                if (url.startsWith('/Genres?')) return { Items: [{ Id: 'g1', Name: 'Action' }, { Id: 'g2', Name: 'Drama' }, { Id: 'g3', Name: 'Empty' }] };
-                const genre = new URLSearchParams(url.split('?')[1]).get('GenreIds');
-                return { Items: genre === 'g3' ? [] : [{ Id: `${genre}-a` }, { Id: `${genre}-b` }] };
-            },
+            async cachedGet(url) { cached.push(url); return answer(url); },
+            async get(url) { gets.push(url); return answer(url); },
         },
     });
     const source = read('modules/genres.js').replace(/^import [^;]*;$/gms, '').replace(/^export \{[^}]*\};$/gms, '');
     vm.runInContext(`${source}\nthis.renderGenreRows = renderGenreRows; this.genreNameOf = genreNameOf;`, context);
+    const tick = () => new Promise(resolve => setImmediate(resolve));
     await context.renderGenreRows('films', 'Films', 'Movies', '<tabs>');
     assert.match(page.innerHTML, /<tabs>/);
-    const genres = new URLSearchParams(gets[0].split('?')[1]);
+    // Nothing asked until a row nears the screen; then only that row
+    assert.equal(observer.watched.size, 3);
+    assert.match(observer.options.rootMargin, /^\d+px 0px$/);
+    assert.deepEqual(gets, []);
+    observer.show('0', '2');
+    await tick();
+    assert.deepEqual(gets.map(u => new URLSearchParams(u.split('?')[1]).get('GenreIds')), ['g1', 'g3']);
+    assert.equal(slots.get('1').innerHTML, '');
+    observer.show('1');
+    await tick();
+    // The random rows are never taken from the cache; only the genre list is
+    assert.equal(cached.length, 1);
+    const genres = new URLSearchParams(cached[0].split('?')[1]);
     assert.deepEqual(Object.fromEntries(genres), {
         ParentId: 'films', IncludeItemTypes: 'Movie', Recursive: 'true', SortBy: 'SortName', SortOrder: 'Ascending',
     });

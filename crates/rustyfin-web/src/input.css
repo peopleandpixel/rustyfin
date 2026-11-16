@@ -309,6 +309,16 @@ body {
 
 /* The card's played, favourite and menu buttons, bottom right, shown on hover or focus; on a
    touch screen only the menu button, always */
+/* A genre row not loaded yet keeps about a row's height, so only the rows near the screen load */
+.jf-genre-slot {
+  min-height: 18rem;
+}
+
+/* A long press on a card opens its menu (cardmenu.js), not iOS's link callout */
+.jf-card[data-id] {
+  -webkit-touch-callout: none;
+}
+
 .jf-card-actions {
   position: absolute;
   right: 0.4rem;

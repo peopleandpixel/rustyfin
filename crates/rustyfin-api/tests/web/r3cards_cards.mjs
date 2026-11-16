@@ -45,7 +45,8 @@ function sandbox({ isAdmin = false, item = null } = {}) {
     });
     vm.runInContext(`${strip(read('modules/cards.js'))}\n${strip(read('modules/cardmenu.js'))}
         this.fns = { itemCard, cardState, cardMarksHtml, applyCardUserData, cardMenuCommands, cardMenuHtml,
-            toggleCardPlayed, toggleCardFavorite, setCardLikes, playCardItem, openCardMenu };`, context);
+            toggleCardPlayed, toggleCardFavorite, setCardLikes, playCardItem, openCardMenu, openAddTo, cardPointerDown,
+        cardPointerMove, cardContextMenu, cardClickAfterLongPress, LONG_PRESS_MS };`, context);
     return { fns: context.fns, calls, toasts, events, context };
 }
 
@@ -196,6 +197,107 @@ test('a mark redraws the badges and buttons of every card of the item', () => {
     fns.applyCardUserData('s1', { IsFavorite: true, Likes: false });
     assert.equal(cards[0].dataset.favorite, 'true');
     assert.equal(cards[0].dataset.likes, 'false');
+});
+
+// A popover menu element as openCardMenu uses it, counting its opens
+function fakeMenu() {
+    return {
+        innerHTML: '', style: {}, shown: 0, matches: () => false, showPopover() { this.shown++; }, hidePopover() {},
+        setAttribute() {}, addEventListener() {}, getBoundingClientRect: () => ({ width: 100, height: 100 }), querySelector: () => null,
+    };
+}
+
+function menuSandbox() {
+    const s = sandbox();
+    const menu = fakeMenu();
+    const pending = [];
+    s.context.document.getElementById = () => menu;
+    s.context.innerWidth = 1000;
+    s.context.innerHeight = 800;
+    s.context.location = { hash: '#library/films' };
+    // Each item answer waits until the test resolves it
+    s.context.API.get = url => new Promise(resolve => pending.push({ url, resolve }));
+    const anchor = id => ({ dataset: { id }, getBoundingClientRect: () => ({ right: 500, bottom: 300, height: 30 }) });
+    return { ...s, menu, pending, anchor };
+}
+
+test('a slow item answer for an earlier open, or after leaving the page, opens no menu', async () => {
+    const s = menuSandbox();
+    const first = s.fns.openCardMenu(s.anchor('a'));
+    const second = s.fns.openCardMenu(s.anchor('b'));
+    s.pending[1].resolve(movie({}, { Id: 'b', Name: 'Bravo' }));
+    await second;
+    s.pending[0].resolve(movie({}, { Id: 'a', Name: 'Alpha' }));
+    await first;
+    assert.equal(s.menu.shown, 1);
+    assert.match(s.menu.innerHTML, /data-id="b"/);
+    assert.doesNotMatch(s.menu.innerHTML, /data-id="a"/);
+    const third = s.fns.openCardMenu(s.anchor('c'));
+    s.context.location.hash = '#home';
+    s.pending[2].resolve(movie({}, { Id: 'c' }));
+    await third;
+    assert.equal(s.menu.shown, 1);
+});
+
+test('Escape in a reused add-to dialog adds nothing', async () => {
+    const s = sandbox();
+    const added = [];
+    const dialog = {
+        dataset: {}, innerHTML: '', returnValue: 'ok', seenOnOpen: null,
+        querySelector: sel => (sel === 'select' ? dialog.select : dialog.input),
+        select: { value: 'p1', addEventListener() {}, focus() {} },
+        input: { value: '', hidden: false, focus() {} },
+        showModal() { this.seenOnOpen = this.returnValue; },
+    };
+    s.context.document.getElementById = () => dialog;
+    Object.assign(s.context.API, {
+        getPlaylists: async () => [{ Id: 'p1', Name: 'Mix' }],
+        addToPlaylist: async (id, ids) => added.push([id, ids]),
+        createPlaylist: async (name, ids) => added.push([name, ids]),
+    });
+    // The last use of the dialog ended with OK; this one is closed with Escape (returnValue stays)
+    await s.fns.openAddTo({ dataset: { id: 'm1' } }, 'playlist');
+    assert.equal(dialog.seenOnOpen, '');
+    dialog.onclose();
+    await new Promise(resolve => setImmediate(resolve));
+    assert.deepEqual(added, []);
+    // OK still adds
+    await s.fns.openAddTo({ dataset: { id: 'm1' } }, 'playlist');
+    dialog.returnValue = 'ok';
+    dialog.onclose();
+    await new Promise(resolve => setImmediate(resolve));
+    assert.deepEqual(plain(added), [['p1', ['m1']]]);
+});
+
+test('a long touch press opens the menu (iOS fires no contextmenu); a move cancels it', async () => {
+    const s = menuSandbox();
+    const timers = [];
+    s.context.setTimeout = (f, ms) => { timers.push({ f, ms, live: true }); return timers.length; };
+    s.context.clearTimeout = id => { if (timers[id - 1]) timers[id - 1].live = false; };
+    const card = { dataset: { id: 'm1' }, closest: sel => (sel === '#card-menu' ? null : card), getBoundingClientRect: () => ({}) };
+    const target = { closest: () => card };
+    const down = (pointerType, x = 10, y = 10) => s.fns.cardPointerDown({ pointerType, target, clientX: x, clientY: y });
+    const fire = () => timers.filter(t => t.live).forEach(t => { t.live = false; t.f(); });
+    // A mouse press does nothing; right click is the mouse's way
+    down('mouse');
+    assert.equal(timers.length, 0);
+    // A press that moves (a scroll) is no long press
+    down('touch');
+    assert.equal(timers[0].ms, s.fns.LONG_PRESS_MS);
+    s.fns.cardPointerMove({ clientX: 10, clientY: 40 });
+    fire();
+    assert.equal(s.pending.length, 0);
+    // A still press opens the menu at the finger
+    down('touch');
+    s.fns.cardPointerMove({ clientX: 12, clientY: 11 });
+    fire();
+    assert.deepEqual(s.pending.map(p => p.url), ['/Items/m1']);
+    // The click that ends the press, and Android's contextmenu, don't open the item or a second menu
+    const click = { target, prevented: false, stopped: false, preventDefault() { this.prevented = true; }, stopPropagation() { this.stopped = true; } };
+    s.fns.cardClickAfterLongPress(click);
+    assert.ok(click.prevented && click.stopped);
+    s.fns.cardContextMenu({ target, clientX: 1, clientY: 1, preventDefault() {} });
+    assert.equal(s.pending.length, 1);
 });
 
 test("api.js setRating is Jellyfin's likes call", async () => {

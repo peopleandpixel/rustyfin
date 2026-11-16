@@ -13,6 +13,9 @@ const NO_USER_DATA = ['Person', 'Genre', 'MusicGenre', 'Studio', 'CollectionFold
 
 // The item a context menu was opened for, by id (the menu's play and add commands need its type)
 const menuItems = new Map();
+// Counts menu opens: an item answer for an earlier open is dropped
+let menuSeq = 0;
+const currentRoute = () => globalThis.location?.hash ?? '';
 
 // The menu's commands for an item, in Jellyfin Web's order: [{ action, label, icon, ...data }] with
 // 'separator' entries between the groups. Actions other than the card-* ones are the router's.
@@ -110,13 +113,18 @@ async function openCardMenu(el, point = null) {
     const id = el.dataset.id || el.closest('.jf-card')?.dataset.id;
     if (!id) return;
     const anchor = el.getBoundingClientRect();
+    const seq = ++menuSeq;
+    const route = currentRoute();
+    // Only the latest open, on the page it was made on, shows a menu
+    const stale = () => seq !== menuSeq || currentRoute() !== route || el.isConnected === false;
     let item;
     try {
         item = await API.get(`/Items/${encodeURIComponent(id)}`);
     } catch (e) {
-        toast(e.message, 'error');
+        if (!stale()) toast(e.message, 'error');
         return;
     }
+    if (stale()) return;
     menuItems.clear();
     menuItems.set(item.Id, item);
     const menu = menuElement();
@@ -233,6 +241,8 @@ async function openAddTo(el, kind) {
     dialog.onclose = () => {
         if (dialog.returnValue === 'ok') addTo(kind, id, select.value, name.value.trim());
     };
+    // A reused dialog keeps the last returnValue; Escape must not read as the last OK
+    dialog.returnValue = '';
     dialog.showModal();
     (lists.length ? select : name).focus();
 }
@@ -258,15 +268,63 @@ async function addTo(kind, id, target, name) {
     }
 }
 
-// A right click (or a long press on touch) on a card opens its menu at the pointer
-document.addEventListener('contextmenu', e => {
+// A right click on a card opens its menu at the pointer. So does a long press on a touch screen:
+// iOS Safari fires no contextmenu for touch, so a timer does it (LONG_PRESS_MS without moving), and
+// the click that ends the press doesn't open the item.
+const LONG_PRESS_MS = 500;
+const LONG_PRESS_SLOP = 10;
+let longPress = null;
+let longPressAt = 0;
+
+function cancelLongPress() {
+    if (longPress) clearTimeout(longPress.timer);
+    longPress = null;
+}
+
+function cardPointerDown(e) {
+    cancelLongPress();
+    if (e.pointerType !== 'touch') return;
+    const card = e.target.closest?.('.jf-card[data-id]');
+    if (!card || card.closest('#card-menu')) return;
+    const press = { x: e.clientX, y: e.clientY };
+    press.timer = setTimeout(() => {
+        longPress = null;
+        longPressAt = Date.now();
+        openCardMenu(card, press);
+    }, LONG_PRESS_MS);
+    longPress = press;
+}
+
+function cardPointerMove(e) {
+    if (longPress && Math.hypot(e.clientX - longPress.x, e.clientY - longPress.y) > LONG_PRESS_SLOP) cancelLongPress();
+}
+
+// The click (and Android's contextmenu) right after a long press opened the menu are its own
+const justLongPressed = () => Date.now() - longPressAt < 800;
+
+function cardContextMenu(e) {
     const card = e.target.closest?.('.jf-card[data-id]');
     if (!card || card.closest('#card-menu')) return;
     e.preventDefault();
+    if (justLongPressed()) return;
+    cancelLongPress();
     openCardMenu(card, { x: e.clientX, y: e.clientY });
-});
+}
+
+function cardClickAfterLongPress(e) {
+    if (!justLongPressed() || !e.target.closest?.('.jf-card[data-id]')) return;
+    e.preventDefault();
+    e.stopPropagation();
+}
+
+document.addEventListener('pointerdown', cardPointerDown, { passive: true });
+document.addEventListener('pointermove', cardPointerMove, { passive: true });
+for (const type of ['pointerup', 'pointercancel', 'scroll']) document.addEventListener(type, cancelLongPress, { passive: true, capture: true });
+document.addEventListener('contextmenu', cardContextMenu);
+document.addEventListener('click', cardClickAfterLongPress, true);
 
 export {
     cardMenuCommands, cardMenuHtml, openCardMenu, toggleCardPlayed, toggleCardFavorite, setCardLikes, playCardItem,
-    openAddTo, addTo, userDataChanged,
+    openAddTo, addTo, userDataChanged, cardPointerDown, cardPointerMove, cardContextMenu, cardClickAfterLongPress,
+    cancelLongPress, LONG_PRESS_MS,
 };
