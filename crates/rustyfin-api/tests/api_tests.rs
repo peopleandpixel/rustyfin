@@ -29194,18 +29194,26 @@ async fn r3users2_public_users_say_whether_they_have_a_password() {
         post_startup_user(&app, None, "owner", "pw-owner").await,
         StatusCode::NO_CONTENT
     );
-    let kid = add_user(&state, "kid", "pw-kid", false).await;
+    // A password set to the empty one: the tile signs in at a click
+    add_user(&state, "kid", "", false).await;
+    // No password hash at all: password sign-in is off for the user, so the tile asks
+    let sso = add_user(&state, "sso", "pw-sso", false).await;
     sqlx::query("UPDATE users SET password_hash = '' WHERE id = ?")
-        .bind(kid.to_string())
+        .bind(sso.to_string())
         .execute(&state.db)
         .await
         .unwrap();
 
+    for _ in 0..2 {
+        // The second answer comes from the remembered check
+        let users = r3users2_public(&app).await;
+        assert_eq!(users["owner"]["HasPassword"], true, "{users:?}");
+        assert_eq!(users["owner"]["HasConfiguredPassword"], true);
+        assert_eq!(users["kid"]["HasPassword"], false, "{users:?}");
+        assert_eq!(users["kid"]["HasConfiguredPassword"], false);
+        assert_eq!(users["sso"]["HasPassword"], true, "{users:?}");
+    }
     let users = r3users2_public(&app).await;
-    assert_eq!(users["owner"]["HasPassword"], true, "{users:?}");
-    assert_eq!(users["owner"]["HasConfiguredPassword"], true);
-    assert_eq!(users["kid"]["HasPassword"], false, "{users:?}");
-    assert_eq!(users["kid"]["HasConfiguredPassword"], false);
     // Only what a tile needs: no policy, configuration or hash
     assert!(users["owner"].get("Policy").is_none());
     assert!(users["owner"].get("PasswordHash").is_none());

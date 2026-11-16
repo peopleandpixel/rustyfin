@@ -163,23 +163,45 @@ async fn get_public_users(
     let tags = rustyfin_db::repo_user::primary_image_tags(&state.db_ro).await?;
     let policies = rustyfin_db::repo_parental::all_policies(&state.db_ro).await?;
     let local = resolve_client(peer.ip(), &headers, &state.known_proxies).is_local();
-    Ok(Json(
-        users
-            .into_iter()
-            .filter(|u| {
-                policies
-                    .get(&u.id)
-                    .is_none_or(|p| !p.access.is_hidden && (local || p.access.enable_remote_access))
-            })
-            .map(|u| {
-                let primary_image_tag = tags.get(&u.id).cloned();
-                PublicUserDto {
-                    primary_image_tag,
-                    ..PublicUserDto::from(u)
-                }
-            })
-            .collect(),
-    ))
+    let mut out = Vec::with_capacity(users.len());
+    for u in users.into_iter().filter(|u| {
+        policies
+            .get(&u.id)
+            .is_none_or(|p| !p.access.is_hidden && (local || p.access.enable_remote_access))
+    }) {
+        let primary_image_tag = tags.get(&u.id).cloned();
+        let has_password = needs_password(&u.password_hash).await;
+        out.push(PublicUserDto {
+            primary_image_tag,
+            has_password,
+            has_configured_password: has_password,
+            ..PublicUserDto::from(u)
+        });
+    }
+    Ok(Json(out))
+}
+
+/// Whether signing in as a user takes a password, for Jellyfin Web's tiles: false only when the
+/// stored password is the empty one, so the tile signs in at a click. An empty hash means password
+/// sign-in is off for the user (a setup code, single sign-on), so the tile asks. Each hash is
+/// checked once (one Argon2 verify) and remembered, so the public list does no hashing per request.
+async fn needs_password(hash: &str) -> bool {
+    static CHECKED: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, bool>>> =
+        std::sync::OnceLock::new();
+    if hash.is_empty() {
+        return true;
+    }
+    let checked = CHECKED.get_or_init(Default::default);
+    if let Some(needs) = checked.lock().ok().and_then(|m| m.get(hash).copied()) {
+        return needs;
+    }
+    let needs = !rustyfin_auth::verify_password("", hash)
+        .await
+        .unwrap_or(false);
+    if let Ok(mut m) = checked.lock() {
+        m.insert(hash.to_string(), needs);
+    }
+    needs
 }
 
 async fn create_user(

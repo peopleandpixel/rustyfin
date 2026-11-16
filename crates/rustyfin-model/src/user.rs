@@ -180,8 +180,9 @@ pub struct PublicUserDto {
     /// The profile picture's tag, left out when the user has none, as in Jellyfin.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub primary_image_tag: Option<String>,
-    /// Whether the user signs in with a password. Jellyfin Web's user tiles sign a user without
-    /// one in at a click, and ask the others for theirs.
+    /// Whether the user signs in with a password (set by `GET /Users/Public`, which checks for an
+    /// empty one). Jellyfin Web's user tiles sign a user without one in at a click, and ask the
+    /// others for theirs.
     #[serde(default)]
     pub has_password: bool,
     #[serde(default)]
