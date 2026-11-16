@@ -49,7 +49,12 @@ pub fn admin_routes() -> Router<AppState> {
             "/Items/{id}/RemoteSearch/Subtitles/{key}",
             get(search_remote_subtitles).post(download_remote_subtitle),
         )
-        .route("/Videos/{id}/Subtitles", post(upload_subtitle))
+        // The JSON body carries the file in base64, a third larger than the file
+        .route(
+            "/Videos/{id}/Subtitles",
+            post(upload_subtitle)
+                .layer(axum::extract::DefaultBodyLimit::max(UPLOAD_BODY_MAX_BYTES)),
+        )
         .route("/Videos/{id}/Subtitles/{index}", delete(delete_subtitle))
 }
 
@@ -130,7 +135,11 @@ async fn external_subtitle_with_stored(
     let stream = source
         .media_streams
         .into_iter()
-        .find(|s| usize::try_from(s.index) == Ok(index) && s.is_external)
+        .find(|s| {
+            usize::try_from(s.index) == Ok(index)
+                && s.is_external
+                && s.codec_type.eq_ignore_ascii_case("subtitle")
+        })
         .ok_or_else(|| ApiError::NotFound(format!("Subtitle index {index} not found")))?;
     let stored = stream.path.unwrap_or_default();
     let path = validate_path_against_library(state, &stored).await?;
@@ -883,6 +892,9 @@ const UPLOAD_FORMATS: [&str; 4] = ["srt", "vtt", "ass", "ssa"];
 
 /// The largest uploaded subtitle file, decoded.
 const UPLOAD_MAX_BYTES: usize = 10 << 20;
+
+/// The largest upload request: the file in base64 (4 bytes for every 3) and the other fields.
+const UPLOAD_BODY_MAX_BYTES: usize = UPLOAD_MAX_BYTES / 3 * 4 + (1 << 20);
 
 /// Jellyfin's `UploadSubtitleDto`. `Data` is the file in base64.
 #[derive(Debug, Deserialize)]
