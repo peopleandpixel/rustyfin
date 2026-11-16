@@ -399,9 +399,19 @@ struct Probe {
     last_pos: f64,
     /// A Matroska or MP4 file: its index lets ffmpeg seek straight to a key frame.
     indexed: bool,
-    /// The video's codec and decoder configuration, where its key frames can be read as a raw
-    /// stream (`key_frames`): H.264 or HEVC, and not rotated, as a raw stream can't say so.
-    raw: Option<(Codec, Vec<u8>)>,
+    /// Where the video's key frames can be read as a raw stream (`key_frames`): H.264 or HEVC,
+    /// and not rotated, as a raw stream can't say so.
+    raw: Option<RawVideo>,
+}
+
+/// What a raw stream of a video's key frames needs from its container.
+#[derive(Clone, Debug)]
+struct RawVideo {
+    codec: Codec,
+    /// The decoder configuration (`avcC`, `hvcC`).
+    config: Vec<u8>,
+    /// The container's sample aspect ratio, as `n/d`, which the raw stream may not carry.
+    sar: Option<String>,
 }
 
 /// How seek mode reads a tile's key frames.
@@ -505,7 +515,8 @@ async fn probe(path: &str, cancel: &Cancel) -> Result<Option<Probe>, String> {
             "-show_data",
             "-show_entries",
             "format=start_time,duration,size,format_name:stream=codec_name,avg_frame_rate,\
-             width,height,extradata:stream_side_data=rotation:packet=pts_time,pos",
+             width,height,sample_aspect_ratio,extradata:stream_side_data=rotation:\
+             packet=pts_time,pos",
             // The first packet, and the last key frame, which a seek past the end lands on
             "-read_intervals",
             "%+#1,99999999%+#1",
@@ -548,15 +559,22 @@ async fn probe(path: &str, cancel: &Cancel) -> Result<Option<Probe>, String> {
         list.iter()
             .any(|d| d["rotation"].as_i64().is_some_and(|r| r % 360 != 0))
     });
+    let sar = stream["sample_aspect_ratio"]
+        .as_str()
+        .and_then(|r| r.split_once(':'))
+        .and_then(|(n, d)| Some((n.parse::<u32>().ok()?, d.parse::<u32>().ok()?)))
+        .filter(|&(n, d)| n > 0 && d > 0)
+        .map(|(n, d)| format!("{n}/{d}"));
     let raw = stream["codec_name"]
         .as_str()
         .and_then(Codec::from_name)
         .filter(|_| !rotated)
-        .map(|codec| {
-            let config = key_frames::hex_dump(stream["extradata"].as_str().unwrap_or_default());
-            (codec, config)
+        .map(|codec| RawVideo {
+            codec,
+            config: key_frames::hex_dump(stream["extradata"].as_str().unwrap_or_default()),
+            sar,
         })
-        .filter(|(codec, config)| KeyFrameStream::new(*codec, config).is_some());
+        .filter(|raw| KeyFrameStream::new(raw.codec, &raw.config).is_some());
     let probe = (|| {
         Some(Probe {
             start: num(&format["start_time"])?,
@@ -672,7 +690,7 @@ async fn seek_tile(
     tile: Tile<'_>,
     start: f64,
     slots: std::ops::Range<u32>,
-    raw: Option<(Codec, Vec<u8>)>,
+    raw: Option<RawVideo>,
     cancel: &Cancel,
 ) -> Result<(), String> {
     let _slot = tokio::select! {
@@ -693,21 +711,20 @@ async fn seek_tile(
         .collect();
     let intervals = intervals.join(",");
     match raw {
-        Some((codec, config)) => {
-            let stream = KeyFrameStream::new(codec, &config)
-                .ok_or("the decoder configuration can't be read")?;
-            raw_tile(&tile, &intervals, slots.len(), codec, stream, cancel).await
-        }
+        Some(raw) => raw_tile(&tile, &intervals, slots.len(), &raw, cancel).await,
         None => concat_tile(&tile, &intervals, slots.len(), cancel).await,
     }
 }
 
 /// The ffmpeg arguments that decode one input into tile image `tile`, and list each frame
-/// it decoded in `frames` (framecrc), after the input arguments `input`.
-fn tile_args(input: Vec<String>, tile: &Tile<'_>, frames: &Path) -> Vec<String> {
+/// it decoded in `frames` (framecrc), after the input arguments `input`. Frames get the sample
+/// aspect ratio `sar` first, where the input lacks the container's.
+fn tile_args(input: Vec<String>, sar: Option<&str>, tile: &Tile<'_>, frames: &Path) -> Vec<String> {
     let output = tile.tiles.join(format!("{}.jpg", tile.index));
-    let graph =
-        format!("[0:V:0]scale={WIDTH}:-2,split[t][n];[t]tile={TILE_SIDE}x{TILE_SIDE}[tiles]");
+    let setsar = sar.map_or(String::new(), |sar| format!("setsar={sar},"));
+    let graph = format!(
+        "[0:V:0]{setsar}scale={WIDTH}:-2,split[t][n];[t]tile={TILE_SIDE}x{TILE_SIDE}[tiles]"
+    );
     let mut args = input;
     args.extend(
         [
@@ -753,17 +770,18 @@ async fn frame_times(frames: &Path) -> Result<Vec<i64>, String> {
 }
 
 /// `seek_tile` from a raw stream: one ffprobe opens the file once, seeks to each of the
-/// `wanted` key frames (`intervals`) and prints its packet, which `stream` turns into the input
-/// of one ffmpeg. The order is the stream's own (see `key_frames`), so this only checks that
-/// each key frame gave one frame.
+/// `wanted` key frames (`intervals`) and prints its packet, which a `KeyFrameStream` turns into
+/// the input of one ffmpeg. The order is the stream's own (see `key_frames`), so this only
+/// checks that each key frame gave one frame.
 async fn raw_tile(
     tile: &Tile<'_>,
     intervals: &str,
     wanted: usize,
-    codec: Codec,
-    stream: KeyFrameStream,
+    raw: &RawVideo,
     cancel: &Cancel,
 ) -> Result<(), String> {
+    let stream = KeyFrameStream::new(raw.codec, &raw.config)
+        .ok_or("the decoder configuration can't be read")?;
     let frames = tile.work.join(format!("seek-{}.crc", tile.index));
     let input = [
         "-threads",
@@ -771,13 +789,13 @@ async fn raw_tile(
         "-skip_loop_filter",
         "all",
         "-f",
-        codec.format(),
+        raw.codec.format(),
         "-i",
         "pipe:0",
     ]
     .map(String::from)
     .to_vec();
-    let ffmpeg_args = tile_args(input, tile, &frames);
+    let ffmpeg_args = tile_args(input, raw.sar.as_deref(), tile, &frames);
     let probe_args = [
         "-probesize",
         PROBE_BYTES,
@@ -988,7 +1006,7 @@ async fn concat_tile(
     ]
     .map(String::from)
     .to_vec();
-    let args = tile_args(input, tile, &frames);
+    let args = tile_args(input, None, tile, &frames);
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
     run_ffmpeg(&args, cancel).await?;
     let times = frame_times(&frames).await?;
