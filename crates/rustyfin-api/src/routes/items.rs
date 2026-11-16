@@ -290,6 +290,14 @@ async fn enrich_item(
     // ServerId
     item.server_id = Some(server_id.to_string());
 
+    // Jellyfin sends HasLyrics on audio items only
+    if item.media_type == rustyfin_model::media::MediaType::Audio {
+        let with_lyrics = rustyfin_db::repo_lyrics::with_lyrics(pool, &[item.id])
+            .await
+            .unwrap_or_default();
+        item.has_lyrics = Some(!with_lyrics.is_empty());
+    }
+
     // Type flags
     item.is_movie = item.media_type == rustyfin_model::media::MediaType::Movie;
     item.is_series = item.media_type == rustyfin_model::media::MediaType::Series;
@@ -1046,6 +1054,23 @@ pub(crate) async fn enrich_items_with(
         for item in items.iter_mut() {
             if let Some(info) = photos.get(&item.id) {
                 apply_photo_info(item, info);
+            }
+        }
+    }
+
+    // Batch query 3a': which audio items have lyrics; Jellyfin sends HasLyrics on audio only
+    let audio_ids: Vec<Uuid> = items
+        .iter()
+        .filter(|item| item.media_type == rustyfin_model::media::MediaType::Audio)
+        .map(|item| item.id)
+        .collect();
+    if !audio_ids.is_empty() {
+        let with_lyrics = rustyfin_db::repo_lyrics::with_lyrics(pool, &audio_ids)
+            .await
+            .unwrap_or_default();
+        for item in items.iter_mut() {
+            if item.media_type == rustyfin_model::media::MediaType::Audio {
+                item.has_lyrics = Some(with_lyrics.contains(&item.id.to_string()));
             }
         }
     }
@@ -3043,10 +3068,19 @@ async fn delete_item(
             "This user may not delete media.".to_string(),
         ));
     }
+    // The uploaded lyric files of the item and the items under it go with them.
+    let library = rustyfin_db::repo_media::get_item_by_id(&state.db, id)
+        .await?
+        .map(|item| item.library_id);
+    let lyrics = match library {
+        Some(library) => rustyfin_core::lyrics::uploads_in_library(&state.db, library).await,
+        None => Vec::new(),
+    };
     let deleted = rustyfin_db::repo_media::delete_item(&state.db, id).await?;
     if !deleted {
         return Err(ApiError::NotFound("item not found".into()));
     }
+    rustyfin_core::lyrics::remove_orphaned_uploads(&state.db, &lyrics).await;
     // The items under it lose theirs at the image tasks' next run.
     rustyfin_core::trickplay::remove_item_files(&state.data_dir, id).await;
     Ok(Json(json!({ "status": "ok" })).into_response())

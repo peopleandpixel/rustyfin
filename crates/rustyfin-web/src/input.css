@@ -1242,6 +1242,47 @@ button.jf-crumb:hover {
 }
 
 /* Now playing: the music bar along the bottom of every page; the page scrolls clear of it */
+/* The music player's lyrics panel (lyrics.js), over the now-playing bar */
+.jf-lyrics-panel {
+  position: fixed;
+  right: 1rem;
+  bottom: 6rem;
+  z-index: 40;
+  display: flex;
+  flex-direction: column;
+  width: 20rem;
+  max-width: calc(100% - 2rem);
+  max-height: 60vh;
+  padding: 1rem;
+  border-radius: 0.75rem;
+  background: rgb(0 0 0 / 0.8);
+  backdrop-filter: blur(12px);
+  border: 1px solid rgb(255 255 255 / 0.1);
+}
+.jf-lyrics-body {
+  overflow-y: auto;
+  text-align: center;
+}
+.jf-lyric-line {
+  display: block;
+  width: 100%;
+  padding: 0.25rem 0.5rem;
+  color: rgb(255 255 255 / 0.5);
+  font-size: 0.9rem;
+  line-height: 1.5;
+  min-height: 1.5em;
+}
+button.jf-lyric-line {
+  cursor: pointer;
+}
+button.jf-lyric-line:hover {
+  color: rgb(255 255 255 / 0.8);
+}
+.jf-lyric-line.active {
+  color: #fff;
+  font-weight: 600;
+}
+
 .jf-now-playing {
   position: fixed;
   left: 0;

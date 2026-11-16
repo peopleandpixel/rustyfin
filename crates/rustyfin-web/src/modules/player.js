@@ -6,6 +6,7 @@ import { renderHome } from './home.js';
 import { currentDetailId, renderDetail, versionLabels } from './item.js';
 import { clearQueue, queueNeighbours, playQueueStep } from './queue.js';
 import { stopThemeSong } from './theme-media.js';
+import { setLyricsTrack, highlightLyrics } from './lyrics.js';
 import {
     trackPrefs, defaultTracks, defaultSubtitleIndex as preferredSubtitleIndex, subtitleAppearance, saveSubtitleAppearance,
     subtitleCss, stepSubtitleOffset, qualityOptions, bitrateLabel, maxStreamingBitrate, setMaxStreamingBitrate,
@@ -1405,6 +1406,7 @@ function playerKeyAction(e) {
 function updateNowPlaying(session, item = null) {
     const bar = $('now-playing');
     const audio = session?.streamType === 'Audio';
+    setLyricsTrack(audio ? session.itemId : null, item?.HasLyrics);
     const video = $('video-player');
     const picture = audio ? itemPicture(item) : null;
     const art = picture ? API.imageUrl(picture.id, 'Primary', { maxHeight: 512, tag: picture.tag }) : '';
@@ -1428,6 +1430,7 @@ function updateNowPlayingProgress(session) {
     if (session.streamType !== 'Audio' || $('now-playing')?.hidden) return;
     const total = session.total();
     const pos = session.position();
+    highlightLyrics(pos * 1e7);
     if (!seekDragging) $('now-playing-seek').value = total > 0 ? Math.min(100, pos / total * 100) : 0;
     $('now-playing-time').textContent = `${formatDurationSeconds(pos)} / ${formatDurationSeconds(total)}`;
 }

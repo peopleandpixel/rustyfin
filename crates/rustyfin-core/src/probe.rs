@@ -66,6 +66,8 @@ pub struct AudioTags {
     pub album_art: Option<Vec<u8>>,
     /// MIME type of the album art
     pub album_art_mime: Option<String>,
+    /// The lyrics tag (ID3 USLT, Vorbis LYRICS, MP4 ©lyr), see [`crate::lyrics::lyrics_tag`].
+    pub lyrics: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -587,6 +589,7 @@ fn extract_audio_tags(
         comment: get("comment"),
         album_art,
         album_art_mime,
+        lyrics: crate::lyrics::lyrics_tag(tags),
     })
 }
 
@@ -1037,6 +1040,17 @@ async fn probe_and_write(
     match probe {
         Ok(result) => {
             if as_primary {
+                // Jellyfin's audio probe keeps a track's lyrics tag as its lyrics
+                // (`AudioFileProber`), which its HasLyrics shows.
+                let embedded = result
+                    .audio_tags
+                    .as_ref()
+                    .is_some_and(|tags| tags.lyrics.is_some());
+                if let Err(e) =
+                    rustyfin_db::repo_lyrics::set_embedded(pool, *item_id, embedded).await
+                {
+                    warn!("failed to record the lyrics tag of '{}': {}", path, e);
+                }
                 save_runtime_and_chapters(
                     pool,
                     item_id,

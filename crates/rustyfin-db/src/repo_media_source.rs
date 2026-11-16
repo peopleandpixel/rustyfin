@@ -20,12 +20,19 @@ use uuid::Uuid;
 /// 3: a video stream's Dolby Vision configuration record, which its VideoRangeType is read from,
 /// and a video's external subtitle files, stored as its streams. Neither touches audio files, so
 /// audio sources are read again only below [`AUDIO_PROBE_VERSION`].
-pub const PROBE_VERSION: i64 = 3;
+///
+/// 4: whether an audio file's tags hold lyrics, which its HasLyrics shows. It doesn't touch
+/// video files, so video sources are read again only below [`VIDEO_PROBE_VERSION`].
+pub const PROBE_VERSION: i64 = 4;
 
 /// The last [`PROBE_VERSION`] that changed what a probe stores for an audio file. A scan reads an
 /// audio source again only when an older probe wrote it, so a video-only change doesn't re-read
 /// a music library from its share.
-pub const AUDIO_PROBE_VERSION: i64 = 2;
+pub const AUDIO_PROBE_VERSION: i64 = 4;
+
+/// The last [`PROBE_VERSION`] that changed what a probe stores for a video file, so that an
+/// audio-only change doesn't re-read every video.
+pub const VIDEO_PROBE_VERSION: i64 = 3;
 
 // ---------------------------------------------------------------------------
 // MediaSource DB row
