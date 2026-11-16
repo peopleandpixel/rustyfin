@@ -3396,6 +3396,7 @@ const B124_WEB_MODULES: &[&str] = &[
     "jellyfin-import.js",
     "library-admin.js",
     "library.js",
+    "libtabs.js",
     "metadata-admin.js",
     "music.js",
     "playback-admin.js",
@@ -26852,6 +26853,12 @@ fn r3music_tabs() {
     b124_node_test("r3music_tabs.mjs");
 }
 
+// A movie or TV library's tabs (Suggestions, Favorites, Upcoming, Networks), a mixed library's
+// folders opened in place, and the empty search's suggestions (tests/web/r3tabs_library.mjs)
+#[test]
+fn r3tabs_library() {
+    b124_node_test("r3tabs_library.mjs");
+}
 
 // R3 collections: the web client's collection and playlist lists, pages, Remove and reordering
 // (tests/web/r3collections_web.mjs)
