@@ -26913,6 +26913,12 @@ fn r3extras_web() {
     b124_node_test("r3extras_web.mjs");
 }
 
+// R3 extras round 2: series, season and episode pages show their extras (tests/web/r3extras2_web.mjs)
+#[test]
+fn r3extras2_web() {
+    b124_node_test("r3extras2_web.mjs");
+}
+
 // R3 metadata: the admin's refresh, Identify, image and metadata editor dialogs in the web client
 // (tests/web/r3metadata_admin.mjs)
 #[test]
