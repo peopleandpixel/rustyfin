@@ -3407,6 +3407,7 @@ const B124_WEB_MODULES: &[&str] = &[
     "search.js",
     "sessions.js",
     "settings.js",
+    "theme-media.js",
     "user-editor.js",
     "user-settings.js",
     "util.js",
@@ -26153,6 +26154,13 @@ fn r3item_detail() {
 #[test]
 fn r3item_play() {
     b124_node_test("r3item_play.mjs");
+}
+
+// R3 item extras: the Trailer button, the Special Features row and theme songs in the web client
+// (tests/web/r3extras_web.mjs)
+#[test]
+fn r3extras_web() {
+    b124_node_test("r3extras_web.mjs");
 }
 
 

@@ -254,7 +254,8 @@ function dateLocaleLabel(tag) {
 function displaySettingsHtml() {
     const dateOptions = [{ value: '', label: t('settings.date_format_auto') }, ...DATE_LOCALES.map(tag => ({ value: tag, label: dateLocaleLabel(tag) }))];
     return selectHtml(t('settings.date_format'), 'id="pref-datetimelocale" data-pref="datetimelocale" onchange="changeUserPref(this)"', dateOptions, userSetting('datetimelocale', ''))
-        + toggleHtml(t('settings.show_backdrops'), 'id="pref-backdrops" data-pref="enableBackdrops" onchange="changeUserPref(this)"', userSetting('enableBackdrops', 'true') !== 'false');
+        + toggleHtml(t('settings.show_backdrops'), 'id="pref-backdrops" data-pref="enableBackdrops" onchange="changeUserPref(this)"', userSetting('enableBackdrops', 'true') !== 'false')
+        + toggleHtml(t('settings.play_theme_songs'), 'id="pref-theme-songs" data-pref="enableThemeSongs" onchange="changeUserPref(this)"', userSetting('enableThemeSongs', 'false') === 'true');
 }
 
 function homeSettingsHtml(config, libraries) {

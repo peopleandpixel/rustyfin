@@ -4,6 +4,7 @@
 import { $, toast } from './modules/util.js';
 import './modules/cards.js';
 import './modules/user-settings.js';
+import './modules/theme-media.js';
 import { navigate, toggleUserMenu, closeUserMenu, toggleSidebar } from './modules/router.js';
 import {
     wizSetUiLanguage, wizApplyPath, wizNext, wizPrev, wizSkipLibrary, wizFinishWithoutImport, wizComplete,

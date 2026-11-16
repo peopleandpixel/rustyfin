@@ -12,6 +12,7 @@ import {
 import { renderSearch } from './search.js';
 import { playWithResumeChoice, stopPlayback, playItem, playerAutoHide, onPlayerClosed } from './player.js';
 import { playContainer } from './queue.js';
+import { stopThemeSong } from './theme-media.js';
 import {
     openCardMenu, toggleCardPlayed, toggleCardFavorite, setCardLikes, playCardItem, openAddTo,
 } from './cardmenu.js';
@@ -45,6 +46,8 @@ function navigate(page, data, { fromHistory = false } = {}) {
     libraryRemember();
     if (page !== 'library') stopLibraryLoad();
     libraryRestore = fromHistory && page === 'library';
+    // A theme song plays only on item pages; the next item page keeps or replaces it
+    if (page !== 'detail') stopThemeSong();
     document.querySelectorAll('[id^="page-"]').forEach(el => el.classList.add('hidden'));
     const el = $('page-' + page);
     if (el) {
