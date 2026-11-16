@@ -256,8 +256,9 @@ pub async fn set_share(
     user_id: Uuid,
     can_edit: bool,
 ) -> Result<(), sqlx::Error> {
-    let mut conn = pool.acquire().await?;
-    insert_share(&mut conn, playlist_id, user_id, can_edit).await
+    let mut tx = crate::begin_write(pool).await?;
+    insert_share(&mut tx, playlist_id, user_id, can_edit).await?;
+    tx.commit().await
 }
 
 async fn insert_share(
@@ -326,8 +327,9 @@ pub async fn set_open_access(
     playlist_id: Uuid,
     open: bool,
 ) -> Result<(), sqlx::Error> {
-    let mut conn = pool.acquire().await?;
-    set_open_access_on(&mut conn, playlist_id, open).await
+    let mut tx = crate::begin_write(pool).await?;
+    set_open_access_on(&mut tx, playlist_id, open).await?;
+    tx.commit().await
 }
 
 async fn set_open_access_on(

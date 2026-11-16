@@ -1262,10 +1262,11 @@ impl TaskScheduler {
     }
 
     /// Run SQLite VACUUM to defragment the database. Put off, with the task's result saying so,
-    /// while a scan or an image run is going: false then.
+    /// while a scan or an image run is going: false then. It holds `SCAN_LOCK` throughout, so a
+    /// scan that starts meanwhile waits for it.
     async fn run_db_vacuum(&self) -> bool {
-        let scan_lock_held = crate::scanner::SCAN_LOCK.try_lock().is_err();
-        let blockers = self.vacuum_blockers(scan_lock_held).await;
+        let no_scan = crate::scanner::SCAN_LOCK.try_lock();
+        let blockers = self.vacuum_blockers(no_scan.is_err()).await;
         if !blockers.is_empty() {
             let now = Utc::now().to_rfc3339();
             let why = format!("Put off while this runs: {}", blockers.join(", "));
@@ -1282,6 +1283,10 @@ impl TaskScheduler {
             .await;
             return false;
         }
+        // No blockers: the lock was free, and is this run's until it returns.
+        let Ok(_no_scan) = no_scan else {
+            return false;
+        };
         self.set_task_state(TASK_DB_VACUUM, TaskState::Running)
             .await;
         let start = Utc::now();

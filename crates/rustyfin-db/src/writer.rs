@@ -5,13 +5,17 @@
 
 use std::borrow::Cow;
 use std::error::Error as StdError;
+use std::future::Future;
 use std::ops::{Deref, DerefMut};
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::pin::Pin;
+use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
 use sqlx::error::{DatabaseError, ErrorKind};
-use sqlx::{Sqlite, SqliteConnection, SqlitePool, Transaction};
+use sqlx::pool::MaybePoolConnection;
+use sqlx::sqlite::{SqliteConnectOptions, SqliteQueryResult};
+use sqlx::{SqlSafeStr, Sqlite, SqliteConnection, SqlitePool, Transaction};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 /// A write transaction, begun with `BEGIN IMMEDIATE`, holding its database's writer turn. It is
@@ -51,16 +55,34 @@ impl DerefMut for WriteTx {
     }
 }
 
-/// The writer turn of `pool`'s database file.
+/// Whose writer turn a pool takes: its database file's, or for the plain `:memory:` filename,
+/// where each connection is a database of its own, the pool's.
+enum Owner {
+    File(PathBuf),
+    Pool(Weak<SqliteConnectOptions>),
+}
+
+/// The writer turn of `pool`'s database.
 fn turns(pool: &SqlitePool) -> Arc<Semaphore> {
-    static TURNS: Mutex<Vec<(PathBuf, Arc<Semaphore>)>> = Mutex::new(Vec::new());
-    let file = pool.connect_options().get_filename().to_path_buf();
+    static TURNS: Mutex<Vec<(Owner, Arc<Semaphore>)>> = Mutex::new(Vec::new());
+    let options = pool.connect_options();
+    let file = options.get_filename();
     let mut turns = TURNS.lock().unwrap_or_else(|p| p.into_inner());
-    if let Some((_, turn)) = turns.iter().find(|(f, _)| *f == file) {
+    turns.retain(|(owner, _)| !matches!(owner, Owner::Pool(gone) if gone.strong_count() == 0));
+    let found = turns.iter().find(|(owner, _)| match owner {
+        Owner::File(f) => f == file,
+        Owner::Pool(p) => p.as_ptr() == Arc::as_ptr(&options),
+    });
+    if let Some((_, turn)) = found {
         return turn.clone();
     }
+    let owner = if file == std::path::Path::new(":memory:") {
+        Owner::Pool(Arc::downgrade(&options))
+    } else {
+        Owner::File(file.to_path_buf())
+    };
     let turn = Arc::new(Semaphore::new(1));
-    turns.push((file, turn.clone()));
+    turns.push((owner, turn.clone()));
     turn
 }
 
@@ -109,17 +131,52 @@ impl DatabaseError for TurnTimedOut {
 /// Begins a write transaction on `pool` once no other writer of its database holds the turn.
 /// A writer that waits `crate::BUSY_TIMEOUT` for it fails with "database is locked", as one
 /// that waits that long for SQLite's lock does: one that never ends holds no one up for good.
+/// The turn's holder waits as long for a pool connection, then fails with `PoolTimedOut`, so it
+/// doesn't keep the writers behind it waiting the pool's full acquire timeout.
 pub async fn begin_write(pool: &SqlitePool) -> Result<WriteTx, sqlx::Error> {
-    begin_write_within(pool, crate::BUSY_TIMEOUT).await
+    begin_write_within(pool, crate::BUSY_TIMEOUT, crate::BUSY_TIMEOUT).await
 }
 
-async fn begin_write_within(pool: &SqlitePool, wait: Duration) -> Result<WriteTx, sqlx::Error> {
-    let Ok(Ok(turn)) = tokio::time::timeout(wait, turns(pool).acquire_owned()).await else {
+async fn begin_write_within(
+    pool: &SqlitePool,
+    turn_wait: Duration,
+    connection_wait: Duration,
+) -> Result<WriteTx, sqlx::Error> {
+    let Ok(Ok(turn)) = tokio::time::timeout(turn_wait, turns(pool).acquire_owned()).await else {
         return Err(sqlx::Error::Database(Box::new(TurnTimedOut)));
     };
-    let tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+    let Ok(connection) = tokio::time::timeout(connection_wait, pool.acquire()).await else {
+        return Err(sqlx::Error::PoolTimedOut);
+    };
+    // What `Pool::begin_with` does after its own acquire: a transaction that owns the connection.
+    let tx = Transaction::begin(
+        MaybePoolConnection::PoolConnection(connection?),
+        Some("BEGIN IMMEDIATE".into_sql_str()),
+    )
+    .await?;
     Ok(WriteTx { tx, turn })
 }
+
+/// `.execute_write(pool)`: a single statement as its own write transaction, in its database's
+/// writer turn (`begin_write`), so that while it waits it holds no pool connection.
+pub trait ExecuteWrite<'q>: sqlx::Execute<'q, Sqlite> + Send + Sized + 'q {
+    fn execute_write<'p>(
+        self,
+        pool: &'p SqlitePool,
+    ) -> Pin<Box<dyn Future<Output = Result<SqliteQueryResult, sqlx::Error>> + Send + 'p>>
+    where
+        'q: 'p,
+    {
+        Box::pin(async move {
+            let mut tx = begin_write(pool).await?;
+            let done = sqlx::Executor::execute(&mut *tx, self).await?;
+            tx.commit().await?;
+            Ok(done)
+        })
+    }
+}
+
+impl<'q, E: sqlx::Execute<'q, Sqlite> + Send + 'q> ExecuteWrite<'q> for E {}
 
 #[cfg(test)]
 mod tests {
@@ -186,14 +243,15 @@ mod tests {
         let dir = crate::tests::temp_dir();
         let pool = pool(&dir.join("w.db"), 2).await;
         let held = begin_write(&pool).await.unwrap();
-        let late = begin_write_within(&pool, Duration::from_millis(200)).await;
+        let late =
+            begin_write_within(&pool, Duration::from_millis(200), Duration::from_secs(2)).await;
         let Err(e) = late else {
             panic!("began while the turn was held")
         };
         assert!(crate::busy::is_busy(&e), "{e}");
         drop(held);
         assert!(
-            begin_write_within(&pool, Duration::from_secs(2))
+            begin_write_within(&pool, Duration::from_secs(2), Duration::from_secs(2))
                 .await
                 .is_ok()
         );
@@ -210,5 +268,41 @@ mod tests {
         let _held = begin_write(&a).await.unwrap();
         let other = tokio::time::timeout(Duration::from_secs(1), begin_write(&b)).await;
         assert!(matches!(other, Ok(Ok(_))));
+    }
+
+    // Each pool on the plain `:memory:` filename is a database of its own, with its own turn.
+    #[tokio::test]
+    async fn r3dbpool_in_memory_pools_have_their_own_writer_turns() {
+        let memory = || {
+            crate::pool_options(1)
+                .connect_with(sqlx::sqlite::SqliteConnectOptions::new().filename(":memory:"))
+        };
+        let (a, b) = (memory().await.unwrap(), memory().await.unwrap());
+        assert!(!Arc::ptr_eq(&turns(&a), &turns(&b)));
+        assert!(Arc::ptr_eq(&turns(&a), &turns(&a)));
+        let _held = begin_write(&a).await.unwrap();
+        let other = tokio::time::timeout(Duration::from_secs(1), begin_write(&b)).await;
+        assert!(matches!(other, Ok(Ok(_))));
+    }
+
+    // The turn's holder waits no longer for a connection than the writers behind it wait for
+    // the turn, and gives the turn back when it gives up.
+    #[tokio::test]
+    async fn r3dbpool_the_turn_holder_waits_as_long_for_a_connection() {
+        let dir = crate::tests::temp_dir();
+        let pool = pool(&dir.join("w.db"), 1).await;
+        let busy = pool.acquire().await.unwrap();
+        let started = Instant::now();
+        let waited =
+            begin_write_within(&pool, Duration::from_secs(2), Duration::from_millis(300)).await;
+        assert!(
+            matches!(waited, Err(sqlx::Error::PoolTimedOut)),
+            "{:?}",
+            waited.err()
+        );
+        assert!(started.elapsed() < Duration::from_secs(2));
+        drop(busy);
+        let next = tokio::time::timeout(Duration::from_secs(2), begin_write(&pool)).await;
+        assert!(matches!(next, Ok(Ok(_))), "the turn came back");
     }
 }

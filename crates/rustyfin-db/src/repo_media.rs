@@ -225,8 +225,10 @@ pub async fn save_refresh_changes(
     read: &MediaItem,
     updated: &MediaItem,
 ) -> Result<Vec<&'static str>, sqlx::Error> {
-    let mut conn = pool.acquire().await?;
-    save_refresh_changes_on(&mut conn, read, updated).await
+    let mut tx = crate::begin_write(pool).await?;
+    let changes = save_refresh_changes_on(&mut tx, read, updated).await?;
+    tx.commit().await?;
+    Ok(changes)
 }
 
 /// [`save_refresh_changes`] on one connection, so a caller can put it in a transaction with
@@ -3711,8 +3713,9 @@ pub async fn set_forced_sort_name(
     item_id: uuid::Uuid,
     forced: Option<&str>,
 ) -> Result<(), sqlx::Error> {
-    let mut conn = pool.acquire().await?;
-    set_forced_sort_name_on(&mut conn, item_id, forced).await
+    let mut tx = crate::begin_write(pool).await?;
+    set_forced_sort_name_on(&mut tx, item_id, forced).await?;
+    tx.commit().await
 }
 
 /// [`set_forced_sort_name`] on one connection, for a transaction.

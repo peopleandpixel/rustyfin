@@ -1,14 +1,17 @@
 //! "database is locked": a write that waited `busy_timeout` for another connection's write lock
 //! and gave up. A long writer (a filter index rebuild, VACUUM, a big sort name pass) can hold the
-//! lock past that, so background writers, which nobody waits on, try again a few times.
+//! lock past that, so background writers, which nobody waits on, try again a few times. So they
+//! do when no pool connection came in time (`PoolTimedOut`).
 
 use std::future::Future;
 use std::time::Duration;
 
 use tracing::warn;
 
-/// The waits before the second, third and fourth tries. With `busy_timeout` in each try, a
-/// writer gives up after about a minute.
+/// The waits before the second, third and fourth tries. A try that meets a held lock usually
+/// fails after `busy_timeout` (10 s), so a writer typically gives up after about a minute. At
+/// worst each try also waits out the pool's acquire timeout first (30 s), and a writer gives up
+/// after 4 × 40 s plus these 17 s: about three minutes.
 const RETRY_WAITS: [Duration; 3] = [
     Duration::from_secs(2),
     Duration::from_secs(5),
@@ -26,23 +29,45 @@ pub fn is_busy(e: &sqlx::Error) -> bool {
     }
 }
 
-/// Runs `write` again while it fails with "database is locked", up to three more times. `write`
-/// must be one statement or one whole transaction, so a failed try wrote nothing. `what` names
-/// it in the log.
-pub async fn retry_busy<T, F, Fut>(what: &str, mut write: F) -> Result<T, sqlx::Error>
+/// Whether trying `e`'s write again later may work: "database is locked", or no connection in
+/// time.
+fn is_transient(e: &sqlx::Error) -> bool {
+    is_busy(e) || matches!(e, sqlx::Error::PoolTimedOut)
+}
+
+/// Runs `write` again while it fails with "database is locked" or no connection came in time, up
+/// to three more times. `write` must be one statement or one whole transaction, so a failed try
+/// wrote nothing. `what` names it in the log.
+pub async fn retry_busy<T, F, Fut>(what: &str, write: F) -> Result<T, sqlx::Error>
 where
     F: FnMut() -> Fut,
     Fut: Future<Output = Result<T, sqlx::Error>>,
 {
+    retry_busy_until(what, std::future::pending, write).await
+}
+
+/// `retry_busy` that stops waiting to try again once `stop()` completes (a cancelled job, say),
+/// and returns the last try's error.
+pub async fn retry_busy_until<T, F, Fut, S, Stop>(
+    what: &str,
+    mut stop: S,
+    mut write: F,
+) -> Result<T, sqlx::Error>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<T, sqlx::Error>>,
+    S: FnMut() -> Stop,
+    Stop: Future<Output = ()>,
+{
     for wait in RETRY_WAITS {
         match write().await {
-            Err(e) if is_busy(&e) => {
-                warn!(
-                    what,
-                    retry_in_secs = wait.as_secs(),
-                    "database is locked; trying again"
-                );
-                tokio::time::sleep(wait).await;
+            Err(e) if is_transient(&e) => {
+                warn!(what, retry_in_secs = wait.as_secs(), error = %e,
+                    "the database is busy; trying again");
+                tokio::select! {
+                    _ = tokio::time::sleep(wait) => {}
+                    _ = stop() => return Err(e),
+                }
             }
             done => return done,
         }
@@ -95,8 +120,39 @@ mod tests {
     }
 
     #[test]
-    fn r3dbpool_only_sqlite_busy_is_retried() {
+    fn r3dbpool_only_a_busy_database_is_retried() {
         assert!(!is_busy(&sqlx::Error::PoolTimedOut));
-        assert!(!is_busy(&sqlx::Error::RowNotFound));
+        assert!(is_transient(&sqlx::Error::PoolTimedOut));
+        assert!(!is_transient(&sqlx::Error::RowNotFound));
+    }
+
+    // A stop ends the wait before the next try at once, with the last try's error.
+    #[tokio::test]
+    async fn r3dbpool_retry_busy_stops_waiting_when_told() {
+        let (stop, stopped) = tokio::sync::watch::channel(false);
+        let mut tries = 0;
+        let started = std::time::Instant::now();
+        let stopping = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            stop.send(true).unwrap();
+        });
+        let result: Result<(), _> = retry_busy_until(
+            "test write",
+            || {
+                let mut stopped = stopped.clone();
+                async move {
+                    let _ = stopped.wait_for(|s| *s).await;
+                }
+            },
+            || {
+                tries += 1;
+                async { Err(sqlx::Error::PoolTimedOut) }
+            },
+        )
+        .await;
+        stopping.await.unwrap();
+        assert!(matches!(result, Err(sqlx::Error::PoolTimedOut)));
+        assert_eq!(tries, 1);
+        assert!(started.elapsed() < Duration::from_secs(2));
     }
 }

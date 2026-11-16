@@ -12,7 +12,7 @@ use std::process::Stdio;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
-use rustyfin_db::busy::retry_busy;
+use rustyfin_db::busy::retry_busy_until;
 use sqlx::SqlitePool;
 use tokio::fs;
 use tokio::process::Command;
@@ -333,9 +333,11 @@ pub async fn generate(
     let _ = fs::remove_dir_all(&work).await;
     moved.map_err(|e| format!("could not move the tiles to {}: {e}", dest.display()))?;
 
-    retry_busy("saving a trickplay tile set", || {
-        rustyfin_db::repo_trickplay::save_trickplay(pool, item_id, &made)
-    })
+    retry_busy_until(
+        "saving a trickplay tile set",
+        || cancel.cancelled(),
+        || rustyfin_db::repo_trickplay::save_trickplay(pool, item_id, &made),
+    )
     .await
     .map_err(|e| format!("{SAVE_FAILED}: {e}"))?;
     Ok(made)
@@ -1042,12 +1044,12 @@ pub async fn generate_for_libraries_with_progress(
             match result {
                 Ok(set) => {
                     made += 1;
-                    retry_busy("clearing a trickplay failure", || {
+                    retry_busy_until("clearing a trickplay failure", || cancel.cancelled(), || {
                         clear_failure(pool, item_id, FAILURE_KIND)
                     })
                     .await
                     .map_err(db)?;
-                    retry_busy("storing a trickplay file version", || {
+                    retry_busy_until("storing a trickplay file version", || cancel.cancelled(), || {
                         set_image_version(pool, item_id, Some(version))
                     })
                     .await
@@ -1065,12 +1067,12 @@ pub async fn generate_for_libraries_with_progress(
                 }
                 Err(e) => {
                     warn!(item = %item_id, path = %path, error = %e, "could not make trickplay tiles");
-                    retry_busy("recording a trickplay failure", || {
+                    retry_busy_until("recording a trickplay failure", || cancel.cancelled(), || {
                         record_failure(pool, item_id, FAILURE_KIND, version)
                     })
                     .await
                     .map_err(db)?;
-                    retry_busy("storing a trickplay file version", || {
+                    retry_busy_until("storing a trickplay file version", || cancel.cancelled(), || {
                         set_image_version(pool, item_id, Some(version))
                     })
                     .await

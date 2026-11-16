@@ -1,5 +1,7 @@
 use rustyfin_model::activity::{ActivityLogEntry, ActivityLogResult};
 use sqlx::SqlitePool;
+
+use crate::writer::ExecuteWrite;
 use uuid::Uuid;
 
 pub async fn log_activity(
@@ -22,7 +24,7 @@ pub async fn log_activity(
     .bind(&iid)
     .bind(severity)
     .bind(overview)
-    .execute(pool)
+    .execute_write(pool)
     .await?;
     Ok(())
 }
@@ -109,7 +111,7 @@ pub async fn delete_activity_older_than(pool: &SqlitePool, days: u32) -> Result<
     let done =
         sqlx::query("DELETE FROM activity_log WHERE julianday(date) < julianday('now') - ?1")
             .bind(i64::from(days))
-            .execute(pool)
+            .execute_write(pool)
             .await?;
     Ok(done.rows_affected())
 }
