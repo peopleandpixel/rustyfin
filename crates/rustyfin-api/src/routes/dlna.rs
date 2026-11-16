@@ -1,8 +1,8 @@
 use crate::query::Query;
 use axum::Json;
 use axum::Router;
-use axum::extract::{Request, State};
-use axum::http::{StatusCode, header};
+use axum::extract::{Path, Request, State};
+use axum::http::{HeaderMap, StatusCode, header};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -28,6 +28,7 @@ pub fn routes() -> Router<AppState> {
             "/dlna/control/ConnectionManager",
             post(connection_manager_control),
         )
+        .route("/Dlna/{server_id}/Items/{id}/Stream", get(dlna_stream))
 }
 
 /// While `EnableDlnaServer` is off, the DLNA server's routes answer 404. Checked per request, so
@@ -88,7 +89,7 @@ async fn content_directory_control(
 
         // DLNA devices don't sign in: they browse as the configured DLNA user, with that user's
         // library access and parental limits, and see nothing without one.
-        let Some(hidden) = dlna_user_limits(&state).await? else {
+        let Some((_, hidden)) = dlna_user_limits(&state).await? else {
             return Ok(soap_response("Browse", &build_browse_response("", 0, 0)));
         };
         let didl = if object_id == "0" {
@@ -114,7 +115,7 @@ async fn content_directory_control(
                 if let Ok(Some(item)) = rustyfin_db::repo_media::get_item_by_id(&state.db, id).await
                     && !hidden.hides(item.id, item.library_id)
                 {
-                    let item_xml = media_item_to_didl(&item, &state.bind_addr);
+                    let item_xml = media_item_to_didl(&item, &state.bind_addr, &state.server_id);
                     build_browse_response(&item_xml, 1, 1)
                 } else {
                     build_browse_response("", 0, 0)
@@ -139,7 +140,11 @@ async fn content_directory_control(
                     .collect();
                 let mut items_xml = String::new();
                 for item in &page {
-                    items_xml.push_str(&media_item_to_didl(item, &state.bind_addr));
+                    items_xml.push_str(&media_item_to_didl(
+                        item,
+                        &state.bind_addr,
+                        &state.server_id,
+                    ));
                 }
                 build_browse_response(&items_xml, page.len(), total)
             } else {
@@ -162,9 +167,9 @@ async fn content_directory_control(
     }
 }
 
-/// The limits of the DLNA user (`DlnaDefaultUserId`), or `None` when none is set or the user is
+/// The DLNA user (`DlnaDefaultUserId`) and its limits, or `None` when none is set or the user is
 /// gone or disabled.
-async fn dlna_user_limits(state: &AppState) -> Result<Option<HiddenItems>, ApiError> {
+async fn dlna_user_limits(state: &AppState) -> Result<Option<(uuid::Uuid, HiddenItems)>, ApiError> {
     let configured = state.config.read().await.dlna_default_user_id.clone();
     let Some(user) = configured.and_then(|id| uuid::Uuid::parse_str(id.trim()).ok()) else {
         return Ok(None);
@@ -176,7 +181,45 @@ async fn dlna_user_limits(state: &AppState) -> Result<Option<HiddenItems>, ApiEr
     {
         return Ok(None);
     }
-    Ok(Some(HiddenItems::for_user(state, user).await?))
+    Ok(Some((user, HiddenItems::for_user(state, user).await?)))
+}
+
+/// GET /Dlna/{serverId}/Items/{id}/Stream: an item's file, with byte ranges, for a DLNA renderer,
+/// which can't sign in. Every request checks that the DLNA user exists, is enabled, may play media
+/// and may see the item (library access and parental limits); anything else answers 404, as for an
+/// item that doesn't exist, so the id alone gets nothing.
+async fn dlna_stream(
+    State(state): State<AppState>,
+    Path((server_id, id)): Path<(String, uuid::Uuid)>,
+    headers: HeaderMap,
+) -> Result<Response, ApiError> {
+    let not_found = || ApiError::NotFound("Item not found".into());
+    let simple = |id: &str| id.replace('-', "").to_ascii_lowercase();
+    if simple(&server_id) != simple(&state.server_id) {
+        return Err(not_found());
+    }
+    let Some((user, hidden)) = dlna_user_limits(&state).await? else {
+        return Err(not_found());
+    };
+    let item = rustyfin_db::repo_media::get_item_by_id(&state.db_ro, id)
+        .await?
+        .ok_or_else(not_found)?;
+    let file = matches!(
+        item.media_type,
+        MediaType::Movie
+            | MediaType::Episode
+            | MediaType::Video
+            | MediaType::Audio
+            | MediaType::Photo
+    );
+    if !file || hidden.hides(item.id, item.library_id) {
+        return Err(not_found());
+    }
+    let access = crate::parental::user_policy(&state, user).await?;
+    if !access.access.enable_media_playback {
+        return Err(not_found());
+    }
+    super::streaming::serve_file(item.path, &headers).await
 }
 
 async fn connection_manager_control(body: String) -> Response {
@@ -188,7 +231,11 @@ async fn connection_manager_control(body: String) -> Response {
     }
 }
 
-fn media_item_to_didl(item: &rustyfin_model::media::MediaItem, bind_addr: &str) -> String {
+fn media_item_to_didl(
+    item: &rustyfin_model::media::MediaItem,
+    bind_addr: &str,
+    server_id: &str,
+) -> String {
     let is_container = matches!(
         item.media_type,
         MediaType::Series | MediaType::Season | MediaType::MusicAlbum | MediaType::MusicArtist
@@ -206,7 +253,11 @@ fn media_item_to_didl(item: &rustyfin_model::media::MediaItem, bind_addr: &str) 
             class = upnp_class(&item.media_type, true),
         )
     } else {
-        let url = format!("http://{}/Items/{}/Download", bind_addr, item.id);
+        // The DLNA stream route, which checks the DLNA user's limits on every request.
+        let url = format!(
+            "http://{}/Dlna/{}/Items/{}/Stream",
+            bind_addr, server_id, item.id
+        );
         let mime = match item.media_type {
             MediaType::Movie | MediaType::Episode | MediaType::Video => "video/mp4",
             MediaType::Audio => "audio/mpeg",

@@ -24936,12 +24936,15 @@ async fn r3parental_session_now_playing_never_names_a_hidden_item() {
     let w = r2parental().await;
     w.reset_kid_password().await;
     let play = |token: &str, item: uuid::Uuid| {
-        request(
-            "POST",
-            "/Sessions/Playing",
-            Some(token),
-            Some(serde_json::json!({ "ItemId": item, "PositionTicks": 0 })),
-        )
+        let body = serde_json::json!({
+            "ItemId": item, "PositionTicks": 0, "MediaSourceId": item.simple().to_string(),
+            "PlaylistItemId": format!("r3parental-{item}"),
+        });
+        request("POST", "/Sessions/Playing", Some(token), Some(body))
+    };
+    // No form of the id: hyphenated, or as Jellyfin's 32-digit MediaSourceId.
+    let names = |text: &str, item: uuid::Uuid| {
+        text.contains(&item.to_string()) || text.contains(&item.simple().to_string())
     };
     let session = |all: &serde_json::Value, device: &str| {
         all.as_array()
@@ -24959,9 +24962,12 @@ async fn r3parental_session_now_playing_never_names_a_hidden_item() {
         StatusCode::NO_CONTENT
     );
     let (_, all) = w.get(&w.admin, "/Sessions").await;
+    let s = session(&all, "r3parental-np-a");
+    assert_eq!(s["NowPlayingItem"]["Name"], "Rough");
     assert_eq!(
-        session(&all, "r3parental-np-a")["NowPlayingItem"]["Name"],
-        "Rough"
+        s["PlayState"]["MediaSourceId"],
+        w.id("Rough").simple().to_string(),
+        "{s}"
     );
 
     // An administrator with limits sees the session, but not the item it plays.
@@ -24977,7 +24983,10 @@ async fn r3parental_session_now_playing_never_names_a_hidden_item() {
     let (_, all) = w.get(&w.admin, "/Sessions").await;
     let s = session(&all, "r3parental-np-a");
     assert!(s["NowPlayingItem"].is_null(), "{s}");
+    assert!(s["PlayState"]["MediaSourceId"].is_null(), "{s}");
+    assert!(s["PlaylistItemId"].is_null(), "{s}");
     assert!(!all.to_string().contains("Rough"), "{all}");
+    assert!(!names(&all.to_string(), w.id("Rough")), "{all}");
     let uri = format!(
         "/Sessions/Playing/NowPlayingItem?SessionId={}",
         s["Id"].as_str().unwrap()
@@ -25002,6 +25011,7 @@ async fn r3parental_session_now_playing_never_names_a_hidden_item() {
     );
     for name in ["Edgy", "Rough"] {
         assert!(!mine.to_string().contains(name), "{name}: {mine}");
+        assert!(!names(&mine.to_string(), w.id(name)), "{name}: {mine}");
     }
     let rows: i64 =
         sqlx::query_scalar("SELECT COUNT(*) FROM user_item_data WHERE user_id = ? AND item_id = ?")
@@ -25028,7 +25038,7 @@ async fn r3parental_session_now_playing_never_names_a_hidden_item() {
 async fn r3parental_dlna_browses_as_the_dlna_user_with_its_limits() {
     let w = r2parental().await;
     let lib = w.library_id().await;
-    w.other_library().await;
+    let (_, far) = w.other_library().await;
     w.late_episode().await;
     w.configure(serde_json::json!({ "EnableDlnaServer": true }))
         .await;
@@ -25037,12 +25047,24 @@ async fn r3parental_dlna_browses_as_the_dlna_user_with_its_limits() {
     let kind_season = w.id("Kind Season").to_string();
     let grim_season = w.id("Grim Season").to_string();
 
-    // No DLNA user: DLNA devices don't sign in, so nothing is listed.
+    // A DLNA stream, with an optional Range header: its status and body.
+    let world = &w;
+    let stream = move |item: &str, range: Option<&str>| {
+        let uri = format!("/Dlna/{}/Items/{item}/Stream", world.state.server_id);
+        let mut req = Request::builder().uri(uri);
+        if let Some(range) = range {
+            req = req.header("Range", range);
+        }
+        g1_send_raw(&world.app, req.body(Body::empty()).unwrap())
+    };
+
+    // No DLNA user: DLNA devices don't sign in, so nothing is listed or streamed.
     let root = w.dlna_browse("0", "BrowseDirectChildren").await;
     assert!(root.contains("<TotalMatches>0</TotalMatches>"), "{root}");
     assert!(!root.contains("Parental"), "{root}");
     let one = w.dlna_browse(&gentle, "BrowseMetadata").await;
     assert!(!one.contains("Gentle"), "{one}");
+    assert_eq!(stream(&gentle, None).await.0, StatusCode::NOT_FOUND);
 
     // The kid as the DLNA user, without limits: everything.
     w.configure(serde_json::json!({ "DlnaDefaultUserId": w.kid_id.to_string() }))
@@ -25068,6 +25090,23 @@ async fn r3parental_dlna_browses_as_the_dlna_user_with_its_limits() {
     assert!(!one.contains("Rough"), "{one}");
     let one = w.dlna_browse(&gentle, "BrowseMetadata").await;
     assert!(one.contains("Gentle"), "{one}");
+    // The item's stream URL is the DLNA route, which checks the DLNA user on every request.
+    let url = format!("/Dlna/{}/Items/{gentle}/Stream", w.state.server_id);
+    assert!(one.contains(&url), "{one}");
+    assert_eq!(
+        stream(&gentle, None).await,
+        (StatusCode::OK, "r2parental video bytes".to_string())
+    );
+    assert_eq!(
+        stream(&gentle, Some("bytes=0-9")).await,
+        (StatusCode::PARTIAL_CONTENT, "r2parental".to_string())
+    );
+    // Hidden by rating, and in a library the user may not see: 404, whatever the id.
+    assert_eq!(stream(&rough, None).await.0, StatusCode::NOT_FOUND);
+    assert_eq!(
+        stream(&far.to_string(), None).await.0,
+        StatusCode::NOT_FOUND
+    );
     let children = w.dlna_browse(&kind_season, "BrowseDirectChildren").await;
     assert!(children.contains("Kind Episode"), "{children}");
     assert!(!children.contains("Kind Late Episode"), "{children}");
@@ -25080,6 +25119,24 @@ async fn r3parental_dlna_browses_as_the_dlna_user_with_its_limits() {
         children.contains("<TotalMatches>0</TotalMatches>"),
         "{children}"
     );
+
+    // The DLNA user may not play media: nothing streams.
+    w.set_policy(serde_json::json!({ "EnableMediaPlayback": false }))
+        .await;
+    assert_eq!(stream(&gentle, None).await.0, StatusCode::NOT_FOUND);
+    w.set_policy(serde_json::json!({ "EnableMediaPlayback": true }))
+        .await;
+    assert_eq!(stream(&gentle, None).await.0, StatusCode::OK);
+
+    // A disabled DLNA user lists and streams nothing.
+    w.set_policy(serde_json::json!({ "IsDisabled": true }))
+        .await;
+    let root = w.dlna_browse("0", "BrowseDirectChildren").await;
+    assert!(root.contains("<TotalMatches>0</TotalMatches>"), "{root}");
+    assert!(!root.contains("Parental"), "{root}");
+    assert_eq!(stream(&gentle, None).await.0, StatusCode::NOT_FOUND);
+    w.set_policy(serde_json::json!({ "IsDisabled": false }))
+        .await;
 
     // A DLNA user that doesn't exist lists nothing.
     w.configure(serde_json::json!({ "DlnaDefaultUserId": uuid::Uuid::new_v4().to_string() }))
@@ -35884,6 +35941,13 @@ fn r3livelog_web_view() {
 #[test]
 fn r3parental_web_user_editor() {
     b124_node_test("r3parental_user_editor.mjs");
+}
+
+// The dashboard's DLNA tab: the switch and the DLNA user, saved into the whole configuration
+// (tests/web/r3parental_dlna_admin.mjs).
+#[test]
+fn r3parental_web_dlna_admin() {
+    b124_node_test("r3parental_dlna_admin.mjs");
 }
 
 // ── B18: one scan per run, and Scan all's order ──
