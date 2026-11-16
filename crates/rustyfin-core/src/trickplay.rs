@@ -1944,6 +1944,70 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn r3trickplay_a_failed_save_is_not_the_videos_failure() {
+        let test = "r3trickplay_a_failed_save_is_not_the_videos_failure";
+        if !have_ffmpeg(test) {
+            return;
+        }
+        use rustyfin_model::library::{Library, LibraryContentType};
+
+        let dir = std::env::temp_dir().join(format!("r3trickplay-save-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let clip = marked_clip(&dir, "clip.mkv", (10, 25, 20), "", &[]);
+        let pool = rustyfin_db::init_db(dir.join("db.sqlite").to_str().unwrap())
+            .await
+            .unwrap();
+        let lib = Library {
+            id: Uuid::new_v4(),
+            name: "Films".to_string(),
+            content_type: LibraryContentType::Movies,
+            paths: vec![dir.to_string_lossy().into_owned()],
+        };
+        rustyfin_db::repo_library::create_library(&pool, &lib)
+            .await
+            .unwrap();
+        let item = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO media_items (id, name, media_type, path, library_id, runtime_ticks)
+             VALUES (?1, 'Film', 'Movie', ?2, ?3, 250000000)",
+        )
+        .bind(item.to_string())
+        .bind(clip.to_string_lossy().into_owned())
+        .bind(lib.id.to_string())
+        .execute(&pool)
+        .await
+        .unwrap();
+        // The tiles are made, but the database won't take them, as when its pool timed out
+        sqlx::query(
+            "CREATE TRIGGER no_saves BEFORE INSERT ON trickplay_infos
+             BEGIN SELECT RAISE(ABORT, 'the database is down'); END",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let libs = [lib.id.to_string()];
+        let made = generate_for_libraries(&pool, &dir.join("data"), &libs, &Cancel::new())
+            .await
+            .unwrap();
+        assert_eq!(made, 0);
+        let failure = rustyfin_db::repo_trickplay::get_failure(&pool, item, FAILURE_KIND)
+            .await
+            .unwrap();
+        assert_eq!(failure, None, "a database error isn't the video's failure");
+
+        // So the next run, with the database back, makes the set
+        sqlx::query("DROP TRIGGER no_saves")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let made = generate_for_libraries(&pool, &dir.join("data"), &libs, &Cancel::new())
+            .await
+            .unwrap();
+        assert_eq!(made, 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
     async fn r2chapters_cancel_kills_the_running_ffmpeg() {
         let have_ffmpeg = std::process::Command::new("ffmpeg")
             .arg("-version")
