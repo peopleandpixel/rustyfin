@@ -989,6 +989,20 @@
         "remove_link": "Entfernen",
         "remove_link_confirm": "Verknüpfung von {{name}} mit dem Anbieter wirklich entfernen?"
     },
+    "dlna_admin": {
+        "tab": "DLNA",
+        "title": "DLNA-Server",
+        "enable": "DLNA-Server aktivieren",
+        "user": "DLNA-Benutzer",
+        "no_user": "Kein Benutzer",
+        "user_disabled": "{{name}} (deaktiviert)",
+        "user_hint": "DLNA-Geräte melden sich nicht an. Sie sehen die Bibliotheken und Jugendschutz-Grenzen dieses Benutzers und spielen nur ab, was dieser Benutzer sehen darf.",
+        "no_user_warning": "DLNA-Geräte sehen nichts, bis ein Benutzer gewählt ist.",
+        "save": "Speichern",
+        "saved": "DLNA-Einstellungen gespeichert",
+        "load_failed": "Die DLNA-Einstellungen konnten nicht geladen werden",
+        "save_failed": "Nichts wurde gespeichert ({{error}})."
+    },
     "jellyfin_import": {
         "tab": "Jellyfin-Import",
         "title": "Aus Jellyfin importieren",

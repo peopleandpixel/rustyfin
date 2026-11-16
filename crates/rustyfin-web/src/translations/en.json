@@ -1221,6 +1221,20 @@
         "password_mismatch": "The passwords don't match.",
         "password_set": "Password saved."
     },
+    "dlna_admin": {
+        "tab": "DLNA",
+        "title": "DLNA server",
+        "enable": "Enable the DLNA server",
+        "user": "DLNA user",
+        "no_user": "No user",
+        "user_disabled": "{{name}} (disabled)",
+        "user_hint": "DLNA devices don't sign in. They see this user's libraries and parental limits, and play only what this user may see.",
+        "no_user_warning": "DLNA devices see nothing until a user is chosen.",
+        "save": "Save",
+        "saved": "DLNA settings saved",
+        "load_failed": "The DLNA settings couldn't be loaded",
+        "save_failed": "Nothing was saved ({{error}})."
+    },
     "playback_admin": {
         "transcoding": "Transcoding",
         "hardware": "Hardware acceleration",
