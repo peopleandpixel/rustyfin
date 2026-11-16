@@ -41,7 +41,9 @@ pub async fn extract_for_item(
         .map_err(|e| format!("could not read the chapters: {e}"))?;
     let mut made = 0;
     let mut tried = false;
-    let _job = image_job().await;
+    let Some(_job) = image_job(cancel).await else {
+        return Ok(made);
+    };
     for chapter in chapters.iter().filter(|c| c.image_path.is_none()) {
         let file = image_path(data_dir, item_id, chapter.start_position_ticks);
         let made_ok = match extract_one(path, chapter.start_position_ticks, &file, cancel).await {
