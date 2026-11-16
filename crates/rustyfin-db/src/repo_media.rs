@@ -1713,22 +1713,32 @@ pub async fn get_similar_items(
 ) -> Result<Vec<MediaItem>, sqlx::Error> {
     let media_type = item.media_type.item_kind().to_string();
 
-    // Get candidate items: same media type, same library, excluding the current item
-    let candidates = sqlx::query_as::<_, MediaItemRow>(
+    // Get candidate items: same media type, same library, excluding the current item. In a large
+    // library the 200 kept are the likeliest, as the scoring below weighs them: most genres shared
+    // (stored '|'-separated), then the closest year, then the best rated.
+    let mut q = QueryBuilder::<Sqlite>::new(
         "SELECT id, name, sort_name, overview, media_type, path, parent_id, library_id, \
          production_year, community_rating, official_rating, genres, date_created, \
          premiere_date, runtime_ticks, index_number, parent_index_number, index_number_end, location_type, tmdb_id, tvdb_id, \
          tags, status, original_language, tagline, production_countries, budget, revenue, \
          homepage, end_date, vote_count, popularity \
-         FROM media_items \
-         WHERE media_type = ? AND id != ? AND library_id = ? AND extra_type IS NULL \
-         LIMIT 200",
-    )
-    .bind(&media_type)
-    .bind(item.id.to_string())
-    .bind(item.library_id.to_string())
-    .fetch_all(pool)
-    .await?;
+         FROM media_items WHERE media_type = ",
+    );
+    q.push_bind(&media_type)
+        .push(" AND id != ")
+        .push_bind(item.id.to_string())
+        .push(" AND library_id = ")
+        .push_bind(item.library_id.to_string())
+        .push(" AND extra_type IS NULL ORDER BY (0");
+    for genre in &item.genres {
+        q.push(" + (('|' || COALESCE(genres, '') || '|') LIKE ")
+            .push_bind(format!("%|{genre}|%"))
+            .push(")");
+    }
+    q.push(") DESC, ABS(COALESCE(production_year, 0) - ")
+        .push_bind(item.production_year.unwrap_or(0))
+        .push(") ASC, community_rating DESC, id LIMIT 200");
+    let candidates = q.build_query_as::<MediaItemRow>().fetch_all(pool).await?;
 
     if candidates.is_empty() {
         return Ok(Vec::new());

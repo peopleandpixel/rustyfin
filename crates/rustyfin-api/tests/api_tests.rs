@@ -27966,6 +27966,54 @@ async fn r3tabs_movie_recommendations_are_jellyfin_rows() {
     );
 }
 
+// A user with a parental limit gets no row headed by a movie above it, and no such movie in a row.
+#[tokio::test]
+async fn r3tabs_recommendations_leave_out_hidden_movies() {
+    let w = r2parental().await;
+    w.set_policy(serde_json::json!({ "MaxParentalRating": 10 }))
+        .await;
+    // The kid played Gentle and Rough (R) and likes Pleasant and Edgy (PG-13)
+    for (name, played, favorite, day) in [
+        ("Gentle", 1, 0, 2),
+        ("Rough", 1, 0, 3),
+        ("Pleasant", 0, 1, 1),
+        ("Edgy", 0, 1, 1),
+    ] {
+        sqlx::query(
+            "INSERT INTO user_item_data (user_id, item_id, played, is_favorite, last_played_date) \
+             VALUES (?, ?, ?, ?, ?)",
+        )
+        .bind(w.kid_id.to_string())
+        .bind(w.id(name).to_string())
+        .bind(played)
+        .bind(favorite)
+        .bind(format!("2026-01-{day:02}T20:00:00+00:00"))
+        .execute(&w.state.db)
+        .await
+        .unwrap();
+    }
+    let allowed = ["Gentle", "Odd", "Plain", "Pleasant", "Spooky"];
+    let rows = r3tabs_rows(&w.app, &w.kid, "/Movies/Recommendations").await;
+    assert!(
+        rows.iter()
+            .any(|(_, baseline, items)| baseline == "Gentle"
+                && items.contains(&"Pleasant".to_string())),
+        "Gentle's row, with Pleasant in it: {rows:?}"
+    );
+    for (kind, baseline, items) in &rows {
+        assert!(
+            allowed.contains(&baseline.as_str()),
+            "{kind} headed by {baseline}"
+        );
+        for item in items {
+            assert!(
+                allowed.contains(&item.as_str()),
+                "{baseline}'s row holds {item}"
+            );
+        }
+    }
+}
+
 // A library's Latest row asks /Items/Latest with its IncludeItemTypes, which keeps that type.
 #[tokio::test]
 async fn r3tabs_latest_keeps_include_item_types() {
@@ -27989,33 +28037,64 @@ async fn r3tabs_latest_keeps_include_item_types() {
 #[tokio::test]
 async fn r3tabs_next_up_and_upcoming_keep_to_parent_library() {
     let s = b15_shows().await;
-    s.play(s.viewer_id, "Hotel S01E01", 1).await;
     let lib = rustyfin_db::repo_media::get_item_by_id(&s.state.db, s.ids["Hotel"])
         .await
         .unwrap()
         .unwrap()
         .library_id;
-    let other = uuid::Uuid::new_v4();
+    // India, its seasons and its episodes move to a second TV library
+    let folder = media_folder(&s.state, "r3tabs-other-shows");
+    let other = rustyfin_model::library::Library {
+        id: uuid::Uuid::new_v4(),
+        name: "R3 Tabs Other Shows".to_string(),
+        content_type: rustyfin_model::library::LibraryContentType::TvShows,
+        paths: vec![folder],
+    };
+    rustyfin_db::repo_library::create_library(&s.state.db, &other)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE media_items SET library_id = ? WHERE name LIKE 'India%'")
+        .bind(other.id.to_string())
+        .execute(&s.state.db)
+        .await
+        .unwrap();
+    s.play(s.viewer_id, "Hotel S01E01", 1).await;
+    s.play(s.viewer_id, "India S01E01", 2).await;
+    assert_eq!(
+        s.next_up(&s.viewer, "").await,
+        b15_ok(&["India S01E02", "Hotel S01E02"], 2),
+        "without ParentId, both libraries"
+    );
     assert_eq!(
         s.next_up(&s.viewer, &format!("ParentId={lib}")).await,
         b15_ok(&["Hotel S01E02"], 1)
     );
     assert_eq!(
-        s.next_up(&s.viewer, &format!("parentId={other}")).await,
-        b15_ok(&[], 0)
+        s.next_up(&s.viewer, &format!("parentId={}", other.id))
+            .await,
+        b15_ok(&["India S01E02"], 1)
     );
-    // Upcoming: an episode that airs tomorrow
-    sqlx::query("UPDATE media_items SET premiere_date = date('now', '+1 day') WHERE id = ?")
-        .bind(s.ids["Quiet S01E02"].to_string())
-        .execute(&s.state.db)
-        .await
-        .unwrap();
-    for (parent, expected) in [(lib, 1), (other, 0)] {
-        let uri = format!("/Shows/Upcoming?ParentId={parent}");
+    // Upcoming: an episode of each library that airs tomorrow
+    for label in ["Quiet S01E02", "India S02E01"] {
+        sqlx::query("UPDATE media_items SET premiere_date = date('now', '+1 day') WHERE id = ?")
+            .bind(s.ids[label].to_string())
+            .execute(&s.state.db)
+            .await
+            .unwrap();
+    }
+    for (parent, expected) in [
+        (String::new(), 2),
+        (format!("ParentId={lib}"), 1),
+        (format!("ParentId={}", other.id), 1),
+    ] {
+        let uri = format!("/Shows/Upcoming?{parent}");
         let (status, json) = send(&s.app, request("GET", &uri, Some(&s.viewer), None)).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(json["TotalRecordCount"], expected, "{uri}: {json}");
     }
+    let uri = format!("/Shows/Upcoming?ParentId={}", other.id);
+    let (_, json) = send(&s.app, request("GET", &uri, Some(&s.viewer), None)).await;
+    assert_eq!(json["Items"][0]["Id"], s.ids["India S02E01"].to_string());
 }
 
 // GET /Shows/NextUp lists one episode per series the user has started: the first unplayed episode

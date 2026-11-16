@@ -87,15 +87,21 @@ async fn get_recommendations(
     };
     let category_limit = q.category_limit.unwrap_or(5);
     let item_limit = q.item_limit.unwrap_or(8);
+    if category_limit == 0 || item_limit == 0 {
+        return Ok(Json(Vec::new()));
+    }
     let db = |e: sqlx::Error| crate::error::ApiError::Internal(e.to_string());
     let hidden = HiddenItems::for_caller(&state, &claims).await?;
     let played = rustyfin_db::repo_media::get_played_ids(&state.db_ro, user_id)
         .await
         .map_err(db)?;
 
+    // A liked movie that is also a recently played seed heads only the recently played row, as
+    // Jellyfin excludes those ids from the liked query
     let mut kinds = Vec::new();
-    for (liked, kind, seeds) in [
-        (false, "SimilarToRecentlyPlayed", 6),
+    let mut taken = std::collections::HashSet::new();
+    for (liked, kind, count) in [
+        (false, "SimilarToRecentlyPlayed", 6usize),
         (true, "SimilarToLikedItem", 10),
     ] {
         let mut seeds = rustyfin_db::repo_media::get_recommendation_seeds(
@@ -103,11 +109,14 @@ async fn get_recommendations(
             user_id,
             q.parent_id,
             liked,
-            seeds,
+            (count + taken.len()) as i64,
         )
         .await
         .map_err(db)?;
         hidden.retain(&mut seeds);
+        seeds.retain(|s| !taken.contains(&s.id));
+        seeds.truncate(count);
+        taken.extend(seeds.iter().map(|s| s.id));
         kinds.push((kind, seeds.into_iter()));
     }
 
