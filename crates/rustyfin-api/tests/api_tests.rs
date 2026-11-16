@@ -17633,6 +17633,88 @@ async fn w1filters_genres_ratings_and_years_are_lists() {
     }
 }
 
+// R3 playback: /Items filters by Jellyfin's SubtitleLanguages, and a code matches in both its
+// ISO 639-2 spellings, as the streams report "deu" for the "ger" a file stores
+#[tokio::test]
+async fn r3playback_subtitle_languages_filter_matches_both_iso_codes() {
+    let state = test_state().await;
+    let (token, _) = admin_session(&state).await;
+    let folder = std::path::PathBuf::from(media_folder(&state, "r3langs"));
+    let mut ids = Vec::new();
+    for (name, subtitle, audio) in [
+        ("R3 German.mkv", "ger", "eng"),
+        ("R3 English.mkv", "eng", "ger"),
+        ("R3 French.mkv", "fra", "fre"),
+    ] {
+        let file = folder.join(name);
+        std::fs::write(&file, b"r3").unwrap();
+        let id = g4_insert_item(&state, "Movie", &file).await;
+        let source: rustyfin_model::media_source::MediaSourceResponse =
+            serde_json::from_value(serde_json::json!({
+                "Id": uuid::Uuid::new_v4().to_string(),
+                "Uid": uuid::Uuid::new_v4().to_string(),
+                "Container": "mkv",
+                "Protocol": "File",
+                "Path": file.to_str().unwrap(),
+                "MediaStreams": [
+                    { "Index": 0, "Codec": "h264", "CodecType": "video" },
+                    { "Index": 1, "Codec": "ac3", "CodecType": "audio", "Language": audio },
+                    { "Index": 2, "Codec": "subrip", "CodecType": "subtitle", "Language": subtitle },
+                ],
+            }))
+            .unwrap();
+        rustyfin_db::repo_media_source::insert_media_source_with_streams(&state.db, &id, &source)
+            .await
+            .unwrap();
+        ids.push(id.to_string());
+    }
+    let (german, english, french) = (&ids[0], &ids[1], &ids[2]);
+    let app = app(state);
+
+    let found = |query: &'static str| {
+        let app = app.clone();
+        let token = token.clone();
+        async move {
+            let uri = format!("/Items?Recursive=true&IncludeItemTypes=Movie&{query}");
+            let (status, body) = send(&app, request("GET", &uri, Some(&token), None)).await;
+            assert_eq!(status, StatusCode::OK, "{uri}");
+            let mut ids: Vec<String> = body["Items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|item| item["Id"].as_str().unwrap().to_string())
+                .collect();
+            ids.sort();
+            ids
+        }
+    };
+    let sorted = |list: &[&String]| {
+        let mut list: Vec<String> = list.iter().map(|s| s.to_string()).collect();
+        list.sort();
+        list
+    };
+    // The stored "ger" is found by the "deu" the API reports, and by itself; audio doesn't count
+    assert_eq!(found("SubtitleLanguages=deu").await, sorted(&[german]));
+    assert_eq!(found("SubtitleLanguages=ger").await, sorted(&[german]));
+    assert_eq!(found("subtitleLanguages=DEU").await, sorted(&[german]));
+    // The stored "fra" is found by "fre"; a list takes any of its languages
+    assert_eq!(found("SubtitleLanguages=fre").await, sorted(&[french]));
+    assert_eq!(
+        found("SubtitleLanguages=eng,fre").await,
+        sorted(&[english, french])
+    );
+    assert_eq!(
+        found("SubtitleLanguages=eng&SubtitleLanguages=ger").await,
+        sorted(&[german, english])
+    );
+    // Rustyfin's older single SubtitleLanguage still filters
+    assert_eq!(found("SubtitleLanguage=deu").await, sorted(&[german]));
+    assert!(found("SubtitleLanguages=spa").await.is_empty());
+    // Without the filter, or with a blank one, all three
+    assert_eq!(found("SubtitleLanguages=").await.len(), 3);
+    assert_eq!(found("Fields=Path").await.len(), 3);
+}
+
 #[tokio::test]
 async fn w1filters_series_status_maps_provider_words() {
     let (app, token, library) = w1filters_seed().await;

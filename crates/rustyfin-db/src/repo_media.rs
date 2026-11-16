@@ -1823,6 +1823,29 @@ pub async fn resumable_item_ids(
 /// The ids of the series whose status is one of Jellyfin's `SeriesStatus` values (`Continuing`,
 /// `Ended`, `Unreleased`). Metadata providers store their own words, so TMDb's map onto them as
 /// Jellyfin's TMDb provider maps them.
+/// The ids of the items with a subtitle stream whose language is one of `languages`, compared
+/// without ASCII case. The caller passes every spelling it accepts (see
+/// `rustyfin_model::media_source::language_forms`).
+pub async fn item_ids_with_subtitle_language(
+    pool: &SqlitePool,
+    languages: &[String],
+) -> Result<Vec<String>, sqlx::Error> {
+    if languages.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut qb: QueryBuilder<Sqlite> = QueryBuilder::new(
+        "SELECT DISTINCT ms.item_id FROM media_streams mst \
+         JOIN media_sources ms ON ms.id = mst.source_id \
+         WHERE LOWER(mst.codec_type) = 'subtitle' AND LOWER(mst.language) IN (",
+    );
+    let mut list = qb.separated(", ");
+    for language in languages {
+        list.push_bind(language.to_ascii_lowercase());
+    }
+    qb.push(")");
+    qb.build_query_scalar().fetch_all(pool).await
+}
+
 pub async fn series_ids_with_status(
     pool: &SqlitePool,
     statuses: &[&str],
