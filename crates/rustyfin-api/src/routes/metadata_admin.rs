@@ -110,6 +110,12 @@ async fn refresh_item(
         replace_all_metadata: bool_param(&params, "ReplaceAllMetadata")?.unwrap_or(false),
         replace_all_images: bool_param(&params, "ReplaceAllImages")?.unwrap_or(false),
     };
+    // An admin's "replace all metadata" asks the providers again, past their answer caches
+    if request.replace_all_metadata && request.metadata == RefreshMode::FullRefresh {
+        rustyfin_core::metadata::forget_cached_answers(&state.db, &item, &state.plugin_manager)
+            .await
+            .map_err(ApiError::Internal)?;
+    }
     run_refresh(&state, &item, request).await?;
     Ok(Json(json!({ "status": "ok" })))
 }

@@ -11,3 +11,6 @@ chrono = { workspace = true }
 unicode-normalization = "0.1.26"
 unicase = "2.10"
 reqwest = { workspace = true }
+sha2 = "0.10"
+tokio = { workspace = true }
+tracing = { workspace = true }

@@ -14695,6 +14695,13 @@ async fn g12_stub() -> (String, G12Hits) {
                 "backdrops": [{"file_path": "/g12-backdrop.jpg"}]
             }),
             "/movie/9001/credits" => serde_json::json!({"id": 9001, "cast": [], "crew": []}),
+            // Another film, that an item can be wrongly identified as
+            "/movie/7101" => serde_json::json!({
+                "id": 7101,
+                "title": "Wrong Film",
+                "overview": "Not the item's film",
+                "release_date": "1985-03-01"
+            }),
             "/movie/9001/videos" => serde_json::json!({"results": [
                 {"key": "g12trailer", "name": "G12 Trailer", "type": "Trailer", "site": "YouTube"}
             ]}),
@@ -14901,11 +14908,11 @@ async fn r3metadata_identify_lists_matches_and_applies_one() {
     assert_eq!(results[0]["Name"], "Alpha Film", "{results}");
     assert_eq!(results[0]["ProviderIds"]["Tmdb"], "9001");
     assert_eq!(results[0]["SearchProviderName"], "TheMovieDb");
-    // The same search again comes from the TMDb client's cache
+    // A manual search always asks TMDb again
     server
         .json("POST", "/Items/RemoteSearch/Movie", search)
         .await;
-    assert_eq!(server.hits_to("/search/movie"), 1);
+    assert_eq!(server.hits_to("/search/movie"), 2);
 
     // A TMDb id is looked up directly
     let by_id = server
@@ -14957,6 +14964,91 @@ async fn r3metadata_identify_lists_matches_and_applies_one() {
         )
         .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+/// An item identified as the wrong film keeps that TMDb id through every refresh, "replace all
+/// metadata" included: as in Jellyfin, a refresh looks an id up and never searches again
+/// (MetadataService passes the item's provider ids to the providers). Identify is the way to
+/// re-identify it, and it replaces the wrong film's metadata.
+#[tokio::test]
+async fn r3meta_a_wrong_id_stays_until_identify_replaces_it() {
+    let server = g12_server(Some("r3-key"), None).await;
+    let id = server.insert_movie().await;
+    sqlx::query("UPDATE media_items SET tmdb_id = 7101 WHERE id = ?")
+        .bind(id.to_string())
+        .execute(&server.db)
+        .await
+        .unwrap();
+
+    let (status, body) = server
+        .send(
+            "POST",
+            &format!(
+                "/Items/{id}/Refresh?MetadataRefreshMode=FullRefresh\
+                 &ImageRefreshMode=FullRefresh&ReplaceAllMetadata=true&ReplaceAllImages=false"
+            ),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let item = server.item(id).await;
+    assert_eq!(item.tmdb_id, Some(7101));
+    assert_eq!(item.name, "Wrong Film");
+    assert_eq!(server.hits_to("/search/movie"), 0);
+
+    let (status, body) = server
+        .send(
+            "POST",
+            &format!("/Items/RemoteSearch/Apply/{id}"),
+            Some(
+                serde_json::json!({"Name": "Alpha Film", "ProviderIds": {"Tmdb": "9001"}})
+                    .to_string(),
+            ),
+        )
+        .await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+    let item = server.item(id).await;
+    assert_eq!(item.tmdb_id, Some(9001));
+    assert_eq!(item.name, "Alpha Film");
+    assert_eq!(item.overview.as_deref(), Some("G12 stub overview"));
+    assert_eq!(item.production_year, Some(2001));
+}
+
+/// An admin's "replace all metadata" refresh asks TMDb again about the item, past the answer
+/// cache: by its id, or, with no id yet, by a new search. Other refreshes use the cache.
+#[tokio::test]
+async fn r3meta_replace_all_asks_tmdb_again() {
+    let server = g12_server(Some("r3-key"), None).await;
+    let id = server.insert_movie().await;
+    let refresh = |replace: bool| {
+        format!(
+            "/Items/{id}/Refresh?MetadataRefreshMode=FullRefresh&ImageRefreshMode=FullRefresh\
+             &ReplaceAllMetadata={replace}&ReplaceAllImages=false"
+        )
+    };
+    for _ in 0..2 {
+        let (status, body) = server.send("POST", &refresh(false), None).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+    }
+    assert_eq!(server.item(id).await.tmdb_id, Some(9001));
+    assert_eq!(server.hits_to("/search/movie"), 1);
+    assert_eq!(server.hits_to("/movie/9001"), 1);
+
+    let (status, body) = server.send("POST", &refresh(true), None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(server.hits_to("/movie/9001"), 2);
+    assert_eq!(server.hits_to("/search/movie"), 1);
+
+    // Not identified any more: the replace-all searches again instead of using the cached search
+    sqlx::query("UPDATE media_items SET tmdb_id = NULL WHERE id = ?")
+        .bind(id.to_string())
+        .execute(&server.db)
+        .await
+        .unwrap();
+    let (status, body) = server.send("POST", &refresh(true), None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(server.hits_to("/search/movie"), 2);
+    assert_eq!(server.item(id).await.tmdb_id, Some(9001));
 }
 
 #[tokio::test]
@@ -26196,7 +26288,11 @@ async fn b142_server() -> (AppState, axum::Router, String, String) {
     state.plugin_manager = state.plugin_manager.with_database(state.db.clone());
     let pm = &state.plugin_manager;
     rustyfin_core::plugin_manager::install_tmdb_plugin(pm, state.tmdb.clone()).await;
-    rustyfin_core::plugin_manager::install_omdb_plugin(pm).await;
+    rustyfin_core::plugin_manager::install_omdb_plugin(
+        pm,
+        rustyfin_model::answer_store::AnswerStore::memory_only(),
+    )
+    .await;
     rustyfin_core::plugin_manager::install_fanart_plugin(pm).await;
     let app = app(state.clone());
     let (owner, _, viewer, _) = g1_owner_and_viewer(&state, &app).await;

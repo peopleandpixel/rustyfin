@@ -115,6 +115,34 @@ pub trait MetadataLookups: Send + Sync {
         let _ = (series, id);
         Box::pin(async { Ok(Some(Vec::new())) })
     }
+    /// Forgets the cached answers about a movie's or series' id (a series' seasons included), so
+    /// that a "replace all metadata" refresh asks the provider again.
+    fn forget(&self, series: bool, id: i64) -> Forgetting<'_> {
+        let _ = (series, id);
+        Box::pin(async {})
+    }
+    /// Forgets the cached searches for `title`, so that a "replace all metadata" refresh of an
+    /// item with no provider id searches again.
+    fn forget_search(&self, series: bool, title: &str) -> Forgetting<'_> {
+        let _ = (series, title);
+        Box::pin(async {})
+    }
+}
+
+/// A cache entry being forgotten.
+pub type Forgetting<'a> = std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>>;
+
+/// Lookups by IMDb id (OMDb's), asked after the provider that identified the item: a movie's or
+/// series' details, and a series' season with its episodes. Their answers fill only what is
+/// still missing, as a later provider does in Jellyfin.
+pub trait ImdbLookups: Send + Sync {
+    fn by_imdb_id(&self, imdb_id: &str) -> LookupFuture<'_, ExternalMetadata>;
+    fn season(&self, series_imdb_id: &str, season_number: i32) -> LookupFuture<'_, SeasonMetadata>;
+    /// Forgets the cached answers about an IMDb id (a series' seasons included).
+    fn forget(&self, imdb_id: &str) -> Forgetting<'_> {
+        let _ = imdb_id;
+        Box::pin(async {})
+    }
 }
 
 /// One match of a provider search: Jellyfin's RemoteSearchResult, with the provider's own id.
