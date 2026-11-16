@@ -1031,6 +1031,8 @@ struct VideoPlaybackInfoQuery {
     max_video_bit_depth: Option<u32>,
     h264_profile: Option<String>,
     h264_video_bit_depth: Option<String>,
+    hevc_profile: Option<String>,
+    hevc_video_bit_depth: Option<String>,
 }
 
 impl From<HashMap<String, String>> for VideoPlaybackInfoQuery {
@@ -1089,6 +1091,8 @@ impl From<HashMap<String, String>> for VideoPlaybackInfoQuery {
             max_video_bit_depth: params.get("MaxVideoBitDepth").and_then(|v| v.parse().ok()),
             h264_profile: params.get("h264-profile").cloned(),
             h264_video_bit_depth: params.get("h264-videobitdepth").cloned(),
+            hevc_profile: params.get("hevc-profile").cloned(),
+            hevc_video_bit_depth: params.get("hevc-videobitdepth").cloned(),
         }
     }
 }
@@ -1243,6 +1247,19 @@ async fn video_universal(
         }
         if let Some(seg_time) = query.segment_time {
             url.push_str(&format!("&SegmentTime={}", seg_time));
+        }
+        // What the client states about the video it takes, which decides a stream copy
+        if let Some(depth) = query.max_video_bit_depth {
+            url.push_str(&format!("&MaxVideoBitDepth={depth}"));
+        }
+        for (name, value) in [
+            ("hevc-profile", &query.hevc_profile),
+            ("hevc-videobitdepth", &query.hevc_video_bit_depth),
+        ] {
+            if let Some(value) = value.as_deref().filter(|v| !v.trim().is_empty()) {
+                let encoded: String = form_urlencoded::byte_serialize(value.as_bytes()).collect();
+                url.push_str(&format!("&{name}={encoded}"));
+            }
         }
         let encoded: String = form_urlencoded::byte_serialize(play_session_id.as_bytes()).collect();
         url.push_str(&format!("&PlaySessionId={encoded}"));

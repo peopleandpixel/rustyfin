@@ -71,8 +71,14 @@ pub struct TranscodeProfile {
     /// Output time 0 is this point.
     pub start_time_ticks: i64,
     /// An image subtitle burned in with an overlay. It wins over the text burn-in, and it turns
-    /// the video copy and hardware acceleration off.
+    /// the video copy off. Hardware acceleration decodes and scales on the device and overlays in
+    /// software; a subtitle of unknown video size turns it off.
     pub image_subtitle: Option<ImageSubtitle>,
+    /// Write fragmented MP4 segments (`init.mp4` and `segment_NNNN.mp4`) instead of MPEG-TS, as
+    /// HEVC needs in HLS
+    pub fmp4: bool,
+    /// The codec tag of a copied video stream, such as `hvc1`, which Apple players need for HEVC
+    pub video_tag: Option<String>,
 }
 
 impl Default for TranscodeProfile {
@@ -95,6 +101,8 @@ impl Default for TranscodeProfile {
             copy_audio: false,
             start_time_ticks: 0,
             image_subtitle: None,
+            fmp4: false,
+            video_tag: None,
         }
     }
 }
@@ -363,8 +371,9 @@ impl TranscodeManager {
             .map_err(|e| TranscodeError::Io(format!("Cannot create output dir: {e}")))?;
 
         let playlist_path = output_dir.join("main.m3u8");
-        // Use Jellyfin-compatible segment naming: segment_{id}.ts
-        let segment_pattern = output_dir.join("segment_%04d.ts");
+        // Use Jellyfin-compatible segment naming: segment_{id}.ts, or .mp4 for fragmented MP4
+        let extension = if profile.fmp4 { "mp4" } else { "ts" };
+        let segment_pattern = output_dir.join(format!("segment_%04d.{extension}"));
 
         let args = build_ffmpeg_args(
             input_path,
@@ -749,6 +758,55 @@ fn subtitles_filter(input: &str, sub_idx: u32, start_time_ticks: i64) -> String 
     }
 }
 
+/// The size the scale step gives a `width`×`height` video within `max_width`×`max_height`: at
+/// most its own size, its aspect kept, in even numbers as 4:2:0 frames need.
+fn output_size((width, height): (u32, u32), max_width: u32, max_height: u32) -> (u32, u32) {
+    let (w, h) = (f64::from(width.max(2)), f64::from(height.max(2)));
+    let scale = (f64::from(max_width) / w)
+        .min(f64::from(max_height) / h)
+        .min(1.0);
+    let even = |v: f64| ((v.round() as u32) / 2 * 2).max(2);
+    (even(w * scale), even(h * scale))
+}
+
+/// The filter graph that burns picture subtitle `sub` (input 1) into the video (input 0) and
+/// names the result `[v]`.
+///
+/// With the video's size known, the video is scaled to its output size and made 8-bit 4:2:0
+/// first (on the device with `hw_accel`, then downloaded), the subtitle is scaled to that same
+/// size, and the overlay runs once per frame at the output size. For a hardware encoder the
+/// result is NV12, uploaded again for VAAPI. Without the size, the subtitle is laid over the
+/// video as it is and the result scaled like any video (`scale_filter`, in software).
+fn image_overlay_graph(
+    sub: ImageSubtitle,
+    hw_accel: HwAccel,
+    profile: &TranscodeProfile,
+    scale_filter: &str,
+) -> String {
+    let overlay = "overlay=eof_action=pass:repeatlast=0";
+    let index = sub.stream_index;
+    let Some(size) = sub.video_size else {
+        return format!("[0:V:0][1:{index}]{overlay},{scale_filter}[v]");
+    };
+    let (w, h) = output_size(size, profile.max_width, profile.max_height);
+    let (main, after) = match hw_accel {
+        HwAccel::None => (format!("scale={w}:{h},format=yuv420p"), String::new()),
+        HwAccel::Vaapi => (
+            format!("scale_vaapi=w={w}:h={h}:format=nv12,hwdownload,format=nv12"),
+            ",format=nv12,hwupload".to_string(),
+        ),
+        HwAccel::Nvenc => (
+            format!("scale_cuda=w={w}:h={h}:format=nv12,hwdownload,format=nv12"),
+            ",format=nv12".to_string(),
+        ),
+        HwAccel::Qsv => (
+            format!("scale_qsv=w={w}:h={h}:format=nv12,hwdownload,format=nv12"),
+            ",format=nv12".to_string(),
+        ),
+    };
+    format!("[0:V:0]{main}[main];[1:{index}]scale={w}:{h}[sub];[main][sub]{overlay}{after}[v]")
+}
+
 fn build_ffmpeg_args(
     input: &str,
     playlist_output: &str,
@@ -761,12 +819,13 @@ fn build_ffmpeg_args(
     args.push("-y".to_string());
     args.extend(["-hide_banner".to_string(), "-nostats".to_string()]);
 
-    // An image subtitle is overlaid in software, so it turns hardware acceleration off
+    // An image subtitle is overlaid in software. With hardware acceleration the device decodes
+    // and scales to the output size first; that needs the video's size, so a subtitle without
+    // one turns hardware acceleration off
     let image_subtitle = profile.image_subtitle.filter(|_| !profile.audio_only);
-    let hw_accel = if image_subtitle.is_some() {
-        HwAccel::None
-    } else {
-        profile.hw_accel
+    let hw_accel = match image_subtitle {
+        Some(sub) if sub.video_size.is_none() => HwAccel::None,
+        _ => profile.hw_accel,
     };
 
     // Burn-in and the overlay need a re-encode, so they turn the video copy off
@@ -809,12 +868,23 @@ fn build_ffmpeg_args(
     }
 
     // Resume or seek point: an input seek, so output time 0 is the start point
-    if profile.start_time_ticks > 0 {
-        args.extend(["-ss".to_string(), seconds_text(profile.start_time_ticks)]);
-    }
+    let seek: Vec<String> = if profile.start_time_ticks > 0 {
+        vec!["-ss".to_string(), seconds_text(profile.start_time_ticks)]
+    } else {
+        Vec::new()
+    };
+    args.extend(seek.iter().cloned());
 
     // Input
     args.extend(["-i".to_string(), input.to_string()]);
+
+    // An image subtitle is read from a second input of the same file. From the first, its sparse
+    // packets stall the overlay: ffmpeg then decodes and filters at about half speed (1080p HEVC
+    // burn-in ran slower than real time). The second input seeks to the same point.
+    if image_subtitle.is_some() {
+        args.extend(seek);
+        args.extend(["-i".to_string(), input.to_string()]);
+    }
 
     if profile.audio_only {
         // Audio-only transcoding: drop the video only. -an would drop the audio too.
@@ -865,19 +935,7 @@ fn build_ffmpeg_args(
 
         // Subtitle burn-in: an image subtitle is overlaid, and it wins over a text burn-in
         if let Some(sub) = image_subtitle {
-            // The subtitle is scaled to the video's size first when that is known, laid over the
-            // video, and the result is scaled like any video. hw_accel is None here, so
-            // scale_filter is the software scale.
-            let graph = match sub.video_size {
-                Some((w, h)) => format!(
-                    "[0:{}]scale={w}:{h}[sub];[0:V:0][sub]overlay=eof_action=pass:repeatlast=0,{scale_filter}[v]",
-                    sub.stream_index
-                ),
-                None => format!(
-                    "[0:V:0][0:{}]overlay=eof_action=pass:repeatlast=0,{scale_filter}[v]",
-                    sub.stream_index
-                ),
-            };
+            let graph = image_overlay_graph(sub, hw_accel, profile, &scale_filter);
             args.extend(["-filter_complex".to_string(), graph]);
         } else if profile.burn_subtitles {
             let sub_idx = profile.subtitle_stream_index.unwrap_or(0);
@@ -924,6 +982,20 @@ fn build_ffmpeg_args(
         ]);
     }
 
+    // An encoded video gets a key frame at each segment start, as Jellyfin forces them. The
+    // muxer cuts a segment only at a key frame, so without them the first segment (which the
+    // playlist waits for) runs to the encoder's next one: about 10 s of video, not 6.
+    if !profile.audio_only && !copy_video {
+        args.extend([
+            "-force_key_frames:v".to_string(),
+            format!("expr:gte(t,n_forced*{})", profile.segment_duration.max(1)),
+        ]);
+    }
+    // A copied video keeps the tag the client needs (hvc1 for HEVC on Apple players)
+    if copy_video && let Some(tag) = &profile.video_tag {
+        args.extend(["-tag:v".to_string(), tag.clone()]);
+    }
+
     // HLS output settings
     args.extend([
         "-f".to_string(),
@@ -934,8 +1006,18 @@ fn build_ffmpeg_args(
         "0".to_string(),
         "-hls_flags".to_string(),
         "independent_segments".to_string(),
-        "-hls_segment_type".to_string(),
-        "mpegts".to_string(),
+    ]);
+    if profile.fmp4 {
+        args.extend([
+            "-hls_segment_type".to_string(),
+            "fmp4".to_string(),
+            "-hls_fmp4_init_filename".to_string(),
+            "init.mp4".to_string(),
+        ]);
+    } else {
+        args.extend(["-hls_segment_type".to_string(), "mpegts".to_string()]);
+    }
+    args.extend([
         "-hls_segment_filename".to_string(),
         segment_pattern.to_string(),
         "-hls_playlist_type".to_string(),
@@ -1378,40 +1460,213 @@ mod tests {
         assert_eq!(maps(&args_for(&profile)), ["0:a:0?"]);
     }
 
+    /// The values of every `flag` in `args`, in order.
+    fn values<'a>(args: &'a [String], flag: &str) -> Vec<&'a str> {
+        args.windows(2)
+            .filter(|w| w[0] == flag)
+            .map(|w| w[1].as_str())
+            .collect()
+    }
+
     #[test]
     fn test_build_ffmpeg_args_image_subtitle_is_overlaid() {
-        let sw_scale = "scale='min(1920,iw)':'min(1080,ih)':force_original_aspect_ratio=decrease";
-        // Hardware acceleration and a video copy give way to the software overlay
-        for hw_accel in [HwAccel::None, HwAccel::Vaapi, HwAccel::Nvenc, HwAccel::Qsv] {
+        let sub = |video_size| ImageSubtitle {
+            stream_index: 5,
+            video_size,
+        };
+        let profile = TranscodeProfile {
+            image_subtitle: Some(sub(Some((1440, 1080)))),
+            audio_stream_index: Some(1),
+            copy_video: true,
+            ..Default::default()
+        };
+        let args = args_for(&profile);
+        // The subtitle comes from a second input of the same file. The video is scaled and made
+        // 8-bit first, the subtitle scaled once to the same size, and laid over it
+        assert_eq!(values(&args, "-i"), ["/input.mkv", "/input.mkv"]);
+        assert!(
+            has_pair(
+                &args,
+                "-filter_complex",
+                "[0:V:0]scale=1440:1080,format=yuv420p[main];[1:5]scale=1440:1080[sub];\
+                 [main][sub]overlay=eof_action=pass:repeatlast=0[v]"
+            ),
+            "{args:?}"
+        );
+        // A video copy gives way to the encode
+        assert_eq!(maps(&args), ["[v]", "0:1"]);
+        assert!(has_pair(&args, "-c:v", "libx264"), "{args:?}");
+        for flag in ["-vf", "-hwaccel", "-vaapi_device"] {
+            assert!(!args.contains(&flag.to_string()), "{args:?}");
+        }
+
+        // A video over the limits is scaled down, the subtitle to the same size
+        let profile = TranscodeProfile {
+            image_subtitle: Some(sub(Some((1920, 1040)))),
+            max_width: 1280,
+            max_height: 720,
+            ..Default::default()
+        };
+        let graph = values(&args_for(&profile), "-filter_complex").concat();
+        assert!(
+            graph
+                .starts_with("[0:V:0]scale=1280:692,format=yuv420p[main];[1:5]scale=1280:692[sub]"),
+            "{graph}"
+        );
+
+        // Both inputs seek to the start point
+        let profile = TranscodeProfile {
+            image_subtitle: Some(sub(Some((1920, 1040)))),
+            start_time_ticks: 600_000_000,
+            ..Default::default()
+        };
+        let args = args_for(&profile);
+        let seeks: Vec<usize> = args
+            .iter()
+            .enumerate()
+            .filter(|(_, a)| *a == "-ss")
+            .map(|(i, _)| i)
+            .collect();
+        let inputs: Vec<usize> = args
+            .iter()
+            .enumerate()
+            .filter(|(_, a)| *a == "-i")
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(seeks.len(), 2, "{args:?}");
+        assert_eq!(inputs, [seeks[0] + 2, seeks[1] + 2], "{args:?}");
+        assert_eq!(values(&args, "-ss"), ["60.000", "60.000"]);
+    }
+
+    #[test]
+    fn test_build_ffmpeg_args_image_subtitle_on_hardware() {
+        // The device decodes and scales; the frames come down as NV12 for the overlay, and go
+        // back up for VAAPI, whose encoder takes only device frames
+        for (hw_accel, scale, after, codec) in [
+            (
+                HwAccel::Vaapi,
+                "scale_vaapi",
+                ",format=nv12,hwupload",
+                "h264_vaapi",
+            ),
+            (HwAccel::Nvenc, "scale_cuda", ",format=nv12", "h264_nvenc"),
+            (HwAccel::Qsv, "scale_qsv", ",format=nv12", "h264_qsv"),
+        ] {
             let profile = TranscodeProfile {
                 image_subtitle: Some(ImageSubtitle {
-                    stream_index: 5,
-                    video_size: Some((1440, 1080)),
+                    stream_index: 4,
+                    video_size: Some((1920, 1040)),
                 }),
-                audio_stream_index: Some(1),
-                copy_video: true,
                 hw_accel,
                 ..Default::default()
             };
             let args = args_for(&profile);
-            // The subtitle is scaled to the source video's size, laid over it, then the
-            // result is scaled like any encoded video
+            let graph = format!(
+                "[0:V:0]{scale}=w=1920:h=1040:format=nv12,hwdownload,format=nv12[main];\
+                 [1:4]scale=1920:1040[sub];[main][sub]overlay=eof_action=pass:repeatlast=0{after}[v]"
+            );
             assert!(
-                has_pair(
-                    &args,
-                    "-filter_complex",
-                    &format!(
-                        "[0:5]scale=1440:1080[sub];[0:V:0][sub]overlay=eof_action=pass:repeatlast=0,{sw_scale},format=yuv420p[v]"
-                    )
-                ),
+                has_pair(&args, "-filter_complex", &graph),
                 "{hw_accel:?}: {args:?}"
             );
-            assert_eq!(maps(&args), ["[v]", "0:1"], "{hw_accel:?}");
-            assert!(has_pair(&args, "-c:v", "libx264"), "{hw_accel:?}: {args:?}");
-            for flag in ["-vf", "-hwaccel", "-vaapi_device"] {
-                assert!(!args.contains(&flag.to_string()), "{hw_accel:?}: {args:?}");
-            }
+            assert!(has_pair(&args, "-c:v", codec), "{hw_accel:?}: {args:?}");
+            // The device flags belong to the video's input only
+            let hwaccel = position(&args, "-hwaccel");
+            let inputs: Vec<usize> = args
+                .iter()
+                .enumerate()
+                .filter(|(_, a)| *a == "-i")
+                .map(|(i, _)| i)
+                .collect();
+            assert!(hwaccel < inputs[0], "{hw_accel:?}: {args:?}");
+            assert_eq!(values(&args, "-hwaccel").len(), 1, "{hw_accel:?}");
+            assert!(
+                !args.contains(&"-preset".to_string()),
+                "{hw_accel:?}: {args:?}"
+            );
         }
+        // Without the video's size the overlay stays in software
+        let profile = TranscodeProfile {
+            image_subtitle: Some(ImageSubtitle {
+                stream_index: 4,
+                video_size: None,
+            }),
+            hw_accel: HwAccel::Vaapi,
+            ..Default::default()
+        };
+        let args = args_for(&profile);
+        assert!(has_pair(&args, "-c:v", "libx264"), "{args:?}");
+        assert!(!args.contains(&"-hwaccel".to_string()), "{args:?}");
+    }
+
+    #[test]
+    fn test_output_size_fits_the_limits_in_even_numbers() {
+        assert_eq!(output_size((1920, 1040), 1920, 1080), (1920, 1040));
+        assert_eq!(output_size((1440, 1080), 1920, 1080), (1440, 1080));
+        assert_eq!(output_size((1920, 1040), 1280, 720), (1280, 692));
+        assert_eq!(output_size((3840, 2160), 1920, 1080), (1920, 1080));
+        assert_eq!(output_size((720, 576), 1920, 1080), (720, 576));
+        assert_eq!(output_size((1919, 1079), 4000, 4000), (1918, 1078));
+        assert_eq!(output_size((1920, 1080), 0, 0), (2, 2));
+    }
+
+    #[test]
+    fn test_build_ffmpeg_args_force_key_frames_at_segment_starts() {
+        let key_frames = |profile: &TranscodeProfile| {
+            values(&args_for(profile), "-force_key_frames:v")
+                .concat()
+                .to_string()
+        };
+        let encoded = TranscodeProfile::default();
+        assert_eq!(key_frames(&encoded), "expr:gte(t,n_forced*6)");
+        let short = TranscodeProfile {
+            segment_duration: 3,
+            hw_accel: HwAccel::Nvenc,
+            ..Default::default()
+        };
+        assert_eq!(key_frames(&short), "expr:gte(t,n_forced*3)");
+        // A copied video keeps its own key frames, and audio alone has none
+        for profile in [
+            TranscodeProfile {
+                copy_video: true,
+                ..Default::default()
+            },
+            TranscodeProfile {
+                audio_only: true,
+                ..Default::default()
+            },
+        ] {
+            assert_eq!(key_frames(&profile), "", "{profile:?}");
+        }
+    }
+
+    #[test]
+    fn test_build_ffmpeg_args_fmp4_segments_and_the_copy_tag() {
+        let profile = TranscodeProfile {
+            copy_video: true,
+            fmp4: true,
+            video_tag: Some("hvc1".to_string()),
+            ..Default::default()
+        };
+        let args = args_for(&profile);
+        assert!(has_pair(&args, "-hls_segment_type", "fmp4"), "{args:?}");
+        assert!(
+            has_pair(&args, "-hls_fmp4_init_filename", "init.mp4"),
+            "{args:?}"
+        );
+        assert!(has_pair(&args, "-tag:v", "hvc1"), "{args:?}");
+        assert!(has_pair(&args, "-c:v", "copy"), "{args:?}");
+        // MPEG-TS stays the default, and an encoded video gets no copy tag
+        let args = args_for(&TranscodeProfile {
+            video_tag: Some("hvc1".to_string()),
+            ..Default::default()
+        });
+        assert!(has_pair(&args, "-hls_segment_type", "mpegts"), "{args:?}");
+        assert!(!args.contains(&"-tag:v".to_string()), "{args:?}");
+        assert!(
+            !args.contains(&"-hls_fmp4_init_filename".to_string()),
+            "{args:?}"
+        );
     }
 
     #[test]
@@ -1428,10 +1683,11 @@ mod tests {
             has_pair(
                 &args,
                 "-filter_complex",
-                "[0:V:0][0:3]overlay=eof_action=pass:repeatlast=0,scale='min(1920,iw)':'min(1080,ih)':force_original_aspect_ratio=decrease,format=yuv420p[v]"
+                "[0:V:0][1:3]overlay=eof_action=pass:repeatlast=0,scale='min(1920,iw)':'min(1080,ih)':force_original_aspect_ratio=decrease,format=yuv420p[v]"
             ),
             "{args:?}"
         );
+        assert_eq!(values(&args, "-i"), ["/input.mkv", "/input.mkv"]);
         assert_eq!(maps(&args), ["[v]", "0:a:0?"]);
         // The image subtitle wins over a text burn-in asked for at the same time
         let profile = TranscodeProfile {
@@ -1707,10 +1963,12 @@ mod tests {
         }
     }
 
-    /// The args the base built for the default profile, before the format step.
+    /// The args the base built for the default profile, before the format step, with the key
+    /// frames forced at segment starts that came later.
     fn base_args(input: &str, playlist: &str, segments: &str) -> Vec<String> {
         "-y -hide_banner -nostats -i INPUT -c:v libx264 -b:v 8000k -maxrate 8000k -bufsize 16000k \
-         -vf SCALE -map 0:V:0? -map 0:a:0? -c:a aac -b:a 192k -ac 2 -f hls -hls_time 6 \
+         -vf SCALE -map 0:V:0? -map 0:a:0? -c:a aac -b:a 192k -ac 2 \
+         -force_key_frames:v expr:gte(t,n_forced*6) -f hls -hls_time 6 \
          -hls_list_size 0 -hls_flags independent_segments -hls_segment_type mpegts \
          -hls_segment_filename SEGMENTS -hls_playlist_type event -start_number 0 \
          -preset veryfast PLAYLIST"
@@ -1783,6 +2041,99 @@ mod tests {
             .collect();
         segments.sort();
         segments
+    }
+
+    /// Makes a `seconds`-long test file at `path` with ffmpeg; `video` are the video options.
+    fn make_source(path: &Path, seconds: u32, video: &str) {
+        let make = format!(
+            "-f lavfi -i testsrc2=size=320x240:rate=25 -f lavfi -i sine=frequency=440 -t {seconds} \
+             {video} -c:a aac"
+        );
+        let mut args: Vec<String> = make.split_whitespace().map(String::from).collect();
+        args.push(path.to_str().unwrap().to_string());
+        run_ffmpeg(&args, true);
+    }
+
+    /// The durations of a playlist's segments.
+    fn segment_durations(playlist: &Path) -> Vec<f64> {
+        std::fs::read_to_string(playlist)
+            .unwrap()
+            .lines()
+            .filter_map(|line| line.strip_prefix("#EXTINF:"))
+            .map(|rest| rest.trim_end_matches(',').parse().unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn test_forced_key_frames_cut_the_first_segment_at_its_length() {
+        if !have_ffmpeg("test_forced_key_frames_cut_the_first_segment_at_its_length") {
+            return;
+        }
+        let dir = TestDir(std::env::temp_dir().join(format!("rustyfin-r3kf-{}", Uuid::new_v4())));
+        std::fs::create_dir_all(&dir.0).unwrap();
+        // libx264's own key frames come every 250 frames, 10 s here: one 7 s segment without
+        // the forced ones
+        let input = dir.0.join("gop10.mp4");
+        make_source(&input, 7, "-c:v libx264 -pix_fmt yuv420p");
+        let profile = TranscodeProfile {
+            segment_duration: 2,
+            ..Default::default()
+        };
+        let out = transcode_into(&dir.0, "out", &input, &profile);
+        let durations = segment_durations(&out.join("main.m3u8"));
+        assert!(durations.len() >= 3, "{durations:?}");
+        assert!((durations[0] - 2.0).abs() < 0.1, "{durations:?}");
+    }
+
+    #[test]
+    fn test_copied_hevc_goes_out_in_fragmented_mp4() {
+        if !have_ffmpeg("test_copied_hevc_goes_out_in_fragmented_mp4") {
+            return;
+        }
+        let dir = TestDir(std::env::temp_dir().join(format!("rustyfin-r3hevc-{}", Uuid::new_v4())));
+        std::fs::create_dir_all(&dir.0).unwrap();
+        let input = dir.0.join("main10.mkv");
+        make_source(
+            &input,
+            4,
+            "-c:v libx265 -pix_fmt yuv420p10le -x265-params keyint=50:log-level=error",
+        );
+        let profile = TranscodeProfile {
+            copy_video: true,
+            fmp4: true,
+            video_tag: Some("hvc1".to_string()),
+            segment_duration: 2,
+            ..Default::default()
+        };
+        let out = dir.0.join("out");
+        std::fs::create_dir_all(&out).unwrap();
+        let playlist = out.join("main.m3u8");
+        let args = build_ffmpeg_args(
+            input.to_str().unwrap(),
+            playlist.to_str().unwrap(),
+            out.join("segment_%04d.mp4").to_str().unwrap(),
+            &profile,
+        );
+        run_ffmpeg(&args, false);
+
+        let text = std::fs::read_to_string(&playlist).unwrap();
+        assert!(text.contains("#EXT-X-MAP:URI=\"init.mp4\""), "{text}");
+        assert!(text.contains("segment_0000.mp4"), "{text}");
+        assert!(out.join("init.mp4").is_file());
+        // The init segment and a media segment together play as 10-bit HEVC tagged hvc1
+        let mut joined = std::fs::read(out.join("init.mp4")).unwrap();
+        joined.extend(std::fs::read(out.join("segment_0000.mp4")).unwrap());
+        let probe_in = dir.0.join("joined.mp4");
+        std::fs::write(&probe_in, joined).unwrap();
+        let probe = std::process::Command::new("ffprobe")
+            .args(["-v", "error", "-select_streams", "v:0", "-show_entries"])
+            .arg("stream=codec_name,codec_tag_string,pix_fmt")
+            .args(["-of", "csv=p=0"])
+            .arg(&probe_in)
+            .output()
+            .unwrap();
+        let probed = String::from_utf8_lossy(&probe.stdout);
+        assert_eq!(probed.trim(), "hevc,hvc1,yuv420p10le", "{probed}");
     }
 
     #[test]

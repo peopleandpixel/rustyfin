@@ -32536,6 +32536,52 @@ async fn r3playback_universal_keeps_the_clients_play_session_id() {
     assert_eq!(ids.len(), 2);
 }
 
+// R3 playback: Universal passes what the client states about HEVC on to the transcode URL, so a
+// Matroska HEVC film is copied for a client that lists HEVC rather than encoded
+#[tokio::test]
+async fn r3playback_universal_passes_the_hevc_limits_on() {
+    let state = test_state().await;
+    let (token, _) = admin_session(&state).await;
+    let folder = std::path::PathBuf::from(media_folder(&state, "r3hevc"));
+    let file = folder.join("R3 HEVC.mkv");
+    std::fs::write(&file, b"r3").unwrap();
+    let id = g4_insert_item(&state, "Movie", &file).await;
+    g4_insert_source(
+        &state,
+        id,
+        "mkv",
+        &file,
+        &[("Video", "hevc"), ("Audio", "dts")],
+    )
+    .await;
+    let app = app(state);
+
+    let uri = format!(
+        "/Videos/{id}/Universal?VideoCodecs=h264,hevc&AudioCodecs=aac\
+         &hevc-videobitdepth=10&hevc-profile=main,main%2010&MaxVideoBitDepth=10"
+    );
+    let (status, body) = send(&app, request("GET", &uri, Some(&token), None)).await;
+    assert_eq!(status, StatusCode::OK);
+    let url = body["Url"].as_str().unwrap();
+    assert!(url.contains("/main.m3u8?"), "{url}");
+    for part in [
+        "VideoCodec=h264,hevc",
+        "MaxVideoBitDepth=10",
+        "hevc-videobitdepth=10",
+        "hevc-profile=main%2Cmain+10",
+    ] {
+        assert!(url.contains(part), "{part} in {url}");
+    }
+    // A client that states none of them gets none in its URL
+    let uri = format!("/Videos/{id}/Universal?VideoCodecs=h264&AudioCodecs=aac");
+    let (_, body) = send(&app, request("GET", &uri, Some(&token), None)).await;
+    let url = body["Url"].as_str().unwrap();
+    assert!(
+        !url.contains("hevc-") && !url.contains("MaxVideoBitDepth"),
+        "{url}"
+    );
+}
+
 #[test]
 fn r3playback_web_session_id() {
     b124_node_test("r3playback_session_id.mjs");

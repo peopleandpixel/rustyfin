@@ -74,6 +74,12 @@ pub struct TranscodeQuery {
     /// that is not a number does not fail the whole query.
     #[serde(rename = "h264-videobitdepth")]
     pub h264_video_bit_depth: Option<String>,
+    /// Jellyfin's hevc-profile: the HEVC profiles the client takes, split on commas or pipes
+    #[serde(rename = "hevc-profile")]
+    pub hevc_profile: Option<String>,
+    /// Jellyfin's hevc-videobitdepth: read when MaxVideoBitDepth is absent
+    #[serde(rename = "hevc-videobitdepth")]
+    pub hevc_video_bit_depth: Option<String>,
 }
 
 impl TranscodeQuery {
@@ -120,7 +126,7 @@ struct Track {
 }
 
 /// What the transcode route knows about the source.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 struct SourceInfo {
     video_codec: Option<String>,
     video_profile: Option<String>,
@@ -197,6 +203,64 @@ fn client_takes(list: Option<&str>, codecs: &[&str]) -> bool {
         .filter(|name| !name.is_empty())
         .collect();
     names.is_empty() || names.iter().any(|name| codecs.contains(&name.as_str()))
+}
+
+/// The names a client lists HEVC by.
+const HEVC_NAMES: [&str; 4] = ["hevc", "h265", "hvc1", "hev1"];
+
+/// Whether a client codec list names one of `codecs`. Unlike `client_takes`, an absent or empty
+/// list names none: a client must ask for HEVC to get it.
+fn client_lists(list: Option<&str>, codecs: &[&str]) -> bool {
+    list.unwrap_or_default()
+        .split(',')
+        .map(|name| name.trim().to_ascii_lowercase())
+        .any(|name| codecs.contains(&name.as_str()))
+}
+
+/// Whether the source is HEVC.
+fn is_hevc(source: &SourceInfo) -> bool {
+    matches!(source.video_codec.as_deref(), Some("hevc" | "h265"))
+}
+
+/// Whether a client takes the source's HEVC as it is, by what Jellyfin clients send with the
+/// stream URL: its bit depth within MaxVideoBitDepth, else `hevc-videobitdepth`, else 8 (a
+/// client that states nothing gets no 10-bit video, as with H.264); and its profile among those
+/// `hevc-profile` lists, when it lists any ("Main 10" matches "main10").
+fn client_takes_hevc(query: &TranscodeQuery, source: &SourceInfo) -> bool {
+    let max_depth = query
+        .max_video_bit_depth
+        .or_else(|| {
+            query
+                .hevc_video_bit_depth
+                .as_deref()
+                .and_then(|depth| depth.trim().parse().ok())
+        })
+        .unwrap_or(8);
+    let deep = source.video_profile.as_deref().is_some_and(is_deep_profile);
+    let depth = source.video_bit_depth.unwrap_or(if deep { 10 } else { 8 });
+    if depth > max_depth {
+        return false;
+    }
+    let squash = |profile: &str| -> String {
+        profile
+            .chars()
+            .filter(char::is_ascii_alphanumeric)
+            .collect::<String>()
+            .to_ascii_lowercase()
+    };
+    let listed: Vec<String> = query
+        .hevc_profile
+        .as_deref()
+        .unwrap_or_default()
+        .split([',', '|'])
+        .map(squash)
+        .filter(|profile| !profile.is_empty())
+        .collect();
+    listed.is_empty()
+        || source
+            .video_profile
+            .as_deref()
+            .is_some_and(|profile| listed.contains(&squash(profile)))
 }
 
 /// Whether a source size is known and within a client limit. No limit always fits.
@@ -375,9 +439,7 @@ fn stream_copy(query: &TranscodeQuery, source: &SourceInfo) -> (bool, bool) {
     let audio = tracks
         .audio
         .and_then(|index| source.audio.iter().find(|track| track.index == index));
-    let copy_video = !query.audio_only.unwrap_or(false)
-        && tracks.burn_in.is_none()
-        && matches!(source.video_codec.as_deref(), Some("h264" | "avc" | "avc1"))
+    let copy_h264 = matches!(source.video_codec.as_deref(), Some("h264" | "avc" | "avc1"))
         && client_takes(query.video_codec.as_deref(), &["h264", "avc", "avc1"])
         && client_takes_h264(
             H264Request {
@@ -388,7 +450,14 @@ fn stream_copy(query: &TranscodeQuery, source: &SourceInfo) -> (bool, bool) {
             },
             source.video_profile.as_deref(),
             source.video_bit_depth,
-        )
+        );
+    // HEVC is copied only for a client that lists it; it goes out in fragmented MP4
+    let copy_hevc = is_hevc(source)
+        && client_lists(query.video_codec.as_deref(), &HEVC_NAMES)
+        && client_takes_hevc(query, source);
+    let copy_video = !query.audio_only.unwrap_or(false)
+        && tracks.burn_in.is_none()
+        && (copy_h264 || copy_hevc)
         && size_fits(query.max_width, source.width)
         && size_fits(query.max_height, source.height)
         && bitrate_fits(query.video_bitrate, source.video_bitrate);
@@ -408,6 +477,12 @@ fn transcode_profile(query: TranscodeQuery, source: &SourceInfo) -> TranscodePro
     let mut profile = query.into_profile();
     profile.copy_video = copy_video;
     profile.copy_audio = copy_audio;
+    // Copied HEVC needs fragmented MP4 segments (browsers and Apple players take no HEVC in
+    // MPEG-TS) and the hvc1 tag, as Jellyfin sends it
+    if copy_video && is_hevc(source) {
+        profile.fmp4 = true;
+        profile.video_tag = Some("hvc1".to_string());
+    }
     profile.audio_stream_index = tracks.audio;
     match tracks.burn_in {
         Some(BurnIn::Image(stream_index)) => {
@@ -530,8 +605,9 @@ async fn hls_master_playlist(
 
 /// Point each segment line of an FFmpeg playlist at the segment route:
 /// `hls/{playback_id}/video/{segment}`, with `?{query}` when the query is non-empty. The query is
-/// the playlist request's own, so the `api_key` in it authorises the segment requests. Empty lines
-/// and `#` tags stay as they are.
+/// the playlist request's own, so the `api_key` in it authorises the segment requests. The
+/// fragmented MP4 init segment (`#EXT-X-MAP:URI="init.mp4"`) points there too; empty lines and
+/// the other `#` tags stay as they are.
 fn rewrite_playlist(content: &str, playback_id: &Uuid, query: Option<&str>) -> String {
     let suffix = query
         .filter(|query| !query.is_empty())
@@ -540,7 +616,13 @@ fn rewrite_playlist(content: &str, playback_id: &Uuid, query: Option<&str>) -> S
     content
         .split('\n')
         .map(|line| {
-            if line.is_empty() || line.starts_with('#') {
+            if let Some(uri) = line
+                .strip_prefix("#EXT-X-MAP:URI=\"")
+                .and_then(|rest| rest.strip_suffix('"'))
+            {
+                // The fragmented MP4 init segment
+                format!("#EXT-X-MAP:URI=\"hls/{playback_id}/video/{uri}{suffix}\"")
+            } else if line.is_empty() || line.starts_with('#') {
                 line.to_string()
             } else {
                 format!("hls/{playback_id}/video/{line}{suffix}")
@@ -571,6 +653,8 @@ async fn hls_segment(
 
     let content_type = if segment.ends_with(".ts") {
         "video/mp2t"
+    } else if segment.ends_with(".mp4") || segment.ends_with(".m4s") {
+        "video/mp4"
     } else if segment.ends_with(".m3u8") {
         "application/vnd.apple.mpegurl"
     } else {
@@ -611,6 +695,8 @@ async fn hls_segment_legacy(
 
     let content_type = if segment.ends_with(".ts") {
         "video/mp2t"
+    } else if segment.ends_with(".mp4") || segment.ends_with(".m4s") {
+        "video/mp4"
     } else if segment.ends_with(".m3u8") {
         "application/vnd.apple.mpegurl"
     } else {
@@ -1354,5 +1440,92 @@ mod tests {
         // The other rules still hold: a client that does not list H.264 gets it encoded
         let query = query("VideoCodec=hevc&AudioCodec=aac&MaxVideoBitDepth=10");
         assert!(!stream_copy(&query, &h264_as(Some("High 10"), Some(10))).0);
+    }
+
+    /// A 1920x1040 HEVC source of `profile` and `bit_depth` with AC3 audio, like a Blu-ray rip.
+    fn hevc_as(profile: &str, bit_depth: Option<u32>) -> SourceInfo {
+        SourceInfo {
+            video_codec: Some("hevc".into()),
+            video_profile: Some(profile.into()),
+            video_bit_depth: bit_depth,
+            height: Some(1040),
+            ..h264_with(&["ac3"])
+        }
+    }
+
+    #[test]
+    fn r3playback_hevc_is_copied_for_a_client_that_lists_it() {
+        let main10 = hevc_as("Main 10", Some(10));
+        let main = hevc_as("Main", Some(8));
+        let copies = |params: &str, source: &SourceInfo| stream_copy(&query(params), source).0;
+        for (params, source) in [
+            ("VideoCodec=h264,hevc&hevc-videobitdepth=10", &main10),
+            ("VideoCodec=hevc&MaxVideoBitDepth=10", &main10),
+            ("VideoCodec=h264,h265", &main),
+            ("VideoCodec=HEVC", &main),
+            (
+                "VideoCodec=hevc&hevc-profile=main,main10&hevc-videobitdepth=10",
+                &main10,
+            ),
+            (
+                "VideoCodec=hevc&hevc-profile=Main%7CMain%2010&hevc-videobitdepth=10",
+                &main10,
+            ),
+            ("VideoCodec=hevc&MaxWidth=1920&VideoBitrate=10000", &main),
+        ] {
+            assert!(copies(params, source), "{params}");
+        }
+        for (params, source) in [
+            // Not listed, or no list at all
+            ("", &main),
+            ("VideoCodec=h264", &main),
+            // A client that states no depth gets no 10-bit video; nor one that states 8
+            ("VideoCodec=hevc", &main10),
+            ("VideoCodec=hevc&hevc-videobitdepth=8", &main10),
+            ("VideoCodec=hevc&hevc-videobitdepth=ten", &main10),
+            // A profile the list leaves out
+            (
+                "VideoCodec=hevc&hevc-profile=main&hevc-videobitdepth=10",
+                &main10,
+            ),
+            // Over the size or bitrate limit, or with a burn-in
+            ("VideoCodec=hevc&MaxWidth=1280", &main),
+            ("VideoCodec=hevc&VideoBitrate=4000", &main),
+            ("VideoCodec=hevc&SubtitleMethod=Encode", &main),
+        ] {
+            let mut source = source.clone();
+            source.subtitles = vec![track(3, "subrip")];
+            assert!(!copies(params, &source), "{params}");
+        }
+        // An unknown depth is read from the profile
+        assert!(!copies("VideoCodec=hevc", &hevc_as("Main 10", None)));
+        assert!(copies("VideoCodec=hevc", &hevc_as("Main", None)));
+    }
+
+    #[test]
+    fn r3playback_copied_hevc_goes_out_in_fragmented_mp4() {
+        let main10 = hevc_as("Main 10", Some(10));
+        let profile = transcode_profile(query("VideoCodec=hevc&hevc-videobitdepth=10"), &main10);
+        assert!(profile.copy_video && profile.fmp4, "{profile:?}");
+        assert_eq!(profile.video_tag.as_deref(), Some("hvc1"));
+        // Encoded HEVC and copied H.264 stay in MPEG-TS
+        let encoded = transcode_profile(query("VideoCodec=h264"), &main10);
+        assert!(!encoded.copy_video && !encoded.fmp4 && encoded.video_tag.is_none());
+        let h264 = transcode_profile(query("VideoCodec=h264"), &h264_with(&["aac"]));
+        assert!(h264.copy_video && !h264.fmp4 && h264.video_tag.is_none());
+    }
+
+    #[test]
+    fn r3playback_rewrite_points_the_init_segment_at_the_segment_route() {
+        let playback_id = Uuid::new_v4();
+        let content = "#EXTM3U\n#EXT-X-MAP:URI=\"init.mp4\"\n#EXTINF:6.0,\nsegment_0000.mp4\n";
+        let expected = format!(
+            "#EXTM3U\n#EXT-X-MAP:URI=\"hls/{playback_id}/video/init.mp4?api_key=k\"\n\
+             #EXTINF:6.0,\nhls/{playback_id}/video/segment_0000.mp4?api_key=k\n"
+        );
+        assert_eq!(
+            rewrite_playlist(content, &playback_id, Some("api_key=k")),
+            expected
+        );
     }
 }
