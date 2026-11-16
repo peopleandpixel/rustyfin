@@ -69,7 +69,7 @@ async fn next_up(
     // One episode per series: its next unplayed episode (see get_next_up)
     let mut episodes =
         rustyfin_db::repo_media::get_next_up(&state.db_ro, user_id, series_id, &options).await?;
-    HiddenItems::for_caller(&state, &claims)
+    hidden_for(&state, &claims, user_id)
         .await?
         .retain(&mut episodes);
 
@@ -250,7 +250,7 @@ async fn get_episodes(
         // Use single-query subquery to fetch all episodes for the series
         rustyfin_db::repo_media::get_episodes_for_series(&state.db_ro, series_id, q.season).await?
     };
-    HiddenItems::for_caller(&state, &claims)
+    hidden_for(&state, &claims, user_id)
         .await?
         .retain(&mut episodes);
 
@@ -310,6 +310,19 @@ async fn get_episodes(
         total_record_count: total,
         start_index: start as i64,
     }))
+}
+
+/// The items hidden from the user a route answers for: `user` (an administrator's `userId`), else
+/// the caller.
+async fn hidden_for(
+    state: &AppState,
+    claims: &Claims,
+    user: Option<Uuid>,
+) -> Result<HiddenItems, ApiError> {
+    match user {
+        Some(user) => HiddenItems::for_user(state, user).await,
+        None => HiddenItems::for_caller(state, claims).await,
+    }
 }
 
 /// Jellyfin's `UserViewBuilder.FilterForAdjacency`: the episode `id` and the ones just before

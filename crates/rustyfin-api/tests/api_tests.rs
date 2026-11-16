@@ -48349,3 +48349,220 @@ async fn r3queues_resume_exclude_active_sessions() {
         assert_eq!(body["TotalRecordCount"], 1, "{uri}");
     }
 }
+
+/// Inserts a made-up item in `library` (an episode's `parent` is its season) and returns its id.
+async fn r3queues_insert(
+    state: &AppState,
+    library: &str,
+    kind: &str,
+    parent: Option<uuid::Uuid>,
+    index: i64,
+    created: &str,
+) -> uuid::Uuid {
+    let id = uuid::Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO media_items (id, library_id, name, media_type, path, parent_id, \
+         index_number, parent_index_number, date_created) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+    )
+    .bind(id.to_string())
+    .bind(library)
+    .bind(format!("R3Q {kind} {index}"))
+    .bind(kind)
+    .bind(format!("/r3q/{id}.mkv"))
+    .bind(parent.map(|p| p.to_string()))
+    .bind(index)
+    .bind(parent.map(|_| 1))
+    .bind(created)
+    .execute(&state.db)
+    .await
+    .unwrap();
+    id
+}
+
+/// The library an item is in.
+async fn r3queues_library_of(state: &AppState, item: uuid::Uuid) -> String {
+    sqlx::query_scalar("SELECT library_id FROM media_items WHERE id = ?")
+        .bind(item.to_string())
+        .fetch_one(&state.db)
+        .await
+        .unwrap()
+}
+
+/// A series with many new episodes doesn't leave the Latest row short: candidates are read until
+/// there are `limit` entries.
+#[tokio::test]
+async fn r3queues_latest_fills_the_limit_past_a_busy_series() {
+    let state = test_state().await;
+    let app = app(state.clone());
+    let (token, _) = admin_session(&state).await;
+    let (series, [e1, _, _]) = g1f_insert_show(&state).await;
+    let season = b93_season_of(&state, e1).await;
+    let library = r3queues_library_of(&state, e1).await;
+    for n in 0..50 {
+        let created = format!("2030-02-01T00:{:02}:00+00:00", n);
+        r3queues_insert(&state, &library, "Episode", Some(season), 10 + n, &created).await;
+    }
+    let mut movies = Vec::new();
+    for n in 0..5 {
+        let created = format!("2030-01-0{}T00:00:00+00:00", n + 1);
+        movies.push(r3queues_insert(&state, &library, "Movie", None, n, &created).await);
+    }
+    let (status, body) = r3queues_get(&app, &token, "/Items/Latest?limit=6").await;
+    assert_eq!(status, StatusCode::OK);
+    let ids = r3queues_ids(&body);
+    assert_eq!(ids.len(), 6, "{body}");
+    assert_eq!(ids[0], series);
+    let mut rest = ids[1..].to_vec();
+    rest.sort();
+    movies.sort();
+    assert_eq!(rest, movies);
+    assert!(body[0]["ChildCount"].as_i64().unwrap() >= 50);
+}
+
+/// Without `parentId`, the played filter is ignored when one of the user's libraries is music;
+/// with a non-music `parentId` it applies.
+#[tokio::test]
+async fn r3queues_latest_ignores_is_played_with_a_music_library() {
+    let state = test_state().await;
+    let app = app(state.clone());
+    let (token, user) = admin_session(&state).await;
+    let (_, [e1, _, _]) = g1f_insert_show(&state).await;
+    let tv = r3queues_library_of(&state, e1).await;
+    rustyfin_db::repo_playback::mark_played(&state.db, user, e1)
+        .await
+        .unwrap();
+    let (_, body) = r3queues_get(&app, &token, "/Items/Latest").await;
+    assert_eq!(body[0]["ChildCount"], 2, "no music library: played hidden");
+    let music = rustyfin_model::library::Library {
+        id: uuid::Uuid::new_v4(),
+        name: "R3Q Music".to_string(),
+        content_type: rustyfin_model::library::LibraryContentType::Music,
+        paths: vec![media_folder(&state, "r3q-music")],
+    };
+    rustyfin_db::repo_library::create_library(&state.db, &music)
+        .await
+        .unwrap();
+    let (_, body) = r3queues_get(&app, &token, "/Items/Latest").await;
+    assert_eq!(body[0]["ChildCount"], 3, "a music library: played kept");
+    let (_, body) = r3queues_get(&app, &token, "/Items/Latest?isPlayed=false").await;
+    assert_eq!(body[0]["ChildCount"], 3, "even when asked for");
+    let (_, body) = r3queues_get(&app, &token, &format!("/Items/Latest?parentId={tv}")).await;
+    assert_eq!(body[0]["ChildCount"], 2, "the TV library alone");
+    // Excluded from Latest, the music library no longer counts.
+    rustyfin_db::repo_user::update_configuration(
+        &state.db,
+        user,
+        &serde_json::json!({ "LatestItemsExcludes": [music.id.to_string()] }),
+    )
+    .await
+    .unwrap();
+    let (_, body) = r3queues_get(&app, &token, "/Items/Latest").await;
+    assert_eq!(body[0]["ChildCount"], 2);
+}
+
+/// `LatestItemsExcludes` leaves its libraries out of Latest without `parentId`, and only them.
+#[tokio::test]
+async fn r3queues_latest_items_excludes() {
+    let state = test_state().await;
+    let app = app(state.clone());
+    let (token, user) = admin_session(&state).await;
+    let (series, [e1, _, _]) = g1f_insert_show(&state).await;
+    let tv = r3queues_library_of(&state, e1).await;
+    let (_, body) = r3queues_get(&app, &token, "/Items/Latest").await;
+    assert_eq!(r3queues_ids(&body), vec![series]);
+    rustyfin_db::repo_user::update_configuration(
+        &state.db,
+        user,
+        &serde_json::json!({ "LatestItemsExcludes": [uuid::Uuid::new_v4().to_string()] }),
+    )
+    .await
+    .unwrap();
+    let (_, body) = r3queues_get(&app, &token, "/Items/Latest").await;
+    assert_eq!(
+        r3queues_ids(&body),
+        vec![series],
+        "another library excluded"
+    );
+    rustyfin_db::repo_user::update_configuration(
+        &state.db,
+        user,
+        &serde_json::json!({ "LatestItemsExcludes": [tv] }),
+    )
+    .await
+    .unwrap();
+    let (_, body) = r3queues_get(&app, &token, "/Items/Latest").await;
+    assert_eq!(r3queues_ids(&body), Vec::<uuid::Uuid>::new());
+    let (_, body) = r3queues_get(&app, &token, &format!("/Items/Latest?parentId={tv}")).await;
+    assert_eq!(
+        r3queues_ids(&body),
+        vec![series],
+        "a parentId reads it anyway"
+    );
+}
+
+/// An administrator asking with a restricted user's `userId` gets what that user may see.
+#[tokio::test]
+async fn r3queues_user_id_lists_follow_that_users_access() {
+    let state = test_state().await;
+    let app = app(state.clone());
+    let (token, _) = admin_session(&state).await;
+    let (series, [e1, e2, _]) = g1f_insert_show(&state).await;
+    let (status, body) = b21_new_user(&app, &token, "r3q-restricted").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let kid: uuid::Uuid = body["Id"].as_str().unwrap().parse().unwrap();
+    let uri = format!("/Users/{kid}/Policy");
+    let policy = serde_json::json!({ "EnableAllFolders": false, "EnabledFolders": [] });
+    let (status, body) = send(&app, request("POST", &uri, Some(&token), Some(policy))).await;
+    assert!(status.is_success(), "{status} {body}");
+    rustyfin_db::repo_playback::mark_played(&state.db, kid, e1)
+        .await
+        .unwrap();
+
+    let (_, body) = r3queues_get(&app, &token, "/Items/Latest").await;
+    assert_eq!(
+        r3queues_ids(&body),
+        vec![series],
+        "the administrator's own row"
+    );
+    for uri in [
+        format!("/Items/Latest?userId={kid}"),
+        format!("/Users/{kid}/Items/Latest"),
+        format!("/Shows/NextUp?userId={kid}"),
+        format!("/Shows/{series}/Episodes?userId={kid}"),
+    ] {
+        let (status, body) = r3queues_get(&app, &token, &uri).await;
+        assert_eq!(status, StatusCode::OK, "{uri}");
+        assert_eq!(r3queues_ids(&body), Vec::<uuid::Uuid>::new(), "{uri}");
+    }
+    // With the library allowed again, the same requests list it.
+    let library = r3queues_library_of(&state, e1).await;
+    let policy = serde_json::json!({ "EnableAllFolders": false, "EnabledFolders": [library] });
+    let (status, _) = send(&app, request("POST", &uri, Some(&token), Some(policy))).await;
+    assert!(status.is_success());
+    let (_, body) = r3queues_get(&app, &token, &format!("/Shows/NextUp?userId={kid}")).await;
+    assert_eq!(r3queues_ids(&body), vec![e2]);
+}
+
+/// `nextUpDateCutoff` reads the newest finished play: a later play still in progress doesn't
+/// keep the series in.
+#[tokio::test]
+async fn r3queues_next_up_cutoff_reads_finished_plays() {
+    let state = test_state().await;
+    let app = app(state.clone());
+    let (token, user) = admin_session(&state).await;
+    let (_, [e1, e2, _]) = g1f_insert_show(&state).await;
+    let old = chrono::DateTime::parse_from_rfc3339("2010-05-01T00:00:00Z")
+        .unwrap()
+        .with_timezone(&chrono::Utc);
+    rustyfin_db::repo_playback::mark_played_on(&state.db, user, e1, Some(old))
+        .await
+        .unwrap();
+    // In progress now, so its play date is today.
+    rustyfin_db::repo_playback::update_playback_position(&state.db, user, e2, 50_000_000)
+        .await
+        .unwrap();
+    let (_, body) = r3queues_get(&app, &token, "/Shows/NextUp?nextUpDateCutoff=2020-01-01").await;
+    assert_eq!(r3queues_ids(&body), Vec::<uuid::Uuid>::new());
+    let (_, body) = r3queues_get(&app, &token, "/Shows/NextUp?nextUpDateCutoff=2010-01-01").await;
+    assert_eq!(r3queues_ids(&body), vec![e2]);
+}

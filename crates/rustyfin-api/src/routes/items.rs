@@ -3216,18 +3216,18 @@ async fn get_latest(
     )
     .await?
     .unwrap_or(claims.sub);
-    latest_page(&state, &claims, user, &params).await
+    latest_page(&state, user, &params).await
 }
 
 /// The "Latest" row (`/Items/Latest`, `/Users/{userId}/Items/Latest`), as Jellyfin's
-/// `UserLibraryController.GetLatestMedia` builds it: `isPlayed` (unset means unplayed only when
-/// the user's `HidePlayedInLatest` is on, and is ignored for a music library), `groupItems`
+/// `UserLibraryController.GetLatestMedia` builds it, for `user` and what that user may see:
+/// `isPlayed` (unset means unplayed only when the user's `HidePlayedInLatest` is on; ignored
+/// when a music library is read), `groupItems`
 /// (default true: two or more new episodes of a series show as the series, new tracks as their
 /// album, each with `ChildCount`), `limit` (default 20) entries, and without `parentId` the
 /// user's `LatestItemsExcludes` libraries left out.
 async fn latest_page(
     state: &AppState,
-    claims: &Claims,
     user: Uuid,
     params: &[(String, String)],
 ) -> Result<Json<Vec<MediaItem>>, ApiError> {
@@ -3259,8 +3259,18 @@ async fn latest_page(
             .flatten()
             .filter_map(|id| id.as_str().and_then(|id| Uuid::parse_str(id).ok()))
             .collect();
+        // Jellyfin ignores the played filter when any library the row reads is music.
+        let policy = crate::parental::user_policy(state, user).await?;
+        let libraries = rustyfin_db::repo_library::get_all_libraries(&state.db_ro).await?;
+        if libraries.iter().any(|l| {
+            l.content_type == rustyfin_model::library::LibraryContentType::Music
+                && !exclude_libraries.contains(&l.id)
+                && policy.allows_folder(&l.id.to_string())
+        }) {
+            is_played = None;
+        }
     }
-    let filter = rustyfin_db::repo_media::LatestFilter {
+    let mut filter = rustyfin_db::repo_media::LatestFilter {
         user_id: Some(user),
         item_types: item_kinds(params, "includeItemTypes")
             .into_iter()
@@ -3269,25 +3279,34 @@ async fn latest_page(
         library_id,
         exclude_libraries,
         is_played,
-        limit: (limit as i64).saturating_mul(5),
-        hidden_ids_json: HiddenItems::for_caller(state, claims).await?.json(),
+        limit: (limit as i64).saturating_mul(5).max(1),
+        offset: 0,
+        hidden_ids_json: HiddenItems::for_user(state, user).await?.json(),
     };
-    let candidates = rustyfin_db::repo_media::get_latest_items(&state.db_ro, &filter).await?;
 
     // Jellyfin's UserViewManager.GetLatestItems: group by container in first-seen order, up to
-    // `limit` groups.
+    // `limit` groups. Pages of candidates are read until there are `limit` groups, so a series
+    // with many new episodes doesn't leave the row short.
     let mut groups: Vec<(Option<Uuid>, Vec<MediaItem>)> = Vec::new();
-    for (item, container) in candidates {
-        if groups.len() >= limit {
+    'pages: while groups.len() < limit {
+        let candidates = rustyfin_db::repo_media::get_latest_items(&state.db_ro, &filter).await?;
+        let last_page = (candidates.len() as i64) < filter.limit;
+        for (item, container) in candidates {
+            if groups.len() >= limit {
+                break 'pages;
+            }
+            match container.filter(|_| group_items) {
+                Some(id) => match groups.iter_mut().find(|(c, _)| *c == Some(id)) {
+                    Some((_, members)) => members.push(item),
+                    None => groups.push((Some(id), vec![item])),
+                },
+                None => groups.push((None, vec![item])),
+            }
+        }
+        if last_page {
             break;
         }
-        match container.filter(|_| group_items) {
-            Some(id) => match groups.iter_mut().find(|(c, _)| *c == Some(id)) {
-                Some((_, members)) => members.push(item),
-                None => groups.push((Some(id), vec![item])),
-            },
-            None => groups.push((None, vec![item])),
-        }
+        filter.offset += filter.limit;
     }
     let mut items = Vec::with_capacity(groups.len());
     let mut child_counts = Vec::with_capacity(groups.len());
@@ -3596,7 +3615,7 @@ async fn get_user_latest(
     Extension(claims): Extension<Claims>,
 ) -> Result<Json<Vec<MediaItem>>, ApiError> {
     let user = path_user(&state, &claims, user_id).await?;
-    latest_page(&state, &claims, user, &params).await
+    latest_page(&state, user, &params).await
 }
 
 async fn get_user_resume(

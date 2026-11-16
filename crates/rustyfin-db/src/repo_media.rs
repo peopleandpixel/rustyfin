@@ -719,6 +719,8 @@ pub struct LatestFilter {
     /// Only played (true) or unplayed (false) items.
     pub is_played: Option<bool>,
     pub limit: i64,
+    /// Rows to skip, to read the next page.
+    pub offset: i64,
     pub hidden_ids_json: Option<String>,
 }
 
@@ -758,13 +760,14 @@ pub async fn get_latest_items(
          FROM media_items m \
          WHERE m.media_type IN (SELECT value FROM json_each(?1)) \
          AND (?2 IS NULL OR m.library_id = ?2) \
-         AND m.library_id NOT IN (SELECT value FROM json_each(?3)) \
+         AND (m.library_id IS NULL OR m.library_id NOT IN (SELECT value FROM json_each(?3))) \
          AND m.extra_type IS NULL \
          AND m.location_type IS NOT 'Virtual' \
          AND (?4 IS NULL OR EXISTS (SELECT 1 FROM user_item_data ud \
               WHERE ud.item_id = m.id AND ud.user_id = ?5 AND ud.played = 1) = ?4) \
          AND {visible} \
-         ORDER BY m.date_created DESC, m.sort_name DESC, m.production_year DESC LIMIT ?7",
+         ORDER BY m.date_created DESC, m.sort_name DESC, m.production_year DESC, m.id \
+         LIMIT ?7 OFFSET ?8",
         visible = crate::repo_parental::visible_sql("m.id", "m.library_id", "?6"),
     )))
     .bind(serde_json::to_string(&kinds).unwrap_or_default())
@@ -774,6 +777,7 @@ pub async fn get_latest_items(
     .bind(filter.user_id.map(|u| u.to_string()))
     .bind(filter.hidden_ids_json.as_deref())
     .bind(filter.limit)
+    .bind(filter.offset)
     .fetch_all(pool)
     .await?;
 
@@ -2956,18 +2960,21 @@ pub async fn get_next_up(
     let uid = user_id.map(|u| u.to_string());
 
     // Candidate series, each with its newest qualifying play.
-    let candidates: Vec<(String, Option<String>)> = match (series_id, uid.as_deref()) {
-        (Some(sid), _) => sqlx::query_scalar::<_, String>(
-            "SELECT id FROM media_items WHERE id = ? AND media_type = 'Series'",
-        )
-        .bind(sid.to_string())
-        .fetch_optional(pool)
-        .await?
-        .map(|id| vec![(id, None)])
-        .unwrap_or_default(),
-        (None, Some(user)) => {
-            sqlx::query_as::<_, (String, Option<String>)>(
-                "SELECT se.parent_id, MAX(ud.last_played_date) \
+    // Each candidate with its newest qualifying play and its newest finished play.
+    let candidates: Vec<(String, Option<String>, Option<String>)> =
+        match (series_id, uid.as_deref()) {
+            (Some(sid), _) => sqlx::query_scalar::<_, String>(
+                "SELECT id FROM media_items WHERE id = ? AND media_type = 'Series'",
+            )
+            .bind(sid.to_string())
+            .fetch_optional(pool)
+            .await?
+            .map(|id| vec![(id, None, None)])
+            .unwrap_or_default(),
+            (None, Some(user)) => {
+                sqlx::query_as::<_, (String, Option<String>, Option<String>)>(
+                    "SELECT se.parent_id, MAX(ud.last_played_date), \
+                 MAX(CASE WHEN ud.played = 1 THEN ud.last_played_date END) \
                  FROM user_item_data ud \
                  JOIN media_items e ON e.id = ud.item_id AND e.media_type = 'Episode' \
                  JOIN media_items se ON se.id = e.parent_id AND se.media_type = 'Season' \
@@ -2975,26 +2982,30 @@ pub async fn get_next_up(
                  AND (ud.played = 1 OR ud.playback_position_ticks > 0) \
                  AND se.parent_id IS NOT NULL \
                  GROUP BY se.parent_id",
-            )
-            .bind(user)
-            .fetch_all(pool)
-            .await?
-        }
-        (None, None) => Vec::new(),
-    };
-    // Jellyfin's `nextUpDateCutoff`: a series whose newest play is older is left out. It does not
-    // apply to `series_id`.
+                )
+                .bind(user)
+                .fetch_all(pool)
+                .await?
+            }
+            (None, None) => Vec::new(),
+        };
+    // Jellyfin's `nextUpDateCutoff`: a series whose newest finished play is older (or that has
+    // none) is left out. It does not apply to `series_id`.
     let candidates: Vec<(String, Option<String>)> = match options.date_cutoff {
         Some(cutoff) if series_id.is_none() => candidates
             .into_iter()
-            .filter(|(_, newest)| {
-                newest
+            .filter(|(_, _, finished)| {
+                finished
                     .as_deref()
                     .and_then(|d| DateTime::parse_from_rfc3339(d).ok())
                     .is_some_and(|d| d.with_timezone(&Utc) >= cutoff)
             })
+            .map(|(series, newest, _)| (series, newest))
             .collect(),
-        _ => candidates,
+        _ => candidates
+            .into_iter()
+            .map(|(series, newest, _)| (series, newest))
+            .collect(),
     };
 
     let mut entries = Vec::new();
