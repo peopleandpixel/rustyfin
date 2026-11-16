@@ -242,8 +242,10 @@ test('the handler leaves Ctrl, Alt and Meta keys, and a control focused by keybo
         for (const key of ['ArrowDown', '5', 'm']) assert.equal(press({ key, target: new Element(match) }).prevented, undefined);
     }
     assert.deepEqual(calls, []);
-    // After a click (no focus ring) and on the sliders the player takes them
-    assert.equal(press({ key: 'ArrowDown', target: new Element('select', false) }).prevented, true);
+    // A menu or text field keeps its keys even after a click; a button after a click, and the sliders, don't
+    assert.equal(press({ key: 'ArrowDown', target: new Element('select', false) }).prevented, undefined);
+    assert.equal(press({ key: 'k', target: new Element('input', false) }).prevented, undefined);
+    assert.equal(press({ key: 'ArrowDown', target: new Element('button', false) }).prevented, true);
     assert.equal(press({ key: 'f' }).prevented, true);
     press({ key: 'Escape', target: new Element('select') });
     assert.deepEqual(calls, ['action', 'action', 'close']);
