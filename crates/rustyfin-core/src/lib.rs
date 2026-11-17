@@ -2,6 +2,7 @@ pub mod chapter_images;
 pub mod config_file;
 pub mod date_backfill;
 pub mod dlna;
+pub mod driver_env;
 pub mod encoding;
 pub mod extras;
 pub mod hwaccel;
