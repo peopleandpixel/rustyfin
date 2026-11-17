@@ -14,6 +14,7 @@ import {
     aspectRatio, setAspectRatio, SEGMENT_TYPES, segmentAction, setSegmentAction, stillWatchingSetting,
     setStillWatchingSetting, stillWatchingDue, burnsInSubtitle,
 } from './playerprefs.js';
+import { lockLandscape, unlockOrientation } from './mobile.js';
 let playerReportInterval = null;
 let playerBars = null;
 
@@ -977,6 +978,7 @@ function playerAreaClick(e) {
 }
 
 function closePlayer() {
+    unlockOrientation();
     const m = $('player-modal');
     if (m) {
         if (typeof m.close === 'function') m.close();
@@ -2067,9 +2069,10 @@ function toggleFullscreen() {
             else video.webkitEnterFullscreen?.();
         };
         const container = $('player-modal')?.querySelector('.jf-player-container');
-        if (container && container.requestFullscreen) container.requestFullscreen().catch(videoOnly);
+        if (container && container.requestFullscreen) container.requestFullscreen().then(lockLandscape).catch(videoOnly);
         else videoOnly();
     } else {
+        unlockOrientation();
         document.exitFullscreen().catch(() => {});
     }
 }
