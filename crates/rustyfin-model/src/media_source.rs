@@ -522,14 +522,15 @@ impl<'de> Deserialize<'de> for MediaStream {
 
 /// A frame rate ("24000/1001", "25/1" or "23.976") as Jellyfin's float, rounded to 3 decimals as
 /// Jellyfin does; null when it is no rate (ffprobe's "0/0")
-fn frame_rate_value(text: &str) -> Option<f32> {
+fn frame_rate_value(text: &str) -> Option<f64> {
     let rate = match text.split_once('/') {
         Some((numerator, denominator)) => {
             numerator.trim().parse::<f64>().ok()? / denominator.trim().parse::<f64>().ok()?
         }
         None => text.trim().parse::<f64>().ok()?,
     };
-    (rate.is_finite() && rate > 0.0).then(|| ((rate * 1000.0).round() / 1000.0) as f32)
+    // An f64, so 24000/1001 goes out as 23.976 and not as an f32's 23.97599983215332
+    (rate.is_finite() && rate > 0.0).then(|| (rate * 1000.0).round() / 1000.0)
 }
 
 fn serialize_frame_rate<S: serde::Serializer>(
@@ -584,8 +585,11 @@ mod tests {
             ..MediaStream::default()
         };
         let json = serde_json::to_value(&stream).unwrap();
-        assert_eq!(json["AverageFrameRate"], serde_json::json!(23.976_f32));
-        assert!(json["AverageFrameRate"].is_f64());
+        assert_eq!(json["AverageFrameRate"], serde_json::json!(23.976));
+        assert_eq!(
+            serde_json::to_string(&json["AverageFrameRate"]).unwrap(),
+            "23.976"
+        );
         assert_eq!(json["RealFrameRate"], serde_json::json!(25.0));
 
         let none = serde_json::to_value(MediaStream {
