@@ -1586,31 +1586,28 @@ const PLAYED_CLAUSE: &str = "(CASE WHEN media_type IN ('Series', 'Season')
         ELSE id IN (SELECT item_id FROM user_item_data WHERE user_id = ? AND played = 1) END)";
 
 /// The Series and Seasons in a library (every library when `library` is empty) that have episodes,
-/// all of them played by the user, as Jellyfin works it out and as `get_unplayed_counts` counts
-/// it, as a JSON list. The episodes are found by library and type, their seasons and series by
-/// primary key, and the user's rows by theirs.
+/// all of them played by the user, as a JSON list. The episodes are those of
+/// `repo_playback::folder_episodes_sql`, the one definition the played badges use too: no virtual
+/// one, and none that `visible` (a `repo_parental::filter_json` filter) hides.
 async fn played_folder_ids(
     pool: &SqlitePool,
     user_id: &str,
     library: &str,
+    visible: Option<&str>,
 ) -> Result<String, sqlx::Error> {
-    let ids: Vec<String> = sqlx::query_scalar(
-        "SELECT ef.folder_id FROM (
-             SELECT e.id AS episode_id, p.id AS folder_id
-             FROM media_items e JOIN media_items p ON p.id = e.parent_id AND p.media_type = 'Season'
-             WHERE e.media_type = 'Episode' AND (?1 = '' OR e.library_id = ?1)
-             UNION ALL
-             SELECT e.id, p.parent_id
-             FROM media_items e JOIN media_items p ON p.id = e.parent_id AND p.media_type = 'Season'
-             WHERE e.media_type = 'Episode' AND (?1 = '' OR e.library_id = ?1)
-               AND p.parent_id IS NOT NULL
-         ) ef
+    let episodes = crate::repo_playback::folder_episodes_sql(
+        |_| "(?1 = '' OR e.library_id = ?1)".to_string(),
+        "?3",
+    );
+    let ids: Vec<String> = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+        "SELECT ef.folder_id FROM ({episodes}) ef
          LEFT JOIN user_item_data ud ON ud.item_id = ef.episode_id AND ud.user_id = ?2
          GROUP BY ef.folder_id
-         HAVING MIN(COALESCE(ud.played, 0)) = 1",
-    )
+         HAVING MIN(COALESCE(ud.played, 0)) = 1"
+    )))
     .bind(library)
     .bind(user_id)
+    .bind(visible)
     .fetch_all(pool)
     .await?;
     Ok(serde_json::to_string(&ids).unwrap_or_else(|_| "[]".to_string()))
@@ -1684,7 +1681,7 @@ pub async fn get_items_filtered(
         } else {
             String::new()
         };
-        played_folder_ids(pool, &uid_str, &library).await?
+        played_folder_ids(pool, &uid_str, &library, hidden_ids_json).await?
     } else {
         "[]".to_string()
     };
@@ -4969,6 +4966,84 @@ mod tests {
         .await
         .unwrap();
         items.into_iter().map(|item| item.name).collect()
+    }
+
+    /// One definition of a played series or season, as in Jellyfin 12.4: a virtual episode and
+    /// one the user may not see never count, for the IsPlayed and IsUnplayed filters as for the
+    /// played badges and counts.
+    #[tokio::test]
+    async fn r3rel_played_folders_skip_virtual_and_hidden_episodes_as_the_badges_do() {
+        let pool = crate::test_pool().await;
+        let user = uuid::Uuid::new_v4();
+        crate::insert_test_user(&pool, user).await;
+        let id = uuid::Uuid::new_v4;
+        let (series_a, season_a, a1, a2, missing) = (id(), id(), id(), id(), id());
+        let (series_b, season_b, b1, hidden) = (id(), id(), id(), id());
+        let rows = [
+            (series_a, "Series", None, 0),
+            (season_a, "Season", Some(series_a), 0),
+            (a1, "Episode", Some(season_a), 0),
+            (a2, "Episode", Some(season_a), 0),
+            (missing, "Episode", Some(season_a), 1),
+            (series_b, "Series", None, 0),
+            (season_b, "Season", Some(series_b), 0),
+            (b1, "Episode", Some(season_b), 0),
+            (hidden, "Episode", Some(season_b), 0),
+        ];
+        sqlx::query(
+            "INSERT INTO libraries (id, name, content_type) VALUES ('lib', 'L', 'tvshows')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        for (item, kind, parent, is_virtual) in rows {
+            sqlx::query(
+                "INSERT INTO media_items (id, name, media_type, path, parent_id, library_id, \
+                 is_virtual_item) VALUES (?1, ?1, ?2, '/x/' || ?1, ?3, 'lib', ?4)",
+            )
+            .bind(item.to_string())
+            .bind(kind)
+            .bind(parent.map(|p| p.to_string()))
+            .bind(is_virtual)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        // Every episode with a file is played but the hidden one; the missing one has no file.
+        for episode in [a1, a2, b1] {
+            crate::repo_playback::mark_played(&pool, user, episode)
+                .await
+                .unwrap();
+        }
+        let hide: std::collections::HashSet<String> = [hidden.to_string()].into();
+        let visible = crate::repo_parental::filter_json(&hide, None);
+        let folders = [series_a, season_a, series_b, season_b];
+        for (filter, played) in [
+            (None, vec![series_a, season_a]),
+            (
+                visible.as_deref(),
+                vec![series_a, season_a, series_b, season_b],
+            ),
+        ] {
+            let listed: Vec<String> = serde_json::from_str(
+                &super::played_folder_ids(&pool, &user.to_string(), "", filter)
+                    .await
+                    .unwrap(),
+            )
+            .unwrap();
+            let counts = crate::repo_playback::get_unplayed_counts(&pool, user, &folders, filter)
+                .await
+                .unwrap();
+            for folder in folders {
+                let id = folder.to_string();
+                let expected = played.contains(&folder);
+                assert_eq!(listed.contains(&id), expected, "filter {filter:?}: {id}");
+                let badge = counts
+                    .get(&id)
+                    .is_some_and(|c| crate::repo_playback::folder_played(*c));
+                assert_eq!(badge, expected, "badge {filter:?}: {id}");
+            }
+        }
     }
 
     #[tokio::test]
