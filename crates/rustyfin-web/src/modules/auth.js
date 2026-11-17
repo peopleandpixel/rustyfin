@@ -4,6 +4,7 @@ import { currentPage, navigate, closeUserMenu } from './router.js';
 import { renderSettings } from './settings.js';
 import { loadUserSettings } from './user-settings.js';
 import { jiChoice, jiConfirm, jiShownCodes } from './jellyfin-import.js';
+import { showLoginDisclaimer } from './branding.js';
 import { loadSidebar, initScanProgressWebSocket, stopScanProgressWebSocket } from './library-admin.js';
 
 // --- OpenID Connect: helpers for the sign-in page and the profile ---
@@ -177,6 +178,7 @@ function loginCard(title, subtitle, body, wide = false) {
                 <p class="text-white/40 text-xs mt-1">${escapeHtml(subtitle)}</p>
             </div>
             ${body}
+            <p id="login-disclaimer" class="hidden mt-6 text-xs text-white/50 text-center whitespace-pre-line"></p>
         </div>
     </div>`;
 }
@@ -242,6 +244,7 @@ function showLoginStep(step, name = '') {
         tiles,
     ));
     loadOidcSignIn();
+    showLoginDisclaimer($('login-disclaimer'));
     if (tiles) document.querySelector('#page-login [data-login="user"]')?.focus();
     else (name ? $('login-pass') : $('login-user'))?.focus();
 }
@@ -269,23 +272,11 @@ function renderLogin(data) {
     }).catch(() => { loginUsers = []; });
 }
 
-// A tile: a user without a password signs in at once, as in Jellyfin Web; the others get the form with
-// their name filled in and the password field focused
-async function signInFromTile(userId) {
+// A tile opens the form with the user's name filled in and the password field focused, as Jellyfin Web 12.4
+// does for every user (an empty password still signs in from there)
+function signInFromTile(userId) {
     const user = loginUsers.find(u => u.Id === userId);
-    if (!user) return;
-    if (user.HasPassword === false) {
-        try {
-            await API.login(user.Name, '');
-        } catch (err) {
-            showLoginStep('manual', user.Name);
-            showLoginError(err.status === 403 ? t('oidc.password_sign_in_off') : err.message);
-            return;
-        }
-        await finishSignIn();
-        return;
-    }
-    showLoginStep('manual', user.Name);
+    if (user) showLoginStep('manual', user.Name);
 }
 
 // The page's own buttons (data-login): the tiles, Manual login, back to the tiles and Forgot password
@@ -379,9 +370,9 @@ async function submitForgotPin(e) {
     try {
         const result = await API.redeemResetPin(pin);
         input.value = '';
-        // Outside the local network the server tries no PIN, and answers Jellyfin's failed result
+        // Jellyfin Web shows any failed result as an invalid PIN
         if (result.Success === false) {
-            forgotMessage(t('login.forgot_in_network'), 'error');
+            forgotMessage(t('login.pin_invalid'), 'error');
             return;
         }
         // The PIN is the new password now

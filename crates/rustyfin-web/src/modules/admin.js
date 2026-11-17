@@ -8,11 +8,13 @@ import { sessionsPanelHtml, followSessions, unfollowSessions } from './sessions.
 import { playbackPanelHtml, loadPlaybackAdmin } from './playback-admin.js';
 import { dlnaPanelHtml, loadDlnaAdmin } from './dlna-admin.js';
 import { serverDetailsHtml, generalPanelHtml, loadGeneralSettings, triggerSummary } from './dashboard.js';
+import { SERVER_ADMIN_TABS, SERVER_ADMIN_LOADERS, serverAdminPanelsHtml } from './server-admin.js';
 
 // The dashboard's tab panels, in the order of their tab buttons
 const ADMIN_TABS = [
     'admin-overview', 'admin-general', 'admin-users', 'admin-libs', 'admin-playback', 'admin-tasks', 'admin-plugins',
-    'admin-sessions', 'admin-activity', 'admin-livelog', 'admin-signin', 'admin-import', 'admin-dlna',
+    'admin-sessions', 'admin-activity', 'admin-livelog', 'admin-signin', 'admin-import', 'admin-network',
+    'admin-apikeys', 'admin-devices', 'admin-branding', 'admin-backups', 'admin-dlna',
 ];
 
 async function renderAdmin(tab) {
@@ -38,7 +40,8 @@ async function renderAdmin(tab) {
         ]);
         const accountById = new Map(accounts.map(a => [oidcAccountKey(a.UserId), a]));
 
-        const tabs = [t('admin.overview'), t('dashboard.general'), t('admin.users'), t('admin.libraries'), t('admin.playback'), t('admin.tasks'), t('admin.plugins'), t('admin.sessions'), t('admin.activity_log_tab'), t('admin.live_log'), t('oidc.admin_tab'), t('jellyfin_import.tab'), t('dlna_admin.tab')];
+        const tabs = [t('admin.overview'), t('dashboard.general'), t('admin.users'), t('admin.libraries'), t('admin.playback'), t('admin.tasks'), t('admin.plugins'), t('admin.sessions'), t('admin.activity_log_tab'), t('admin.live_log'), t('oidc.admin_tab'), t('jellyfin_import.tab'),
+            t('server_admin.tab_network'), t('server_admin.tab_api_keys'), t('server_admin.tab_devices'), t('server_admin.tab_branding'), t('server_admin.tab_backups'), t('dlna_admin.tab')];
         const tabIds = ADMIN_TABS;
 
         page.innerHTML = `
@@ -173,7 +176,7 @@ async function renderAdmin(tab) {
                                 <td class="py-3 text-right space-x-2">
                                     <button class="text-[#00a4dc] hover:text-[#38bdf8]" data-action="scan-library-admin" data-id="${escapeHtml(l.id || l.Id)}">${t('admin.scan')}</button>
                                     <button class="text-[#00a4dc] hover:text-[#38bdf8]" data-action="edit-library" data-id="${escapeHtml(l.id || l.Id)}" aria-label="${escapeHtml(t('dashboard.edit_library_title', { name: l.name || l.Name }))}">${t('dashboard.edit_library')}</button>
-                                    <button class="text-[#00a4dc] hover:text-[#38bdf8]" data-action="library-options" data-id="${escapeHtml(l.id || l.Id)}" data-name="${escapeHtml(l.name || l.Name)}" aria-label="${escapeHtml(t('library.options_for', { name: l.name || l.Name }))}">${t('library.options_button')}</button>
+                                    <button class="text-[#00a4dc] hover:text-[#38bdf8]" data-action="library-options" data-id="${escapeHtml(l.id || l.Id)}" data-name="${escapeHtml(l.name || l.Name)}" data-type="${escapeHtml(l.CollectionType || '')}" aria-label="${escapeHtml(t('library.options_for', { name: l.name || l.Name }))}">${t('library.options_button')}</button>
                                     <button class="text-red-400 hover:text-red-300" data-action="delete-library" data-id="${escapeHtml(l.id || l.Id)}">${t('common.delete')}</button>
                                 </td>
                             </tr>`).join('')}
@@ -280,6 +283,9 @@ async function renderAdmin(tab) {
 
             <!-- DLNA: the server switch and the user DLNA devices browse as, filled by loadDlnaAdmin -->
             ${dlnaPanelHtml()}
+
+            <!-- Networking, API keys, Devices, Branding and Backups, filled by server-admin.js -->
+            ${serverAdminPanelsHtml()}
         </div>`;
         // #admin/import opens the import tab (the wizard's last step sends the admin there), and
         // #admin/playback the playback tab
@@ -287,6 +293,8 @@ async function renderAdmin(tab) {
         if (tab === 'playback') showAdminTab(page.querySelector('[data-tab="admin-playback"]'), 'admin-playback');
         if (tab === 'general') showAdminTab(page.querySelector('[data-tab="admin-general"]'), 'admin-general');
         if (tab === 'libraries') showAdminTab(page.querySelector('[data-tab="admin-libs"]'), 'admin-libs');
+        // #admin/network, #admin/apikeys, #admin/devices, #admin/branding and #admin/backups
+        if (SERVER_ADMIN_TABS.includes(`admin-${tab}`)) showAdminTab(page.querySelector(`[data-tab="admin-${tab}"]`), `admin-${tab}`);
     } catch (e) {
         page.innerHTML = `<div class="p-6 rounded-xl bg-red-500/10 text-red-400">${escapeHtml(e.message)}</div>`;
     }
@@ -314,6 +322,7 @@ function showAdminTab(btn, tabId) {
     if (tabId === 'admin-general') loadGeneralSettings();
     if (tabId === 'admin-import') loadJellyfinImport();
     if (tabId === 'admin-dlna') loadDlnaAdmin();
+    SERVER_ADMIN_LOADERS[tabId]?.();
 }
 
 // An administrator changes another user's role or disabled state. The checkbox is disabled while the request runs, the users list cache is dropped, and the users tab is shown again after the page is rendered.

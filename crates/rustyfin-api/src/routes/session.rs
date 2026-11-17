@@ -431,7 +431,8 @@ async fn send_device_command(
     // The device owner's session on it, which its sockets joined
     let session = match owner {
         Some(owner) => {
-            rustyfin_db::repo_session::find_device_session(&state.db_ro, owner, &device_id).await?
+            rustyfin_db::repo_session::find_device_session(&state.db_ro, owner, &device_id, None)
+                .await?
         }
         None => None,
     }
