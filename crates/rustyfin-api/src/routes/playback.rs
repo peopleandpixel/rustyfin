@@ -222,9 +222,11 @@ async fn report_start(
     );
     // Jellyfin writes user data only for an item it finds, and has no now-playing item for one it
     // does not (SessionManager.OnPlaybackStart), so a non-media id stores nothing and reports null.
-    let media_type = reported_item(&state, claims.sub, req.item_id)
-        .await?
-        .map(|item| item.media_type);
+    let item = reported_item(&state, claims.sub, req.item_id).await?;
+    if let Some(item) = &item {
+        notify_playback(&state, claims.sub, item, true).await;
+    }
+    let media_type = item.map(|item| item.media_type);
     let is_media = media_type.is_some();
     if let Some(media_type) = media_type {
         let position = req.position_ticks.unwrap_or(0);
@@ -384,6 +386,9 @@ async fn report_stop(
         "Playback stopped"
     );
     record_stop(&state, claims.sub, &req).await?;
+    if let Some(item) = reported_item(&state, claims.sub, req.item_id).await? {
+        notify_playback(&state, claims.sub, &item, false).await;
+    }
     // The playback's transcodes end with it, as in Jellyfin, rather than at the stall sweep
     if let Some(psid) = req.play_state.play_session_id.as_deref() {
         let stopped = state.transcode_manager.stop_reported_playback(psid).await;
@@ -400,6 +405,43 @@ async fn report_stop(
     }
 
     Ok(())
+}
+
+/// Tells the notification providers that `user` started (or stopped) playing `item`, as
+/// Jellyfin's VideoPlayback and AudioPlayback events (and their Stopped ones) do.
+async fn notify_playback(state: &AppState, user: Uuid, item: &MediaItem, started: bool) {
+    use rustyfin_core::plugin_manager::NotificationEvent;
+    if state
+        .plugin_manager
+        .notification_providers()
+        .await
+        .is_empty()
+    {
+        return;
+    }
+    let audio = item.media_type == rustyfin_model::media::MediaType::Audio;
+    let event = match (audio, started) {
+        (true, true) => NotificationEvent::AudioPlayback,
+        (true, false) => NotificationEvent::AudioPlaybackStopped,
+        (false, true) => NotificationEvent::VideoPlayback,
+        (false, false) => NotificationEvent::VideoPlaybackStopped,
+    };
+    let who = match rustyfin_db::repo_user::get_user_by_id(&state.db_ro, user).await {
+        Ok(Some(found)) => found.name,
+        _ => "Someone".to_string(),
+    };
+    let (title, message) = if started {
+        (
+            "Playback started",
+            format!("{who} is playing {}", item.name),
+        )
+    } else {
+        (
+            "Playback stopped",
+            format!("{who} has finished playing {}", item.name),
+        )
+    };
+    state.plugin_manager.notify(event, title, &message);
 }
 
 /// The watch data of a stop: `user`'s position, played state and track choice for the item, by

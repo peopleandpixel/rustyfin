@@ -240,8 +240,32 @@ pub struct NotificationProviderHandle {
     pub plugin_id: String,
     pub priority: i32,
     pub status: PluginStatus,
-    #[allow(dead_code)]
     send_notification: SendNotificationFn,
+}
+
+/// The events a notification provider is told about: those of Jellyfin 12.4's `NotificationType`
+/// that Rustyfin has (it has no plugin installs, updates, login lockout or pending restart).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NotificationEvent {
+    /// A scheduled task failed
+    TaskFailed,
+    /// A scan added playable items
+    NewLibraryContent,
+    /// Someone started playing a video or an audio item
+    VideoPlayback,
+    AudioPlayback,
+    /// Someone stopped playing it
+    VideoPlaybackStopped,
+    AudioPlaybackStopped,
+}
+
+impl NotificationEvent {
+    fn priority(self) -> NotificationPriority {
+        match self {
+            NotificationEvent::TaskFailed => NotificationPriority::High,
+            _ => NotificationPriority::Normal,
+        }
+    }
 }
 
 /// Install the built-in TMDb plugin. It is enabled by a key (`RUSTYFIN_TMDB_API_KEY` or a saved
@@ -284,6 +308,121 @@ pub async fn install_fanart_plugin(pm: &PluginManager) {
     install_keyed_plugin(pm, plugin, "Fanart.tv", false, None, move |p| async move {
         plugin_fanart::register_fanart_provider(&p, pm).await
     })
+    .await;
+}
+
+/// Install the other built-in plugins: Trakt, TheTVDB, Local NFO, OpenSubtitles, Podnapisi,
+/// MQTT, ntfy, Pushover and Webhook. Each is disabled unless a saved status enables it. Its
+/// provider is registered whatever its config and reads the plugin's current config on each
+/// call, so a config saved later takes effect at once, without a restart.
+pub async fn install_other_plugins(pm: &PluginManager) {
+    install_configurable_plugin(pm, plugin_trakt::TraktPlugin::default(), |p| async move {
+        plugin_trakt::register_trakt_provider(&p, pm).await
+    })
+    .await;
+    install_configurable_plugin(pm, plugin_tvdb::TvdbPlugin::default(), |p| async move {
+        plugin_tvdb::register_tvdb_provider(&p, pm).await;
+        Ok(())
+    })
+    .await;
+    install_configurable_plugin(
+        pm,
+        plugin_local_nfo::LocalNfoPlugin::default(),
+        |p| async move {
+            plugin_local_nfo::register_local_nfo_provider(&p, pm).await;
+            Ok(())
+        },
+    )
+    .await;
+    install_configurable_plugin(
+        pm,
+        plugin_opensubtitles::OpenSubtitlesPlugin::default(),
+        |p| async move {
+            plugin_opensubtitles::register_opensubtitles_provider(&p, pm).await;
+            Ok(())
+        },
+    )
+    .await;
+    install_configurable_plugin(
+        pm,
+        plugin_podnapisi::PodnapisiPlugin::default(),
+        |p| async move {
+            plugin_podnapisi::register_podnapisi_provider(&p, pm).await;
+            Ok(())
+        },
+    )
+    .await;
+    install_configurable_plugin(pm, plugin_mqtt::MqttPlugin::default(), |p| async move {
+        plugin_mqtt::register_mqtt_provider(&p, pm).await
+    })
+    .await;
+    install_configurable_plugin(pm, plugin_ntfy::NtfyPlugin::default(), |p| async move {
+        plugin_ntfy::register_ntfy_provider(&p, pm).await
+    })
+    .await;
+    install_configurable_plugin(
+        pm,
+        plugin_pushover::PushoverPlugin::default(),
+        |p| async move { plugin_pushover::register_pushover_provider(&p, pm).await },
+    )
+    .await;
+    install_configurable_plugin(
+        pm,
+        plugin_webhook::WebhookPlugin::default(),
+        |p| async move { plugin_webhook::register_webhook_provider(&p, pm).await },
+    )
+    .await;
+}
+
+/// Installs a built-in plugin that has no API key gate: the saved config is applied, the saved
+/// status is kept (Disabled when none), the provider is registered, and each later save of the
+/// config is applied to the plugin, whose provider reads it on its next call.
+async fn install_configurable_plugin<P, F, Fut>(pm: &PluginManager, plugin: P, register: F)
+where
+    P: Plugin + 'static,
+    F: FnOnce(Arc<P>) -> Fut,
+    Fut: Future<Output = Result<(), String>>,
+{
+    let plugin = Arc::new(plugin);
+    let id = plugin.id().to_string();
+    let saved = pm.load_plugin_config_from_db(&id).await;
+    if let Some(config) = &saved
+        && let Err(e) = Plugin::set_configuration(plugin.as_ref(), config.clone())
+    {
+        tracing::warn!("failed to apply saved config for {}: {}", id, e);
+    }
+    let status = match saved
+        .as_ref()
+        .and_then(|c| c.get("status"))
+        .and_then(|v| v.as_str())
+    {
+        Some("Active") => PluginStatus::Active,
+        Some("Malfunctioned") => PluginStatus::Malfunctioned,
+        _ => PluginStatus::Disabled,
+    };
+    pm.register_builtin_plugin(BuiltinPluginInfo {
+        name: plugin.name().to_string(),
+        version: plugin.version().to_string(),
+        id: id.clone(),
+        description: plugin.description().to_string(),
+        plugin_type: plugin.plugin_type(),
+        status,
+    })
+    .await;
+    if let Err(e) = register(plugin.clone()).await {
+        tracing::debug!("{} plugin not registered as provider: {}", id, e);
+    }
+    let hook_plugin = plugin.clone();
+    pm.register_config_hook(
+        &id,
+        Arc::new(move |config: &serde_json::Value| {
+            if let Err(e) = Plugin::set_configuration(hook_plugin.as_ref(), config.clone()) {
+                tracing::warn!("failed to apply {} config: {}", hook_plugin.id(), e);
+            }
+            // The status stays as the admin set it
+            None
+        }),
+    )
     .await;
 }
 
@@ -1116,6 +1255,36 @@ impl PluginManager {
     }
 
     /// Returns the list of registered notification providers that are currently active.
+    /// Sends `event` to every enabled notification provider (MQTT, ntfy, Pushover, Webhook) in the
+    /// background. A provider's failure is logged, never the caller's.
+    pub fn notify(&self, event: NotificationEvent, title: &str, message: &str) {
+        let pm = self.clone();
+        let (title, message) = (title.to_string(), message.to_string());
+        tokio::spawn(async move { pm.send_notification(event, &title, &message).await });
+    }
+
+    /// `notify`, done when every provider has answered; returns how many sent it.
+    pub async fn send_notification(
+        &self,
+        event: NotificationEvent,
+        title: &str,
+        message: &str,
+    ) -> usize {
+        let priority = event.priority();
+        let mut sent = 0;
+        for provider in self.notification_providers().await {
+            match (provider.send_notification)(title, message, priority).await {
+                Ok(()) => sent += 1,
+                Err(e) => tracing::warn!(
+                    plugin = %provider.plugin_id,
+                    event = ?event,
+                    "notification not sent: {e}"
+                ),
+            }
+        }
+        sent
+    }
+
     pub async fn notification_providers(&self) -> Vec<NotificationProviderHandle> {
         let inner = self.inner.read().await;
         inner

@@ -8,7 +8,7 @@ use rustyfin_model::plugin::{NotificationPriority, Plugin, PluginType};
 use serde::{Deserialize, Serialize};
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 /// A single webhook endpoint configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -40,7 +40,8 @@ pub struct WebhookHeader {
 
 /// Webhook notification provider plugin.
 pub struct WebhookPlugin {
-    config: Mutex<Option<WebhookPluginConfig>>,
+    /// Shared with the registered provider, which reads the current config on each send
+    config: Arc<Mutex<Option<WebhookPluginConfig>>>,
 }
 
 /// Configuration for the webhook plugin.
@@ -64,7 +65,7 @@ fn default_timeout() -> u64 {
 impl Default for WebhookPlugin {
     fn default() -> Self {
         Self {
-            config: Mutex::new(None),
+            config: Arc::new(Mutex::new(None)),
         }
     }
 }
@@ -111,12 +112,6 @@ impl Plugin for WebhookPlugin {
 
     fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
         self
-    }
-}
-
-impl WebhookPlugin {
-    fn config(&self) -> Option<WebhookPluginConfig> {
-        self.config.lock().unwrap().clone()
     }
 }
 
@@ -232,9 +227,7 @@ pub async fn send_notification(
 #[cfg(feature = "dynamic")]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rustyfin_plugin_create() -> *mut std::ffi::c_void {
-    let plugin: Box<dyn Plugin> = Box::new(WebhookPlugin {
-        config: Mutex::new(None),
-    });
+    let plugin: Box<dyn Plugin> = Box::new(WebhookPlugin::default());
     Box::into_raw(Box::new(plugin)).cast()
 }
 
@@ -261,8 +254,8 @@ pub async fn register_webhook_provider<P>(
 where
     P: NotificationProviderRegistrar,
 {
-    let config = plugin.config().ok_or("Webhook plugin not configured")?;
-    let config1 = config.clone();
+    // Always registers; each send reads the plugin's current config, and fails without one
+    let config1 = plugin.config.clone();
     let plugin_id = plugin.id().to_string();
 
     plugin_manager
@@ -272,12 +265,13 @@ where
                   message: &str,
                   priority: NotificationPriority|
                   -> Pin<Box<dyn Future<Output = Result<(), String>> + Send>> {
-                let config = config1.clone();
+                let config = config1.lock().unwrap().clone();
                 let title = title.to_string();
                 let message = message.to_string();
-                Box::pin(
-                    async move { send_notification(&config, &title, &message, priority).await },
-                )
+                Box::pin(async move {
+                    let config = config.ok_or("Webhook plugin not configured")?;
+                    send_notification(&config, &title, &message, priority).await
+                })
             },
         )
         .await;
