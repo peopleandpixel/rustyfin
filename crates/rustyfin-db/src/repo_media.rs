@@ -680,6 +680,26 @@ pub async fn delete_item_rows_in(
     Ok(result.rows_affected() > 0)
 }
 
+/// The item `id` and all its descendants (a series' seasons and episodes, an album's tracks), or
+/// nothing for an unknown id.
+pub async fn subtree_ids(pool: &SqlitePool, id: Uuid) -> Result<Vec<Uuid>, sqlx::Error> {
+    let ids: Vec<String> = sqlx::query_scalar(
+        "WITH RECURSIVE tree(id) AS (
+            SELECT id FROM media_items WHERE id = ?1
+            UNION
+            SELECT m.id FROM media_items m JOIN tree t ON m.parent_id = t.id
+        )
+        SELECT id FROM tree",
+    )
+    .bind(id.to_string())
+    .fetch_all(pool)
+    .await?;
+    Ok(ids
+        .iter()
+        .filter_map(|id| Uuid::parse_str(id).ok())
+        .collect())
+}
+
 /// Deletes the item `id` and all its descendants, deepest first, in one write transaction.
 /// Returns whether the item itself existed.
 pub async fn delete_item(pool: &SqlitePool, id: Uuid) -> Result<bool, sqlx::Error> {

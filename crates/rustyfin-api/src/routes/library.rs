@@ -554,7 +554,8 @@ async fn remove_library(
     }
     rustyfin_core::local_images::remove_orphaned_covers(&state.db, &covers).await;
     rustyfin_core::lyrics::remove_orphaned_uploads(&state.db, &lyrics).await;
-    state.cache.invalidate_library_lists();
+    // Its items are gone: none of them may be served from a cache
+    state.cache.library_changed(&state.image_cache);
     crate::routes::streaming::forget_library_roots(&state);
     state.task_scheduler.watcher().libraries_changed();
     Ok(Json(json!({ "status": "ok" })))
@@ -652,8 +653,7 @@ pub(crate) async fn run_claimed_scan(
     .map_err(|e| ApiError::Internal(e.to_string()))?;
 
     // Invalidate caches after scan
-    state.cache.invalidate_on_scan();
-    state.image_cache.invalidate_all();
+    state.cache.library_changed(&state.image_cache);
     broadcast_event(
         state,
         WsEvent::LibraryChanged {
@@ -735,8 +735,7 @@ async fn refresh_all(State(state): State<AppState>) -> Result<Json<Value>, ApiEr
         )
         .await;
         // Caches are cleared after each library's scan, before its LibraryChanged, as scan_library does.
-        state.cache.invalidate_on_scan();
-        state.image_cache.invalidate_all();
+        state.cache.library_changed(&state.image_cache);
         match result {
             Ok(count) => {
                 tracing::info!(
@@ -1055,7 +1054,7 @@ async fn remove_folders(
             rustyfin_core::scan_sync::remove_items_under(&state.db, lib.id, folder, &kept).await?;
         tracing::info!(library = %lib.id, folder, gone, "removed the items of a folder taken out of the library");
     }
-    state.cache.invalidate_library_lists();
+    state.cache.library_changed(&state.image_cache);
     Ok(())
 }
 

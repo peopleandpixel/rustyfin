@@ -1050,7 +1050,10 @@ async fn upload_subtitle(
                 .await?;
         }
     }
-    state.cache.invalidate_item(&id.to_string());
+    state
+        .cache
+        .item_changed(&state.db, &state.image_cache, id)
+        .await;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -1073,7 +1076,10 @@ async fn delete_subtitle(
         }
     }
     rustyfin_db::repo_media_source::delete_external_stream(&state.db, &id, &stored).await?;
-    state.cache.invalidate_item(&id.to_string());
+    state
+        .cache
+        .item_changed(&state.db, &state.image_cache, id)
+        .await;
     Ok(StatusCode::NO_CONTENT)
 }
 

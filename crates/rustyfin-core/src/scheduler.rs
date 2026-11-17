@@ -70,8 +70,8 @@ fn skipped(id: &str) {
     );
 }
 
-/// The callback that runs when a scheduled library scan ends.
-type OnScan = Arc<dyn Fn() + Send + Sync>;
+/// The callback that runs when a scheduled task that writes items ends.
+type OnItemsChanged = Arc<dyn Fn() + Send + Sync>;
 
 #[derive(Clone)]
 struct TaskEntry {
@@ -86,7 +86,7 @@ pub struct TaskScheduler {
     scans: ScanRegistry,
     changes: ChangeQueue,
     watcher: LibraryWatcher,
-    on_scan: Arc<std::sync::RwLock<Option<OnScan>>>,
+    on_items_changed: Arc<std::sync::RwLock<Option<OnItemsChanged>>>,
     plugin_manager: crate::plugin_manager::PluginManager,
     http_client: reqwest::Client,
     /// The image tasks and intro detection running, each with the handle that stops it.
@@ -493,7 +493,7 @@ impl TaskScheduler {
             scans: ScanRegistry::new(),
             changes,
             watcher,
-            on_scan: Arc::new(std::sync::RwLock::new(None)),
+            on_items_changed: Arc::new(std::sync::RwLock::new(None)),
             plugin_manager,
             http_client,
             image_runs: Arc::new(std::sync::Mutex::new(HashMap::new())),
@@ -540,14 +540,28 @@ impl TaskScheduler {
         }
     }
 
-    /// Sets the callback that runs once each time the scheduled library scan ends, whether or
-    /// not a library failed. The server uses it to clear the caches a scan can change.
-    pub fn set_on_scan(&self, f: impl Fn() + Send + Sync + 'static) {
+    /// Sets the callback that runs once each time a scheduled task that writes items ends,
+    /// whether or not it failed: the library scan, the metadata refresh and the missing episodes.
+    /// The server uses it to clear the caches those items are in.
+    pub fn set_on_items_changed(&self, f: impl Fn() + Send + Sync + 'static) {
         let mut slot = self
-            .on_scan
+            .on_items_changed
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         *slot = Some(Arc::new(f));
+    }
+
+    /// Runs the `set_on_items_changed` callback, if any.
+    fn items_changed(&self) {
+        // Cloned out of the lock so the callback never runs while the lock is held.
+        let callback = self
+            .on_items_changed
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        if let Some(f) = callback {
+            f();
+        }
     }
 
     /// The library scans in progress.
@@ -895,6 +909,7 @@ impl TaskScheduler {
             start_time_utc: start.to_rfc3339(),
             end_time_utc: Utc::now().to_rfc3339(),
         };
+        self.items_changed();
         self.set_task_result(TASK_MISSING_EPISODES, result).await;
         self.set_task_state(TASK_MISSING_EPISODES, TaskState::Idle)
             .await;
@@ -1110,15 +1125,7 @@ impl TaskScheduler {
             }
         };
 
-        // Cloned out of the lock so the callback never runs while the lock is held.
-        let on_scan = self
-            .on_scan
-            .read()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clone();
-        if let Some(f) = on_scan {
-            f();
-        }
+        self.items_changed();
 
         self.set_task_result(TASK_LIBRARY_SCAN, result).await;
         self.set_task_state(TASK_LIBRARY_SCAN, TaskState::Idle)
@@ -1483,6 +1490,7 @@ impl TaskScheduler {
             }
         };
 
+        self.items_changed();
         self.set_task_result(TASK_METADATA_REFRESH, result).await;
         self.set_task_state(TASK_METADATA_REFRESH, TaskState::Idle)
             .await;
