@@ -84,14 +84,20 @@ async fn main() {
     );
 
     // Validate FFmpeg exists and is accessible
-    if let Ok(ffmpeg_path) = std::env::var("RUSTYFIN_FFMPEG_PATH") {
-        if !std::path::Path::new(&ffmpeg_path).exists() {
+    // Every spawn takes its programs from `media_tools`, so this checks what will run
+    let tools = rustyfin_core::media_tools::current();
+    if tools.custom {
+        let ffmpeg_path = tools.ffmpeg.display();
+        if !tools.ffmpeg.exists() {
             tracing::warn!(
                 "FFmpeg path '{}' does not exist — transcoding will fail",
                 ffmpeg_path
             );
         } else {
-            tracing::info!("FFmpeg found at: {}", ffmpeg_path);
+            tracing::info!(
+                "FFmpeg found at: {ffmpeg_path} (ffprobe: {})",
+                tools.ffprobe.display()
+            );
         }
     } else if which::which("ffmpeg").is_ok() {
         tracing::info!("FFmpeg found in PATH");

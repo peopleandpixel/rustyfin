@@ -291,7 +291,7 @@ impl TranscodeManager {
         Self {
             sessions: Arc::new(DashMap::new()),
             cache_root: data_dir.join("transcodes"),
-            ffmpeg: PathBuf::from("ffmpeg"),
+            ffmpeg: crate::media_tools::ffmpeg(),
             playlist_wait: Duration::from_secs(30),
             start_lock: Arc::new(tokio::sync::Mutex::new(())),
             closed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -1139,6 +1139,33 @@ impl TranscodeManager {
             .collect();
         drop(start_lock);
 
+        let mut stopped = 0;
+        for id in matching {
+            if self.stop_session(id).await {
+                stopped += 1;
+            }
+        }
+        stopped
+    }
+
+    /// Kill the transcodes of a playback the client reported stopped (`/Sessions/Playing/Stopped`),
+    /// as Jellyfin 12.4's `KillTranscodingJobs` does: those of `play_session_id`, their files
+    /// deleted. Unlike `stop_play_session`, a later start of that play session isn't refused:
+    /// a client may play on with it. Returns how many were stopped; none for an empty id.
+    pub async fn stop_reported_playback(&self, play_session_id: &str) -> usize {
+        if play_session_id.trim().is_empty() {
+            return 0;
+        }
+        let matching: Vec<Uuid> = self
+            .sessions
+            .iter()
+            .filter(|e| {
+                e.value()
+                    .play_session_id
+                    .eq_ignore_ascii_case(play_session_id)
+            })
+            .map(|e| *e.key())
+            .collect();
         let mut stopped = 0;
         for id in matching {
             if self.stop_session(id).await {
@@ -4595,6 +4622,24 @@ exec sleep 30
         // Saving the options tries the hardware again
         mgr.set_encoding_settings(mgr.encoding_settings());
         assert!(hw("/in.mkv").await && hw("/other.mkv").await);
+        mgr.stop_all().await;
+    }
+
+    /// A reported playback stop ends the transcodes of its play session only, and a later start
+    /// of that play session isn't refused.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn r3hwaccel_reported_stop_kills_only_that_play_session() {
+        let (_dir, mgr) = fake_manager("good", Duration::from_secs(10));
+        let (a, b) = (Uuid::new_v4(), Uuid::new_v4());
+        start(&mgr, a, "ps-a", "dev").await.unwrap();
+        start(&mgr, b, "ps-b", "dev").await.unwrap();
+        assert_eq!(mgr.stop_reported_playback("").await, 0);
+        assert_eq!(mgr.stop_reported_playback("PS-A").await, 1);
+        assert!(!mgr.is_active(a).await);
+        assert!(mgr.is_active(b).await, "the other play session runs on");
+        start(&mgr, a, "ps-a", "dev").await.unwrap();
+        assert!(mgr.is_active(a).await);
         mgr.stop_all().await;
     }
 
