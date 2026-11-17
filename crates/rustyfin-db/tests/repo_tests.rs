@@ -613,6 +613,8 @@ async fn test_get_items_filtered_no_overflow() {
         None,
         None,
         None,
+        None,
+        None,
     )
     .await
     .unwrap();
@@ -671,6 +673,8 @@ async fn r3player_random_sort_returns_every_match() {
                 start,
                 limit,
                 true,
+                None,
+                None,
                 None,
                 None,
                 None,
@@ -1129,6 +1133,8 @@ async fn test_filtered_query_with_genres_and_tags() {
         None,
         None,
         None,
+        None,
+        None,
     )
     .await
     .unwrap();
@@ -1154,8 +1160,8 @@ async fn test_filtered_query_with_name_starts_with() {
         (Uuid::new_v4(), "The Meridian", "Meridian, The"),
         (
             Uuid::new_v4(),
-            "2001: A Space Odyssey",
-            "2001: A Space Odyssey",
+            "2001: A Copper Orbit",
+            "2001: A Copper Orbit",
         ),
     ];
 
@@ -1191,6 +1197,8 @@ async fn test_filtered_query_with_name_starts_with() {
         0,
         100,
         false,
+        None,
+        None,
         None,
         None,
         None,
@@ -1243,6 +1251,8 @@ async fn test_filtered_query_with_name_starts_with() {
         None,
         None,
         None,
+        None,
+        None,
     )
     .await
     .unwrap();
@@ -1250,7 +1260,7 @@ async fn test_filtered_query_with_name_starts_with() {
     assert_eq!(total_m, 1);
     assert_eq!(items_m[0].name, "The Meridian");
 
-    // Filter by '#' (matches numbers / symbols like "2001: A Space Odyssey")
+    // Filter by '#' (matches numbers / symbols like "2001: A Copper Orbit")
     let (items_hash, total_hash) = rustyfin_db::repo_media::get_items_filtered(
         &pool,
         None,
@@ -1281,12 +1291,14 @@ async fn test_filtered_query_with_name_starts_with() {
         None,
         None,
         None,
+        None,
+        None,
     )
     .await
     .unwrap();
 
     assert_eq!(total_hash, 1);
-    assert_eq!(items_hash[0].name, "2001: A Space Odyssey");
+    assert_eq!(items_hash[0].name, "2001: A Copper Orbit");
 }
 
 // ── J5: genres, studios, years ──

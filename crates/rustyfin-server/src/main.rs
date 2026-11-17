@@ -101,6 +101,27 @@ async fn main() {
         );
     }
 
+    // A restore staged in the dashboard replaces the database and settings before either is read
+    if std::env::var_os("RUSTYFIN_DB").is_none() {
+        match rustyfin_api::backup_archive::apply_pending_restore(
+            &data_dir,
+            &data_dir.join("rustyfin.db"),
+        )
+        .await
+        {
+            Ok(Some(name)) => tracing::info!("restored the backup {name}"),
+            Ok(None) => {}
+            Err(e @ rustyfin_api::backup_archive::RestoreError::RolledBack(_)) => {
+                tracing::error!("the staged restore failed: {e}")
+            }
+            // Starting on an empty database would let anyone claim the owner account
+            Err(e @ rustyfin_api::backup_archive::RestoreError::Fatal(_)) => {
+                tracing::error!("the staged restore failed, so the server won't start: {e}");
+                std::process::exit(1);
+            }
+        }
+    }
+
     let db_url = std::env::var("RUSTYFIN_DB")
         .unwrap_or_else(|_| data_dir.join("rustyfin.db").display().to_string());
 
@@ -112,8 +133,13 @@ async fn main() {
 
     let server_id = load_or_create_server_id(&data_dir);
 
+    // The network settings saved in the dashboard, under the environment variables that set the
+    // same things
+    let network = rustyfin_api::named_config::network_startup(&data_dir);
+
     // IPv6 dual-stack: use [::]:8096 to listen on both IPv4 and IPv6
-    let bind_addr = std::env::var("RUSTYFIN_BIND").unwrap_or_else(|_| "0.0.0.0:8096".to_string());
+    let bind_addr =
+        rustyfin_api::named_config::startup_bind(std::env::var("RUSTYFIN_BIND").ok(), network.bind);
 
     let tls_cert = std::env::var("RUSTYFIN_TLS_CERT").ok();
     let tls_key = std::env::var("RUSTYFIN_TLS_KEY").ok();
@@ -143,8 +169,15 @@ async fn main() {
         }
     };
 
-    // Load or create server configuration
-    let mut config = load_config(&data_dir);
+    // Load or create server configuration. A file that can't be read is kept and the server
+    // doesn't start: defaults would lose the settings it holds, and show the startup wizard.
+    let mut config = match load_config(&data_dir) {
+        Ok(config) => config,
+        Err(e) => {
+            tracing::error!("{e}. Fix or remove the file; the server does not start without it.");
+            std::process::exit(1);
+        }
+    };
     // Sort names made from here on use the configuration's rules
     rustyfin_model::sort_name::set_rules(config.sort_rules());
 
@@ -202,6 +235,16 @@ async fn main() {
     transcode_manager.set_encoding_settings(encoding);
     // Start periodic cleanup of stale transcode sessions and old cache directories
     transcode_manager.spawn_cleanup_task();
+    // Finds the video devices and what each decodes, in the background: until it ends, new
+    // transcodes take the saved options; then, while the administrator hasn't chosen a
+    // hardware acceleration type, the best device decodes
+    {
+        let manager = transcode_manager.clone();
+        let data_dir = data_dir.clone();
+        tokio::spawn(async move {
+            manager.detect_hardware(&data_dir).await;
+        });
+    }
 
     let data_dir_arc = Arc::new(data_dir);
 
@@ -288,14 +331,26 @@ async fn main() {
         .await;
     }
 
-    // One TMDb client (cache, rate limiter, retries) shared by the provider and AppState.
-    let tmdb = rustyfin_core::tmdb_client::TmdbClient::new(http_client.clone(), tmdb_settings);
+    // One TMDb client (cache, rate limiter, retries) shared by the provider and AppState. The
+    // providers' answers are kept under the data dir's cache, across restarts.
+    let metadata_cache = data_dir_arc.join("cache").join("metadata");
+    let tmdb = rustyfin_core::tmdb_client::TmdbClient::new(
+        http_client.clone(),
+        rustyfin_core::tmdb_client::TmdbSettings {
+            cache_dir: Some(metadata_cache.join("tmdb")),
+            ..tmdb_settings
+        },
+    );
 
     // Register TMDb plugin: enabled by a key (env or saved), also when one is saved later
     rustyfin_core::plugin_manager::install_tmdb_plugin(&plugin_manager_with_db, tmdb.clone()).await;
 
     // Register OMDb and Fanart.tv plugins: enabled by a saved key, also when one is saved later
-    rustyfin_core::plugin_manager::install_omdb_plugin(&plugin_manager_with_db).await;
+    rustyfin_core::plugin_manager::install_omdb_plugin(
+        &plugin_manager_with_db,
+        rustyfin_model::answer_store::AnswerStore::new(metadata_cache.join("omdb")),
+    )
+    .await;
     rustyfin_core::plugin_manager::install_fanart_plugin(&plugin_manager_with_db).await;
 
     // Register Trakt plugin (disabled by default)
@@ -425,7 +480,10 @@ async fn main() {
     // Reverse proxies we trust to set X-Forwarded-For (comma-separated CIDRs or IPs). Loopback is
     // trusted only when listed.
     let known_proxies = Arc::new(rustyfin_api::middleware::parse_known_proxies(
-        &std::env::var("RUSTYFIN_KNOWN_PROXIES").unwrap_or_default(),
+        &std::env::var("RUSTYFIN_KNOWN_PROXIES")
+            .ok()
+            .or(network.known_proxies)
+            .unwrap_or_default(),
     ));
 
     // In-memory response caches
@@ -442,6 +500,7 @@ async fn main() {
         bind_addr: Arc::new(bind_addr.clone()),
         published_url: std::env::var("RUSTYFIN_PUBLISHED_URL")
             .ok()
+            .or(network.published_url)
             .filter(|url| !url.trim().is_empty())
             .map(Arc::new),
         api_key: api_key.map(Arc::new),
@@ -736,9 +795,16 @@ async fn main() {
                 loop {
                     if sig.recv().await.is_some() {
                         tracing::info!("SIGHUP received, reloading configuration");
-                        let new_config = load_config(&data_dir);
+                        // The file is read under the write lock that every save holds through its
+                        // write, so a save in flight is never undone by the file it replaces
                         let mut cfg = config.write().await;
-                        *cfg = new_config;
+                        match load_config(&data_dir) {
+                            Ok(new_config) => *cfg = new_config,
+                            Err(e) => {
+                                tracing::error!("{e}; the configuration in use is kept");
+                                continue;
+                            }
+                        }
                         changes.set_delay(std::time::Duration::from_secs(u64::from(
                             cfg.library_monitor_delay,
                         )));
@@ -850,37 +916,10 @@ async fn shutdown_signal() -> &'static str {
     }
 }
 
-fn load_config(data_dir: &std::path::Path) -> ServerConfiguration {
-    let config_path = data_dir.join("config.json");
-    if config_path.exists() {
-        match std::fs::read_to_string(&config_path) {
-            Ok(content) => match serde_json::from_str::<ServerConfiguration>(&content) {
-                Ok(mut cfg) => {
-                    tracing::info!("loaded configuration from {}", config_path.display());
-                    // A file from an older Rustyfin is brought up to date once, and saved so
-                    if cfg.upgrade()
-                        && let Err(e) =
-                            rustyfin_core::config_file::write_config_atomic(&config_path, &cfg)
-                    {
-                        tracing::warn!("could not save the upgraded config.json: {}", e);
-                    }
-                    return cfg;
-                }
-                Err(e) => {
-                    tracing::warn!("failed to parse config.json, using defaults: {}", e);
-                }
-            },
-            Err(e) => {
-                tracing::warn!("failed to read config.json, using defaults: {}", e);
-            }
-        }
-    }
-    let cfg = ServerConfiguration::default();
-    // Persist default config
-    if let Ok(json) = serde_json::to_string_pretty(&cfg) {
-        std::fs::write(&config_path, &json).ok();
-    }
-    cfg
+fn load_config(
+    data_dir: &std::path::Path,
+) -> Result<ServerConfiguration, rustyfin_core::config_file::LoadError> {
+    rustyfin_core::config_file::load_config(&data_dir.join("config.json"))
 }
 
 fn load_tls_config(cert_path: &str, key_path: &str) -> rustls::ServerConfig {

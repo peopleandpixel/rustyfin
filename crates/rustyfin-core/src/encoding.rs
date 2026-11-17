@@ -46,6 +46,20 @@ impl HardwareAccelerationType {
         }
     }
 
+    /// Jellyfin's name for the type, as `HardwareAccelerationType` stores it.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Amf => "amf",
+            Self::Qsv => "qsv",
+            Self::Nvenc => "nvenc",
+            Self::V4l2m2m => "v4l2m2m",
+            Self::Vaapi => "vaapi",
+            Self::VideoToolbox => "videotoolbox",
+            Self::Rkmpp => "rkmpp",
+        }
+    }
+
     /// The acceleration the transcoder builds arguments for: VAAPI, QSV and NVENC. The other
     /// types transcode in software.
     pub fn transcoder_accel(self) -> HwAccel {
@@ -56,6 +70,34 @@ impl HardwareAccelerationType {
             _ => HwAccel::None,
         }
     }
+}
+
+impl serde::Serialize for HardwareAccelerationType {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.name())
+    }
+}
+
+/// The encoding options in effect, for code that runs outside the transcoder (trickplay and
+/// chapter images): the transcode manager's settings, updated whenever it takes new ones (a
+/// save, or a hardware detection while the type is automatic). Nothing reads it yet: it is the
+/// shared setting the trickplay work's hardware decoding path reads (its type, device and
+/// decoding codecs), so keep it even while it has no caller here.
+pub fn current() -> EncodingSettings {
+    current_cell()
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+}
+
+pub(crate) fn set_current(settings: &EncodingSettings) {
+    *current_cell().write().unwrap_or_else(|e| e.into_inner()) = settings.clone();
+}
+
+fn current_cell() -> &'static std::sync::RwLock<EncodingSettings> {
+    static CURRENT: std::sync::OnceLock<std::sync::RwLock<EncodingSettings>> =
+        std::sync::OnceLock::new();
+    CURRENT.get_or_init(Default::default)
 }
 
 /// The encoding options the transcoder acts on, read from the stored options. A missing or

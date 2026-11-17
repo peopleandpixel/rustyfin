@@ -7,8 +7,8 @@ use std::sync::{Arc, Mutex};
 use crate::tmdb_client::{TmdbApi, TmdbClient};
 use rustyfin_model::media::MediaType;
 use rustyfin_model::metadata::{
-    ExternalMetadata, LookupFailed, LookupResult, MetadataImage, MetadataLookups, MetadataPerson,
-    RemoteImage, RemoteSearchHit, SeasonMetadata,
+    ExternalMetadata, Forgetting, LookupFailed, LookupResult, MetadataImage, MetadataLookups,
+    MetadataPerson, RemoteImage, RemoteSearchHit, SeasonMetadata, SeasonSummary, SeriesSeasons,
 };
 use rustyfin_model::plugin::{Plugin, PluginStatus, PluginType};
 use serde::Deserialize;
@@ -63,13 +63,10 @@ struct TmdbLookups {
     key: Arc<Mutex<Option<String>>>,
     client: TmdbClient,
     /// Season answers by (series id, season number), the season TMDb lacks (404) included. All
-    /// episodes of a season ask for it at once in a scan; this makes that one request, and a
-    /// missing season isn't asked for again by each of them or by the next run within the hour.
+    /// episodes of a season ask for it at once in a scan; this makes that one request. The
+    /// client keeps the answers across restarts.
     seasons: moka::future::Cache<(i64, i32), Option<SeasonMetadata>>,
 }
-
-/// How long `TmdbLookups` keeps a season's answer: longer than a scan or refresh run.
-const SEASON_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(3600);
 
 impl TmdbLookups {
     fn api(&self) -> Option<TmdbApi> {
@@ -111,10 +108,32 @@ impl MetadataLookups for TmdbLookups {
             // is not
             self.seasons
                 .try_get_with((series_id, season_number), async {
-                    season_lookup(&tmdb, series_id, season_number).await
+                    season_lookup(&tmdb, series_id, season_number, false).await
                 })
                 .await
                 .map_err(|e| failure(&e))
+        })
+    }
+
+    fn series_seasons_fresh(&self, id: i64) -> Answer<'_, SeriesSeasons> {
+        Box::pin(async move {
+            let tmdb = self.api().ok_or(LookupFailed::Unauthorized)?;
+            series_seasons_lookup(&tmdb, id)
+                .await
+                .map_err(|e| failure(&e))
+        })
+    }
+
+    fn season_fresh(&self, series_id: i64, season_number: i32) -> Answer<'_, SeasonMetadata> {
+        Box::pin(async move {
+            let tmdb = self.api().ok_or(LookupFailed::Unauthorized)?;
+            let answer = season_lookup(&tmdb, series_id, season_number, true)
+                .await
+                .map_err(|e| failure(&e))?;
+            self.seasons
+                .insert((series_id, season_number), answer.clone())
+                .await;
+            Ok(answer)
         })
     }
 
@@ -131,6 +150,24 @@ impl MetadataLookups for TmdbLookups {
                 .await
                 .map_err(|e| failure(&e))
         })
+    }
+
+    fn forget(&self, series: bool, id: i64) -> Forgetting<'_> {
+        Box::pin(async move {
+            self.client.forget(series, id).await;
+            if series
+                && let Err(e) = self
+                    .seasons
+                    .invalidate_entries_if(move |key, _| key.0 == id)
+            {
+                tracing::debug!("TMDb season cache: {e}");
+            }
+        })
+    }
+
+    fn forget_search(&self, series: bool, title: &str) -> Forgetting<'_> {
+        let title = title.to_string();
+        Box::pin(async move { self.client.forget_search(series, &title).await })
     }
 
     fn images(&self, series: bool, id: i64) -> Answer<'_, Vec<RemoteImage>> {
@@ -255,7 +292,7 @@ where
         client,
         seasons: moka::future::Cache::builder()
             .max_capacity(10_000)
-            .time_to_live(SEASON_CACHE_TTL)
+            .support_invalidation_closures()
             .build(),
     });
 
@@ -658,6 +695,45 @@ struct TmdbTvDetails {
     images: Option<TmdbImages>,
     external_ids: Option<TmdbExternalIds>,
     content_ratings: Option<TmdbContentRatings>,
+    seasons: Option<Vec<TmdbSeasonSummary>>,
+}
+
+/// One season in a series' details
+#[derive(Debug, Deserialize)]
+struct TmdbSeasonSummary {
+    season_number: i32,
+    name: Option<String>,
+    episode_count: Option<i32>,
+}
+
+/// A series' season list from its details, asked of TMDb even when the details are cached: the
+/// same request as `series_lookup`, so the fresh answer replaces the cached one.
+async fn series_seasons_lookup(
+    tmdb: &TmdbApi,
+    tmdb_id: i64,
+) -> Result<Option<SeriesSeasons>, crate::tmdb_client::TmdbError> {
+    let endpoint = format!("/tv/{}", tmdb_id);
+    let query = [("append_to_response", SERIES_APPEND)];
+    let Some(json) = final_json_with(tmdb, &endpoint, &query, true).await? else {
+        return Ok(None);
+    };
+    let Ok(details) = serde_json::from_value::<TmdbTvDetails>(json) else {
+        return Ok(None);
+    };
+    let seasons = details
+        .seasons
+        .unwrap_or_default()
+        .into_iter()
+        .map(|s| SeasonSummary {
+            number: s.season_number,
+            name: non_empty(s.name),
+            episode_count: s.episode_count,
+        })
+        .collect();
+    Ok(Some(SeriesSeasons {
+        status: non_empty(details.status),
+        seasons,
+    }))
 }
 
 /// TMDb genre
@@ -736,7 +812,22 @@ async fn final_json(
     endpoint: &str,
     query: &[(&str, &str)],
 ) -> Result<Option<serde_json::Value>, crate::tmdb_client::TmdbError> {
-    match tmdb.get_json(endpoint, query).await {
+    final_json_with(tmdb, endpoint, query, false).await
+}
+
+/// `final_json`; `fresh` asks TMDb even when an answer is cached, and keeps the new one.
+async fn final_json_with(
+    tmdb: &TmdbApi,
+    endpoint: &str,
+    query: &[(&str, &str)],
+    fresh: bool,
+) -> Result<Option<serde_json::Value>, crate::tmdb_client::TmdbError> {
+    let answer = if fresh {
+        tmdb.get_json_fresh(endpoint, query).await
+    } else {
+        tmdb.get_json(endpoint, query).await
+    };
+    match answer {
         Ok(json) => Ok(Some(json)),
         Err(e) if matches!(e.kind, crate::tmdb_client::TmdbErrorKind::Status(404)) => Ok(None),
         Err(e) => Err(e),
@@ -874,8 +965,11 @@ async fn search_hits(
     } else {
         "/search/movie"
     };
-    let Some(json) = final_json(tmdb, endpoint, &query).await? else {
-        return Ok(None);
+    // An admin's manual search always asks TMDb, and keeps the answer for the scans
+    let json = match tmdb.get_json_fresh(endpoint, &query).await {
+        Ok(json) => json,
+        Err(e) if e.is_not_found() => return Ok(None),
+        Err(e) => return Err(e),
     };
     let Ok(resp) = serde_json::from_value::<TmdbSearchResult>(json) else {
         return Ok(None);
@@ -1047,7 +1141,7 @@ async fn series_lookup(
 /// rating, still and guest stars and crew; their IMDb and TVDb ids would need one call each, so
 /// they are left out.
 pub async fn season(tmdb: &TmdbApi, series_id: i64, season_number: i32) -> Option<SeasonMetadata> {
-    season_lookup(tmdb, series_id, season_number)
+    season_lookup(tmdb, series_id, season_number, false)
         .await
         .ok()
         .flatten()
@@ -1060,10 +1154,11 @@ async fn season_lookup(
     tmdb: &TmdbApi,
     series_id: i64,
     season_number: i32,
+    fresh: bool,
 ) -> Result<Option<SeasonMetadata>, crate::tmdb_client::TmdbError> {
     let endpoint = format!("/tv/{}/season/{}", series_id, season_number);
     let query = [("append_to_response", SEASON_APPEND)];
-    let Some(json) = final_json(tmdb, &endpoint, &query).await? else {
+    let Some(json) = final_json_with(tmdb, &endpoint, &query, fresh).await? else {
         return Ok(None);
     };
     let Ok(season) = serde_json::from_value::<TmdbSeason>(json) else {

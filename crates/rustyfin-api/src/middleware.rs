@@ -59,11 +59,27 @@ async fn request_claims(
         ));
     }
 
-    // Otherwise the token must be a live user token
-    let claims = rustyfin_auth::validate_token(&state.db_ro, &presented.token)
-        .await
-        .map_err(|_| ApiError::Unauthorized)?;
-    Ok((claims, Some(presented.token)))
+    // Otherwise the token must be a live user token, or an API key made in the dashboard
+    match rustyfin_auth::validate_token(&state.db_ro, &presented.token).await {
+        Ok(claims) => Ok((claims, Some(presented.token))),
+        Err(_)
+            if rustyfin_auth::validate_api_key(&state.db, &presented.token)
+                .await
+                .unwrap_or(false) =>
+        {
+            Ok((
+                Claims {
+                    sub: uuid::Uuid::nil(),
+                    name: "ApiKey".to_string(),
+                    is_admin: true,
+                    iat: 0,
+                    exp: i64::MAX,
+                },
+                None,
+            ))
+        }
+        Err(_) => Err(ApiError::Unauthorized),
+    }
 }
 
 pub async fn require_auth(
@@ -88,12 +104,31 @@ pub async fn require_auth(
     if let Some(t) = token {
         req.extensions_mut().insert(rustyfin_auth::RequestToken(t));
     }
+    if let Some(device) = stated_device(req.headers()) {
+        req.extensions_mut().insert(device);
+    }
     Ok(match policy {
         Some((user, policy)) => {
             crate::parental::with_request_policy(user, policy, next.run(req)).await
         }
         None => next.run(req).await,
     })
+}
+
+/// The device that the request's `MediaBrowser` header (`Authorization`, else
+/// `X-Emby-Authorization`) names, when it has a `DeviceId`.
+fn stated_device(headers: &HeaderMap) -> Option<crate::sessions::StatedDevice> {
+    let auth = ["Authorization", "X-Emby-Authorization"]
+        .iter()
+        .filter_map(|name| headers.get(*name)?.to_str().ok())
+        .find_map(parse_media_browser)?;
+    let device_id = auth.device_id.filter(|id| !id.trim().is_empty())?;
+    Some(crate::sessions::StatedDevice(rustyfin_auth::TokenDevice {
+        device_id,
+        device_name: auth.device.unwrap_or_default(),
+        app_name: auth.client.unwrap_or_default(),
+        app_version: auth.version.unwrap_or_default(),
+    }))
 }
 
 /// Guards the setup wizard routes. While the server has no users, anyone may use them. After that, only an

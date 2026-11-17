@@ -1,8 +1,9 @@
 // The user settings page and the server configuration form
-import { $, toast, escapeHtml } from './util.js';
+import { $, toast, escapeHtml, icon } from './util.js';
 import { showOidcLinkResult, oidcCardHtml } from './auth.js';
 import {
     HOME_SECTIONS, homeSlots, homeSlotValues, loadUserSettings, userSetting, saveUserSettings, saveUserConfiguration, showsInLatest, avatarUrl,
+    showsInMyMedia, arrangeLibraries, libraryKey, SCREENSAVER_BACKDROP, SCREENSAVER_TIMES, DEFAULT_IDLE_SECONDS,
 } from './user-settings.js';
 
 // --- Settings Page Renderer ---
@@ -18,7 +19,7 @@ async function renderSettings(data) {
             API.oidcInfo().catch(() => null),
             API.oidcAccount(API.userId).catch(() => null),
             API.get('/Localization/Cultures').catch(() => []),
-            API.getLibraries().catch(() => []),
+            API.getLibraries({ includeHidden: true }).catch(() => []),
             loadUserSettings({ force: true }).catch(() => null),
         ]);
 
@@ -255,7 +256,16 @@ function displaySettingsHtml() {
     const dateOptions = [{ value: '', label: t('settings.date_format_auto') }, ...DATE_LOCALES.map(tag => ({ value: tag, label: dateLocaleLabel(tag) }))];
     return selectHtml(t('settings.date_format'), 'id="pref-datetimelocale" data-pref="datetimelocale" onchange="changeUserPref(this)"', dateOptions, userSetting('datetimelocale', ''))
         + toggleHtml(t('settings.show_backdrops'), 'id="pref-backdrops" data-pref="enableBackdrops" onchange="changeUserPref(this)"', userSetting('enableBackdrops', 'true') !== 'false')
-        + toggleHtml(t('settings.play_theme_songs'), 'id="pref-theme-songs" data-pref="enableThemeSongs" onchange="changeUserPref(this)"', userSetting('enableThemeSongs', 'false') === 'true');
+        + toggleHtml(t('settings.play_theme_songs'), 'id="pref-theme-songs" data-pref="enableThemeSongs" onchange="changeUserPref(this)"', userSetting('enableThemeSongs', 'false') === 'true')
+        + screensaverSettingsHtml();
+}
+
+// Jellyfin Web's Screensaver and Screensaver time (in seconds; shown in minutes). Off unless chosen.
+function screensaverSettingsHtml() {
+    const kinds = [{ value: 'none', label: t('settings.screensaver_none') }, { value: SCREENSAVER_BACKDROP, label: t('settings.screensaver_backdrop') }];
+    const times = SCREENSAVER_TIMES.map(s => ({ value: String(s), label: t('settings.screensaver_minutes', { minutes: s / 60 }) }));
+    return selectHtml(t('settings.screensaver'), 'id="pref-screensaver" data-pref="screensaver" onchange="changeUserPref(this)"', kinds, userSetting('screensaver', 'none'))
+        + selectHtml(t('settings.screensaver_time'), 'id="pref-screensaver-time" data-pref="screensaverTime" onchange="changeUserPref(this)"', times, userSetting('screensaverTime', String(DEFAULT_IDLE_SECONDS)));
 }
 
 function homeSettingsHtml(config, libraries) {
@@ -275,12 +285,30 @@ function homeSettingsHtml(config, libraries) {
         options.some(o => o.value === value) ? options : [...options, { value, label: t('settings.home_jellyfin_only', { id: value }) }],
         value,
     )).join('');
-    const libs = (libraries || []).map(lib => {
+    return settingsCard(t('settings.home'), 'bg-violet-400', sections + homeLibrariesHtml(config, libraries));
+}
+
+// The libraries in the user's order (OrderedViews), each with Move up and Move down, "Show in My
+// Media" (MyMediaExcludes) and "Show in Recently Added" (LatestItemsExcludes), as Jellyfin Web's
+// home screen settings
+function homeLibrariesHtml(config, libraries) {
+    const libs = arrangeLibraries(libraries, { config });
+    if (!libs.length) return '';
+    const moveBtn = (libId, delta, iconName, label, disabled) => `<button type="button" class="jf-btn-ghost !p-1" data-action="move-home-library" data-id="${escapeHtml(libId)}" data-delta="${delta}" aria-label="${escapeHtml(label)}" title="${escapeHtml(label)}"${disabled ? ' disabled' : ''}>${icon(iconName, { size: 16 })}</button>`;
+    const rows = libs.map((lib, i) => {
         const libId = lib.Id || lib.id;
-        return toggleHtml(escapeHtml(lib.Name || lib.name || ''), `data-latest-library="${escapeHtml(libId)}" onchange="changeLatestLibrary(this)"`, showsInLatest(libId, config));
+        const rawName = lib.Name || lib.name || '';
+        return `
+                <li class="flex flex-wrap items-center gap-x-4 gap-y-1 py-2 border-t border-white/5" data-home-library="${escapeHtml(libId)}">
+                    <span class="flex items-center gap-1">${moveBtn(libId, -1, 'ChevronUp', t('settings.home_move_up', { name: rawName }), i === 0)}${moveBtn(libId, 1, 'ChevronDown', t('settings.home_move_down', { name: rawName }), i === libs.length - 1)}</span>
+                    <span class="font-semibold text-white min-w-[8rem]" data-library-name>${escapeHtml(rawName)}</span>
+                    ${toggleHtml(t('settings.home_show_in_my_media'), `data-my-media-library="${escapeHtml(libId)}" onchange="changeMyMediaLibrary(this)"`, showsInMyMedia(libId, config))}
+                    ${toggleHtml(t('settings.home_show_in_latest'), `data-latest-library="${escapeHtml(libId)}" onchange="changeLatestLibrary(this)"`, showsInLatest(libId, config))}
+                </li>`;
     }).join('');
-    return settingsCard(t('settings.home'), 'bg-violet-400', sections + (libs ? `
-                <p class="text-xs font-semibold text-white/70 pt-2">${t('settings.home_show_in_latest')}</p>${libs}` : ''));
+    return `
+                <p class="text-xs font-semibold text-white/70 pt-2">${t('settings.home_libraries')}</p>
+                <ul id="home-library-order" class="text-sm">${rows}</ul>`;
 }
 
 function playbackSettingsHtml(config, cultures) {
@@ -368,15 +396,50 @@ function changeHomeSection(input) {
     return saveControl(input, value => saveUserSettings(homeSlotValues(Number(input.dataset.homeSlot), value)));
 }
 
-// A library's "Show in Latest" switch: off adds it to UserConfiguration.LatestItemsExcludes
-function changeLatestLibrary(input) {
-    const libId = input.dataset.latestLibrary;
+// A library's switch over a UserConfiguration list of excluded libraries: off adds it
+function saveLibraryExclude(input, field, libId) {
     return saveControl(input, async value => {
         const me = await API.getMe();
-        const key = id => String(id).toLowerCase().replace(/-/g, '');
-        const others = (me.Configuration?.LatestItemsExcludes || []).filter(id => key(id) !== key(libId));
-        await saveUserConfiguration({ LatestItemsExcludes: value === 'true' ? others : [...others, libId] });
+        const others = (me.Configuration?.[field] || []).filter(id => libraryKey(id) !== libraryKey(libId));
+        await saveUserConfiguration({ [field]: value === 'true' ? others : [...others, libId] });
     });
+}
+
+// A library's "Show in Latest" switch: off adds it to UserConfiguration.LatestItemsExcludes
+function changeLatestLibrary(input) {
+    return saveLibraryExclude(input, 'LatestItemsExcludes', input.dataset.latestLibrary);
+}
+
+// A library's "Show in My Media" switch: off adds it to UserConfiguration.MyMediaExcludes
+function changeMyMediaLibrary(input) {
+    return saveLibraryExclude(input, 'MyMediaExcludes', input.dataset.myMediaLibrary);
+}
+
+// Moves a library one place up or down and saves every library's id in the new order as
+// UserConfiguration.OrderedViews, as Jellyfin Web does; the list is drawn again in that order
+async function moveHomeLibrary(button) {
+    const list = $('home-library-order');
+    const row = button.closest('[data-home-library]');
+    if (!list || !row) return;
+    const rows = [...list.children];
+    const from = rows.indexOf(row);
+    const to = from + Number(button.dataset.delta);
+    if (to < 0 || to >= rows.length) return;
+    const libs = rows.map(r => ({ Id: r.dataset.homeLibrary, Name: r.querySelector('[data-library-name]').textContent }));
+    [libs[from], libs[to]] = [libs[to], libs[from]];
+    list.querySelectorAll('button').forEach(b => { b.disabled = true; });
+    try {
+        await saveUserConfiguration({ OrderedViews: libs.map(lib => lib.Id) });
+        toast(t('settings.saved'));
+    } catch (e) {
+        toast(e.message, 'error');
+    }
+    const { config } = await loadUserSettings();
+    const box = document.createElement('div');
+    box.innerHTML = homeLibrariesHtml(config, libs);
+    list.replaceWith(box.querySelector('ul'));
+    const moved = $('home-library-order')?.querySelector(`[data-home-library="${CSS.escape(row.dataset.homeLibrary)}"]`);
+    (moved?.querySelector(`[data-delta="${button.dataset.delta}"]:not([disabled])`) || moved?.querySelector('button:not([disabled])'))?.focus();
 }
 
 // Uploads the chosen picture base64-encoded, as Jellyfin Web sends it to /UserImage
@@ -492,6 +555,7 @@ function oidcAccountKey(id) { return String(id).toLowerCase().replace(/-/g, '');
 
 export {
     renderSettings, changeNextEpisodeAutoPlay, changeUiLanguage, providerKeyField, handleSaveConfig, oidcAccountKey,
-    changeUserConfig, changeUserPref, changeHomeSection, changeSubtitleAppearance, changeLatestLibrary, chooseProfileImage,
+    changeUserConfig, changeUserPref, changeHomeSection, changeSubtitleAppearance, changeLatestLibrary, changeMyMediaLibrary,
+    moveHomeLibrary, homeLibrariesHtml, chooseProfileImage,
     deleteProfileImage, homeSettingsHtml, playbackSettingsHtml, subtitleSettingsHtml, displaySettingsHtml,
 };

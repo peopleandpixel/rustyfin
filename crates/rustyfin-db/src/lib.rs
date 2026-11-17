@@ -4,15 +4,19 @@
 pub mod busy;
 pub mod pool_watch;
 pub mod repo_activity;
+pub mod repo_api_key;
 pub mod repo_by_name;
 pub mod repo_chapter;
 pub mod repo_collection;
 pub mod repo_device;
 pub mod repo_extras;
 pub mod repo_image;
+pub mod repo_instant_mix;
+pub mod repo_item_filter;
 pub mod repo_jellyfin_import;
 pub mod repo_library;
 pub mod repo_live_tv;
+pub mod repo_lyrics;
 pub mod repo_media;
 pub mod repo_media_segment;
 pub mod repo_media_source;
@@ -34,6 +38,7 @@ pub mod repo_sync_play;
 pub mod repo_token;
 pub mod repo_trickplay;
 pub mod repo_user;
+pub mod repo_virtual;
 pub mod writer;
 
 pub use writer::{WriteTx, begin_write};

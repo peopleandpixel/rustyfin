@@ -67,7 +67,7 @@ const HINT_FTS_SQL: &str =
      FROM media_items m
      JOIN media_items_fts f ON f.rowid = m.rowid
      WHERE media_items_fts MATCH ?1
-       AND m.extra_type IS NULL
+       AND m.extra_type IS NULL AND m.is_virtual_item = 0
        AND (?2 IS NULL OR m.library_id = ?2 OR (m.id <> ?2 AND m.id IN (
             WITH RECURSIVE below(id) AS (
                 SELECT c.id FROM media_items c WHERE c.parent_id = ?2
@@ -83,7 +83,7 @@ const HINT_LIKE_SQL: &str =
             m.index_number, m.parent_index_number, m.end_date, m.status, m.library_id
      FROM media_items m
      WHERE m.name LIKE ?1
-       AND m.extra_type IS NULL
+       AND m.extra_type IS NULL AND m.is_virtual_item = 0
        AND (?2 IS NULL OR m.library_id = ?2 OR (m.id <> ?2 AND m.id IN (
             WITH RECURSIVE below(id) AS (
                 SELECT c.id FROM media_items c WHERE c.parent_id = ?2
@@ -263,7 +263,7 @@ pub async fn search_items(
              m.homepage, m.end_date, m.vote_count, m.popularity \
              FROM media_items m \
              JOIN media_items_fts f ON f.rowid = m.rowid \
-             WHERE media_items_fts MATCH ?1 AND m.extra_type IS NULL \
+             WHERE media_items_fts MATCH ?1 AND m.extra_type IS NULL AND m.is_virtual_item = 0 \
              LIMIT ?2",
         )
         .bind(&fts_query)
@@ -282,7 +282,7 @@ pub async fn search_items(
              m.homepage, m.end_date, m.vote_count, m.popularity \
              FROM media_items m \
              JOIN media_items_fts f ON f.rowid = m.rowid \
-             WHERE media_items_fts MATCH ? AND m.extra_type IS NULL AND m.media_type IN ({}) \
+             WHERE media_items_fts MATCH ? AND m.extra_type IS NULL AND m.is_virtual_item = 0 AND m.media_type IN ({}) \
              LIMIT ?",
             placeholders.join(",")
         );
@@ -310,7 +310,7 @@ pub async fn search_items(
                      premiere_date, runtime_ticks, index_number, parent_index_number, index_number_end, location_type, tmdb_id, tvdb_id, \
                      tags, status, original_language, tagline, production_countries, budget, revenue, \
                      homepage, end_date, vote_count, popularity \
-                     FROM media_items WHERE name LIKE ?1 AND extra_type IS NULL LIMIT ?2",
+                     FROM media_items WHERE name LIKE ?1 AND extra_type IS NULL AND is_virtual_item = 0 LIMIT ?2",
                 )
                 .bind(&like_prefix)
                 .bind(limit)
@@ -325,7 +325,7 @@ pub async fn search_items(
                      premiere_date, runtime_ticks, index_number, parent_index_number, index_number_end, location_type, tmdb_id, tvdb_id, \
                      tags, status, original_language, tagline, production_countries, budget, revenue, \
                      homepage, end_date, vote_count, popularity \
-                     FROM media_items WHERE name LIKE ? AND extra_type IS NULL AND media_type IN ({}) LIMIT ?",
+                     FROM media_items WHERE name LIKE ? AND extra_type IS NULL AND is_virtual_item = 0 AND media_type IN ({}) LIMIT ?",
                     placeholders.join(",")
                 );
                 let mut q =
