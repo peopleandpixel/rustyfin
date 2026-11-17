@@ -68,6 +68,8 @@ function sandbox(answers) {
         initLiveLog: () => {},
         loadOidcAdminTab: () => {},
         loadJellyfinImport: () => {},
+        // The Networking, API keys, Devices, Branding and Backups tabs (server-admin.js)
+        SERVER_ADMIN_LOADERS: {},
         followSessions: () => {},
         unfollowSessions: () => {},
     });

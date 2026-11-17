@@ -47,11 +47,15 @@ pub async fn get_user_item_data(
 
 /// For each Series or Season in `folder_ids`, counts its episodes and the ones `user_id` has not
 /// played, as `(episodes, unplayed)`. A season's episodes are its children; a series' episodes
-/// are those of its seasons, specials included. Folders with no episodes have no entry.
+/// are those of its seasons, specials included. Virtual episodes (missing and unaired ones, with
+/// no file) never count, as in Jellyfin. Only the episodes that pass `visible` (a
+/// `repo_parental::filter_json` filter) count; `None` counts them all. Folders with no episodes
+/// have no entry.
 pub async fn get_unplayed_counts(
     pool: &SqlitePool,
     user_id: Uuid,
     folder_ids: &[Uuid],
+    visible: Option<&str>,
 ) -> Result<HashMap<String, (i64, i64)>, sqlx::Error> {
     if folder_ids.is_empty() {
         return Ok(HashMap::new());
@@ -63,18 +67,26 @@ pub async fn get_unplayed_counts(
         .map(|i| format!("?{}", i))
         .collect();
     let placeholder_str = placeholders.join(",");
+    // The filter comes after the folder ids.
+    let shown = crate::repo_parental::visible_sql(
+        "e.id",
+        "e.library_id",
+        &format!("?{}", folder_ids.len() + 2),
+    );
     let sql = format!(
         "SELECT ef.folder_id, COUNT(*), SUM(CASE WHEN ud.played = 1 THEN 0 ELSE 1 END) \
          FROM ( \
              SELECT e.id AS episode_id, p.id AS folder_id \
              FROM media_items e JOIN media_items p ON p.id = e.parent_id \
              WHERE e.media_type = 'Episode' AND p.media_type = 'Season' AND p.id IN ({ph}) \
+               AND e.is_virtual_item = 0 AND {shown} \
              UNION ALL \
              SELECT e.id, g.id \
              FROM media_items e \
              JOIN media_items p ON p.id = e.parent_id AND p.media_type = 'Season' \
              JOIN media_items g ON g.id = p.parent_id \
              WHERE e.media_type = 'Episode' AND g.media_type = 'Series' AND g.id IN ({ph}) \
+               AND e.is_virtual_item = 0 AND {shown} \
          ) ef \
          LEFT JOIN user_item_data ud ON ud.item_id = ef.episode_id AND ud.user_id = ?1 \
          GROUP BY ef.folder_id",
@@ -86,6 +98,7 @@ pub async fn get_unplayed_counts(
     for id in folder_ids {
         query = query.bind(id.to_string());
     }
+    query = query.bind(visible);
     let rows = query.fetch_all(pool).await?;
 
     Ok(rows
@@ -382,14 +395,18 @@ pub async fn get_stream_choice(
 
 /// The episodes under a Series (through its seasons) or a Season, as a CTE `eps(id)` over `?1`.
 /// Other items have none. Jellyfin's Folder.MarkPlayed/MarkUnplayed reach these episodes.
+// Virtual episodes (missing and unaired, no file) are left out, as Jellyfin 12.4's
+// Folder.MarkPlayed leaves them: a file that later takes one over must not arrive played.
 const EPISODES_UNDER_FOLDER: &str = "WITH eps(id) AS ( \
      SELECT e.id FROM media_items f \
      JOIN media_items s ON s.parent_id = f.id AND s.media_type = 'Season' \
      JOIN media_items e ON e.parent_id = s.id AND e.media_type = 'Episode' \
+       AND e.is_virtual_item = 0 \
      WHERE f.id = ?1 AND f.media_type = 'Series' \
      UNION \
      SELECT e.id FROM media_items f \
      JOIN media_items e ON e.parent_id = f.id AND e.media_type = 'Episode' \
+       AND e.is_virtual_item = 0 \
      WHERE f.id = ?1 AND f.media_type = 'Season' ) ";
 
 /// Marks an item played for the user now. See `mark_played_on`.

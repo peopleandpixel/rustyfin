@@ -9,6 +9,9 @@ const LOCKABLE_FIELDS = ['Name', 'Overview', 'Genres', 'OfficialRating', 'Cast',
 const IMAGE_TYPES = ['Primary', 'Backdrop', 'Logo', 'Thumb', 'Banner', 'Art', 'Disc'];
 const REMOTE_IMAGE_TYPES = ['Primary', 'Backdrop', 'Logo'];
 
+// The person kinds the editor offers (Jellyfin's PersonKind, the common ones)
+const PERSON_TYPES = ['Actor', 'Director', 'Writer', 'Producer', 'GuestStar', 'Composer'];
+
 const LABEL = 'block text-xs font-semibold text-white/70 mb-1';
 const CHECKBOX = 'w-4 h-4 rounded bg-white/10 border-white/20 text-[#00a4dc]';
 
@@ -36,7 +39,9 @@ function splitList(text) {
 
 // The metadata editor's form values as Jellyfin's item update (POST /Items/{id}). A blank field clears it;
 // an unticked field in "Fields a refresh may change" is locked. The sort title goes only when it was
-// changed, as a blank one sets the sort name back to the title's.
+// changed, as a blank one sets the sort name back to the title's. The provider ids the form shows go over
+// the item's others; people without a name are dropped. The studios go as the item had them unless the
+// field was edited, so a studio with a comma in its name stays whole.
 function itemUpdateBody(values) {
     const text = v => String(v ?? '').trim() || null;
     const number = v => {
@@ -45,6 +50,9 @@ function itemUpdateBody(values) {
     };
     const year = Number.parseInt(values.year, 10);
     const sortChanged = text(values.sortName) !== text(values.sortNameBefore);
+    const day = v => (v ? `${v}T00:00:00.0000000Z` : null);
+    const providerIds = { ...(values.providerIdsBefore || {}) };
+    for (const [key, id] of Object.entries(values.providerIds || {})) providerIds[key] = String(id ?? '').trim();
     return {
         Name: text(values.name),
         OriginalTitle: text(values.originalTitle),
@@ -52,12 +60,19 @@ function itemUpdateBody(values) {
         Overview: text(values.overview),
         Taglines: text(values.tagline) ? [text(values.tagline)] : [],
         ProductionYear: Number.isFinite(year) ? year : null,
-        PremiereDate: values.premiereDate ? `${values.premiereDate}T00:00:00.0000000Z` : null,
+        PremiereDate: day(values.premiereDate),
+        ...('endDate' in values ? { EndDate: day(values.endDate) } : {}),
         CommunityRating: number(values.communityRating),
         CriticRating: number(values.criticRating),
         OfficialRating: text(values.officialRating),
         Genres: splitList(values.genres),
         Tags: splitList(values.tags),
+        Studios: (Array.isArray(values.studioNames) && String(values.studios ?? '') === String(values.studiosBefore ?? '')
+            ? values.studioNames : splitList(values.studios)).map(Name => ({ Name })),
+        People: (values.people || [])
+            .map(p => ({ Name: text(p.name), Role: text(p.role), Type: p.type || 'Actor' }))
+            .filter(p => p.Name),
+        ProviderIds: providerIds,
         LockData: !!values.lockData,
         LockedFields: LOCKABLE_FIELDS.filter(field => !values.enabled?.[field]),
     };
@@ -361,9 +376,46 @@ async function openImageEditor(id) {
 }
 
 // The metadata editor: title, overview, dates, ratings, genres, tags and the locks
+// A person kind's label; a kind without a translation shows as the server names it
+function personTypeLabel(kind) {
+    const key = `metadata.person_${kind}`;
+    const label = t(key);
+    return label === key ? kind : label;
+}
+
+// One row of the editor's people: name, role and kind, and a button that removes the row. A kind
+// the list doesn't have (Conductor, Lyricist, ...) is added as an option, so it stays as it was.
+function personRowHtml(person = {}) {
+    const type = String(person.Type || 'Actor');
+    const kinds = PERSON_TYPES.includes(type) ? PERSON_TYPES : [...PERSON_TYPES, type];
+    return `<div class="grid grid-cols-[1fr_1fr_auto_auto] gap-2 items-center" data-person>
+        <input class="jf-input w-full" data-person-name aria-label="${escapeHtml(t('metadata.person_name'))}" placeholder="${escapeHtml(t('metadata.person_name'))}" value="${escapeHtml(person.Name ?? '')}">
+        <input class="jf-input w-full" data-person-role aria-label="${escapeHtml(t('metadata.person_role'))}" placeholder="${escapeHtml(t('metadata.person_role'))}" value="${escapeHtml(person.Role ?? '')}">
+        <select class="jf-input" data-person-type aria-label="${escapeHtml(t('metadata.person_type'))}">${kinds.map(kind =>
+            `<option value="${escapeHtml(kind)}"${kind === type ? ' selected' : ''}>${escapeHtml(personTypeLabel(kind))}</option>`).join('')}</select>
+        <button type="button" class="jf-btn-ghost !px-2 text-xs" data-remove-person title="${escapeHtml(t('metadata.remove_person'))}" aria-label="${escapeHtml(t('metadata.remove_person'))}">${icon('X', { size: 14 })}</button>
+    </div>`;
+}
+
+// The provider id fields the server offers for the item (MetadataEditorInfo.ExternalIdInfos)
+function providerIdsHtml(infos, ids = {}) {
+    if (!infos.length) return '';
+    const value = key => Object.entries(ids).find(([k]) => k.toLowerCase() === key.toLowerCase())?.[1] ?? '';
+    return `<fieldset class="space-y-2 pt-2 border-t border-white/10">
+        <legend class="${LABEL}">${escapeHtml(t('metadata.provider_ids'))}</legend>
+        <div class="grid grid-cols-1 sm:grid-cols-2 gap-3">${infos.map(info => `<div>
+            <label class="${LABEL}" for="md-ed-pid-${escapeHtml(info.Key)}">${escapeHtml(info.Name)}</label>
+            <input id="md-ed-pid-${escapeHtml(info.Key)}" class="jf-input w-full" data-provider-id="${escapeHtml(info.Key)}" value="${escapeHtml(value(info.Key))}"></div>`).join('')}</div>
+    </fieldset>`;
+}
+
 async function openMetadataEditor(id) {
-    const item = await loadItem(id);
+    const [item, editor] = await Promise.all([
+        loadItem(id),
+        API.getMetadataEditor(id).catch(() => ({ ExternalIdInfos: [] })),
+    ]);
     if (!item) return;
+    const hasEndDate = item.Type === 'Series';
     const field = (name, label, value, attrs = '') => `<div><label class="${LABEL}" for="md-ed-${name}">${escapeHtml(label)}</label>
         <input id="md-ed-${name}" name="${name}" class="jf-input w-full" value="${escapeHtml(value ?? '')}" ${attrs}></div>`;
     const locked = new Set(item.LockedFields || []);
@@ -380,13 +432,21 @@ async function openMetadataEditor(id) {
         <div class="grid grid-cols-2 sm:grid-cols-3 gap-3">
             ${field('year', t('metadata.year'), item.ProductionYear, 'type="number"')}
             ${field('premiereDate', t('metadata.release_date'), item.PremiereDate?.slice(0, 10), 'type="date"')}
+            ${hasEndDate ? field('endDate', t('metadata.end_date'), item.EndDate?.slice(0, 10), 'type="date"') : ''}
             ${field('officialRating', t('metadata.parental_rating'), item.OfficialRating)}
             ${field('communityRating', t('metadata.community_rating'), item.CommunityRating, 'type="number" step="0.1" min="0" max="10"')}
             ${field('criticRating', t('metadata.critic_rating'), item.CriticRating, 'type="number" step="1" min="0" max="100"')}
         </div>
         ${field('genres', t('metadata.genres'), (item.Genres || []).join(', '), `aria-describedby="md-ed-list-help"`)}
         ${field('tags', t('metadata.tags'), (item.Tags || []).join(', '), `aria-describedby="md-ed-list-help"`)}
+        ${field('studios', t('metadata.studios'), (item.Studios || []).map(s => s.Name).join(', '), `aria-describedby="md-ed-list-help"`)}
         <p id="md-ed-list-help" class="text-xs text-white/40">${escapeHtml(t('metadata.list_help'))}</p>
+        <fieldset class="space-y-2 pt-2 border-t border-white/10">
+            <legend class="${LABEL}">${escapeHtml(t('metadata.people'))}</legend>
+            <div class="space-y-2" data-people>${(item.People || []).map(personRowHtml).join('')}</div>
+            <button type="button" class="jf-btn-ghost text-xs" data-add-person>${icon('Plus', { size: 14 })} ${escapeHtml(t('metadata.add_person'))}</button>
+        </fieldset>
+        ${providerIdsHtml(editor?.ExternalIdInfos || [], item.ProviderIds)}
         <label class="flex items-center gap-3 text-sm text-white/70 pt-2 border-t border-white/10">
             <input type="checkbox" name="lockData" class="${CHECKBOX}"${item.LockData ? ' checked' : ''}> ${escapeHtml(t('metadata.lock_item'))}
         </label>
@@ -399,11 +459,27 @@ async function openMetadataEditor(id) {
     </form>`);
     const form = dlg.querySelector('[data-form]');
     form.lockData.addEventListener('change', () => { dlg.querySelector('[data-fields]').hidden = form.lockData.checked; });
+    const people = dlg.querySelector('[data-people]');
+    dlg.querySelector('[data-add-person]').addEventListener('click', () => {
+        people.insertAdjacentHTML('beforeend', personRowHtml());
+        people.lastElementChild.querySelector('[data-person-name]').focus();
+    });
+    people.addEventListener('click', e => e.target.closest('[data-remove-person]')?.closest('[data-person]').remove());
     form.addEventListener('submit', async e => {
         e.preventDefault();
         const values = Object.fromEntries(['name', 'originalTitle', 'sortName', 'overview', 'tagline', 'year', 'premiereDate',
-            'officialRating', 'communityRating', 'criticRating', 'genres', 'tags'].map(name => [name, form[name].value]));
+            'officialRating', 'communityRating', 'criticRating', 'genres', 'tags', 'studios'].map(name => [name, form[name].value]));
+        if (hasEndDate) values.endDate = form.endDate.value;
         values.sortNameBefore = item.ForcedSortName;
+        values.studioNames = (item.Studios || []).map(s => s.Name);
+        values.studiosBefore = values.studioNames.join(', ');
+        values.people = [...people.querySelectorAll('[data-person]')].map(row => ({
+            name: row.querySelector('[data-person-name]').value,
+            role: row.querySelector('[data-person-role]').value,
+            type: row.querySelector('[data-person-type]').value,
+        }));
+        values.providerIdsBefore = item.ProviderIds || {};
+        values.providerIds = Object.fromEntries([...form.querySelectorAll('[data-provider-id]')].map(input => [input.dataset.providerId, input.value]));
         values.lockData = form.lockData.checked;
         values.enabled = Object.fromEntries(LOCKABLE_FIELDS.map(name => [name, form[`enabled-${name}`].checked]));
         try {
@@ -417,4 +493,7 @@ async function openMetadataEditor(id) {
     });
 }
 
-export { openRefreshDialog, openIdentifyDialog, openImageEditor, openMetadataEditor, refreshQuery, itemUpdateBody };
+export {
+    openRefreshDialog, openIdentifyDialog, openImageEditor, openMetadataEditor, refreshQuery, itemUpdateBody,
+    openDialog, closeDialog, actionsHtml, loadItem, itemChanged, LABEL, CHECKBOX,
+};

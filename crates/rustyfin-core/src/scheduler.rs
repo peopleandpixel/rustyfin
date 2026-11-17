@@ -28,6 +28,8 @@ pub const TASK_CHAPTER_IMAGES: &str = "RefreshChapterImages";
 /// Jellyfin's key for its trickplay task.
 pub const TASK_TRICKPLAY: &str = "RefreshTrickplayImages";
 pub const TASK_CLEAN_ACTIVITY_LOG: &str = "CleanActivityLog";
+/// Jellyfin's key for its TMDb upcoming and missing episodes task.
+pub const TASK_MISSING_EPISODES: &str = crate::missing_episodes::TASK_KEY;
 
 /// Jellyfin's default `ActivityLogRetentionDays`.
 const DEFAULT_ACTIVITY_LOG_RETENTION_DAYS: u32 = 30;
@@ -439,6 +441,28 @@ impl TaskScheduler {
             },
         );
 
+        // Jellyfin 12.4's TMDb upcoming and missing episodes task
+        tasks.insert(
+            TASK_MISSING_EPISODES.to_string(),
+            TaskEntry {
+                info: ScheduledTaskInfo {
+                    id: TASK_MISSING_EPISODES.to_string(),
+                    key: TASK_MISSING_EPISODES.to_string(),
+                    is_hidden: false,
+                    name: crate::missing_episodes::TASK_NAME.to_string(),
+                    description: crate::missing_episodes::TASK_DESCRIPTION.to_string(),
+                    category: "Library".to_string(),
+                    state: TaskState::Idle,
+                    current_progress_percentage: None,
+                    // MissingEpisodeRefreshIntervalDays' default
+                    triggers: vec![TaskTriggerInfo::interval(
+                        crate::missing_episodes::DEFAULT_INTERVAL_DAYS as u64 * TICKS_24H,
+                    )],
+                    last_execution_result: None,
+                },
+            },
+        );
+
         let progress = tasks
             .keys()
             .map(|id| (id.clone(), TaskProgress::new()))
@@ -632,6 +656,10 @@ impl TaskScheduler {
                     let sched = self.clone();
                     tokio::spawn(async move { sched.run_clean_activity_log().await });
                 }
+                TASK_MISSING_EPISODES => {
+                    let sched = self.clone();
+                    tokio::spawn(async move { sched.run_missing_episodes().await });
+                }
                 _ => {}
             }
             true
@@ -763,6 +791,63 @@ impl TaskScheduler {
 
     /// Deletes the activity log entries older than the retention age. A retention of 0 keeps
     /// every entry.
+    /// Creates and prunes the virtual (unaired and missing) episodes, as the TMDb plugin's
+    /// settings say (Jellyfin 12.4's TmdbRefreshUpcomingEpisodes).
+    async fn run_missing_episodes(&self) {
+        use crate::missing_episodes::{Settings, Source, TMDB_PLUGIN_ID};
+        let Some(_claim) = self.claim(TASK_MISSING_EPISODES) else {
+            return skipped(TASK_MISSING_EPISODES);
+        };
+        self.set_task_state(TASK_MISSING_EPISODES, TaskState::Running)
+            .await;
+        let start = Utc::now();
+        let progress = self.progress_of(TASK_MISSING_EPISODES);
+        let config = self.plugin_manager.get_configuration(TMDB_PLUGIN_ID).await;
+        let settings = Settings::from_config(config.as_ref().map(|c| &c.values));
+        let providers = self.plugin_manager.metadata_providers().await;
+        let source = providers
+            .iter()
+            .find(|p| p.plugin_id == TMDB_PLUGIN_ID)
+            .and_then(|p| {
+                Some(Source {
+                    lookups: p.lookups.as_deref()?,
+                    provider_name: &p.provider_name,
+                })
+            });
+        let report = |share: f64| progress.report(share);
+        let outcome = crate::missing_episodes::run(
+            &self.db,
+            source,
+            &settings,
+            Utc::now().date_naive(),
+            &report,
+        )
+        .await;
+        let (status, error_message) = match outcome {
+            Ok(outcome) => {
+                tracing::info!(
+                    "upcoming and missing episodes: {} series, {} created, {} updated, {} removed, {} failed",
+                    outcome.series,
+                    outcome.created,
+                    outcome.updated,
+                    outcome.pruned,
+                    outcome.failed
+                );
+                (TaskCompletionStatus::Completed, None)
+            }
+            Err(e) => (TaskCompletionStatus::Failed, Some(e)),
+        };
+        let result = TaskResult {
+            status,
+            error_message,
+            start_time_utc: start.to_rfc3339(),
+            end_time_utc: Utc::now().to_rfc3339(),
+        };
+        self.set_task_result(TASK_MISSING_EPISODES, result).await;
+        self.set_task_state(TASK_MISSING_EPISODES, TaskState::Idle)
+            .await;
+    }
+
     async fn run_clean_activity_log(&self) {
         let Some(_claim) = self.claim(TASK_CLEAN_ACTIVITY_LOG) else {
             return skipped(TASK_CLEAN_ACTIVITY_LOG);

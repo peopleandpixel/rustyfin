@@ -3,6 +3,8 @@
 import { icon, toast, escapeHtml } from './util.js';
 import { applyCardUserData } from './cards.js';
 import { playQueueAt } from './queue.js';
+import { openPhotoViewer } from './photos.js';
+import { canDownload, downloadItems } from './nativeshell.js';
 
 const PLAYABLE = ['Movie', 'Episode', 'Audio', 'MusicVideo', 'Video', 'AudioBook', 'Trailer'];
 const CONTAINERS = ['Series', 'Season', 'MusicAlbum', 'MusicArtist', 'BoxSet', 'Playlist', 'Folder', 'CollectionFolder'];
@@ -10,6 +12,9 @@ const CONTAINERS = ['Series', 'Season', 'MusicAlbum', 'MusicArtist', 'BoxSet', '
 const PLAYLIST_TYPES = ['Movie', 'Episode', 'Audio', 'MusicVideo', 'Video', 'Series', 'Season', 'MusicAlbum', 'MusicArtist', 'BoxSet'];
 const COLLECTION_TYPES = ['Movie', 'Series', 'Season', 'Episode', 'MusicAlbum', 'MusicArtist', 'MusicVideo', 'Video'];
 const NO_USER_DATA = ['Person', 'Genre', 'MusicGenre', 'Studio', 'CollectionFolder', 'UserView'];
+// The music items an Instant mix plays a queue of (the server's /Items/{id}/InstantMix takes each of them)
+const INSTANT_MIX_TYPES = ['Audio', 'MusicAlbum', 'MusicArtist', 'MusicGenre', 'Playlist'];
+const INSTANT_MIX_LIMIT = 200;
 
 // The item a context menu was opened for, by id (the menu's play and add commands need its type)
 const menuItems = new Map();
@@ -30,6 +35,7 @@ function cardMenuCommands(item, isAdmin, shownIn = null) {
     if (PLAYABLE.includes(type)) commands.push({ action: 'card-play', label: t('common.play'), icon: 'Play' });
     else if (container) commands.push({ action: 'play-all', label: t('common.play'), icon: 'Play' });
     if (container) commands.push({ action: 'shuffle', label: t('player.shuffle'), icon: 'Shuffle' });
+    if (INSTANT_MIX_TYPES.includes(type)) commands.push({ action: 'card-instant-mix', label: t('cards.instant_mix'), icon: 'ListMusic' });
     commands.push('separator');
     if (!NO_USER_DATA.includes(type)) {
         commands.push({
@@ -46,6 +52,8 @@ function cardMenuCommands(item, isAdmin, shownIn = null) {
     commands.push('separator');
     if (PLAYLIST_TYPES.includes(type)) commands.push({ action: 'card-add-playlist', label: t('cards.add_to_playlist'), icon: 'ListPlus' });
     if (isAdmin && COLLECTION_TYPES.includes(type)) commands.push({ action: 'card-add-collection', label: t('cards.add_to_collection'), icon: 'FolderPlus' });
+    // In the Jellyfin Android app, into its downloads
+    if (canDownload(item)) commands.push({ action: 'card-download', label: t('native.download'), icon: 'Download' });
     if (shownIn?.canEdit && shownIn.id !== item.Id) {
         const playlist = shownIn.type === 'Playlist';
         commands.push({
@@ -217,7 +225,37 @@ async function setCardLikes(el, likes) {
 // Play from the menu: the item alone, through the queue (resume or start over, as any Play asks)
 function playCardItem(el) {
     const item = menuItems.get(el.dataset.id);
-    if (item) playQueueAt([item], 0);
+    if (item?.Type === 'Photo') openPhotoViewer([item], 0);
+    else if (item) playQueueAt([item], 0);
+}
+
+// The request for an item's Instant mix: similar songs, the item itself first for a song
+function instantMixUrl(id) {
+    const q = new URLSearchParams({ UserId: API.userId || '', Limit: String(INSTANT_MIX_LIMIT) });
+    return `/Items/${encodeURIComponent(id)}/InstantMix?${q}`;
+}
+
+// Plays the Instant mix of a music item as the play queue
+async function playInstantMix(el) {
+    const item = menuItems.get(el.dataset.id);
+    if (!item) return;
+    try {
+        const data = await API.get(instantMixUrl(item.Id));
+        const items = (data?.Items || []).filter(i => !i.IsFolder && i.LocationType !== 'Virtual');
+        if (!items.length) {
+            toast(t('player.queue_empty'), 'error');
+            return;
+        }
+        playQueueAt(items, 0);
+    } catch (e) {
+        toast(t('common.error_message', { message: e.message }), 'error');
+    }
+}
+
+// Download from the menu, into the Jellyfin Android app's downloads
+function downloadCardItem(el) {
+    const item = menuItems.get(el.dataset.id);
+    if (item && downloadItems([item])) toast(t('native.download_started'));
 }
 
 // Add to playlist or collection: a dialog with the existing ones and a new one by name
@@ -233,8 +271,12 @@ function addToDialog(kind) {
     return dialog;
 }
 
-async function openAddTo(el, kind) {
-    const id = el.dataset.id;
+function openAddTo(el, kind) {
+    return openAddToIds([el.dataset.id], kind);
+}
+
+// The add dialog for several items at once (the library's multi-select, multiselect.js); `done` runs after an add
+async function openAddToIds(ids, kind, done = null) {
     let lists = [];
     try {
         const answer = kind === 'playlist' ? await API.getPlaylists() : await API.getCollections();
@@ -263,8 +305,8 @@ async function openAddTo(el, kind) {
     const select = dialog.querySelector('select');
     const name = dialog.querySelector('input');
     select.addEventListener('change', () => { name.hidden = !!select.value; });
-    dialog.onclose = () => {
-        if (dialog.returnValue === 'ok') addTo(kind, id, select.value, name.value.trim());
+    dialog.onclose = async () => {
+        if (dialog.returnValue === 'ok' && await addTo(kind, ids, select.value, name.value.trim())) done?.();
     };
     // A reused dialog keeps the last returnValue; Escape must not read as the last OK
     dialog.returnValue = '';
@@ -272,24 +314,29 @@ async function openAddTo(el, kind) {
     (lists.length ? select : name).focus();
 }
 
+// Adds the item `id` (or the items of an array) to the playlist or collection `target`, or to a new one named `name`.
+// Resolves true when they were added.
 async function addTo(kind, id, target, name) {
+    const ids = [].concat(id);
     try {
         let listName = name;
         if (target) {
-            await (kind === 'playlist' ? API.addToPlaylist(target, [id]) : API.addToCollection(target, [id]));
+            await (kind === 'playlist' ? API.addToPlaylist(target, ids) : API.addToCollection(target, ids));
             const option = document.querySelector(`#card-add-dialog option[value="${CSS.escape(target)}"]`);
             listName = option?.textContent || '';
         } else {
             if (!name) {
                 toast(t('cards.name_required'), 'error');
-                return;
+                return false;
             }
-            await (kind === 'playlist' ? API.createPlaylist(name, [id]) : API.createCollection(name, [id]));
+            await (kind === 'playlist' ? API.createPlaylist(name, ids) : API.createCollection(name, ids));
         }
         API.invalidateCache('/Items');
         toast(t('cards.added_to', { name: listName }));
+        return true;
     } catch (e) {
         toast(e.message, 'error');
+        return false;
     }
 }
 
@@ -315,7 +362,10 @@ function cardPointerDown(e) {
     press.timer = setTimeout(() => {
         longPress = null;
         longPressAt = Date.now();
-        openCardMenu(card, press);
+        // A grid with multi-select (multiselect.js) takes the long press to select the card, as Jellyfin Web's
+        const claim = new CustomEvent('jf-card-longpress', { cancelable: true, detail: { card } });
+        document.dispatchEvent(claim);
+        if (!claim.defaultPrevented) openCardMenu(card, press);
     }, LONG_PRESS_MS);
     longPress = press;
 }
@@ -349,7 +399,8 @@ document.addEventListener('contextmenu', cardContextMenu);
 document.addEventListener('click', cardClickAfterLongPress, true);
 
 export {
-    cardMenuCommands, cardMenuHtml, openCardMenu, toggleCardPlayed, toggleCardFavorite, setCardLikes, playCardItem,
-    openAddTo, addTo, userDataChanged, cardPointerDown, cardPointerMove, cardContextMenu, cardClickAfterLongPress,
+    cardMenuCommands, cardMenuHtml, openCardMenu, toggleCardPlayed, toggleCardFavorite, setCardLikes, playCardItem, instantMixUrl, playInstantMix,
+    downloadCardItem, openAddTo, openAddToIds, addTo, userDataChanged, cardPointerDown, cardPointerMove, cardContextMenu,
+    cardClickAfterLongPress,
     cancelLongPress, LONG_PRESS_MS,
 };
