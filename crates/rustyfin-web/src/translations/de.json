@@ -759,7 +759,20 @@
         "plugin_no_plugins": "Keine Plugins installiert",
         "plugin_builtin": "Eingebaut",
         "plugin_config_json": "Konfiguration (JSON)",
-        "plugin_enabled": "Aktiviert"
+        "plugin_enabled": "Aktiviert",
+        "tmdb_import_unaired": "Nicht erschienene (kommende) Episoden aus für Serien abgerufenen Metadaten erstellen.",
+        "tmdb_import_unaired_desc": "Fügt virtuelle Einträge für auf TMDb aufgeführte Episoden hinzu, die noch nicht ausgestrahlt wurden. Dies füllt die Ansicht \"Demnächst\".",
+        "tmdb_import_missing": "Fehlende Episoden aus für Serien abgerufenen Metadaten erstellen.",
+        "tmdb_import_missing_desc": "Fügt virtuelle Einträge für auf TMDb aufgeführte Episoden hinzu, die bereits ausgestrahlt wurden, aber nicht in der Bibliothek vorhanden sind.",
+        "tmdb_import_specials": "Specials beim Erstellen nicht erschienener und fehlender Episoden einbeziehen.",
+        "tmdb_import_specials_desc": "Ist die Option deaktiviert, werden Specials (Staffel 0) nie als virtuelle Einträge hinzugefügt, und vorhandene virtuelle Specials werden entfernt.",
+        "tmdb_refresh_days": "Episoden-Aktualisierungsintervall (Tage)",
+        "tmdb_refresh_days_desc": "Wie oft die geplante Aufgabe TMDb auf neu angekündigte nicht erschienene oder fehlende Episoden prüft.",
+        "tmdb_grace_days": "Schonfrist für kürzlich ausgestrahlte Episoden (Tage)",
+        "tmdb_grace_days_desc": "Wenn fehlende Episoden deaktiviert sind, wie viele Tage eine kürzlich ausgestrahlte Episode an ihrem Platz bleibt, bevor ihr Platzhalter entfernt wird.",
+        "tmdb_libraries": "TV-Bibliotheken",
+        "tmdb_libraries_desc": "Wähle die TV-Bibliotheken, auf die die obigen Optionen für nicht erschienene und fehlende Episoden angewendet werden.",
+        "tmdb_no_libraries": "Keine TV-Bibliotheken gefunden."
     },
     "quick_connect": {
         "title": "Quick Connect",
