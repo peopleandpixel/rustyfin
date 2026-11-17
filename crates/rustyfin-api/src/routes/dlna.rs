@@ -235,7 +235,10 @@ async fn dlna_stream(
     if !access.access.enable_media_playback {
         return Err(not_found());
     }
-    super::streaming::serve_file(item.path, &headers).await
+    // The same check as the signed-in stream: a file the library owns, inside a library folder,
+    // with no symlink out of it when links out of the libraries are refused
+    let path = super::streaming::validate_path_against_library(&state, &item.path).await?;
+    super::streaming::serve_file(path, &headers).await
 }
 
 async fn connection_manager_control(body: String) -> Response {

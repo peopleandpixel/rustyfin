@@ -41463,6 +41463,64 @@ async fn r3playback_hls_input_outside_the_library_is_refused() {
     manager.stop_all().await;
 }
 
+// R3 security review fixes
+
+/// The DLNA stream needs no sign-in, so it checks a stored path as the signed-in stream does:
+/// a file outside every library, the database, a `..` path and a link out of the library (with
+/// `RefuseLinksOutOfLibraries`) answer 404; the library's own file streams.
+#[tokio::test]
+async fn r3security_dlna_stream_refuses_files_out_of_the_library() {
+    let state = test_state().await;
+    let (_, admin) = admin_session(&state).await;
+    {
+        let mut config = state.config.write().await;
+        config.enable_dlna_server = true;
+        config.dlna_default_user_id = Some(admin.to_string());
+    }
+    let lib = std::path::PathBuf::from(media_folder(&state, "r3security-dlna"));
+    let outside = state.data_dir.join("r3security-outside");
+    std::fs::create_dir_all(&outside).unwrap();
+    let film = outside.join("Film.mkv");
+    std::fs::write(&film, b"outside bytes").unwrap();
+    let db = state.data_dir.join("test.db");
+    std::os::unix::fs::symlink(&db, lib.join("Linked.mkv")).unwrap();
+    std::os::unix::fs::symlink(&film, lib.join("Out.mkv")).unwrap();
+    let inside = lib.join("In.mkv");
+    std::fs::write(&inside, b"inside bytes").unwrap();
+    let s = |p: &std::path::Path| p.to_str().unwrap().to_string();
+    let mut refused = Vec::new();
+    for path in [
+        s(&film),
+        s(&db),
+        s(&lib.join("Linked.mkv")),
+        format!("{}/../../r3security-outside/Film.mkv", lib.display()),
+    ] {
+        refused.push(r3playback_insert_item(&state, &lib, &path).await);
+    }
+    let out_id = r3playback_insert_item(&state, &lib, &s(&lib.join("Out.mkv"))).await;
+    let inside_id = r3playback_insert_item(&state, &lib, &s(&inside)).await;
+    state.config.write().await.refuse_links_out_of_libraries = true;
+    let server_id = state.server_id.to_string();
+    let app = app(state);
+    let stream = |id: uuid::Uuid| {
+        let req = Request::builder()
+            .uri(format!("/Dlna/{server_id}/Items/{id}/Stream"))
+            .body(Body::empty())
+            .unwrap();
+        g1_send_raw(&app, req)
+    };
+
+    for id in refused.into_iter().chain([out_id]) {
+        let (status, body) = stream(id).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{id}: {body}");
+        assert!(!body.contains("outside bytes"), "{id}");
+    }
+    assert_eq!(
+        stream(inside_id).await,
+        (StatusCode::OK, "inside bytes".to_string())
+    );
+}
+
 #[tokio::test]
 async fn r3playback_subtitle_routes_refuse_files_out_of_the_library() {
     let state = test_state().await;
