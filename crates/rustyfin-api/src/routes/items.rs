@@ -373,26 +373,9 @@ async fn enrich_item(
     }
     item.provider_ids = provider_ids;
 
-    // Jellyfin import: metadata columns that live outside media_items
-    if let Ok(Some(extras)) = rustyfin_db::repo_jellyfin_import::item_extras(pool, item.id).await {
-        if let Some(title) = extras.original_title {
-            item.original_title = Some(title);
-        }
-        if let Some(rating) = extras.critic_rating {
-            item.critic_rating = Some(rating);
-        }
-        if let Some(imdb) = extras.imdb_id {
-            item.provider_ids.set("Imdb".to_string(), imdb);
-        }
-        item.forced_sort_name = extras.forced_sort_name.filter(|s| !s.trim().is_empty());
-        item.lock_data = extras.lock_data;
-        item.locked_fields = extras
-            .locked_fields
-            .split('|')
-            .filter(|field| !field.is_empty())
-            .map(str::to_string)
-            .collect();
-    }
+    // The stored fields the lists send too (OriginalTitle, CriticRating, IMDb id, ForcedSortName,
+    // locks, PartCount, DateLastMediaAdded), from the one function both use.
+    apply_stored_fields(pool, std::slice::from_mut(item)).await;
 
     // Photos: what the scan read from the file's header and EXIF block
     if item.media_type == rustyfin_model::media::MediaType::Photo
@@ -439,13 +422,6 @@ async fn enrich_item(
         .unwrap_or_default();
     item.local_trailer_count = Some(trailers);
     item.special_feature_count = Some(specials);
-    // A movie split into files: Jellyfin's PartCount, part 1 included.
-    let parts = rustyfin_db::repo_extras::additional_part_count(pool, item.id)
-        .await
-        .unwrap_or(0);
-    if parts > 0 {
-        item.part_count = Some(parts as i32 + 1);
-    }
 
     // Parallel queries: images, chapters, trickplay, user_data, people, studios
     // These are independent and can run concurrently instead of sequentially.
@@ -905,13 +881,6 @@ async fn enrich_item(
         }
     }
 
-    // --- DateLastMediaAdded for folders ---
-    if item.media_type.is_folder()
-        && let Ok(Some(last_added)) =
-            rustyfin_db::repo_media::get_last_media_added(pool, item.id).await
-    {
-        item.date_last_media_added = Some(last_added);
-    }
     set_top_level_parent(item);
 }
 
@@ -1231,9 +1200,6 @@ pub(crate) async fn enrich_items_with(
     let studios_map = rustyfin_db::repo_media::get_studios_for_items(pool, &item_ids)
         .await
         .unwrap_or_default();
-    let imdb_map = rustyfin_db::repo_media::get_imdb_ids_for_items(pool, &item_ids)
-        .await
-        .unwrap_or_default();
 
     // Batch query 8: People for all items
     let people_map: std::collections::HashMap<String, Vec<rustyfin_db::repo_media::PersonRow>> = {
@@ -1318,9 +1284,6 @@ pub(crate) async fn enrich_items_with(
         }
         if let Some(tvdb) = item.tvdb_id {
             provider_ids.set("Tvdb".to_string(), tvdb.to_string());
-        }
-        if let Some(imdb) = imdb_map.get(&item.id.to_string()) {
-            provider_ids.set("Imdb".to_string(), imdb.clone());
         }
         item.provider_ids = provider_ids;
 
@@ -1904,10 +1867,59 @@ pub(crate) async fn enrich_items_with(
         item.local_trailer_count = Some(trailers);
         item.special_feature_count = Some(specials);
     }
+    apply_stored_fields(pool, items).await;
 
     for item in items.iter_mut() {
         images.apply(item);
         set_top_level_parent(item);
+    }
+}
+
+/// The stored fields that `/Items/{id}` (`enrich_item`) and the lists (`enrich_items_with`) both
+/// send, from one place so the two can't disagree: OriginalTitle and CriticRating from the
+/// metadata columns, the IMDb id, ForcedSortName, LockData and LockedFields, a split movie's
+/// PartCount (part 1 included) and a folder's DateLastMediaAdded. One batch for all of `items`.
+async fn apply_stored_fields(pool: &SqlitePool, items: &mut [MediaItem]) {
+    let ids: Vec<Uuid> = items.iter().map(|item| item.id).collect();
+    let folders: Vec<Uuid> = items
+        .iter()
+        .filter(|item| item.media_type.is_folder())
+        .map(|item| item.id)
+        .collect();
+    let stored = match rustyfin_db::repo_item_dto::stored_fields(pool, &ids, &folders).await {
+        Ok(stored) => stored,
+        Err(e) => {
+            tracing::warn!(error = %e, "could not read the items' stored fields");
+            return;
+        }
+    };
+    for item in items.iter_mut() {
+        let Some(fields) = stored.get(&item.id) else {
+            continue;
+        };
+        if let Some(title) = &fields.original_title {
+            item.original_title = Some(title.clone());
+        }
+        if let Some(rating) = fields.critic_rating {
+            item.critic_rating = Some(rating);
+        }
+        if let Some(imdb) = &fields.imdb_id {
+            item.provider_ids.set("Imdb".to_string(), imdb.clone());
+        }
+        item.forced_sort_name = fields.forced_sort_name.clone();
+        item.lock_data = fields.lock_data;
+        item.locked_fields = fields
+            .locked_fields
+            .split('|')
+            .filter(|field| !field.is_empty())
+            .map(str::to_string)
+            .collect();
+        if fields.additional_parts > 0 {
+            item.part_count = Some(fields.additional_parts as i32 + 1);
+        }
+        if item.media_type.is_folder() && fields.last_media_added.is_some() {
+            item.date_last_media_added = fields.last_media_added;
+        }
     }
 }
 

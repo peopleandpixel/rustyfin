@@ -53796,6 +53796,67 @@ async fn r3items_delete_items_deletes_exactly_the_ids() {
 }
 
 #[tokio::test]
+async fn r3items_detail_and_list_send_the_same_stored_fields() {
+    let state = test_state().await;
+    let lib = r3items_library(&state).await;
+    let (alpha, show) = (lib.id("Alpha"), lib.id("Show"));
+    let part = uuid::Uuid::new_v4();
+    for sql in [
+        format!(
+            "UPDATE item_metadata_extras SET original_title = 'Alpha Original', critic_rating = 77, forced_sort_name = 'aaa alpha', locked_fields = 'Name|Overview' WHERE item_id = '{alpha}'"
+        ),
+        format!(
+            "INSERT INTO media_items (id, library_id, name, media_type, path, owner_id, extra_type) VALUES ('{part}', '{}', 'Alpha part 2', 'Movie', '/nowhere/alpha-part2.mkv', '{alpha}', 'Part')",
+            lib.library
+        ),
+    ] {
+        r3items_sql(&state, &sql).await;
+    }
+    let (token, _) = admin_session(&state).await;
+    let app = app(state);
+    let fields = [
+        "OriginalTitle",
+        "CriticRating",
+        "ForcedSortName",
+        "LockData",
+        "LockedFields",
+        "PartCount",
+        "DateLastMediaAdded",
+        "ProviderIds",
+    ];
+    for id in [alpha, show] {
+        let (status, detail) =
+            send_authed(&app, "GET", &format!("/Items/{id}"), &token, None).await;
+        assert_eq!(status, StatusCode::OK, "{detail}");
+        let (status, list) =
+            send_authed(&app, "GET", &format!("/Items?Ids={id}"), &token, None).await;
+        assert_eq!(status, StatusCode::OK, "{list}");
+        let listed = &list["Items"][0];
+        for field in fields {
+            assert_eq!(detail[field], listed[field], "{field} of {id}");
+        }
+    }
+    // And the values are the stored ones.
+    let (_, listed) = send_authed(&app, "GET", &format!("/Items?Ids={alpha}"), &token, None).await;
+    let alpha = &listed["Items"][0];
+    assert_eq!(alpha["OriginalTitle"], "Alpha Original");
+    assert_eq!(alpha["CriticRating"], 77.0);
+    assert_eq!(alpha["ForcedSortName"], "aaa alpha");
+    assert_eq!(alpha["LockData"], true);
+    assert_eq!(
+        alpha["LockedFields"],
+        serde_json::json!(["Name", "Overview"])
+    );
+    assert_eq!(alpha["PartCount"], 2);
+    assert_eq!(alpha["ProviderIds"]["Imdb"], "tt0000001");
+    let (_, listed) = send_authed(&app, "GET", &format!("/Items?Ids={show}"), &token, None).await;
+    assert!(
+        listed["Items"][0]["DateLastMediaAdded"].is_string(),
+        "{listed}"
+    );
+}
+
+#[tokio::test]
 async fn r3items_item_collections_lists_those_holding_it() {
     let state = test_state().await;
     let lib = r3items_library(&state).await;
