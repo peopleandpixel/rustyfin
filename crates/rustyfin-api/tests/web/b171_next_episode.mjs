@@ -128,7 +128,7 @@ test('next is the following episode in season order, then the next season; speci
 test('audio and subtitle languages carry over, else the defaults stay; subtitles off stays off', () => {
     const { fns } = sandbox();
     const carry = fns.episodeTrackCarry(session());
-    assert.deepEqual(plain(carry), { audioLanguage: 'jpn', subtitleLanguage: 'eng', subtitleForced: false, subtitlesOff: false });
+    assert.deepEqual(plain(carry), { audioLanguage: 'jpn', audioTitle: '', subtitleLanguage: 'eng', subtitleTitle: '', subtitleForced: false, subtitlesOff: false });
     const next = [
         { Index: 0, CodecType: 'video' },
         { Index: 1, CodecType: 'audio', Language: 'eng', IsDefault: true },

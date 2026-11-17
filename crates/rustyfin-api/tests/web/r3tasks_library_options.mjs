@@ -53,6 +53,10 @@ function sandbox(saved = {}) {
             },
             scanLibrary: async () => {},
         },
+        // The editor of the other options (library-options.js, r3dash3_library_options.mjs)
+        renderLibraryOptionsEditor: async () => {},
+        readLibraryOptionsEditor: () => ({}),
+        closeLibraryOptionsEditor: () => {},
         setAddLibraryError: () => {},
         closeAddLibrary: () => {},
         loadSidebar: async () => {},
@@ -186,7 +190,7 @@ test('the page has the dialogs, and the admin library list opens the options', (
     assert.match(html, /<form id="library-options-form" onsubmit="submitLibraryOptions\(event\)"/);
     assert.match(html, /onclick="closeLibraryOptions\(\)"/);
     assert.match(read('modules/admin.js'), /data-action="library-options" data-id=/);
-    assert.match(read('modules/router.js'), /'library-options': el => openLibraryOptions\(el\.dataset\.id, el\.dataset\.name\)/);
+    assert.match(read('modules/router.js'), /'library-options': el => openLibraryOptions\(el\.dataset\.id, el\.dataset\.name, el\.dataset\.type\)/);
     const app = read('app.js');
     const exposed = app.slice(app.indexOf('Object.assign(window, {'));
     assert.match(exposed, /closeLibraryOptions/);

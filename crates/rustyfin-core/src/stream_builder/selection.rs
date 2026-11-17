@@ -69,14 +69,34 @@ pub struct AudioIndexSource {
     pub default: bool,
     /// An audio language was preferred: only streams in the default stream's language are.
     pub language: bool,
+    /// The user's remembered track is the default: it is the only candidate.
+    pub user: bool,
 }
 
 impl SourceFacts {
     /// Sets the default audio and subtitle streams and the subtitle scores from a user's
-    /// settings, as Jellyfin does for a video when no remembered track applies (a remembered
-    /// track reaches the builder as the request's index instead).
+    /// settings, as Jellyfin does for a video when no remembered track applies.
     pub fn apply_preferences(&mut self, prefs: &TrackPreferences) {
-        if prefs.original_language_audio && prefs.play_default_audio_track {
+        self.apply_preferences_and_remembered(prefs, None, None);
+    }
+
+    /// As `apply_preferences`, with the user's remembered audio and subtitle streams (already
+    /// checked against this source; subtitle -1 is off) as the defaults where given, as Jellyfin's
+    /// `SetDefaultAudioAndSubtitleStreamIndices` does: the subtitle default then follows the
+    /// remembered audio's language.
+    pub fn apply_preferences_and_remembered(
+        &mut self,
+        prefs: &TrackPreferences,
+        audio: Option<i32>,
+        subtitle: Option<i32>,
+    ) {
+        if let Some(index) = audio {
+            self.default_audio_stream_index = Some(index);
+            self.audio_index_source = Some(AudioIndexSource {
+                user: true,
+                ..AudioIndexSource::default()
+            });
+        } else if prefs.original_language_audio && prefs.play_default_audio_track {
             // The item's original language isn't known, so no language is preferred
             self.default_audio_stream_index = default_audio_index(&self.streams, &[], true);
             self.audio_index_source = Some(AudioIndexSource::default());
@@ -89,6 +109,7 @@ impl SourceFacts {
             self.audio_index_source = Some(AudioIndexSource {
                 default: prefs.play_default_audio_track,
                 language: !prefs.audio_languages.is_empty(),
+                user: false,
             });
         }
         let audio_language = self.default_audio_stream_index.and_then(|index| {
@@ -97,6 +118,13 @@ impl SourceFacts {
                 .find(|s| s.kind == StreamKind::Audio && s.index == index)
                 .and_then(|s| s.language.clone())
         });
+        // A remembered subtitle (off included) is the default and nothing is scored, as Jellyfin's
+        // SetDefaultSubtitleStreamIndex returns before scoring, so the builder's tie-break for an
+        // external stream can't replace it
+        if subtitle.is_some() {
+            self.default_subtitle_stream_index = subtitle;
+            return;
+        }
         let languages = &prefs.subtitle_languages;
         let mode = prefs.subtitle_mode;
         self.default_subtitle_stream_index =
@@ -450,7 +478,7 @@ mod tests {
             source.audio_index_source,
             Some(AudioIndexSource {
                 default: true,
-                language: false
+                ..AudioIndexSource::default()
             })
         );
         assert_eq!(source.default_subtitle_stream_index, Some(3));
@@ -467,8 +495,8 @@ mod tests {
         assert_eq!(
             source.audio_index_source,
             Some(AudioIndexSource {
-                default: false,
-                language: true
+                language: true,
+                ..AudioIndexSource::default()
             })
         );
         assert_eq!(source.default_subtitle_stream_index, None);
@@ -500,5 +528,45 @@ mod tests {
         };
         assert_eq!(builder_default_subtitle(&source, &[srt]), Some(3));
         assert_eq!(builder_default_subtitle(&source, &[]), Some(2));
+    }
+
+    /// A remembered subtitle, off included, is not scored, as Jellyfin's
+    /// SetDefaultSubtitleStreamIndex returns first: the builder's tie-break for an external
+    /// delivery can't replace it.
+    #[test]
+    fn r3prefs_remembered_subtitle_survives_tied_scores() {
+        let streams = vec![
+            audio(1, Some("eng"), true),
+            sub(2, Some("eng"), "d"),
+            sub(3, Some("eng"), "d"),
+        ];
+        let subrip = SubtitleProfile {
+            format: "subrip".to_string(),
+            method: SubtitleDeliveryMethod::External,
+            didl_mode: String::new(),
+            language: String::new(),
+            container: String::new(),
+        };
+        let prefs = TrackPreferences::default();
+        let mut source = SourceFacts {
+            streams,
+            ..Default::default()
+        };
+        // Not remembered: the two default streams tie and the first external delivery wins
+        source.apply_preferences(&prefs);
+        assert_eq!(
+            builder_default_subtitle(&source, std::slice::from_ref(&subrip)),
+            Some(2)
+        );
+        for remembered in [-1, 3] {
+            for stream in &mut source.streams {
+                stream.score = None;
+            }
+            source.apply_preferences_and_remembered(&prefs, None, Some(remembered));
+            assert_eq!(
+                builder_default_subtitle(&source, std::slice::from_ref(&subrip)),
+                Some(remembered)
+            );
+        }
     }
 }

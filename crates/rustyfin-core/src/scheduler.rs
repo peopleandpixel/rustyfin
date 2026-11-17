@@ -28,14 +28,39 @@ pub const TASK_CHAPTER_IMAGES: &str = "RefreshChapterImages";
 /// Jellyfin's key for its trickplay task.
 pub const TASK_TRICKPLAY: &str = "RefreshTrickplayImages";
 pub const TASK_CLEAN_ACTIVITY_LOG: &str = "CleanActivityLog";
+/// Jellyfin's key for its TMDb upcoming and missing episodes task.
+pub const TASK_MISSING_EPISODES: &str = crate::missing_episodes::TASK_KEY;
 
 /// Jellyfin's default `ActivityLogRetentionDays`.
 const DEFAULT_ACTIVITY_LOG_RETENTION_DAYS: u32 = 30;
 
-/// Default interval: 12 hours in .NET ticks (1 tick = 100ns)
-const TICKS_12H: u64 = 12 * 60 * 60 * 10_000_000;
-/// Default interval: 24 hours in .NET ticks
-const TICKS_24H: u64 = 24 * 60 * 60 * 10_000_000;
+/// One hour in .NET ticks (1 tick = 100ns)
+const TICKS_1H: u64 = 60 * 60 * 10_000_000;
+const TICKS_6H: u64 = 6 * TICKS_1H;
+const TICKS_12H: u64 = 12 * TICKS_1H;
+const TICKS_24H: u64 = 24 * TICKS_1H;
+
+/// A trigger that runs the task at `hour` o'clock each day, server time.
+fn daily_at(hour: u64) -> TaskTriggerInfo {
+    TaskTriggerInfo {
+        trigger_type: "DailyTrigger".to_string(),
+        interval_ticks: None,
+        time_of_day_ticks: Some(hour * TICKS_1H),
+        day_of_week: None,
+        max_runtime_ticks: None,
+    }
+}
+
+/// A trigger that runs the task once after each server start.
+fn at_startup() -> TaskTriggerInfo {
+    TaskTriggerInfo {
+        trigger_type: "StartupTrigger".to_string(),
+        interval_ticks: None,
+        time_of_day_ticks: None,
+        day_of_week: None,
+        max_runtime_ticks: None,
+    }
+}
 
 /// Logs a start skipped because the task runs already (by its triggers or by hand).
 fn skipped(id: &str) {
@@ -75,6 +100,13 @@ pub struct TaskScheduler {
     default_triggers: Arc<HashMap<String, Vec<TaskTriggerInfo>>>,
     /// The tasks running now, started by their triggers or by hand: a second start is skipped.
     running: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
+    /// Held while the triggers file is written, and the results file: one save at a time, each
+    /// of the state as it is once the lock is taken, so the last save is never an older state.
+    saving_triggers: Arc<tokio::sync::Mutex<()>>,
+    saving_results: Arc<tokio::sync::Mutex<()>>,
+    /// The tasks an admin stopped. A library scan's end doesn't start them again; their next
+    /// trigger or a start by hand does, as a cancelled task in Jellyfin waits for its trigger.
+    held: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
 }
 
 /// A task's claim on running, from `TaskScheduler::claim` until it is dropped.
@@ -99,21 +131,116 @@ const STOPPABLE_TASKS: [&str; 3] = [TASK_CHAPTER_IMAGES, TASK_TRICKPLAY, TASK_IN
 /// The file, in the data folder, that keeps the triggers set through the API, by task id.
 const TRIGGERS_FILE: &str = "scheduled_task_triggers.json";
 
-/// The triggers saved in `data_dir`, by task id. A missing or unreadable file keeps the defaults.
-fn saved_triggers(data_dir: &std::path::Path) -> HashMap<String, Vec<TaskTriggerInfo>> {
-    let path = data_dir.join(TRIGGERS_FILE);
+/// The file, in the data folder, that keeps each task's last result, by task id, so a restart
+/// neither forgets when a task last ran nor runs it again at once.
+const RESULTS_FILE: &str = "scheduled_task_results.json";
+
+/// A map by task id saved in `data_dir`. A missing file is empty; an unreadable one is logged and
+/// taken as empty, so the server still starts.
+fn load_saved<T: serde::de::DeserializeOwned>(
+    data_dir: &std::path::Path,
+    file: &str,
+) -> HashMap<String, T> {
+    let path = data_dir.join(file);
     let text = match std::fs::read_to_string(&path) {
         Ok(text) => text,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return HashMap::new(),
         Err(e) => {
-            tracing::warn!(path = %path.display(), error = %e, "could not read the task triggers");
+            tracing::warn!(path = %path.display(), error = %e, "could not read the saved task state");
             return HashMap::new();
         }
     };
     serde_json::from_str(&text).unwrap_or_else(|e| {
-        tracing::warn!(path = %path.display(), error = %e, "task triggers unreadable; using the defaults");
+        tracing::warn!(path = %path.display(), error = %e, "saved task state unreadable; starting without it");
         HashMap::new()
     })
+}
+
+/// The version of the triggers file this build writes. A file without one is from before the
+/// defaults followed Jellyfin's.
+const TRIGGERS_VERSION: u32 = 2;
+
+/// The triggers file: the edited tasks' triggers by task id, with the file's version.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct SavedTriggers<T> {
+    version: u32,
+    triggers: HashMap<String, T>,
+}
+
+/// The triggers file's text for `triggers`.
+fn triggers_json<T: serde::Serialize>(triggers: HashMap<String, T>) -> std::io::Result<Vec<u8>> {
+    serde_json::to_vec_pretty(&SavedTriggers {
+        version: TRIGGERS_VERSION,
+        triggers,
+    })
+    .map_err(std::io::Error::other)
+}
+
+/// The triggers saved in `data_dir`, by task id.
+///
+/// A file without a version is migrated once, then written again with one: a task whose saved
+/// triggers are only its built-in triggers from before the defaults followed Jellyfin's (every
+/// task but the library scan ran each 24 hours, and an early build saved every task's triggers)
+/// takes the new defaults, as never edited. A versioned file holds only edits and is kept as is.
+fn saved_triggers(data_dir: &std::path::Path) -> HashMap<String, Vec<TaskTriggerInfo>> {
+    let value: serde_json::Value = match load_saved::<serde_json::Value>(data_dir, TRIGGERS_FILE) {
+        map if map.is_empty() => return HashMap::new(),
+        map => serde_json::Value::Object(map.into_iter().collect()),
+    };
+    if value.get("Version").is_some() {
+        return serde_json::from_value::<SavedTriggers<Vec<TaskTriggerInfo>>>(value)
+            .map(|f| f.triggers)
+            .unwrap_or_else(|e| {
+                tracing::warn!(error = %e, "task triggers unreadable; using the defaults");
+                HashMap::new()
+            });
+    }
+    let mut saved: HashMap<String, Vec<TaskTriggerInfo>> = match serde_json::from_value(value) {
+        Ok(saved) => saved,
+        Err(e) => {
+            tracing::warn!(error = %e, "task triggers unreadable; using the defaults");
+            return HashMap::new();
+        }
+    };
+    let old_default = [TaskTriggerInfo::interval(TICKS_24H)];
+    saved.retain(|id, triggers| {
+        !([
+            TASK_TRANSCODE_CLEANUP,
+            TASK_INTRO_DETECTION,
+            TASK_DB_VACUUM,
+            TASK_CHAPTER_IMAGES,
+            TASK_TRICKPLAY,
+            TASK_CLEAN_ACTIVITY_LOG,
+        ]
+        .contains(&id.as_str())
+            && triggers[..] == old_default)
+    });
+    let written = triggers_json(saved.clone())
+        .and_then(|json| write_atomic_sync(&data_dir.join(TRIGGERS_FILE), &json));
+    if let Err(e) = written {
+        tracing::warn!(error = %e, "could not save the migrated task triggers");
+    }
+    saved
+}
+
+/// Writes `bytes` to `path` through a temporary file synced to disk, so a crash never leaves half
+/// a file.
+fn write_atomic_sync(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let tmp = path.with_extension("json.tmp");
+    let mut file = std::fs::File::create(&tmp)?;
+    file.write_all(bytes)?;
+    file.sync_all()?;
+    drop(file);
+    std::fs::rename(&tmp, path)
+}
+
+/// `write_atomic_sync` off the async runtime.
+async fn write_atomic(path: std::path::PathBuf, bytes: Vec<u8>) -> std::io::Result<()> {
+    tokio::task::spawn_blocking(move || write_atomic_sync(&path, &bytes))
+        .await
+        .map_err(std::io::Error::other)?
 }
 
 impl TaskScheduler {
@@ -208,7 +335,8 @@ impl TaskScheduler {
                     category: "Maintenance".to_string(),
                     state: TaskState::Idle,
                     current_progress_percentage: None,
-                    triggers: vec![TaskTriggerInfo::interval(TICKS_24H)],
+                    // As Jellyfin: once after each start, then every 24 hours
+                    triggers: vec![at_startup(), TaskTriggerInfo::interval(TICKS_24H)],
                     last_execution_result: None,
                 },
             },
@@ -228,13 +356,13 @@ impl TaskScheduler {
                     category: "Library".to_string(),
                     state: TaskState::Idle,
                     current_progress_percentage: None,
-                    triggers: vec![TaskTriggerInfo::interval(TICKS_24H)],
+                    triggers: vec![TaskTriggerInfo::interval(TICKS_12H)],
                     last_execution_result: None,
                 },
             },
         );
 
-        // Database VACUUM - runs nightly to defragment SQLite
+        // Database VACUUM, every 6 hours as Jellyfin's Optimize database task
         tasks.insert(
             TASK_DB_VACUUM.to_string(),
             TaskEntry {
@@ -249,23 +377,30 @@ impl TaskScheduler {
                     category: "Maintenance".to_string(),
                     state: TaskState::Idle,
                     current_progress_percentage: None,
-                    triggers: vec![TaskTriggerInfo::interval(TICKS_24H)],
+                    triggers: vec![TaskTriggerInfo::interval(TICKS_6H)],
                     last_execution_result: None,
                 },
             },
         );
 
-        // Chapter images and trickplay tiles: nightly, for the libraries that turn them on
-        for (id, name, description) in [
+        // Chapter images and trickplay tiles: nightly, for the libraries that turn them on. As
+        // Jellyfin: chapter images at 02:00 for at most 4 hours, trickplay at 03:00.
+        let chapter_images = TaskTriggerInfo {
+            max_runtime_ticks: Some(4 * TICKS_1H),
+            ..daily_at(2)
+        };
+        for (id, name, description, trigger) in [
             (
                 TASK_CHAPTER_IMAGES,
                 "Extract Chapter Images",
                 "Creates thumbnails for videos that have chapters, in the libraries that turn chapter images on.",
+                chapter_images,
             ),
             (
                 TASK_TRICKPLAY,
                 "Generate Trickplay Images",
                 "Creates trickplay images for videos, in the libraries that turn trickplay on.",
+                daily_at(3),
             ),
         ] {
             tasks.insert(
@@ -280,7 +415,7 @@ impl TaskScheduler {
                         category: "Library".to_string(),
                         state: TaskState::Idle,
                         current_progress_percentage: None,
-                        triggers: vec![TaskTriggerInfo::interval(TICKS_24H)],
+                        triggers: vec![trigger],
                         last_execution_result: None,
                     },
                 },
@@ -302,7 +437,30 @@ impl TaskScheduler {
                     category: "Maintenance".to_string(),
                     state: TaskState::Idle,
                     current_progress_percentage: None,
-                    triggers: vec![TaskTriggerInfo::interval(TICKS_24H)],
+                    // Like Jellyfin, no trigger by default: it runs when started or scheduled
+                    triggers: vec![],
+                    last_execution_result: None,
+                },
+            },
+        );
+
+        // Jellyfin 12.4's TMDb upcoming and missing episodes task
+        tasks.insert(
+            TASK_MISSING_EPISODES.to_string(),
+            TaskEntry {
+                info: ScheduledTaskInfo {
+                    id: TASK_MISSING_EPISODES.to_string(),
+                    key: TASK_MISSING_EPISODES.to_string(),
+                    is_hidden: false,
+                    name: crate::missing_episodes::TASK_NAME.to_string(),
+                    description: crate::missing_episodes::TASK_DESCRIPTION.to_string(),
+                    category: "Library".to_string(),
+                    state: TaskState::Idle,
+                    current_progress_percentage: None,
+                    // MissingEpisodeRefreshIntervalDays' default
+                    triggers: vec![TaskTriggerInfo::interval(
+                        crate::missing_episodes::DEFAULT_INTERVAL_DAYS as u64 * TICKS_24H,
+                    )],
                     last_execution_result: None,
                 },
             },
@@ -323,6 +481,11 @@ impl TaskScheduler {
                 entry.info.triggers = triggers;
             }
         }
+        for (id, result) in load_saved::<TaskResult>(&data_dir, RESULTS_FILE) {
+            if let Some(entry) = tasks.get_mut(&id) {
+                entry.info.last_execution_result = Some(result);
+            }
+        }
         Self {
             tasks: Arc::new(RwLock::new(tasks)),
             db,
@@ -338,6 +501,9 @@ impl TaskScheduler {
             triggers_changed: Arc::new(tokio::sync::Notify::new()),
             default_triggers: Arc::new(default_triggers),
             running: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
+            saving_triggers: Arc::default(),
+            saving_results: Arc::default(),
+            held: Arc::default(),
         }
     }
 
@@ -410,6 +576,11 @@ impl TaskScheduler {
     }
 
     /// A task's info, with the percent it has reported while it is not idle.
+    ///
+    /// As in Jellyfin, every library scan shows as the library scan task: while any library has a
+    /// scan listed (queued, scanning or probing), wherever it was started (a library's Scan, Scan
+    /// all, the setup wizard), an idle library scan task reads Running, at the listed scans'
+    /// average percent. The scans listed are what the web client's scan rings show.
     fn info_of(&self, entry: &TaskEntry) -> ScheduledTaskInfo {
         let mut info = entry.info.clone();
         info.current_progress_percentage = match info.state {
@@ -418,6 +589,17 @@ impl TaskScheduler {
                 self.progress.get(&info.id).and_then(TaskProgress::get)
             }
         };
+        if info.id == TASK_LIBRARY_SCAN && info.state == TaskState::Idle {
+            let scans = self.scans.snapshot();
+            if !scans.is_empty() {
+                let sum: f64 = scans
+                    .iter()
+                    .map(|(_, s)| f64::from(s.progress.unwrap_or(0)))
+                    .sum();
+                info.state = TaskState::Running;
+                info.current_progress_percentage = Some(sum / scans.len() as f64);
+            }
+        }
         info
     }
 
@@ -435,28 +617,53 @@ impl TaskScheduler {
         id: &str,
         triggers: Vec<TaskTriggerInfo>,
     ) -> Result<bool, std::io::Error> {
-        // The lock is held until the file is written, so two saves never write it at once.
-        let mut tasks = self.tasks.write().await;
-        let Some(entry) = tasks.get_mut(id) else {
-            return Ok(false);
-        };
-        entry.info.triggers = triggers;
+        {
+            let mut tasks = self.tasks.write().await;
+            let Some(entry) = tasks.get_mut(id) else {
+                return Ok(false);
+            };
+            entry.info.triggers = triggers;
+        }
         self.triggers_changed.notify_waiters();
-        let all: HashMap<&String, &Vec<TaskTriggerInfo>> = tasks
-            .iter()
-            .filter(|(id, e)| self.default_triggers.get(*id) != Some(&e.info.triggers))
-            .map(|(id, e)| (id, &e.info.triggers))
-            .collect();
-        let json = serde_json::to_vec_pretty(&all).map_err(std::io::Error::other)?;
-        let path = self.data_dir.join(TRIGGERS_FILE);
-        let tmp = path.with_extension("json.tmp");
-        tokio::fs::write(&tmp, json).await?;
-        tokio::fs::rename(&tmp, &path).await?;
+        let _saving = self.saving_triggers.lock().await;
+        let json = {
+            let tasks = self.tasks.read().await;
+            triggers_json(
+                tasks
+                    .iter()
+                    .filter(|(id, e)| self.default_triggers.get(*id) != Some(&e.info.triggers))
+                    .map(|(id, e)| (id.clone(), e.info.triggers.clone()))
+                    .collect(),
+            )?
+        };
+        write_atomic(self.data_dir.join(TRIGGERS_FILE), json).await?;
         Ok(true)
+    }
+
+    /// Whether an admin stopped task `id` since its triggers or a start by hand last ran it.
+    fn is_held(&self, id: &str) -> bool {
+        self.held
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(id)
+    }
+
+    /// Lets a scan's end start task `id` again.
+    fn release(&self, id: &str) {
+        self.held
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(id);
     }
 
     /// Start a task manually (returns true if task exists)
     pub async fn start_task(&self, id: &str) -> bool {
+        self.release(id);
+        self.start_run(id).await
+    }
+
+    /// Starts a run of task `id` in the background; false for an unknown task.
+    async fn start_run(&self, id: &str) -> bool {
         let tasks = self.tasks.read().await;
         if tasks.contains_key(id) {
             drop(tasks);
@@ -491,6 +698,10 @@ impl TaskScheduler {
                     let sched = self.clone();
                     tokio::spawn(async move { sched.run_clean_activity_log().await });
                 }
+                TASK_MISSING_EPISODES => {
+                    let sched = self.clone();
+                    tokio::spawn(async move { sched.run_missing_episodes().await });
+                }
                 _ => {}
             }
             true
@@ -499,8 +710,21 @@ impl TaskScheduler {
         }
     }
 
-    /// Stop a running task (sets state to Idle)
+    /// Stops a running task at an admin's request. A library scan's end then doesn't start it
+    /// again until its triggers or a start by hand run it.
     pub async fn stop_task(&self, id: &str) -> bool {
+        let stopped = self.stop_run(id).await;
+        if stopped {
+            self.held
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(id.to_string());
+        }
+        stopped
+    }
+
+    /// Stops a running task (an image task winds down as Cancelling, the others go Idle).
+    async fn stop_run(&self, id: &str) -> bool {
         // An image task stops between videos and kills the ffmpeg it runs; it shows Cancelling,
         // as in Jellyfin, until it has wound down. The run is looked up and marked under the
         // tasks lock, as its start and end change them, so a run that has just ended stays Idle.
@@ -561,6 +785,7 @@ impl TaskScheduler {
         entry.info.state = state;
     }
 
+    /// Records the end of a run and saves every task's last result in the data folder.
     async fn set_task_result(&self, id: &str, result: TaskResult) {
         let failed = (result.status == TaskCompletionStatus::Failed)
             .then(|| result.error_message.clone().unwrap_or_default());
@@ -572,6 +797,24 @@ impl TaskScheduler {
             entry.info.last_execution_result = Some(result);
             entry.info.name.clone()
         };
+        let saved = {
+            let _saving = self.saving_results.lock().await;
+            let json = {
+                let tasks = self.tasks.read().await;
+                let all: HashMap<&String, &TaskResult> = tasks
+                    .iter()
+                    .filter_map(|(id, e)| Some((id, e.info.last_execution_result.as_ref()?)))
+                    .collect();
+                serde_json::to_vec_pretty(&all)
+            };
+            match json {
+                Ok(json) => write_atomic(self.data_dir.join(RESULTS_FILE), json).await,
+                Err(e) => Err(std::io::Error::other(e)),
+            }
+        };
+        if let Err(e) = saved {
+            tracing::warn!(task = id, error = %e, "could not save the task's last result");
+        }
         // A failed task goes in the activity log, as in Jellyfin.
         if let Some(error) = failed
             && let Err(e) = rustyfin_db::repo_activity::log_activity(
@@ -603,6 +846,63 @@ impl TaskScheduler {
 
     /// Deletes the activity log entries older than the retention age. A retention of 0 keeps
     /// every entry.
+    /// Creates and prunes the virtual (unaired and missing) episodes, as the TMDb plugin's
+    /// settings say (Jellyfin 12.4's TmdbRefreshUpcomingEpisodes).
+    async fn run_missing_episodes(&self) {
+        use crate::missing_episodes::{Settings, Source, TMDB_PLUGIN_ID};
+        let Some(_claim) = self.claim(TASK_MISSING_EPISODES) else {
+            return skipped(TASK_MISSING_EPISODES);
+        };
+        self.set_task_state(TASK_MISSING_EPISODES, TaskState::Running)
+            .await;
+        let start = Utc::now();
+        let progress = self.progress_of(TASK_MISSING_EPISODES);
+        let config = self.plugin_manager.get_configuration(TMDB_PLUGIN_ID).await;
+        let settings = Settings::from_config(config.as_ref().map(|c| &c.values));
+        let providers = self.plugin_manager.metadata_providers().await;
+        let source = providers
+            .iter()
+            .find(|p| p.plugin_id == TMDB_PLUGIN_ID)
+            .and_then(|p| {
+                Some(Source {
+                    lookups: p.lookups.as_deref()?,
+                    provider_name: &p.provider_name,
+                })
+            });
+        let report = |share: f64| progress.report(share);
+        let outcome = crate::missing_episodes::run(
+            &self.db,
+            source,
+            &settings,
+            Utc::now().date_naive(),
+            &report,
+        )
+        .await;
+        let (status, error_message) = match outcome {
+            Ok(outcome) => {
+                tracing::info!(
+                    "upcoming and missing episodes: {} series, {} created, {} updated, {} removed, {} failed",
+                    outcome.series,
+                    outcome.created,
+                    outcome.updated,
+                    outcome.pruned,
+                    outcome.failed
+                );
+                (TaskCompletionStatus::Completed, None)
+            }
+            Err(e) => (TaskCompletionStatus::Failed, Some(e)),
+        };
+        let result = TaskResult {
+            status,
+            error_message,
+            start_time_utc: start.to_rfc3339(),
+            end_time_utc: Utc::now().to_rfc3339(),
+        };
+        self.set_task_result(TASK_MISSING_EPISODES, result).await;
+        self.set_task_state(TASK_MISSING_EPISODES, TaskState::Idle)
+            .await;
+    }
+
     async fn run_clean_activity_log(&self) {
         let Some(_claim) = self.claim(TASK_CLEAN_ACTIVITY_LOG) else {
             return skipped(TASK_CLEAN_ACTIVITY_LOG);
@@ -637,7 +937,8 @@ impl TaskScheduler {
     }
 
     /// When the task's triggers next run it; `clock.last_end` is the later of its loop's last run
-    /// and its last recorded result (a run started by hand counts).
+    /// and its last recorded result (a run started by hand counts). A recorded end in the future
+    /// (the clock was ahead when it was saved) counts as now.
     async fn next_due(
         &self,
         id: &str,
@@ -649,7 +950,7 @@ impl TaskScheduler {
             .last_execution_result
             .as_ref()
             .and_then(|r| chrono::DateTime::parse_from_rfc3339(&r.end_time_utc).ok())
-            .map(|t| t.with_timezone(&Utc));
+            .map(|t| t.with_timezone(&Utc).min(Utc::now()));
         clock.last_end = clock.last_end.max(recorded);
         crate::task_triggers::next_due(&chrono::Local, &info.triggers, &clock)
     }
@@ -694,7 +995,7 @@ impl TaskScheduler {
             done = &mut run => done,
             _ = tokio::time::sleep(limit) => {
                 tracing::info!(task = id, ?limit, "the task ran past its MaxRuntimeTicks; stopping it");
-                self.stop_task(id).await;
+                self.stop_run(id).await;
                 run.await
             }
         }
@@ -730,6 +1031,7 @@ impl TaskScheduler {
                 if !sched.wait_for_trigger(id, clock, &mut rx).await {
                     break;
                 }
+                sched.release(id);
                 while !sched.run_limited(id, run(sched.clone())).await {
                     tokio::select! {
                         _ = tokio::time::sleep(VACUUM_RETRY) => {}
@@ -765,9 +1067,12 @@ impl TaskScheduler {
                     .collect();
                 let client = &self.http_client;
                 let mut errors = Vec::new();
+                // The runs another caller scans, which this task waits for before it ends
+                let mut runs = Vec::new();
                 for (lib, ticket) in libraries.iter().zip(tickets) {
                     // Only the caller that claimed the library's run scans it.
                     if !ticket.claim() {
+                        runs.push(ticket);
                         continue;
                     }
                     if let Err(e) = crate::scanner::scan_library_with_metadata(
@@ -781,8 +1086,13 @@ impl TaskScheduler {
                     {
                         errors.push(format!("{}: {}", lib.name, e));
                     }
-                    // The probes the scan queued keep the library listed until they finish.
-                    drop(ticket);
+                    // The probes the scan queued keep the library listed until they finish, and
+                    // the task Running until then. The next library's scan waits for them anyway
+                    // (the scan lock).
+                    ticket.wait_end().await;
+                }
+                for ticket in runs {
+                    ticket.wait_end().await;
                 }
                 // Waited for, so no late percent lands after the task ends
                 follower.abort();
@@ -948,16 +1258,21 @@ impl TaskScheduler {
     }
 
     /// After a scan of library `library_id` ends, starts the chapter image and trickplay tasks
-    /// that the library asks to run during scans.
+    /// that the library asks to run during scans, unless an admin stopped them since their last
+    /// run by trigger or by hand: a scan of several libraries would otherwise start a stopped
+    /// task again as each library ends.
     async fn after_scan(&self, library_id: uuid::Uuid) {
         let options = rustyfin_db::repo_library::get_library_options(&self.db, library_id)
             .await
             .unwrap_or_default();
-        if options.enable_chapter_extraction && options.extract_chapter_images_during_library_scan {
-            self.start_task(TASK_CHAPTER_IMAGES).await;
-        }
-        if options.enable_trickplay && options.extract_trickplay_images_during_library_scan {
-            self.start_task(TASK_TRICKPLAY).await;
+        let chapters =
+            options.enable_chapter_extraction && options.extract_chapter_images_during_library_scan;
+        let trickplay =
+            options.enable_trickplay && options.extract_trickplay_images_during_library_scan;
+        for (id, wanted) in [(TASK_CHAPTER_IMAGES, chapters), (TASK_TRICKPLAY, trickplay)] {
+            if wanted && !self.is_held(id) {
+                self.start_run(id).await;
+            }
         }
     }
 
@@ -1244,8 +1559,9 @@ impl TaskScheduler {
         // The library monitor starts its monitors in the background and returns at once.
         self.watcher.start();
 
-        // Each task runs when its triggers say (by default an interval). A task that has not run
-        // yet runs its own delay after the start, so they do not all start at once.
+        // Each task runs when its triggers say (by default Jellyfin's). An interval or startup
+        // trigger of a task that has not run yet, or whose saved last run is an interval or more
+        // ago, runs the task its own delay after the start, so they do not all start at once.
         let secs = std::time::Duration::from_secs;
         self.spawn_task_loop(
             TASK_LIBRARY_SCAN,
@@ -1345,7 +1661,7 @@ impl TaskScheduler {
             }
         });
 
-        // Database VACUUM: first two hours after the start, at a quiet time. One put off for a
+        // Database VACUUM: two hours after the start at the earliest. One put off for a
         // scan or an image run is tried again a little later.
         self.spawn_task_loop(
             TASK_DB_VACUUM,
@@ -1679,16 +1995,235 @@ mod tests {
                 .await
                 .unwrap()
         );
-        let saved: HashMap<String, Vec<TaskTriggerInfo>> =
-            serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
+        let saved = r3sched_saved_file(&file);
         assert_eq!(saved.keys().collect::<Vec<_>>(), [TASK_DB_VACUUM]);
         assert_eq!(saved[TASK_DB_VACUUM], edited);
         // Back to its defaults: nothing is saved for it any more
-        let defaults = vec![TaskTriggerInfo::interval(TICKS_24H)];
+        let defaults = vec![TaskTriggerInfo::interval(TICKS_6H)];
         assert!(sched.set_triggers(TASK_DB_VACUUM, defaults).await.unwrap());
-        let saved: HashMap<String, Vec<TaskTriggerInfo>> =
-            serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
+        let saved = r3sched_saved_file(&file);
         assert!(saved.is_empty(), "{saved:?}");
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// The triggers in a saved triggers file, which must carry this build's version.
+    fn r3sched_saved_file(file: &std::path::Path) -> HashMap<String, Vec<TaskTriggerInfo>> {
+        let saved: SavedTriggers<Vec<TaskTriggerInfo>> =
+            serde_json::from_slice(&std::fs::read(file).unwrap()).unwrap();
+        assert_eq!(saved.version, TRIGGERS_VERSION);
+        saved.triggers
+    }
+
+    #[tokio::test]
+    async fn r3sched_a_saved_24_hour_interval_in_a_versioned_file_is_an_edit() {
+        let (sched, dir) = r3tasks_scheduler().await;
+        let daily_ish = vec![TaskTriggerInfo::interval(TICKS_24H)];
+        assert!(
+            sched
+                .set_triggers(TASK_TRICKPLAY, daily_ish.clone())
+                .await
+                .unwrap()
+        );
+        for _ in 0..2 {
+            let restarted = TaskScheduler::new(sched.db.clone(), Arc::new(dir.clone()));
+            assert_eq!(
+                restarted.get_task(TASK_TRICKPLAY).await.unwrap().triggers,
+                daily_ish
+            );
+        }
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
+    async fn r3sched_a_saved_end_in_the_future_counts_as_now() {
+        let (sched, dir) = r3tasks_scheduler().await;
+        let ahead = Utc::now() + chrono::Duration::days(3);
+        sched
+            .set_task_result(
+                TASK_LIBRARY_SCAN,
+                TaskResult {
+                    status: TaskCompletionStatus::Completed,
+                    error_message: None,
+                    start_time_utc: ahead.to_rfc3339(),
+                    end_time_utc: ahead.to_rfc3339(),
+                },
+            )
+            .await;
+        let started = Utc::now();
+        let clock = crate::task_triggers::TriggerClock {
+            last_end: None,
+            loop_ran: false,
+            first: started + chrono::Duration::seconds(60),
+            interval_from: None,
+            started,
+        };
+        let due = sched.next_due(TASK_LIBRARY_SCAN, clock).await.unwrap();
+        let after = Utc::now() + chrono::Duration::hours(12);
+        assert!(due <= after, "due {due}, not 12 hours from now");
+        assert!(due >= started + chrono::Duration::hours(12), "due {due}");
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    fn r3sched_triggers(sched_task: &ScheduledTaskInfo) -> serde_json::Value {
+        serde_json::to_value(&sched_task.triggers).unwrap()
+    }
+
+    #[tokio::test]
+    async fn r3sched_the_default_triggers_are_jellyfins() {
+        let (sched, dir) = r3tasks_scheduler().await;
+        let triggers = |id: &'static str| {
+            let sched = sched.clone();
+            async move { r3sched_triggers(&sched.get_task(id).await.unwrap()) }
+        };
+        let json = |t: Vec<TaskTriggerInfo>| serde_json::to_value(t).unwrap();
+        let interval = |hours: u64| TaskTriggerInfo::interval(hours * TICKS_1H);
+        let trigger = |ty: &str, of_day: Option<u64>, max: Option<u64>| TaskTriggerInfo {
+            trigger_type: ty.into(),
+            interval_ticks: None,
+            time_of_day_ticks: of_day.map(|h| h * TICKS_1H),
+            day_of_week: None,
+            max_runtime_ticks: max.map(|h| h * TICKS_1H),
+        };
+        assert_eq!(triggers(TASK_LIBRARY_SCAN).await, json(vec![interval(12)]));
+        assert_eq!(triggers(TASK_METADATA_REFRESH).await, json(vec![]));
+        assert_eq!(
+            triggers(TASK_TRANSCODE_CLEANUP).await,
+            json(vec![trigger("StartupTrigger", None, None), interval(24)])
+        );
+        assert_eq!(
+            triggers(TASK_INTRO_DETECTION).await,
+            json(vec![interval(12)])
+        );
+        assert_eq!(triggers(TASK_DB_VACUUM).await, json(vec![interval(6)]));
+        assert_eq!(
+            triggers(TASK_CHAPTER_IMAGES).await,
+            json(vec![trigger("DailyTrigger", Some(2), Some(4))])
+        );
+        assert_eq!(
+            triggers(TASK_TRICKPLAY).await,
+            json(vec![trigger("DailyTrigger", Some(3), None)])
+        );
+        assert_eq!(triggers(TASK_CLEAN_ACTIVITY_LOG).await, json(vec![]));
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
+    async fn r3sched_last_results_survive_a_restart() {
+        let (sched, dir) = r3tasks_scheduler().await;
+        sched.run_clean_activity_log().await;
+        let ran = sched
+            .get_task(TASK_CLEAN_ACTIVITY_LOG)
+            .await
+            .unwrap()
+            .last_execution_result
+            .unwrap();
+        let end = Utc::now() - chrono::Duration::hours(2);
+        sched
+            .set_task_result(
+                TASK_LIBRARY_SCAN,
+                TaskResult {
+                    status: TaskCompletionStatus::Failed,
+                    error_message: Some("disk gone".into()),
+                    start_time_utc: (end - chrono::Duration::minutes(5)).to_rfc3339(),
+                    end_time_utc: end.to_rfc3339(),
+                },
+            )
+            .await;
+
+        let restarted = TaskScheduler::new(sched.db.clone(), Arc::new(dir.clone()));
+        let last = |id: &'static str| {
+            let restarted = restarted.clone();
+            async move {
+                serde_json::to_value(restarted.get_task(id).await.unwrap().last_execution_result)
+                    .unwrap()
+            }
+        };
+        assert_eq!(
+            last(TASK_CLEAN_ACTIVITY_LOG).await,
+            serde_json::to_value(&ran).unwrap()
+        );
+        let scan = last(TASK_LIBRARY_SCAN).await;
+        assert_eq!(scan["Status"], "Failed");
+        assert_eq!(scan["ErrorMessage"], "disk gone");
+        assert!(last(TASK_TRICKPLAY).await.is_null(), "never ran");
+
+        // The 12 hour interval counts from the saved end, not from the start
+        let started = Utc::now();
+        let clock = crate::task_triggers::TriggerClock {
+            last_end: None,
+            loop_ran: false,
+            first: started + chrono::Duration::seconds(60),
+            interval_from: None,
+            started,
+        };
+        let due = restarted.next_due(TASK_LIBRARY_SCAN, clock).await.unwrap();
+        let saved_end = chrono::DateTime::parse_from_rfc3339(&end.to_rfc3339()).unwrap();
+        assert_eq!(due, saved_end + chrono::Duration::hours(12));
+        // A task that never ran keeps its start-up delay
+        assert_eq!(
+            restarted.next_due(TASK_INTRO_DETECTION, clock).await,
+            Some(clock.first)
+        );
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
+    async fn r3sched_a_corrupt_saved_file_starts_empty() {
+        let (sched, dir) = r3tasks_scheduler().await;
+        std::fs::write(dir.join(RESULTS_FILE), "{ not json").unwrap();
+        std::fs::write(dir.join(TRIGGERS_FILE), "[1, 2").unwrap();
+        let restarted = TaskScheduler::new(sched.db.clone(), Arc::new(dir.clone()));
+        for task in restarted.get_all_tasks().await {
+            assert!(task.last_execution_result.is_none(), "{}", task.id);
+        }
+        let defaults = sched.get_task(TASK_TRICKPLAY).await.unwrap();
+        let trickplay = restarted.get_task(TASK_TRICKPLAY).await.unwrap();
+        assert_eq!(r3sched_triggers(&trickplay), r3sched_triggers(&defaults));
+        // The next run's end writes a good file again
+        restarted.run_clean_activity_log().await;
+        let saved: HashMap<String, TaskResult> =
+            serde_json::from_slice(&std::fs::read(dir.join(RESULTS_FILE)).unwrap()).unwrap();
+        assert_eq!(saved.keys().collect::<Vec<_>>(), [TASK_CLEAN_ACTIVITY_LOG]);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
+    async fn r3sched_saved_triggers_win_but_old_defaults_give_way() {
+        let (sched, dir) = r3tasks_scheduler().await;
+        let old_default = vec![TaskTriggerInfo::interval(TICKS_24H)];
+        let edited = vec![TaskTriggerInfo::interval(TICKS_6H)];
+        let file: HashMap<&str, Vec<TaskTriggerInfo>> = HashMap::from([
+            // As an early build saved them: every task, with the old 24 hour default
+            (TASK_TRICKPLAY, old_default.clone()),
+            (TASK_DB_VACUUM, old_default.clone()),
+            (
+                TASK_LIBRARY_SCAN,
+                vec![TaskTriggerInfo::interval(TICKS_12H)],
+            ),
+            // Edited by an admin
+            (TASK_CHAPTER_IMAGES, edited.clone()),
+            (TASK_METADATA_REFRESH, old_default.clone()),
+            (TASK_CLEAN_ACTIVITY_LOG, vec![]),
+        ]);
+        std::fs::write(dir.join(TRIGGERS_FILE), serde_json::to_vec(&file).unwrap()).unwrap();
+        let restarted = TaskScheduler::new(sched.db.clone(), Arc::new(dir.clone()));
+        let triggers = |id: &'static str| {
+            let restarted = restarted.clone();
+            async move { restarted.get_task(id).await.unwrap().triggers }
+        };
+        assert_eq!(triggers(TASK_TRICKPLAY).await, vec![daily_at(3)]);
+        assert_eq!(
+            triggers(TASK_DB_VACUUM).await,
+            vec![TaskTriggerInfo::interval(TICKS_6H)]
+        );
+        assert_eq!(triggers(TASK_CHAPTER_IMAGES).await, edited);
+        // A task whose old default was not 24 hours keeps a saved 24 hours: it was edited
+        assert_eq!(triggers(TASK_METADATA_REFRESH).await, old_default);
+        assert!(triggers(TASK_CLEAN_ACTIVITY_LOG).await.is_empty());
+        // The file is migrated once: written again with a version, without the old defaults
+        let saved = r3sched_saved_file(&dir.join(TRIGGERS_FILE));
+        assert!(!saved.contains_key(TASK_TRICKPLAY), "{saved:?}");
+        assert_eq!(saved[TASK_CHAPTER_IMAGES], edited);
         std::fs::remove_dir_all(dir).ok();
     }
 
@@ -1876,6 +2411,129 @@ mod tests {
             r3perf_last(&sched, TASK_INTRO_DETECTION).await,
             (TaskCompletionStatus::Completed, "done".to_string())
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    use uuid::Uuid;
+
+    async fn r3dash3_scan_task(sched: &TaskScheduler) -> (TaskState, Option<f64>) {
+        let info = sched.get_task(TASK_LIBRARY_SCAN).await.unwrap();
+        (info.state, info.current_progress_percentage)
+    }
+
+    /// Any listed library scan shows as the library scan task, at its percent, and the task reads
+    /// Idle again when the scan ends.
+    #[tokio::test]
+    async fn r3dash3_a_listed_scan_shows_as_the_library_scan_task() {
+        let (sched, dir) = r3tasks_scheduler().await;
+        assert_eq!(r3dash3_scan_task(&sched).await, (TaskState::Idle, None));
+        // A scan started outside the scheduler (a library's Scan, Scan all, the wizard)
+        let ticket = sched.scans().queue(Uuid::new_v4());
+        assert_eq!(
+            r3dash3_scan_task(&sched).await,
+            (TaskState::Running, Some(0.0))
+        );
+        assert!(ticket.claim());
+        ticket.start();
+        ticket.add_total(4);
+        ticket.advance(1);
+        let other = sched.scans().queue(Uuid::new_v4());
+        // The average of the listed scans: 25 and 0
+        assert_eq!(
+            r3dash3_scan_task(&sched).await,
+            (TaskState::Running, Some(12.5))
+        );
+        let json = serde_json::to_value(sched.get_task(TASK_LIBRARY_SCAN).await.unwrap()).unwrap();
+        assert_eq!(json["State"], "Running", "{json}");
+        drop(other);
+        // The probes of a scan that has returned keep it listed, and the task Running
+        let probes = ticket.clone();
+        drop(ticket);
+        assert_eq!(r3dash3_scan_task(&sched).await.0, TaskState::Running);
+        drop(probes);
+        assert_eq!(r3dash3_scan_task(&sched).await, (TaskState::Idle, None));
+        assert!(sched.scans().snapshot().is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A scan that is cancelled (its task aborted) or fails (panics) clears the library's listing,
+    /// so neither the scan ring nor the task stays on.
+    #[tokio::test]
+    async fn r3dash3_a_cancelled_or_failed_scan_clears() {
+        let (sched, dir) = r3tasks_scheduler().await;
+        let library = Uuid::new_v4();
+        let mut frames = sched.scans().subscribe();
+        let scans = sched.scans().clone();
+        let cancelled = tokio::spawn(async move {
+            let ticket = scans.queue(library);
+            ticket.claim();
+            ticket.start();
+            std::future::pending::<()>().await;
+            drop(ticket);
+        });
+        while sched.scans().state(library).is_none() {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(r3dash3_scan_task(&sched).await.0, TaskState::Running);
+        cancelled.abort();
+        let _ = cancelled.await;
+        assert!(sched.scans().state(library).is_none());
+        assert_eq!(r3dash3_scan_task(&sched).await, (TaskState::Idle, None));
+
+        let scans = sched.scans().clone();
+        let failed = tokio::spawn(async move {
+            let ticket = scans.queue(library);
+            ticket.claim();
+            ticket.start();
+            panic!("the scan failed");
+        });
+        assert!(failed.await.is_err());
+        assert!(sched.scans().state(library).is_none());
+        assert_eq!(r3dash3_scan_task(&sched).await, (TaskState::Idle, None));
+        // Each run ended with the Idle frame at 100, which clears the web client's ring
+        let mut last = None;
+        while let Ok(update) = frames.try_recv() {
+            last = Some((update.status, update.progress));
+        }
+        assert_eq!(last, Some((crate::scan_progress::ScanStatus::Idle, 100)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The scheduled library scan stays Running until the scans it covers have ended, the ones
+    /// another caller is running included, and only then records its result.
+    #[tokio::test]
+    async fn r3dash3_the_scheduled_scan_waits_for_running_scans() {
+        let (sched, dir) = r3tasks_scheduler().await;
+        let media = dir.join("media");
+        std::fs::create_dir_all(&media).unwrap();
+        let lib = rustyfin_model::library::Library {
+            id: Uuid::new_v4(),
+            name: "Shows A".into(),
+            content_type: rustyfin_model::library::LibraryContentType::TvShows,
+            paths: vec![media.to_string_lossy().to_string()],
+        };
+        rustyfin_db::repo_library::create_library(&sched.db, &lib)
+            .await
+            .unwrap();
+        // Another caller (a library's Scan) has claimed the library's run, which still waits for
+        // the scan lock, so the task joins that run instead of scanning
+        let api_scan = sched.scans().queue(lib.id);
+        assert!(api_scan.claim());
+        let task = {
+            let sched = sched.clone();
+            tokio::spawn(async move { sched.run_library_scan().await })
+        };
+        for _ in 0..50 {
+            tokio::task::yield_now().await;
+        }
+        assert!(!task.is_finished(), "the task waits for the other scan");
+        assert_eq!(r3dash3_scan_task(&sched).await.0, TaskState::Running);
+        drop(api_scan);
+        task.await.unwrap();
+        let info = sched.get_task(TASK_LIBRARY_SCAN).await.unwrap();
+        assert_eq!(info.state, TaskState::Idle);
+        assert!(info.last_execution_result.is_some());
+        assert!(sched.scans().snapshot().is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2106,6 +2764,79 @@ mod tests {
             message.as_deref(),
             Some("Made the trickplay images of 0 videos")
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn r3sched_a_stopped_task_waits_for_its_trigger_not_the_next_scan() {
+        let (sched, dir) = r3tasks_scheduler().await;
+        let library = rustyfin_model::library::Library {
+            id: uuid::Uuid::new_v4(),
+            name: "Library A".to_string(),
+            content_type: rustyfin_model::library::LibraryContentType::Movies,
+            paths: vec![dir.join("a").to_string_lossy().to_string()],
+        };
+        rustyfin_db::repo_library::create_library(&sched.db, &library)
+            .await
+            .unwrap();
+        let options = rustyfin_model::library::LibraryOptions {
+            enable_trickplay: true,
+            extract_trickplay_images_during_library_scan: true,
+            ..Default::default()
+        };
+        rustyfin_db::repo_library::set_library_options(&sched.db, library.id, &options)
+            .await
+            .unwrap();
+        let ran = |sched: TaskScheduler| async move {
+            sched
+                .get_task(TASK_TRICKPLAY)
+                .await
+                .unwrap()
+                .last_execution_result
+                .is_some()
+        };
+        let wait_for_run = |sched: TaskScheduler| async move {
+            for _ in 0..500 {
+                if ran(sched.clone()).await {
+                    return true;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            false
+        };
+
+        // An admin stops a running trickplay run
+        let _run = sched.begin_image_run(TASK_TRICKPLAY).await.unwrap();
+        assert!(sched.stop_task(TASK_TRICKPLAY).await);
+        sched.end_image_run(TASK_TRICKPLAY).await;
+        // The next library's scan ends: the task stays idle
+        sched.after_scan(library.id).await;
+        r3tasks_settle().await;
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert!(
+            !ran(sched.clone()).await,
+            "a scan started the stopped task again"
+        );
+        assert_eq!(
+            sched.get_task(TASK_TRICKPLAY).await.unwrap().state,
+            TaskState::Idle
+        );
+
+        // Once its trigger or a start by hand runs it, a scan's end starts it again
+        sched.release(TASK_TRICKPLAY);
+        sched.after_scan(library.id).await;
+        assert!(wait_for_run(sched.clone()).await, "a scan's end starts it");
+        // A stop by MaxRuntimeTicks doesn't hold it
+        let _run = sched.begin_image_run(TASK_CHAPTER_IMAGES).await.unwrap();
+        assert!(sched.stop_run(TASK_CHAPTER_IMAGES).await);
+        assert!(!sched.is_held(TASK_CHAPTER_IMAGES));
+        // A start by hand releases a stopped task
+        assert!(sched.stop_task(TASK_CHAPTER_IMAGES).await);
+        assert!(sched.is_held(TASK_CHAPTER_IMAGES));
+        sched.end_image_run(TASK_CHAPTER_IMAGES).await;
+        assert!(sched.start_task(TASK_CHAPTER_IMAGES).await);
+        assert!(!sched.is_held(TASK_CHAPTER_IMAGES));
+        r3tasks_settle().await;
         let _ = std::fs::remove_dir_all(&dir);
     }
 

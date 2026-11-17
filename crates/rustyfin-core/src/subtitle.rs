@@ -59,6 +59,17 @@ pub struct ExternalSubtitle {
     pub language: Option<String>,
     pub format: String,
     pub index: usize,
+    /// Named `<basename>.<lang>.forced.<ext>`, as Jellyfin names an uploaded forced subtitle.
+    pub forced: bool,
+}
+
+/// The name parts after a language that Jellyfin writes or reads as flags: `forced`, the
+/// hearing-impaired marks, and the counter it adds when a name is taken (`Film.en.1.srt`).
+fn is_flag(part: &str) -> bool {
+    ["forced", "foreign", "sdh", "hi", "cc", "default"]
+        .iter()
+        .any(|flag| part.eq_ignore_ascii_case(flag))
+        || (!part.is_empty() && part.bytes().all(|b| b.is_ascii_digit()))
 }
 
 /// Discover external subtitle files next to the given media file.
@@ -119,19 +130,38 @@ pub fn external_subtitles_among(media_path: &Path, files: &[PathBuf]) -> Vec<Ext
                 language: None,
                 format: ext,
                 index: 0, // assigned later
+                forced: false,
             });
-        } else if let Some(lang) = file_stem_full
+        } else if let Some(rest) = file_stem_full
             .strip_prefix(stem)
             .and_then(|r| r.strip_prefix('.'))
-            && !lang.is_empty()
-            && lang.len() <= 10
+            && !rest.is_empty()
         {
-            let lang = lang.to_string();
+            // `<lang>` then flags: the language is the first part. Another name of ten
+            // characters or less stays the language, as before.
+            let mut parts = rest.split('.');
+            let first = parts.next().unwrap_or_default();
+            let flags: Vec<&str> = parts.collect();
+            let flagged =
+                !first.is_empty() && !flags.is_empty() && flags.iter().all(|p| is_flag(p));
+            let language = if flagged {
+                first
+            } else if rest.len() <= 10 {
+                rest
+            } else {
+                continue;
+            };
+            let forced = flagged
+                && flags
+                    .iter()
+                    .any(|p| p.eq_ignore_ascii_case("forced") || p.eq_ignore_ascii_case("foreign"));
+            let language = language.to_string();
             results.push(ExternalSubtitle {
                 path,
-                language: Some(lang),
+                language: Some(language),
                 format: ext,
                 index: 0,
+                forced,
             });
         }
     }
@@ -577,6 +607,34 @@ pub async fn download_subtitle(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn r3item2_language_and_flags_from_names() {
+        let media = Path::new("/m/Film.mkv");
+        let files: Vec<PathBuf> = [
+            "Film.en.srt",
+            "Film.en.forced.srt",
+            "Film.de.forced.sdh.1.vtt",
+            "Film.Portuguese.srt",
+            "Film.a.very.long.name.srt",
+        ]
+        .iter()
+        .map(|name| Path::new("/m").join(name))
+        .collect();
+        let found: Vec<(String, bool)> = external_subtitles_among(media, &files)
+            .into_iter()
+            .map(|sub| (sub.language.unwrap_or_default(), sub.forced))
+            .collect();
+        assert_eq!(
+            found,
+            [
+                ("Portuguese".to_string(), false),
+                ("de".to_string(), true),
+                ("en".to_string(), true),
+                ("en".to_string(), false),
+            ]
+        );
+    }
 
     // ── srt_to_vtt ──
 

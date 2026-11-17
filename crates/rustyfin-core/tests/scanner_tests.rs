@@ -1326,9 +1326,9 @@ async fn upgrade_from_old_state_matches_fresh_scan() {
     let argo_uhd = "Argo (2012)/Argo (2012) Bluray-2160p.mkv";
     let santa = "Bad Santa (2003)/Bad Santa (2003).mkv";
     let santa_cut = "Bad Santa (2003)/Bad Santa.mkv";
-    let kane_uhd = "Citizen Kane (1941)/Citizen Kane (1941) Bluray-2160p.mkv";
-    let kane_cd1 = "Citizen Kane (1941)/Citizen Kane cd1.mkv";
-    let kane_cd2 = "Citizen Kane (1941)/Citizen Kane cd2.mkv";
+    let kane_uhd = "Ember Ridge (1941)/Ember Ridge (1941) Bluray-2160p.mkv";
+    let kane_cd1 = "Ember Ridge (1941)/Ember Ridge cd1.mkv";
+    let kane_cd2 = "Ember Ridge (1941)/Ember Ridge cd2.mkv";
     let seven = "Se7en (1995)/Se7en (1995).mkv";
     let thumb = "Se7en (1995)/.@__thumb/Se7en (1995).mkv";
     let machine = "The Machine (2013)/The Machine (2013) Bluray-1080p.mkv";
@@ -1359,7 +1359,9 @@ async fn upgrade_from_old_state_matches_fresh_scan() {
         &[
             (argo_uhd, &[argo_uhd, argo]),
             (santa, &[santa, santa_cut]),
-            (kane_uhd, &[kane_uhd, kane_cd1, kane_cd2]),
+            // cd1 and cd2 stack into one movie (Jellyfin's StackResolver), which is the primary of
+            // its versions (OrganizeAlternateVersions prefers the one with parts); cd2 is its part.
+            (kane_cd1, &[kane_cd1, kane_uhd]),
             (seven, &[seven]),
             (machine, &[machine, scene]),
         ],
@@ -1395,8 +1397,8 @@ async fn upgrade_from_old_state_matches_fresh_scan() {
     let b = insert_movie(&old, &lib, &root.join(santa), year(2003)).await;
     old_probe(&old, &lib, b, &[santa, santa_cut]).await;
 
-    // Citizen Kane: two items. The second, made first, survives; the first holds the 2160p
-    // file as a version and is in a collection.
+    // The stacked movie: two items. The first holds the 2160p file as a version and is in a
+    // collection; it stays the movie, and the second, its part 2, becomes its part.
     let made = |date| Movie {
         date_created: Some(date),
         ..Movie::default()
@@ -1420,7 +1422,7 @@ async fn upgrade_from_old_state_matches_fresh_scan() {
     let set = Uuid::new_v4().to_string();
     exec(
         &old,
-        "INSERT INTO collections (id, name, user_id) VALUES (?1, 'Kane', ?2)",
+        "INSERT INTO collections (id, name, user_id) VALUES (?1, 'Ridge', ?2)",
         &[&set, &user1],
     )
     .await;
@@ -1453,7 +1455,8 @@ async fn upgrade_from_old_state_matches_fresh_scan() {
     for (file, id) in [
         (argo_uhd, a2),
         (santa, b),
-        (kane_uhd, c2),
+        (kane_cd1, c1),
+        (kane_cd2, c2),
         (seven, s),
         (machine, m),
     ] {
@@ -1474,7 +1477,7 @@ async fn upgrade_from_old_state_matches_fresh_scan() {
         .fetch_all(&old)
         .await
         .unwrap();
-    assert_eq!(in_set, [c2.to_string()]);
+    assert_eq!(in_set, [c1.to_string()]);
     assert_eq!(
         sources_of_s(source_ids(&old, &lib).await),
         s_before,
@@ -4435,15 +4438,22 @@ async fn r1scan_metadata_refresh_upgrades_identified_items_by_id() {
             .map(|r| r.end_time_utc);
         assert!(sched.start_task(TASK_METADATA_REFRESH).await);
         let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+        let mut started = tokio::time::Instant::now();
         loop {
-            let ended = sched
-                .get_task(TASK_METADATA_REFRESH)
-                .await
-                .unwrap()
-                .last_execution_result
-                .map(|r| r.end_time_utc);
+            let task = sched.get_task(TASK_METADATA_REFRESH).await.unwrap();
+            let ended = task.last_execution_result.map(|r| r.end_time_utc);
             if ended.is_some() && ended != before {
                 break;
+            }
+            // The previous run records its result before it lets go of the task, so a start
+            // right after it can be skipped as "running already": still idle a second later with
+            // no new result means it was, and it is started again
+
+            if task.state == rustyfin_model::scheduled_task::TaskState::Idle
+                && started.elapsed() > Duration::from_secs(1)
+            {
+                assert!(sched.start_task(TASK_METADATA_REFRESH).await);
+                started = tokio::time::Instant::now();
             }
             assert!(
                 tokio::time::Instant::now() < deadline,
@@ -10182,4 +10192,208 @@ async fn b32_rescans_settle_whether_a_season_has_a_folder() {
     assert_eq!(item_at(&fx.pool, &lib, B32_LOOSE_SEASON).await, season);
     assert_eq!(item_at(&fx.pool, &lib, MOVED).await, episode);
     assert_eq!(marks_of(&fx.pool, &user, season).await, Some(favorite));
+}
+
+/// A virtual item (no file, see `repo_virtual`) under `parent`, stored and marked as one.
+async fn insert_virtual(
+    pool: &SqlitePool,
+    lib: &Library,
+    media_type: rustyfin_model::media::MediaType,
+    parent: Option<Uuid>,
+    name: &str,
+    parent_index: Option<i32>,
+    index: i32,
+) -> Uuid {
+    let id = Uuid::new_v4();
+    let item = rustyfin_model::media::MediaItem {
+        id,
+        name: name.to_string(),
+        sort_name: Some(name.to_lowercase()),
+        media_type,
+        path: String::new(),
+        parent_id: parent,
+        library_id: lib.id,
+        index_number: Some(index),
+        parent_index_number: parent_index,
+        location_type: rustyfin_model::media::LocationType::Virtual,
+        ..rustyfin_model::media::MediaItem::default_dto_fields()
+    };
+    rustyfin_db::repo_media::upsert_media_item(pool, &item)
+        .await
+        .unwrap();
+    rustyfin_db::repo_virtual::mark_virtual(pool, &[id])
+        .await
+        .unwrap();
+    id
+}
+
+/// Whether a row with this id is stored.
+async fn exists(pool: &SqlitePool, id: Uuid) -> bool {
+    let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM media_items WHERE id = ?1")
+        .bind(id.to_string())
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    n == 1
+}
+
+/// Show A with a real Season 1 episode, plus virtual S1E2, a virtual Season 2 and its virtual S2E1.
+/// Returns (series, season 1, season 2, S1E2, S2E1).
+async fn show_with_virtuals(fx: &Fixture, lib: &Library) -> (Uuid, Uuid, Uuid, Uuid, Uuid) {
+    let pool = &fx.pool;
+    touch(&root_of(lib), "Show A/Season 1/Show A S01E01.mkv");
+    scan(pool, lib).await;
+    let series = item_at(pool, lib, "Show A").await;
+    let season1 = item_at(pool, lib, "Show A/Season 1").await;
+    let s1e2 = insert_virtual(
+        pool,
+        lib,
+        rustyfin_model::media::MediaType::Episode,
+        Some(season1),
+        "Show A S01E02",
+        Some(1),
+        2,
+    )
+    .await;
+    let season2 = insert_virtual(
+        pool,
+        lib,
+        rustyfin_model::media::MediaType::Season,
+        Some(series),
+        "Season 2",
+        None,
+        2,
+    )
+    .await;
+    let s2e1 = insert_virtual(
+        pool,
+        lib,
+        rustyfin_model::media::MediaType::Episode,
+        Some(season2),
+        "Show A S02E01",
+        Some(2),
+        1,
+    )
+    .await;
+    (series, season1, season2, s1e2, s2e1)
+}
+
+#[tokio::test]
+async fn r3missing_scan_turns_a_virtual_episode_into_the_arriving_file() {
+    let fx = Fixture::new().await;
+    let lib = fx.library("tv", LibraryContentType::TvShows).await;
+    let pool = &fx.pool;
+    let root = root_of(&lib);
+    let (series, _season1, season2, s1e2, s2e1) = show_with_virtuals(&fx, &lib).await;
+    let user = Uuid::parse_str(&insert_user(pool).await).unwrap();
+    rustyfin_db::repo_playback::mark_played(pool, user, s1e2)
+        .await
+        .unwrap();
+
+    touch(&root, "Show A/Season 1/Show A S01E02.mkv");
+    touch(&root, "Show A/Season 2/Show A S02E01.mkv");
+    scan(pool, &lib).await;
+
+    assert_eq!(
+        item_at(pool, &lib, "Show A/Season 1/Show A S01E02.mkv").await,
+        s1e2
+    );
+    assert_eq!(
+        item_at(pool, &lib, "Show A/Season 2/Show A S02E01.mkv").await,
+        s2e1
+    );
+    assert_eq!(item_at(pool, &lib, "Show A/Season 2").await, season2);
+    assert_eq!(item_at(pool, &lib, "Show A").await, series);
+    for id in [s1e2, s2e1, season2] {
+        assert!(
+            !rustyfin_db::repo_virtual::is_virtual(pool, id)
+                .await
+                .unwrap()
+        );
+    }
+    for id in [s1e2, s2e1] {
+        let location: String =
+            sqlx::query_scalar("SELECT location_type FROM media_items WHERE id = ?1")
+                .bind(id.to_string())
+                .fetch_one(pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            location,
+            rustyfin_model::media::LocationType::FileSystem.as_str()
+        );
+    }
+    let played: bool =
+        sqlx::query_scalar("SELECT played FROM user_item_data WHERE user_id = ?1 AND item_id = ?2")
+            .bind(user.to_string())
+            .bind(s1e2.to_string())
+            .fetch_one(pool)
+            .await
+            .unwrap();
+    assert!(played);
+    // One row per slot: the virtual S1E2 and S2E1 became the files, with no second copy.
+    assert_eq!(episodes(pool, &lib).await.len(), 3);
+    assert_eq!(
+        count(
+            pool,
+            "SELECT COUNT(*) FROM media_items WHERE media_type = 'Episode' AND \
+             ((parent_index_number = 1 AND index_number = 2) OR (parent_index_number = 2 AND index_number = 1))"
+        )
+        .await,
+        2
+    );
+    assert_eq!(
+        paths(pool, &lib, "Season").await,
+        ["Show A/Season 1", "Show A/Season 2"]
+    );
+}
+
+#[tokio::test]
+async fn r3missing_scan_keeps_virtual_items() {
+    let fx = Fixture::new().await;
+    let lib = fx.library("tv", LibraryContentType::TvShows).await;
+    let pool = &fx.pool;
+    let (series, season1, season2, s1e2, s2e1) = show_with_virtuals(&fx, &lib).await;
+
+    scan(pool, &lib).await;
+
+    for id in [series, season1, season2, s1e2, s2e1] {
+        assert!(exists(pool, id).await, "{id} was removed by a scan");
+    }
+    assert!(
+        rustyfin_db::repo_virtual::is_virtual(pool, s1e2)
+            .await
+            .unwrap()
+    );
+    assert!(
+        rustyfin_db::repo_virtual::is_virtual(pool, season2)
+            .await
+            .unwrap()
+    );
+    assert!(
+        rustyfin_db::repo_virtual::is_virtual(pool, s2e1)
+            .await
+            .unwrap()
+    );
+}
+
+#[tokio::test]
+async fn r3missing_removed_series_takes_its_virtual_items() {
+    let fx = Fixture::new().await;
+    let lib = fx.library("tv", LibraryContentType::TvShows).await;
+    let pool = &fx.pool;
+    // A second show keeps the library's root listed, so a missing folder is removed.
+    touch(&root_of(&lib), "Other/Other S01E01.mkv");
+    let (series, season1, season2, s1e2, s2e1) = show_with_virtuals(&fx, &lib).await;
+    let s1e1 = item_at(pool, &lib, "Show A/Season 1/Show A S01E01.mkv").await;
+    std::fs::remove_dir_all(root_of(&lib).join("Show A")).unwrap();
+
+    scan(pool, &lib).await;
+
+    for id in [series, season1, season2, s1e1, s1e2, s2e1] {
+        assert!(
+            !exists(pool, id).await,
+            "{id} survived the removal of its series"
+        );
+    }
 }
