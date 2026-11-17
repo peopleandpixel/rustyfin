@@ -307,6 +307,14 @@
         "subtitle_dropShadow_depressed": "Vertieft",
         "subtitle_dropShadow_uniform": "Gleichmäßig"
     },
+    "native": {
+        "client_settings": "App-Einstellungen",
+        "downloads": "Downloads",
+        "select_server": "Server wählen",
+        "exit": "Beenden",
+        "download": "Herunterladen",
+        "download_started": "Download gestartet"
+    },
     "nav": {
         "toggle_menu": "Menü ein-/ausblenden",
         "search_placeholder": "Filme, Serien, Musik suchen…",

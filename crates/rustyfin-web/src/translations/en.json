@@ -327,6 +327,14 @@
         "subtitle_dropShadow_depressed": "Depressed",
         "subtitle_dropShadow_uniform": "Uniform"
     },
+    "native": {
+        "client_settings": "Client Settings",
+        "downloads": "Downloads",
+        "select_server": "Select Server",
+        "exit": "Exit",
+        "download": "Download",
+        "download_started": "Download started"
+    },
     "nav": {
         "toggle_menu": "Toggle menu",
         "search_placeholder": "Search movies, shows, music…",

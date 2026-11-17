@@ -30,6 +30,7 @@ import {
     changeSegmentAction, togglePlaybackStats, changeStillWatching, openFullPlayer, stopNowPlaying,
 } from './modules/player.js';
 import './modules/playerprefs.js';
+import { nativeShellCommand } from './modules/nativeshell.js';
 import './modules/queue.js';
 import { toggleLyrics } from './modules/lyrics.js';
 import './modules/remote.js';
@@ -81,5 +82,5 @@ Object.assign(window, {
     changeSubtitleAppearance, changeLatestLibrary, changeMyMediaLibrary, chooseProfileImage, deleteProfileImage, saveGeneralSettings,
     addLibraryFolder, renameLibrary, addTaskTrigger, showTriggerFields, toggleLyrics,
     castToDevice, stopCasting, castTogglePause,
-    castSeek, castSetVolume, castToggleMute, castAdjacent, castAudioTrack, castSubtitleTrack,
+    castSeek, castSetVolume, castToggleMute, castAdjacent, castAudioTrack, castSubtitleTrack, nativeShellCommand,
 });

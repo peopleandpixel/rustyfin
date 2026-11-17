@@ -3778,6 +3778,7 @@ const B124_WEB_MODULES: &[&str] = &[
     "metadata-admin.js",
     "multiselect.js",
     "music.js",
+    "nativeshell.js",
     "photos.js",
     "playback-admin.js",
     "player.js",
@@ -29237,6 +29238,18 @@ fn r3item_detail() {
 #[test]
 fn r3item_play() {
     b124_node_test("r3item_play.mjs");
+}
+
+// R3 Android app: the page answers the Jellyfin Android app's NativeShell contract (the app's player, its
+// notification, Back, downloads, its menu screens) and leaves a browser alone (tests/web/r3android_*.mjs)
+#[test]
+fn r3android_shell() {
+    b124_node_test("r3android_shell.mjs");
+}
+
+#[test]
+fn r3android_page() {
+    b124_node_test("r3android_page.mjs");
 }
 
 // R3 item extras: the Trailer button, the Special Features row and theme songs in the web client
