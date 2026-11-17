@@ -187,6 +187,9 @@ pub enum MediaType {
     /// A collection: Jellyfin's `BoxSet`.
     BoxSet,
     Playlist,
+    /// A subfolder of a photo, home videos or mixed library: Jellyfin's `Folder`. It has no file of
+    /// its own; its files and subfolders point at it through `parent_id`.
+    Folder,
     Unknown,
 }
 
@@ -207,6 +210,7 @@ impl std::str::FromStr for MediaType {
             "Genre" => Ok(MediaType::Genre),
             "BoxSet" => Ok(MediaType::BoxSet),
             "Playlist" => Ok(MediaType::Playlist),
+            "Folder" => Ok(MediaType::Folder),
             _ => Ok(MediaType::Unknown),
         }
     }
@@ -234,7 +238,7 @@ impl MediaType {
             MediaType::Genre => "Genre",
             MediaType::BoxSet => "BoxSet",
             MediaType::Playlist => "Playlist",
-            MediaType::Unknown => "Folder",
+            MediaType::Folder | MediaType::Unknown => "Folder",
         }
     }
 
@@ -246,7 +250,7 @@ impl MediaType {
             MediaType::Audio | MediaType::MusicAlbum | MediaType::MusicArtist => "Audio",
             MediaType::Photo => "Photo",
             MediaType::Genre | MediaType::BoxSet | MediaType::Playlist => "Unknown",
-            MediaType::Unknown => "Unknown",
+            MediaType::Folder | MediaType::Unknown => "Unknown",
         }
     }
 
@@ -260,6 +264,7 @@ impl MediaType {
                 | MediaType::Genre
                 | MediaType::BoxSet
                 | MediaType::Playlist
+                | MediaType::Folder
         )
     }
 }
@@ -1357,7 +1362,7 @@ mod tests {
     fn b32_a_virtual_season_gives_no_path() {
         let made_up = MediaItem {
             media_type: MediaType::Season,
-            path: "/tv/One Night (2023)/Season 1".to_string(),
+            path: "/tv/Owl Hollow (2023)/Season 1".to_string(),
             location_type: LocationType::Virtual,
             ..MediaItem::default_dto_fields()
         };
@@ -1370,7 +1375,7 @@ mod tests {
         };
         let json = serde_json::to_value(&folder).unwrap();
         assert_eq!(json["LocationType"], "FileSystem");
-        assert_eq!(json["Path"], "/tv/One Night (2023)/Season 1");
+        assert_eq!(json["Path"], "/tv/Owl Hollow (2023)/Season 1");
     }
 
     #[test]
@@ -1379,7 +1384,7 @@ mod tests {
         // `Dto/DtoService.cs:1517-1521`).
         let made_up = MediaItem {
             media_type: MediaType::Season,
-            path: "/tv/One Night (2023)/Season 1".to_string(),
+            path: "/tv/Owl Hollow (2023)/Season 1".to_string(),
             location_type: LocationType::Virtual,
             index_number: Some(1),
             ..MediaItem::default_dto_fields()
@@ -1396,7 +1401,7 @@ mod tests {
 
         let double = MediaItem {
             media_type: MediaType::Episode,
-            path: "/tv/One Night (2023)/Season 1/One Night S01E03-E04.mkv".to_string(),
+            path: "/tv/Owl Hollow (2023)/Season 1/Owl Hollow S01E03-E04.mkv".to_string(),
             index_number: Some(3),
             index_number_end: Some(4),
             ..MediaItem::default_dto_fields()

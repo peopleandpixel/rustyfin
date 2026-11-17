@@ -2,10 +2,11 @@
 // Entry of the web client: loads its modules in order, then exposes the functions that
 // inline on*="" handlers (index.html and rendered markup) call as globals.
 import { $, toast } from './modules/util.js';
+import './modules/branding.js';
 import './modules/cards.js';
 import './modules/user-settings.js';
 import './modules/theme-media.js';
-import { navigate, toggleUserMenu, closeUserMenu, toggleSidebar } from './modules/router.js';
+import { currentPage, navigate, toggleUserMenu, closeUserMenu, toggleSidebar } from './modules/router.js';
 import {
     wizSetUiLanguage, wizApplyPath, wizNext, wizPrev, wizSkipLibrary, wizFinishWithoutImport, wizComplete,
 } from './modules/wizard.js';
@@ -17,7 +18,7 @@ import { posterLoaded, posterFailed } from './modules/library.js';
 import './modules/genres.js';
 import './modules/libtabs.js';
 import './modules/music.js';
-import './modules/item.js';
+import { currentDetailId, detailUserDataChanged } from './modules/item.js';
 import './modules/metadata-admin.js';
 import './modules/subtitle-admin.js';
 import { doSearch } from './modules/search.js';
@@ -29,9 +30,12 @@ import {
     changeSegmentAction, togglePlaybackStats, changeStillWatching, openFullPlayer, stopNowPlaying,
 } from './modules/player.js';
 import './modules/playerprefs.js';
+import { nativeShellCommand } from './modules/nativeshell.js';
 import './modules/queue.js';
 import { toggleLyrics } from './modules/lyrics.js';
-import './modules/remote.js';
+import { onSocketMessage } from './modules/remote.js';
+import { serverUserDataChanged, setShownIds } from './modules/userdata.js';
+import { queueUserDataChanged } from './modules/queue.js';
 import {
     castToDevice, stopCasting, castTogglePause, castSeek, castSetVolume, castToggleMute, castAdjacent, castAudioTrack,
     castSubtitleTrack,
@@ -39,14 +43,17 @@ import {
 import { sessionControl, openPlayOn, playOnSession } from './modules/sessions.js';
 import './modules/cardmenu.js';
 import './modules/collections.js';
+import './modules/photos.js';
 import './modules/multiselect.js';
 import './modules/screensaver.js';
 import {
     changeNextEpisodeAutoPlay, changeUiLanguage, handleSaveConfig, changeUserConfig, changeUserPref, changeHomeSection,
-    changeSubtitleAppearance, changeLatestLibrary, chooseProfileImage, deleteProfileImage,
+    changeSubtitleAppearance, changeLatestLibrary, changeMyMediaLibrary, chooseProfileImage, deleteProfileImage,
 } from './modules/settings.js';
 import './modules/playback-admin.js';
 import './modules/dlna-admin.js';
+import './modules/server-admin.js';
+import './modules/library-options.js';
 import {
     saveGeneralSettings, addLibraryFolder, renameLibrary, addTaskTrigger, showTriggerFields,
 } from './modules/dashboard.js';
@@ -74,8 +81,15 @@ Object.assign(window, {
     submitLibraryOptions, openAddUser, closeAddUser,
     submitAddUser, clearLiveLog, setLogLevel, closePluginConfig, savePluginConfig, closePluginPriority,
     savePluginPriority, sessionControl, openPlayOn, playOnSession, changeUserConfig, changeUserPref, changeHomeSection,
-    changeSubtitleAppearance, changeLatestLibrary, chooseProfileImage, deleteProfileImage, saveGeneralSettings,
+    changeSubtitleAppearance, changeLatestLibrary, changeMyMediaLibrary, chooseProfileImage, deleteProfileImage, saveGeneralSettings,
     addLibraryFolder, renameLibrary, addTaskTrigger, showTriggerFields, toggleLyrics,
     castToDevice, stopCasting, castTogglePause,
-    castSeek, castSetVolume, castToggleMute, castAdjacent, castAudioTrack, castSubtitleTrack,
+    castSeek, castSetVolume, castToggleMute, castAdjacent, castAudioTrack, castSubtitleTrack, nativeShellCommand,
 });
+
+// User data from the server (another device, or this tab's own marks echoed) and from this tab take
+// one path (userdata.js); the open item page and the play queue follow it
+onSocketMessage('UserDataChanged', serverUserDataChanged);
+setShownIds(() => (currentPage === 'detail' && currentDetailId ? [currentDetailId] : []));
+document.addEventListener('jf-userdata', detailUserDataChanged);
+document.addEventListener('jf-userdata', queueUserDataChanged);

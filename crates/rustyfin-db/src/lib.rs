@@ -4,6 +4,7 @@
 pub mod busy;
 pub mod pool_watch;
 pub mod repo_activity;
+pub mod repo_api_key;
 pub mod repo_by_name;
 pub mod repo_chapter;
 pub mod repo_collection;
@@ -11,6 +12,7 @@ pub mod repo_device;
 pub mod repo_extras;
 pub mod repo_image;
 pub mod repo_instant_mix;
+pub mod repo_item_filter;
 pub mod repo_jellyfin_import;
 pub mod repo_library;
 pub mod repo_live_tv;
@@ -36,6 +38,7 @@ pub mod repo_sync_play;
 pub mod repo_token;
 pub mod repo_trickplay;
 pub mod repo_user;
+pub mod repo_virtual;
 pub mod writer;
 
 pub use writer::{WriteTx, begin_write};
@@ -50,6 +53,41 @@ use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
 /// SQLx scans the `migrations` directory at build time and tracks applied migrations
 /// in the `sqlx_migrations` table, so each migration runs only once.
 static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!();
+
+/// SHA-384 of the earlier text of migration 094, which differed only in a comment.
+const OLD_094_CHECKSUM: &str = "54fefacfdf9e82e00a8bcca4c61e7cf529defb4761dc652772c1328ca189d16fbfe66b3231e30f6cbb40107c4829aba4";
+
+fn hex_bytes(hex: &str) -> Vec<u8> {
+    (0..hex.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
+        .collect()
+}
+
+/// Gives a database that applied the earlier text of migration 094 the current checksum, so
+/// `migrator` accepts it. Any other checksum is left alone and still fails the run.
+async fn repair_094_checksum(
+    pool: &SqlitePool,
+    migrator: &sqlx::migrate::Migrator,
+) -> Result<(), sqlx::Error> {
+    let tracked: Option<i64> = sqlx::query_scalar(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = '_sqlx_migrations'",
+    )
+    .fetch_optional(pool)
+    .await?;
+    let Some(current) = migrator.iter().find(|m| m.version == 94) else {
+        return Ok(());
+    };
+    if tracked.is_none() {
+        return Ok(());
+    }
+    sqlx::query("UPDATE _sqlx_migrations SET checksum = ? WHERE version = 94 AND checksum = ?")
+        .bind(current.checksum.as_ref())
+        .bind(hex_bytes(OLD_094_CHECKSUM))
+        .execute(pool)
+        .await?;
+    Ok(())
+}
 
 /// How long a pool caller waits for a free connection before the call fails.
 pub const ACQUIRE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
@@ -138,6 +176,7 @@ pub async fn init_db(database_url: &str) -> Result<SqlitePool, sqlx::Error> {
 
     // Run migrations — SQLx tracks applied migrations in `sqlx_migrations` table,
     // so each migration runs only once. Idempotent and safe to call repeatedly.
+    repair_094_checksum(&pool, &MIGRATOR).await?;
     MIGRATOR.run(&pool).await?;
     pool_watch::watch("main", &pool, releases);
 
@@ -495,6 +534,60 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A database migrated by a build whose 094 had `checksum`, holding one library.
+    async fn r3sortname_db_with_094_checksum(checksum: Vec<u8>) -> std::path::PathBuf {
+        let dir = temp_dir();
+        let path = dir.join("old.db");
+        let pool = plain_pool(&path).await;
+        MIGRATOR.run(&pool).await.unwrap();
+        sqlx::query(
+            "INSERT INTO libraries (id, name, content_type) VALUES ('lib', 'Film', 'movies')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query("UPDATE _sqlx_migrations SET checksum = ? WHERE version = 94")
+            .bind(checksum)
+            .execute(&pool)
+            .await
+            .unwrap();
+        pool.close().await;
+        path
+    }
+
+    #[tokio::test]
+    async fn r3sortname_a_db_with_the_earlier_094_text_starts_and_keeps_its_data() {
+        let path = r3sortname_db_with_094_checksum(hex_bytes(OLD_094_CHECKSUM)).await;
+        let pool = init_db(path.to_str().unwrap()).await.unwrap();
+        let name: String = sqlx::query_scalar("SELECT name FROM libraries WHERE id = 'lib'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(name, "Film");
+        let checksum: Vec<u8> =
+            sqlx::query_scalar("SELECT checksum FROM _sqlx_migrations WHERE version = 94")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        let current = MIGRATOR.iter().find(|m| m.version == 94).unwrap();
+        assert_eq!(checksum, current.checksum.as_ref());
+        pool.close().await;
+    }
+
+    #[tokio::test]
+    async fn r3sortname_another_094_checksum_still_fails() {
+        let path = r3sortname_db_with_094_checksum(vec![0; 48]).await;
+        let err = init_db(path.to_str().unwrap()).await.unwrap_err();
+        assert!(
+            matches!(
+                err,
+                sqlx::Error::Migrate(ref e)
+                    if matches!(**e, sqlx::migrate::MigrateError::VersionMismatch(94))
+            ),
+            "{err:?}"
+        );
+    }
+
     async fn r3sortname_sort(pool: &SqlitePool, id: &str) -> (Option<String>, Option<String>) {
         sqlx::query_as(
             "SELECT m.sort_name, e.forced_sort_name FROM media_items m \
@@ -517,7 +610,7 @@ mod tests {
         for statement in [
             "INSERT INTO libraries (id, name, content_type) VALUES ('lib', 'Film', 'movies')",
             "INSERT INTO media_items (id, library_id, name, sort_name, media_type, path) VALUES \
-             ('matrix', 'lib', 'The Matrix', 'the matrix', 'Movie', '/m/1.mkv'), \
+             ('meridian', 'lib', 'The Meridian', 'the meridian', 'Movie', '/m/1.mkv'), \
              ('alpha', 'lib', 'The Alpha', 'Alpha, The', 'Movie', '/m/2.mkv'), \
              ('algen', 'lib', 'Ålgen', 'ålgen', 'Movie', '/m/3.mkv'), \
              ('elk', 'lib', 'Élan', 'Zebra', 'Movie', '/m/4.mkv'), \
@@ -538,7 +631,7 @@ mod tests {
             (Some("Alpha, The".into()), Some("Alpha, The".into())),
             "094 keeps a sort name that is not the lowercased name as the forced one"
         );
-        for id in ["matrix", "algen", "elk", "ole", "locked", "ep", "season"] {
+        for id in ["meridian", "algen", "elk", "ole", "locked", "ep", "season"] {
             assert_eq!(r3sortname_sort(&upgraded, id).await.1, None, "{id}");
         }
 
@@ -566,7 +659,7 @@ mod tests {
             .await
             .unwrap();
         let expect = [
-            ("matrix", "matrix", None),
+            ("meridian", "meridian", None),
             ("alpha", "alpha, the", Some("Alpha, The")),
             ("algen", "algen", None),
             ("elk", "zebra", Some("Zebra")),
@@ -604,8 +697,8 @@ mod tests {
             2
         );
         assert_eq!(
-            r3sortname_sort(&upgraded, "matrix").await.0.as_deref(),
-            Some("the matrix")
+            r3sortname_sort(&upgraded, "meridian").await.0.as_deref(),
+            Some("the meridian")
         );
         upgraded.close().await;
     }

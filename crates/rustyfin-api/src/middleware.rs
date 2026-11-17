@@ -59,11 +59,27 @@ async fn request_claims(
         ));
     }
 
-    // Otherwise the token must be a live user token
-    let claims = rustyfin_auth::validate_token(&state.db_ro, &presented.token)
-        .await
-        .map_err(|_| ApiError::Unauthorized)?;
-    Ok((claims, Some(presented.token)))
+    // Otherwise the token must be a live user token, or an API key made in the dashboard
+    match rustyfin_auth::validate_token(&state.db_ro, &presented.token).await {
+        Ok(claims) => Ok((claims, Some(presented.token))),
+        Err(_)
+            if rustyfin_auth::validate_api_key(&state.db, &presented.token)
+                .await
+                .unwrap_or(false) =>
+        {
+            Ok((
+                Claims {
+                    sub: uuid::Uuid::nil(),
+                    name: "ApiKey".to_string(),
+                    is_admin: true,
+                    iat: 0,
+                    exp: i64::MAX,
+                },
+                None,
+            ))
+        }
+        Err(_) => Err(ApiError::Unauthorized),
+    }
 }
 
 pub async fn require_auth(

@@ -1,5 +1,6 @@
-//! Sessions as Jellyfin's `SessionManager` keeps them: one per device, found from the request's
-//! token, with the play state the client reports. The session rows (who, which device, the
+//! Sessions as Jellyfin 12.4's `SessionManager` keeps them: one per client, device and user,
+//! found from the request's token (and the device its header names), with the play state the
+//! client reports. The session rows (who, which device, the
 //! capabilities, the last activity) are in the database; what is playing lives here in memory,
 //! as in Jellyfin, and is gone after a restart.
 
@@ -102,16 +103,20 @@ struct Runtime {
 
 /// What the server keeps in memory about its sessions, by session id. One per `AppState`, so
 /// servers in one process (the tests) never see or sweep each other's sessions.
+/// It also holds the user data changes its sockets are still to be sent.
 #[derive(Debug, Clone, Default)]
-pub struct SessionRuntime(Arc<RwLock<HashMap<String, Runtime>>>);
+pub struct SessionRuntime {
+    sessions: Arc<RwLock<HashMap<String, Runtime>>>,
+    pub(crate) user_data: crate::user_data_changes::Pending,
+}
 
 impl SessionRuntime {
     fn read(&self) -> std::sync::RwLockReadGuard<'_, HashMap<String, Runtime>> {
-        self.0.read().unwrap_or_else(|e| e.into_inner())
+        self.sessions.read().unwrap_or_else(|e| e.into_inner())
     }
 
     fn write(&self) -> std::sync::RwLockWriteGuard<'_, HashMap<String, Runtime>> {
-        self.0.write().unwrap_or_else(|e| e.into_inner())
+        self.sessions.write().unwrap_or_else(|e| e.into_inner())
     }
 }
 
@@ -161,7 +166,7 @@ impl Caller {
     }
 }
 
-/// The session of the request's token: its device's session, made again when it has expired
+/// The session of the request's token: its client's session on its device, made again when it has expired
 /// (Jellyfin's `LogSessionActivity`), and marked active. `None` for the API key and for a token
 /// without a device.
 pub async fn for_token(state: &AppState, token: Option<&str>) -> Result<Option<String>, ApiError> {
@@ -202,9 +207,14 @@ pub async fn for_request(
         };
         via_token = Some(rustyfin_auth::token_hash(token));
     }
-    if let Some(id) =
-        rustyfin_db::repo_session::find_device_session(&state.db, user_id, &device.device_id)
-            .await?
+    // Jellyfin 12.4's session key: the client, the device and the user
+    if let Some(id) = rustyfin_db::repo_session::find_device_session(
+        &state.db,
+        user_id,
+        &device.device_id,
+        Some(&device.app_name),
+    )
+    .await?
     {
         rustyfin_db::repo_session::touch_session(&state.db, &id).await?;
         return Ok(Some(id));
@@ -489,13 +499,14 @@ pub async fn expire_at(state: &AppState, now: DateTime<Utc>) {
 }
 
 /// The items `user`'s active sessions are playing now.
+/// Read from the play state each session keeps, whatever the session is keyed by.
 pub async fn now_playing_items(state: &AppState, user: Uuid) -> Result<Vec<Uuid>, ApiError> {
-    let sessions = rustyfin_db::repo_session::get_active_sessions(&state.db_ro).await?;
     let all = state.session_runtime.read();
-    Ok(sessions
-        .iter()
-        .filter(|s| s.user_id == user)
-        .filter_map(|s| all.get(&s.id)?.playing.as_ref().map(|p| p.item_id))
+    Ok(all
+        .values()
+        .filter_map(|rt| rt.playing.as_ref())
+        .filter(|p| p.user_id == user)
+        .map(|p| p.item_id)
         .collect())
 }
 

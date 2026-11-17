@@ -900,8 +900,8 @@ mod tests {
             ("AC/DC", "ac dc"),
             ("Amélie", "amelie"),
             ("Café: Ünïcode", "cafe unicode"),
-            ("2001: A Space Odyssey", "2001 a space odyssey"),
-            ("東京物語", "東京物語"),
+            ("2001: A Copper Orbit", "2001 a copper orbit"),
+            ("東京灯台", "東京灯台"),
             ("\"*", ""),
             ("", ""),
         ] {

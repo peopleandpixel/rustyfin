@@ -5,6 +5,8 @@ import { renderHome } from './home.js';
 import { currentLibraryId, currentLibraryRoute, renderLibrary, libraryRefreshInPlace } from './library.js';
 import { currentDetailId, renderDetail } from './item.js';
 import { renderAdmin, refreshTasks } from './admin.js';
+import { renderLibraryOptionsEditor, readLibraryOptionsEditor, closeLibraryOptionsEditor } from './library-options.js';
+import { onSocketMessage, connectRemote } from './remote.js';
 // Library id -> { percent, queued } while it scans (percent 0 = not known yet, so its ring spins; queued = waiting its turn). Absent when not scanning.
 let scanStatuses = {};
 
@@ -22,9 +24,12 @@ async function loadSidebar() {
         hide('sidebar-add-lib');
         hide('sidebar-admin-section');
     }
-    let libs;
+    // The drawer lists the user's views for everyone, administrators too, as Jellyfin Web's does:
+    // in the user's order (OrderedViews) and without the ones hidden from My Media, like home.
+    // The pages find any library of theirs, hidden ones included.
+    let libs, shown;
     try {
-        libs = await API.getLibraries();
+        [libs, shown] = await Promise.all([API.getUserViews({ includeHidden: true }), API.getUserViews()]);
     } catch (err) {
         toast(t('library.list_failed', { message: err.message }), 'error');
         return;
@@ -37,7 +42,7 @@ async function loadSidebar() {
         movies: 'Film', tvshows: 'Tv', music: 'Music', photos: 'Image', mixed: 'Folder',
         Movies: 'Film', TvShows: 'Tv', Music: 'Music', Photos: 'Image', Mixed: 'Folder'
     };
-    libraries.forEach(lib => {
+    shown.forEach(lib => {
         const id = lib.id || lib.Id;
         const name = lib.name || lib.Name;
         const type = lib.content_type || lib.ContentType || 'Mixed';
@@ -142,8 +147,9 @@ function readLibraryImageOptions(form) {
     return Object.fromEntries(LIBRARY_IMAGE_OPTIONS.map(([option]) => [option, !!form.elements[option]?.checked]));
 }
 
-// Opens the options dialog of an existing library, with its saved image options.
-async function openLibraryOptions(id, name) {
+// Opens the options dialog of an existing library, with its saved image options and the editor of
+// its other options (library-options.js).
+async function openLibraryOptions(id, name, collectionType) {
     const dlg = $('library-options-modal');
     const form = $('library-options-form');
     if (!dlg || !form) return;
@@ -157,6 +163,7 @@ async function openLibraryOptions(id, name) {
     form.elements.libraryId.value = id;
     $('library-options-title').textContent = t('library.options_title', { name });
     $('library-options-images').innerHTML = libraryImageOptionsHtml('lib-opt', options);
+    await renderLibraryOptionsEditor($('library-options-more'), options, collectionType);
     if (typeof dlg.showModal === 'function') {
         try { dlg.showModal(); } catch { dlg.setAttribute('open', ''); }
     } else {
@@ -165,6 +172,7 @@ async function openLibraryOptions(id, name) {
 }
 
 function closeLibraryOptions() {
+    closeLibraryOptionsEditor();
     const dlg = $('library-options-modal');
     if (!dlg) return;
     if (typeof dlg.close === 'function') {
@@ -183,7 +191,7 @@ async function submitLibraryOptions(e) {
     if (submitBtn) submitBtn.disabled = true;
     try {
         const options = await API.getLibraryOptions(id);
-        await API.saveLibraryOptions(id, { ...options, ...readLibraryImageOptions(form) });
+        await API.saveLibraryOptions(id, { ...options, ...readLibraryOptionsEditor(form), ...readLibraryImageOptions(form) });
     } catch (err) {
         toast(t('library.options_save_failed', { message: err.message }), 'error');
         return;
@@ -443,15 +451,7 @@ openAddLibrary = function() {
     _origOpenAddLibrary();
 };
 
-// --- WebSocket for scan progress ---
-// The scan progress socket while it connects or is open, or null
-let scanSocket = null;
-// The pending retry timer, or null when no retry is scheduled
-let scanSocketRetry = null;
-// Delay before the next retry in ms; doubles up to 30 s and returns to 1 s when a socket opens
-let scanSocketDelay = 1000;
-// True once the current outage has been logged, so the warning is printed only once
-let scanSocketWarned = false;
+// --- Scan progress, task and library events, from the one session socket (remote.js) ---
 
 // A library change re-renders the open detail, library or home page from fresh data. The lists are dropped from the
 // 30 s cache first, so the re-render is not served from it. Other pages get no re-render.
@@ -472,93 +472,71 @@ function refreshViewAfterLibraryChange() {
     }, 500);
 }
 
-function initScanProgressWebSocket() {
-    if (typeof WebSocket === 'undefined') return;
-    if (!API.isLoggedIn() || scanSocket || scanSocketRetry) return;
-
-    const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-    const wsUrl = `${protocol}//${window.location.host}/socket?api_key=${encodeURIComponent(API.token)}`;
-
-    let ws;
+// One server message: the scan rings, the task list and the open page follow it
+function handleScanMessage(data) {
     try {
-        ws = new WebSocket(wsUrl);
-    } catch (e) {
-        console.error('Opening the scan progress socket failed:', e);
-        return;
-    }
-    scanSocket = ws;
-
-    ws.onopen = () => {
-        scanSocketDelay = 1000;
-        scanSocketWarned = false;
-        // The server then sends one frame per scan in progress, so the map is rebuilt from empty
-        scanStatuses = {};
-        updateScanRings();
-    };
-
-    ws.onmessage = (event) => {
-        try {
-            const data = JSON.parse(event.data);
-            if (data.MessageType === 'ScheduledTaskStarted') {
-                // Refresh tasks tab if visible
-                if (currentPage === 'admin') refreshTasks();
-            } else if (data.MessageType === 'ScheduledTaskCompleted') {
-                const libId = data.ItemId;
-                if (data.State === 'Failed') {
-                    toast(t('admin.task_failed', { name: data.Name || t('admin.task'), error: data.Error || t('common.unknown_error') }), 'error');
-                } else if (data.State === 'Completed' && libId) {
-                    // Name the library; the event's Name is an English server label
-                    const lib = libraries.find(l => (l.id || l.Id) === libId);
-                    toast(lib ? t('library.scan_finished_for', { name: lib.name || lib.Name }) : t('library.scan_finished'));
-                }
-                // Refresh tasks tab if visible
-                if (currentPage === 'admin') refreshTasks();
-            } else if (data.MessageType === 'RefreshProgress') {
-                // Scan progress: State "Queued" while it waits its turn, "Active" with each whole percent, "Idle" at "100" when done
-                const id = data.Data?.ItemId;
-                const p = Number(data.Data?.Progress ?? NaN);
-                const state = data.Data?.State;
-                if (id && Number.isFinite(p)) {
-                    // Taken as is, not maxed: a new run of the same library can start lower than the last one
-                    if (state === 'Idle' || p >= 100) delete scanStatuses[id];
-                    else scanStatuses[id] = { percent: p, queued: state === 'Queued' };
-                    updateScanRings(id);
-                }
-            } else if (data.MessageType === 'LibraryChanged') {
-                refreshViewAfterLibraryChange();
+        if (data.MessageType === 'ScheduledTaskStarted') {
+            // Refresh tasks tab if visible
+            if (currentPage === 'admin') refreshTasks();
+        } else if (data.MessageType === 'ScheduledTaskCompleted') {
+            const libId = data.ItemId;
+            if (data.State === 'Failed') {
+                toast(t('admin.task_failed', { name: data.Name || t('admin.task'), error: data.Error || t('common.unknown_error') }), 'error');
+            } else if (data.State === 'Completed' && libId) {
+                // Name the library; the event's Name is an English server label
+                const lib = libraries.find(l => (l.id || l.Id) === libId);
+                toast(lib ? t('library.scan_finished_for', { name: lib.name || lib.Name }) : t('library.scan_finished'));
             }
-        } catch (e) {
-            console.error('Handling a server event failed:', e);
+            // Refresh tasks tab if visible
+            if (currentPage === 'admin') refreshTasks();
+        } else if (data.MessageType === 'RefreshProgress') {
+            // Scan progress: State "Queued" while it waits its turn, "Active" with each whole percent, "Idle" at "100" when done
+            const id = data.Data?.ItemId;
+            const p = Number(data.Data?.Progress ?? NaN);
+            const state = data.Data?.State;
+            if (id && Number.isFinite(p)) {
+                const was = id in scanStatuses;
+                // Taken as is, not maxed: a new run of the same library can start lower than the last one
+                if (state === 'Idle' || p >= 100) delete scanStatuses[id];
+                else scanStatuses[id] = { percent: p, queued: state === 'Queued' };
+                updateScanRings(id);
+                // Every library scan is the library scan task, as in Jellyfin: the dashboard's
+                // task list follows a scan that starts or ends, wherever it was started
+                if (was !== (id in scanStatuses) && currentPage === 'admin') refreshTasks(true);
+            }
+        } else if (data.MessageType === 'LibraryChanged') {
+            refreshViewAfterLibraryChange();
         }
-    };
-
-    ws.onclose = () => {
-        // A socket stopped on purpose is no longer the current one
-        if (scanSocket !== ws) return;
-        scanSocket = null;
-        if (!API.isLoggedIn()) return;
-        if (!scanSocketWarned) {
-            console.warn('Scan progress socket closed, retrying with backoff');
-            scanSocketWarned = true;
-        }
-        // Reconnect with exponential backoff
-        scanSocketRetry = setTimeout(() => {
-            scanSocketRetry = null;
-            initScanProgressWebSocket();
-        }, scanSocketDelay);
-        scanSocketDelay = Math.min(scanSocketDelay * 2, 30000);
-    };
+    } catch (e) {
+        console.error('Handling a server event failed:', e);
+    }
 }
 
-// Called on logout and before a login starts a new socket: closes the socket and cancels any pending retry
+// Subscribed once, before the session socket first opens: each (re)connect starts the rings over,
+// and the server then sends one frame per scan in progress. The socket, with its reconnects, is
+// remote.js's, so the rings, the task list and remote control share one. A microtask runs once
+// every module has loaded (util.js, this module and remote.js import each other) and before any
+// socket event.
+function subscribeScanEvents() {
+    onSocketMessage('SocketOpen', () => {
+        scanStatuses = {};
+        updateScanRings();
+    });
+    for (const type of ['ScheduledTaskStarted', 'ScheduledTaskCompleted', 'RefreshProgress', 'LibraryChanged']) {
+        onSocketMessage(type, (_, message) => handleScanMessage(message));
+    }
+}
+queueMicrotask(subscribeScanEvents);
+
+// After a sign-in: the session socket opens (or reopens) with the new token
+function initScanProgressWebSocket() {
+    connectRemote();
+}
+
+// On sign-out: the rings clear; remote.js closes the socket when the token is gone
 function stopScanProgressWebSocket() {
-    clearTimeout(scanSocketRetry);
-    scanSocketRetry = null;
-    scanSocketDelay = 1000;
-    scanSocketWarned = false;
-    const ws = scanSocket;
-    scanSocket = null;
-    if (ws) ws.close();
+    scanStatuses = {};
+    updateScanRings();
 }
 
 export {

@@ -54,10 +54,6 @@ pub fn admin_routes() -> Router<AppState> {
             "/System/Configuration/{key}",
             post(update_configuration_by_key),
         )
-        .route(
-            "/System/Configuration/Branding",
-            post(update_branding_config),
-        )
         .route("/System/Info/Storage", get(get_storage_info))
         .route("/System/Logs/Log", get(get_logs_log))
         .route("/System/Shutdown", post(shutdown))
@@ -190,7 +186,7 @@ async fn get_full_info(
         internal_metadata_path: metadata_path,
         transcoding_temp_path,
         web_path: std::env::var("RUSTYFIN_WEBCLIENT_DIR").unwrap_or_default(),
-        encoder_location: if std::env::var_os("RUSTYFIN_FFMPEG_PATH").is_some() {
+        encoder_location: if rustyfin_core::media_tools::is_custom() {
             "Custom"
         } else {
             "System"
@@ -455,13 +451,10 @@ fn encoding_path(state: &AppState) -> std::path::PathBuf {
     state.data_dir.join(rustyfin_core::encoding::ENCODING_FILE)
 }
 
-/// The stored encoding options: the defaults, under what a client saved.
-async fn encoding_options(
+/// What a client saved, None when nothing (or nothing readable) was.
+async fn saved_encoding_options(
     state: &AppState,
-) -> Result<serde_json::Map<String, serde_json::Value>, ApiError> {
-    let ffmpeg = std::env::var("RUSTYFIN_FFMPEG_PATH").unwrap_or_else(|_| "ffmpeg".to_string());
-    let mut options =
-        rustyfin_core::encoding::default_options(&ffmpeg, state.transcode_manager.cache_root());
+) -> Result<Option<serde_json::Map<String, serde_json::Value>>, ApiError> {
     let saved = match tokio::fs::read_to_string(encoding_path(state)).await {
         Ok(text) => serde_json::from_str::<serde_json::Value>(&text).unwrap_or_else(|e| {
             tracing::warn!("ignoring an unreadable encoding.json: {e}");
@@ -470,13 +463,49 @@ async fn encoding_options(
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => serde_json::Value::Null,
         Err(e) => return Err(ApiError::Internal(e.to_string())),
     };
-    if let serde_json::Value::Object(saved) = saved {
-        options.extend(saved);
-    }
-    Ok(options)
+    Ok(match saved {
+        serde_json::Value::Object(saved) => Some(saved),
+        _ => None,
+    })
 }
 
-async fn save_encoding_configuration(
+/// The encoding options in effect: the defaults, under the detected device while the
+/// administrator hasn't chosen a hardware acceleration type, under what a client saved
+/// (`rustyfin_core::hwaccel::effective_options`).
+async fn encoding_options(
+    state: &AppState,
+) -> Result<serde_json::Map<String, serde_json::Value>, ApiError> {
+    let ffmpeg = rustyfin_core::media_tools::ffmpeg()
+        .to_string_lossy()
+        .into_owned();
+    let defaults =
+        rustyfin_core::encoding::default_options(&ffmpeg, state.transcode_manager.cache_root());
+    let saved = saved_encoding_options(state).await?;
+    Ok(rustyfin_core::hwaccel::effective_options(
+        defaults,
+        saved.as_ref(),
+        state.transcode_manager.hardware_detection().as_ref(),
+    ))
+}
+
+/// The encoding options as a caller reads them: any signed-in user, as in Jellyfin, but the
+/// devices and paths only an administrator.
+pub(crate) async fn encoding_json(
+    state: &AppState,
+    is_admin: bool,
+) -> Result<serde_json::Value, ApiError> {
+    let mut options = encoding_options(state).await?;
+    if !is_admin {
+        options.retain(|name, _| {
+            !rustyfin_core::encoding::PRIVATE_FIELDS
+                .iter()
+                .any(|private| name.eq_ignore_ascii_case(private))
+        });
+    }
+    Ok(serde_json::Value::Object(options))
+}
+
+pub(crate) async fn save_encoding_configuration(
     state: &AppState,
     body: serde_json::Value,
 ) -> Result<(), ApiError> {
@@ -487,6 +516,13 @@ async fn save_encoding_configuration(
     };
     rustyfin_core::encoding::validate_options(options)
         .map_err(|e| ApiError::BadRequest(format!("encoding: {e}")))?;
+    // A save without a type stays automatic: its detected values aren't stored
+    let mut options = options.clone();
+    rustyfin_core::hwaccel::keep_automatic(
+        &mut options,
+        state.transcode_manager.hardware_detection().as_ref(),
+    );
+    let body = serde_json::Value::Object(options);
     ensure_config_size(ENCODING_KEY, &body)?;
     let path = encoding_path(state);
     let text =
@@ -1101,6 +1137,22 @@ fn disk_usage(_path: &str) -> Result<(i64, i64), std::io::Error> {
     Ok((0, 0))
 }
 
+/// Saves the named configuration `key` (network, branding), with the matching errors.
+pub(crate) async fn save_named(
+    state: &AppState,
+    key: &str,
+    body: serde_json::Value,
+) -> Result<(), ApiError> {
+    use crate::named_config::SaveError;
+    crate::named_config::save(&state.data_dir, key, body)
+        .await
+        .map_err(|e| match e {
+            SaveError::Invalid(m) => ApiError::BadRequest(m),
+            SaveError::TooLarge(m) => ApiError::PayloadTooLarge(m),
+            SaveError::Io(m) => ApiError::Internal(m),
+        })
+}
+
 /// GET /System/Configuration/{key} - Get configuration by key
 async fn get_configuration_by_key(
     State(state): State<AppState>,
@@ -1108,16 +1160,10 @@ async fn get_configuration_by_key(
     Path(key): Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     if key.eq_ignore_ascii_case(ENCODING_KEY) {
-        // Any signed-in user reads them, as in Jellyfin; the devices and paths only an
-        // administrator
-        let mut options = encoding_options(&state).await?;
-        if !claims.is_admin {
-            options.retain(|name, _| {
-                !rustyfin_core::encoding::PRIVATE_FIELDS
-                    .iter()
-                    .any(|private| name.eq_ignore_ascii_case(private))
-            });
-        }
+        return Ok(Json(encoding_json(&state, claims.is_admin).await?));
+    }
+    if crate::named_config::handles(&key) {
+        let options = crate::named_config::load(&state.data_dir, &key, claims.is_admin).await;
         return Ok(Json(serde_json::Value::Object(options)));
     }
     let json = configuration_json(&state, claims.is_admin).await?;
@@ -1134,6 +1180,11 @@ async fn update_configuration_by_key(
 ) -> Result<StatusCode, ApiError> {
     if key.eq_ignore_ascii_case(ENCODING_KEY) {
         save_encoding_configuration(&state, body).await?;
+        tracing::info!("configuration key updated: {}", key);
+        return Ok(StatusCode::NO_CONTENT);
+    }
+    if crate::named_config::handles(&key) {
+        save_named(&state, &key, body).await?;
         tracing::info!("configuration key updated: {}", key);
         return Ok(StatusCode::NO_CONTENT);
     }
@@ -1195,35 +1246,6 @@ fn merge_json_values(
         }
         other => other,
     }
-}
-
-/// POST /System/Configuration/Branding - Update branding configuration
-async fn update_branding_config(
-    State(state): State<AppState>,
-    Json(body): Json<serde_json::Value>,
-) -> Result<StatusCode, ApiError> {
-    // Extract branding settings and store in cache
-    if let Some(enabled) = body.get("SplashscreenEnabled").and_then(|v| v.as_bool()) {
-        state
-            .cache
-            .branding
-            .insert("splashscreen_enabled".to_string(), enabled.to_string());
-    }
-    if let Some(css) = body.get("CustomCss").and_then(|v| v.as_str()) {
-        state
-            .cache
-            .branding
-            .insert("custom_css".to_string(), css.to_string());
-    }
-    if let Some(disclaimer) = body.get("LoginDisclaimer").and_then(|v| v.as_str()) {
-        state
-            .cache
-            .branding
-            .insert("login_disclaimer".to_string(), disclaimer.to_string());
-    }
-
-    tracing::info!("branding configuration updated");
-    Ok(StatusCode::NO_CONTENT)
 }
 
 /// GET /System/Info/Storage - Get storage information

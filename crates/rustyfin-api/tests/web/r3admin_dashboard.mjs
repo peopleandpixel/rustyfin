@@ -147,18 +147,18 @@ test('a General save posts the fresh configuration with the form on top', async 
     same(s.toasts, [['dashboard.saved', null]]);
 });
 
-test('the display languages fall back to the cultures when /Localization/Options is no list', async () => {
+test('the display languages are /Localization/Options, Jellyfin\'s list of { Name, Value }', async () => {
     const box = element();
     const s = sandbox({
         api: {
             'GET /System/Configuration': { UICulture: 'de' }, 'GET /System/Info': {},
             'GET /Localization/Cultures': [{ DisplayName: 'German', TwoLetterISOLanguageName: 'de' }],
-            'GET /Localization/Countries': [], 'GET /Localization/Options': { SubtitleLanguages: [] },
+            'GET /Localization/Countries': [], 'GET /Localization/Options': [{ Name: 'Deutsch', Value: 'de' }],
         },
         elements: { 'admin-general': box },
     });
     await s.fns.loadGeneralSettings();
-    assert.match(box.innerHTML, /id="gen-ui-culture"[^>]*><option value="de" selected>German<\/option>/);
+    assert.match(box.innerHTML, /id="gen-ui-culture"[^>]*><option value="de" selected>Deutsch<\/option>/);
 });
 
 test('the library editor sends Jellyfin\'s folder and rename requests', async () => {

@@ -718,7 +718,7 @@ mod tests {
 
     #[test]
     fn test_urlencoded() {
-        assert_eq!(urlencoded("The Dark Knight"), "The+Dark+Knight");
+        assert_eq!(urlencoded("The Pale Lantern"), "The+Pale+Lantern");
         assert_eq!(
             urlencoded("Türkisch für Anfänger"),
             "T%C3%BCrkisch+f%C3%BCr+Anf%C3%A4nger"

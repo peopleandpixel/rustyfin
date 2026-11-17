@@ -236,6 +236,7 @@ async fn report_start(
             media_type,
         )
         .await?;
+        crate::user_data_changes::changed(&state, claims.sub, req.item_id);
 
         let (audio, subtitle) = reported_choices(
             &state,
@@ -383,6 +384,17 @@ async fn report_stop(
         "Playback stopped"
     );
     record_stop(&state, claims.sub, &req).await?;
+    // The playback's transcodes end with it, as in Jellyfin, rather than at the stall sweep
+    if let Some(psid) = req.play_state.play_session_id.as_deref() {
+        let stopped = state.transcode_manager.stop_reported_playback(psid).await;
+        if stopped > 0 {
+            tracing::debug!(
+                play_session = psid,
+                stopped,
+                "stopped the playback's transcodes"
+            );
+        }
+    }
     if let Some(session) = caller_session(&state, &token).await? {
         crate::sessions::stopped(&state, &session).await;
     }
@@ -416,6 +428,7 @@ pub(crate) async fn record_stop(
             &rules,
         )
         .await?;
+        crate::user_data_changes::changed(state, user, req.item_id);
     }
 
     let (audio, subtitle) = reported_choices(
@@ -654,6 +667,7 @@ async fn played(
 ) -> Result<Json<UserItemDataDto>, ApiError> {
     let data = rustyfin_db::repo_playback::mark_played_on(&state.db, user_id, item_id, date_played)
         .await?;
+    crate::user_data_changes::played_changed(state, user_id, item_id);
     Ok(Json(folder_answer(state, user_id, item_id, data).await?))
 }
 
@@ -663,6 +677,7 @@ async fn unplayed(
     item_id: Uuid,
 ) -> Result<Json<UserItemDataDto>, ApiError> {
     let data = rustyfin_db::repo_playback::mark_unplayed(&state.db, user_id, item_id).await?;
+    crate::user_data_changes::played_changed(state, user_id, item_id);
     Ok(Json(folder_answer(state, user_id, item_id, data).await?))
 }
 
@@ -673,6 +688,7 @@ async fn favorite(
     on: bool,
 ) -> Result<Json<UserItemDataDto>, ApiError> {
     let data = rustyfin_db::repo_playback::set_favorite(&state.db, user_id, item_id, on).await?;
+    crate::user_data_changes::changed(state, user_id, item_id);
     Ok(Json(folder_answer(state, user_id, item_id, data).await?))
 }
 
@@ -736,6 +752,7 @@ async fn update_user_data(
 ) -> Result<Json<UserItemDataDto>, ApiError> {
     let data =
         rustyfin_db::repo_playback::update_user_data(&state.db, user_id, item_id, update).await?;
+    crate::user_data_changes::changed(state, user_id, item_id);
     Ok(Json(folder_answer(state, user_id, item_id, data).await?))
 }
 
@@ -802,6 +819,7 @@ async fn set_likes(
         }
         None => return clear_rating(state, user_id, item_id).await,
     };
+    crate::user_data_changes::changed(state, user_id, item_id);
     Ok(Json(folder_answer(state, user_id, item_id, data).await?))
 }
 
@@ -812,6 +830,7 @@ async fn clear_rating(
     item_id: Uuid,
 ) -> Result<Json<UserItemDataDto>, ApiError> {
     rustyfin_db::repo_playback::clear_user_rating(&state.db, user_id, item_id).await?;
+    crate::user_data_changes::changed(state, user_id, item_id);
     user_data(state, user_id, item_id).await
 }
 
@@ -880,7 +899,7 @@ async fn mark_unplayed(
 /// User data as items answer it: a Series or Season with its Played and UnplayedItemCount derived
 /// from its episodes, other items with their PlayedPercentage, and every answer with Jellyfin's
 /// Key and ItemId.
-async fn folder_answer(
+pub(crate) async fn folder_answer(
     state: &AppState,
     user_id: Uuid,
     item_id: Uuid,
@@ -989,6 +1008,7 @@ async fn set_rating(
         req.likes,
         req.user_rating
     );
+    crate::user_data_changes::changed(&state, user_id, item_id);
     Ok(Json(data))
 }
 

@@ -84,14 +84,20 @@ async fn main() {
     );
 
     // Validate FFmpeg exists and is accessible
-    if let Ok(ffmpeg_path) = std::env::var("RUSTYFIN_FFMPEG_PATH") {
-        if !std::path::Path::new(&ffmpeg_path).exists() {
+    // Every spawn takes its programs from `media_tools`, so this checks what will run
+    let tools = rustyfin_core::media_tools::current();
+    if tools.custom {
+        let ffmpeg_path = tools.ffmpeg.display();
+        if !tools.ffmpeg.exists() {
             tracing::warn!(
                 "FFmpeg path '{}' does not exist — transcoding will fail",
                 ffmpeg_path
             );
         } else {
-            tracing::info!("FFmpeg found at: {}", ffmpeg_path);
+            tracing::info!(
+                "FFmpeg found at: {ffmpeg_path} (ffprobe: {})",
+                tools.ffprobe.display()
+            );
         }
     } else if which::which("ffmpeg").is_ok() {
         tracing::info!("FFmpeg found in PATH");
@@ -99,6 +105,27 @@ async fn main() {
         tracing::warn!(
             "FFmpeg not found — transcoding will not work. Install FFmpeg or set RUSTYFIN_FFMPEG_PATH"
         );
+    }
+
+    // A restore staged in the dashboard replaces the database and settings before either is read
+    if std::env::var_os("RUSTYFIN_DB").is_none() {
+        match rustyfin_api::backup_archive::apply_pending_restore(
+            &data_dir,
+            &data_dir.join("rustyfin.db"),
+        )
+        .await
+        {
+            Ok(Some(name)) => tracing::info!("restored the backup {name}"),
+            Ok(None) => {}
+            Err(e @ rustyfin_api::backup_archive::RestoreError::RolledBack(_)) => {
+                tracing::error!("the staged restore failed: {e}")
+            }
+            // Starting on an empty database would let anyone claim the owner account
+            Err(e @ rustyfin_api::backup_archive::RestoreError::Fatal(_)) => {
+                tracing::error!("the staged restore failed, so the server won't start: {e}");
+                std::process::exit(1);
+            }
+        }
     }
 
     let db_url = std::env::var("RUSTYFIN_DB")
@@ -112,8 +139,13 @@ async fn main() {
 
     let server_id = load_or_create_server_id(&data_dir);
 
+    // The network settings saved in the dashboard, under the environment variables that set the
+    // same things
+    let network = rustyfin_api::named_config::network_startup(&data_dir);
+
     // IPv6 dual-stack: use [::]:8096 to listen on both IPv4 and IPv6
-    let bind_addr = std::env::var("RUSTYFIN_BIND").unwrap_or_else(|_| "0.0.0.0:8096".to_string());
+    let bind_addr =
+        rustyfin_api::named_config::startup_bind(std::env::var("RUSTYFIN_BIND").ok(), network.bind);
 
     let tls_cert = std::env::var("RUSTYFIN_TLS_CERT").ok();
     let tls_key = std::env::var("RUSTYFIN_TLS_KEY").ok();
@@ -209,6 +241,16 @@ async fn main() {
     transcode_manager.set_encoding_settings(encoding);
     // Start periodic cleanup of stale transcode sessions and old cache directories
     transcode_manager.spawn_cleanup_task();
+    // Finds the video devices and what each decodes, in the background: until it ends, new
+    // transcodes take the saved options; then, while the administrator hasn't chosen a
+    // hardware acceleration type, the best device decodes
+    {
+        let manager = transcode_manager.clone();
+        let data_dir = data_dir.clone();
+        tokio::spawn(async move {
+            manager.detect_hardware(&data_dir).await;
+        });
+    }
 
     let data_dir_arc = Arc::new(data_dir);
 
@@ -444,7 +486,10 @@ async fn main() {
     // Reverse proxies we trust to set X-Forwarded-For (comma-separated CIDRs or IPs). Loopback is
     // trusted only when listed.
     let known_proxies = Arc::new(rustyfin_api::middleware::parse_known_proxies(
-        &std::env::var("RUSTYFIN_KNOWN_PROXIES").unwrap_or_default(),
+        &std::env::var("RUSTYFIN_KNOWN_PROXIES")
+            .ok()
+            .or(network.known_proxies)
+            .unwrap_or_default(),
     ));
 
     // In-memory response caches
@@ -461,6 +506,7 @@ async fn main() {
         bind_addr: Arc::new(bind_addr.clone()),
         published_url: std::env::var("RUSTYFIN_PUBLISHED_URL")
             .ok()
+            .or(network.published_url)
             .filter(|url| !url.trim().is_empty())
             .map(Arc::new),
         api_key: api_key.map(Arc::new),
@@ -485,14 +531,12 @@ async fn main() {
         session_runtime: Default::default(),
     };
 
-    // A scheduled library scan clears the same caches as a scan from the API or the monitor.
+    // A scheduled task that writes items (the library scan, the metadata refresh, the missing
+    // episodes) clears the same caches as a scan from the API or the monitor.
     {
         let cache = state.cache.clone();
         let image_cache = state.image_cache.clone();
-        task_scheduler.set_on_scan(move || {
-            cache.invalidate_on_scan();
-            image_cache.invalidate_all();
-        });
+        task_scheduler.set_on_items_changed(move || cache.library_changed(&image_cache));
     }
 
     let transcodes = state.transcode_manager.clone();
@@ -560,12 +604,6 @@ async fn main() {
         tokio::spawn(async move { rustyfin_api::sort_names::apply(&state).await });
     }
 
-    // Background task: finds the users whose password is the empty one, for the sign-in tiles
-    {
-        let db = state.db_ro.clone();
-        tokio::spawn(async move { rustyfin_auth::find_empty_passwords(&db).await });
-    }
-
     // Extract HTTP port for discovery services
     let http_port: u16 = bind_addr
         .rsplit(':')
@@ -573,44 +611,54 @@ async fn main() {
         .and_then(|p| p.parse().ok())
         .unwrap_or(8096);
 
-    // Background task: SSDP discovery (DLNA), only when the DLNA server is on
-    if state.config.read().await.enable_dlna_server {
+    // Background tasks: SSDP discovery (DLNA). They follow EnableDlnaServer as it is now: the
+    // responder holds port 1900 and the advertiser announces only while the DLNA server is on, so
+    // the dashboard's switch applies without a restart.
+    {
         let dlna_config = std::sync::Arc::new(rustyfin_core::dlna::DlnaConfig {
-            server_name: "Rustyfin".to_string(),
+            server_name: String::new(),
             server_id: state.server_id.to_string(),
             http_port,
             bind_ip: std::net::Ipv4Addr::UNSPECIFIED,
         });
         let shutdown_rx = state.shutdown_tx.subscribe();
-        let cfg = dlna_config.clone();
+        let (cfg, settings) = (dlna_config.clone(), state.config.clone());
         tokio::spawn(async move {
-            rustyfin_core::dlna::run_ssdp_responder(cfg, shutdown_rx).await;
+            rustyfin_core::dlna::run_ssdp_responder(cfg, settings, shutdown_rx).await;
         });
         let shutdown_rx = state.shutdown_tx.subscribe();
+        let settings = state.config.clone();
         tokio::spawn(async move {
-            rustyfin_core::dlna::run_ssdp_advertiser(dlna_config, shutdown_rx).await;
+            rustyfin_core::dlna::run_ssdp_advertiser(dlna_config, settings, shutdown_rx).await;
         });
     }
 
-    // Background task: UDP discovery (Jellyfin client auto-discovery on port 7359)
+    // Background task: UDP discovery (Jellyfin client auto-discovery on port 7359), answering with
+    // the configured server name as it is now
     {
         let udp_config = std::sync::Arc::new(rustyfin_core::udp_discovery::UdpDiscoveryConfig {
-            server_name: "Rustyfin".to_string(),
             server_id: state.server_id.to_string(),
             http_port,
             bind_ip: std::net::Ipv4Addr::UNSPECIFIED,
             endpoint_address: state.published_url.as_deref().cloned(),
         });
         let shutdown_rx = state.shutdown_tx.subscribe();
+        let settings = state.config.clone();
         tokio::spawn(async move {
-            rustyfin_core::udp_discovery::run_udp_discovery(udp_config, shutdown_rx).await;
+            rustyfin_core::udp_discovery::run_udp_discovery(udp_config, settings, shutdown_rx)
+                .await;
         });
     }
 
     // Background task: mDNS/Bonjour service discovery
     {
+        // The service is registered once: a rename shows here at the next start.
+        let mdns_name = match state.config.read().await.server_name.trim() {
+            "" => "Rustyfin".to_string(),
+            name => name.to_string(),
+        };
         let mdns_config = std::sync::Arc::new(rustyfin_core::mdns::MdnsConfig {
-            server_name: "Rustyfin".to_string(),
+            server_name: mdns_name,
             server_id: state.server_id.to_string(),
             http_port,
             bind_ip: std::net::Ipv4Addr::UNSPECIFIED,

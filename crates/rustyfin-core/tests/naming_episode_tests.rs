@@ -25,15 +25,15 @@ fn parse_episode_table() {
         ("Show.ep05", Some((None, 5, None))),
         ("Show - Episode 7", Some((None, 7, None))),
         (
-            "Severance - S02E01 - Hello, Ms. Cobel",
+            "Sallowmere - S02E01 - Hello, Ms. Vantrel",
             Some((Some(2), 1, None)),
         ),
         (
-            "The Queen's Gambit - S01E01 - Openings",
+            "The Tailor's Wager - S01E01 - Openings",
             Some((Some(1), 1, None)),
         ),
-        ("McMillion$ - S01E01 - Episode 1", Some((Some(1), 1, None))),
-        ("This Is England '86 - S01E01", Some((Some(1), 1, None))),
+        ("McPenny$ - S01E01 - Episode 1", Some((Some(1), 1, None))),
+        ("This Is Lowmarsh '86 - S01E01", Some((Some(1), 1, None))),
         ("Movie 1920x1080", None),
         ("Pilot", None),
     ];
@@ -65,10 +65,10 @@ fn b32_parse_episode_e_dot() {
     // extension's, so the digits may end the stem. It comes after `S01E02` and `ep05`, before `1x02`.
     let table: &[(&str, Option<i32>)] = &[
         (
-            "Dekalog.E02.1989.720p.BluRay.AAC.1.0.x264-ZQ-xpost",
+            "Vekalon.E02.1989.720p.BluRay.AAC.1.0.x264-ZQ-xpost",
             Some(2),
         ),
-        ("Dekalog.E08.1080p.BluRay.x264-DEPTH", Some(8)),
+        ("Vekalon.E08.1080p.BluRay.x264-QUAYS", Some(8)),
         ("Show.e05", Some(5)),
         ("Show E05", Some(5)),
         ("ShowE05", Some(5)),

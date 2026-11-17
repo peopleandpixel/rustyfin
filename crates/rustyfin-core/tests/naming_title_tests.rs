@@ -30,56 +30,60 @@ fn check<W: Debug, G: Debug + PartialEq<W>>(table: &[(&str, W)], f: impl Fn(&str
 #[test]
 fn clean_name_table() {
     let rows = [
-        ("Argo (2012) Bluray-2160p", "Argo", Some(2012)),
-        ("Argo", "Argo", None),
+        ("Arvel (2012) Bluray-2160p", "Arvel", Some(2012)),
+        ("Arvel", "Arvel", None),
         (
-            "A Most Violent Year (2014) Remux-1080p",
-            "A Most Violent Year",
+            "A Most Patient Harbor (2014) Remux-1080p",
+            "A Most Patient Harbor",
             Some(2014),
         ),
         (
-            "Holy.Motors.2012.BRRip.XviD.5rFF",
-            "Holy Motors",
+            "Hazel.Mirrors.2012.BRRip.XviD.7qGG",
+            "Hazel Mirrors",
             Some(2012),
         ),
         (
-            "Funny Games U S 2007 LiMiTED DVDRip XviD NODLABS",
-            "Funny Games U S",
+            "Fickle Gardens U S 2007 LiMiTED DVDRip XviD QRTZLAB",
+            "Fickle Gardens U S",
             Some(2007),
         ),
         (
-            "Funny.Games.U.S.2007.LiMiTED.DVDRip.XviD-NODLABS.CD1",
-            "Funny Games U S",
+            "Fickle.Gardens.U.S.2007.LiMiTED.DVDRip.XviD-QRTZLAB.CD1",
+            "Fickle Gardens U S",
             Some(2007),
         ),
         (
-            "the.machine.2013.720p.bluray.x264.dts-nohate",
-            "the machine",
+            "the.mangle.2013.720p.bluray.x264.dts-quillgrp",
+            "the mangle",
             Some(2013),
         ),
         (
-            "Star Wars (1977) WEBDL-2160p Proper",
-            "Star Wars",
+            "Sky Tiders (1977) WEBDL-2160p Proper",
+            "Sky Tiders",
             Some(1977),
         ),
-        ("Alien³ (1992) Bluray-1080p", "Alien³", Some(1992)),
+        ("Alderlune³ (1992) Bluray-1080p", "Alderlune³", Some(1992)),
         ("1917 (2019)", "1917", Some(2019)),
         ("1917", "1917", None),
         ("Se7en (1995)", "Se7en", Some(1995)),
         ("Movie - (2010)", "Movie", Some(2010)),
-        ("Citizen Kane cd1", "Citizen Kane", None),
-        ("Argo Bluray-2160p", "Argo", None),
+        ("Clover Vane cd1", "Clover Vane", None),
+        ("Arvel Bluray-2160p", "Arvel", None),
         ("Movie [Director's Cut]", "Movie", None),
         ("[YTS] Movie Name", "Movie Name", None),
         ("Movie Name - 2", "Movie Name", None),
         ("Some_Movie_Name", "Some Movie Name", None),
         ("News.2010.10.12", "News 2010 10 12", None),
-        ("Arcadian ()", "Arcadian", None),
-        ("Hocus Pocus 2 (0)", "Hocus Pocus 2", None),
-        ("The Running Man () Bluray-1080p", "The Running Man", None),
+        ("Brindlemoor ()", "Brindlemoor", None),
+        ("Hollow Pockets 2 (0)", "Hollow Pockets 2", None),
         (
-            "Mad Men TV Series 2007 - IMDb ()",
-            "Mad Men TV Series",
+            "The Wandering Clerk () Bluray-1080p",
+            "The Wandering Clerk",
+            None,
+        ),
+        (
+            "Mild Ferns TV Series 2007 - IMDb ()",
+            "Mild Ferns TV Series",
             Some(2007),
         ),
     ];
@@ -97,11 +101,11 @@ fn clean_name_table() {
 fn title_key_table() {
     check(
         &[
-            ("Alien³", "alien³"),
-            ("The Machine", "themachine"),
+            ("Alderlune³", "alderlune³"),
+            ("The Mangle", "themangle"),
             ("Se7en", "se7en"),
             ("Amélie", "amélie"),
-            ("Mission: Impossible – Fallout", "missionimpossiblefallout"),
+            ("Marble: Harbor – Undertow", "marbleharborundertow"),
             ("WALL·E", "walle"),
         ],
         title_key,
@@ -117,9 +121,9 @@ fn resolution_table() {
         ("x264", None),
         ("4k", None),
         ("S01E02", None),
-        ("Argo (2012) Bluray-2160p", Some(2160)),
-        ("The.Machine.2013.720p.bluray.x264", Some(720)),
-        ("5rFF-hmot480p", Some(480)),
+        ("Arvel (2012) Bluray-2160p", Some(2160)),
+        ("The.Mangle.2013.720p.bluray.x264", Some(720)),
+        ("7qGG-hmir480p", Some(480)),
     ];
     check(table, resolution);
 }
@@ -159,116 +163,133 @@ fn movie_groups(folder: &str, names: &[&str]) -> Vec<Group> {
 }
 
 #[test]
-fn group_argo() {
+fn group_arvel() {
     assert_eq!(
-        movie_groups("Argo (2012)", &["Argo.mkv", "Argo (2012) Bluray-2160p.mkv"]),
+        movie_groups(
+            "Arvel (2012)",
+            &["Arvel.mkv", "Arvel (2012) Bluray-2160p.mkv"]
+        ),
         [group(
-            "Argo",
+            "Arvel",
             Some(2012),
-            &["Argo (2012) Bluray-2160p.mkv", "Argo.mkv"]
+            &["Arvel (2012) Bluray-2160p.mkv", "Arvel.mkv"]
         )]
     );
 }
 
 #[test]
-fn group_citizen_kane_parts() {
+fn group_clover_vane_parts() {
     assert_eq!(
         movie_groups(
-            "Citizen Kane (1941)",
+            "Clover Vane (1941)",
             &[
-                "Citizen Kane cd1.avi",
-                "Citizen Kane (1941) Bluray-2160p.mkv",
-                "Citizen Kane cd2.avi",
+                "Clover Vane cd1.avi",
+                "Clover Vane (1941) Bluray-2160p.mkv",
+                "Clover Vane cd2.avi",
             ]
         ),
         [group(
-            "Citizen Kane",
+            "Clover Vane",
             Some(1941),
             &[
-                "Citizen Kane (1941) Bluray-2160p.mkv",
-                "Citizen Kane cd1.avi",
-                "Citizen Kane cd2.avi",
+                "Clover Vane (1941) Bluray-2160p.mkv",
+                "Clover Vane cd1.avi",
+                "Clover Vane cd2.avi",
             ]
         )]
     );
 }
 
 #[test]
-fn group_alien3_two_films() {
-    // Two titles are two films. "Aliens" sorts first, as 's' is below the
+fn group_alderlune3_two_films() {
+    // Two titles are two films. "Alderlunes" sorts first, as 's' is below the
     // first byte of '³'.
     assert_eq!(
         movie_groups(
-            "Alien³ (1992)",
+            "Alderlune³ (1992)",
             &[
-                "Alien³ (1992) Bluray-1080p.mkv",
-                "Aliens (1986) Bluray-1080p.mkv",
+                "Alderlune³ (1992) Bluray-1080p.mkv",
+                "Alderlunes (1986) Bluray-1080p.mkv",
             ]
         ),
         [
-            group("Aliens", Some(1986), &["Aliens (1986) Bluray-1080p.mkv"]),
-            group("Alien³", Some(1992), &["Alien³ (1992) Bluray-1080p.mkv"]),
+            group(
+                "Alderlunes",
+                Some(1986),
+                &["Alderlunes (1986) Bluray-1080p.mkv"]
+            ),
+            group(
+                "Alderlune³",
+                Some(1992),
+                &["Alderlune³ (1992) Bluray-1080p.mkv"]
+            ),
         ]
     );
 }
 
 #[test]
-fn group_bad_santa_folder_name_first() {
+fn group_odd_pudding_folder_name_first() {
     // The file named like its folder is the primary, ahead of a higher
     // resolution.
     assert_eq!(
         movie_groups(
-            "Bad Santa (2003)",
+            "Odd Pudding (2003)",
             &[
-                "Bad Santa.mkv",
-                "Bad Santa (2003) Bluray-1080p.mkv",
-                "Bad Santa (2003).mkv",
+                "Odd Pudding.mkv",
+                "Odd Pudding (2003) Bluray-1080p.mkv",
+                "Odd Pudding (2003).mkv",
             ]
         ),
         [group(
-            "Bad Santa",
+            "Odd Pudding",
             Some(2003),
             &[
-                "Bad Santa (2003).mkv",
-                "Bad Santa (2003) Bluray-1080p.mkv",
-                "Bad Santa.mkv",
+                "Odd Pudding (2003).mkv",
+                "Odd Pudding (2003) Bluray-1080p.mkv",
+                "Odd Pudding.mkv",
             ]
         )]
     );
 }
 
 #[test]
-fn group_funny_games_folder_year() {
+fn group_fickle_gardens_folder_year() {
     // The folder's year wins over the year in a file name.
     assert_eq!(
         movie_groups(
-            "Funny Games (2007)",
-            &["Funny Games.mkv", "Funny Games (2008) Bluray-1080p.mkv"]
+            "Fickle Gardens (2007)",
+            &[
+                "Fickle Gardens.mkv",
+                "Fickle Gardens (2008) Bluray-1080p.mkv"
+            ]
         ),
         [group(
-            "Funny Games",
+            "Fickle Gardens",
             Some(2007),
-            &["Funny Games (2008) Bluray-1080p.mkv", "Funny Games.mkv"]
+            &[
+                "Fickle Gardens (2008) Bluray-1080p.mkv",
+                "Fickle Gardens.mkv"
+            ]
         )]
     );
 }
 
 #[test]
-fn group_the_machine() {
+fn group_the_mangle() {
     assert_eq!(
         movie_groups(
-            "The Machine (2013)",
+            "The Mangle (2013)",
             &[
-                "the.machine.2013.720p.bluray.x264.dts-nohate.mkv",
-                "The Machine (2013) Bluray-1080p.mkv",
+                "the.mangle.2013.720p.bluray.x264.dts-quillgrp.mkv",
+                "The Mangle (2013) Bluray-1080p.mkv",
             ]
         ),
         [group(
-            "The Machine",
+            "The Mangle",
             Some(2013),
             &[
-                "The Machine (2013) Bluray-1080p.mkv",
-                "the.machine.2013.720p.bluray.x264.dts-nohate.mkv",
+                "The Mangle (2013) Bluray-1080p.mkv",
+                "the.mangle.2013.720p.bluray.x264.dts-quillgrp.mkv",
             ]
         )]
     );
@@ -278,45 +299,45 @@ fn group_the_machine() {
 fn group_resolution_order() {
     assert_eq!(
         movie_groups(
-            "A Most Violent Year (2014)",
+            "A Most Patient Harbor (2014)",
             &[
-                "A Most Violent Year (2014) Bluray-720p.mkv",
-                "A Most Violent Year (2014) Remux-1080p.mkv",
-                "A Most Violent Year (2014) Bluray-1080p.mkv",
+                "A Most Patient Harbor (2014) Bluray-720p.mkv",
+                "A Most Patient Harbor (2014) Remux-1080p.mkv",
+                "A Most Patient Harbor (2014) Bluray-1080p.mkv",
             ]
         ),
         [group(
-            "A Most Violent Year",
+            "A Most Patient Harbor",
             Some(2014),
             &[
-                "A Most Violent Year (2014) Bluray-1080p.mkv",
-                "A Most Violent Year (2014) Remux-1080p.mkv",
-                "A Most Violent Year (2014) Bluray-720p.mkv",
+                "A Most Patient Harbor (2014) Bluray-1080p.mkv",
+                "A Most Patient Harbor (2014) Remux-1080p.mkv",
+                "A Most Patient Harbor (2014) Bluray-720p.mkv",
             ]
         )]
     );
 }
 
 #[test]
-fn group_holy_motors_scene_file() {
+fn group_hazel_mirrors_scene_file() {
     // The file name has no title; the folder has one.
     assert_eq!(
-        movie_groups("Holy.Motors.2012.BRRip.XviD.5rFF", &["5rFF-hmot480p.avi"]),
-        [group("Holy Motors", Some(2012), &["5rFF-hmot480p.avi"])]
+        movie_groups("Hazel.Mirrors.2012.BRRip.XviD.7qGG", &["7qGG-hmir480p.avi"]),
+        [group("Hazel Mirrors", Some(2012), &["7qGG-hmir480p.avi"])]
     );
 }
 
 #[test]
-fn group_iron_claw_empty_year_folder() {
+fn group_tin_ladle_empty_year_folder() {
     assert_eq!(
         movie_groups(
-            "The Iron Claw ()",
-            &["The Iron Claw (2023) WEBDL-2160p.mkv"]
+            "The Tin Ladle ()",
+            &["The Tin Ladle (2023) WEBDL-2160p.mkv"]
         ),
         [group(
-            "The Iron Claw",
+            "The Tin Ladle",
             Some(2023),
-            &["The Iron Claw (2023) WEBDL-2160p.mkv"]
+            &["The Tin Ladle (2023) WEBDL-2160p.mkv"]
         )]
     );
 }
@@ -337,25 +358,25 @@ fn group_split_by_year() {
 }
 
 #[test]
-fn group_star_wars_saga() {
+fn group_sky_tiders_saga() {
     assert_eq!(
         movie_groups(
-            "Star Wars Complete Saga",
+            "Sky Tiders Complete Saga",
             &[
-                "Star Wars Episode IV - A New Hope (1977).mkv",
-                "Star Wars Episode I - The Phantom Menace (1999).mkv",
+                "Sky Tiders Episode IV - Marble Orchard (1977).mkv",
+                "Sky Tiders Episode I - Pale Cartographer (1999).mkv",
             ]
         ),
         [
             group(
-                "Star Wars Episode I - The Phantom Menace",
+                "Sky Tiders Episode I - Pale Cartographer",
                 Some(1999),
-                &["Star Wars Episode I - The Phantom Menace (1999).mkv"]
+                &["Sky Tiders Episode I - Pale Cartographer (1999).mkv"]
             ),
             group(
-                "Star Wars Episode IV - A New Hope",
+                "Sky Tiders Episode IV - Marble Orchard",
                 Some(1977),
-                &["Star Wars Episode IV - A New Hope (1977).mkv"]
+                &["Sky Tiders Episode IV - Marble Orchard (1977).mkv"]
             ),
         ]
     );
@@ -365,8 +386,8 @@ fn group_star_wars_saga() {
 fn group_root_files() {
     // A scan that read the root's name would call this film "Films" (2024).
     assert_eq!(
-        groups_in(Path::new("/media/Films 2024"), &["The Room.avi"], true),
-        [group("The Room", None, &["The Room.avi"])]
+        groups_in(Path::new("/media/Films 2024"), &["The Attic.avi"], true),
+        [group("The Attic", None, &["The Attic.avi"])]
     );
 }
 
@@ -424,16 +445,16 @@ fn group_episode_file_season_in_key() {
 #[test]
 fn b32_f2_versions_without_a_resolution_sort_by_stem() {
     // Jellyfin orders them by FileNameWithoutExtension (12.4 `VideoListResolver.cs:282`, `:296-300`).
-    // By whole name, "Big Eyes (" would sort before "Big Eyes.", as a space is below a dot.
+    // By whole name, "Tin Kites (" would sort before "Tin Kites.", as a space is below a dot.
     assert_eq!(
         movie_groups(
-            "Big Eyes (2014)",
-            &["Big Eyes (2014) BR-DISK.m2ts", "Big Eyes.mkv"]
+            "Tin Kites (2014)",
+            &["Tin Kites (2014) BR-DISK.m2ts", "Tin Kites.mkv"]
         ),
         [group(
-            "Big Eyes",
+            "Tin Kites",
             Some(2014),
-            &["Big Eyes.mkv", "Big Eyes (2014) BR-DISK.m2ts"]
+            &["Tin Kites.mkv", "Tin Kites (2014) BR-DISK.m2ts"]
         )]
     );
 }
@@ -442,7 +463,7 @@ fn b32_f2_versions_without_a_resolution_sort_by_stem() {
 fn b32_series_title_and_year() {
     // Jellyfin's TitleWithYearRegex: the text before the first "(dddd)", trimmed, and that year.
     let table: &[(&str, Option<(&str, i32)>)] = &[
-        ("One Night (2023)", Some(("One Night", 2023))),
+        ("Owl Hollow (2023)", Some(("Owl Hollow", 2023))),
         ("Hotel Series (2015)", Some(("Hotel Series", 2015))),
         ("1923 (2022)", Some(("1923", 2022))),
         ("Show(2010)", Some(("Show", 2010))),

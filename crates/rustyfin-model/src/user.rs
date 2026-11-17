@@ -178,24 +178,26 @@ pub struct PublicUserDto {
     /// The profile picture's tag, left out when the user has none, as in Jellyfin.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub primary_image_tag: Option<String>,
-    /// Whether the user signs in with a password (set by `GET /Users/Public`, which checks for an
-    /// empty one). Jellyfin Web's user tiles sign a user without one in at a click, and ask the
-    /// others for theirs.
-    #[serde(default)]
+    /// Always true, as in Jellyfin 12.4, which no longer tells whether a user has a password; its
+    /// web client opens the password form for every tile.
+    #[serde(default = "always_true")]
     pub has_password: bool,
-    #[serde(default)]
+    #[serde(default = "always_true")]
     pub has_configured_password: bool,
+}
+
+fn always_true() -> bool {
+    true
 }
 
 impl From<User> for PublicUserDto {
     fn from(u: User) -> Self {
-        let has_password = !u.password_hash.is_empty();
         Self {
             id: u.id,
             name: u.name,
             primary_image_tag: None,
-            has_password,
-            has_configured_password: has_password,
+            has_password: true,
+            has_configured_password: true,
         }
     }
 }
@@ -268,8 +270,7 @@ pub struct ForgotPasswordRequest {
 pub struct ForgotPasswordResult {
     pub action: String,
     pub pin_file: String,
-    /// None for `InNetworkRequired`, as in Jellyfin.
-    pub pin_expiration_date: Option<String>,
+    pub pin_expiration_date: String,
 }
 
 /// Request to redeem a reset PIN with no username (`/Users/ForgotPassword/Pin`).

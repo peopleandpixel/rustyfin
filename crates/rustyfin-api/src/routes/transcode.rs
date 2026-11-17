@@ -249,7 +249,7 @@ async fn hevc_facts(path: &str) -> Option<HevcFacts> {
     if let Some(facts) = probed.lock().unwrap().get(&key) {
         return Some(facts.clone());
     }
-    let run = tokio::process::Command::new("ffprobe")
+    let run = tokio::process::Command::new(rustyfin_core::media_tools::ffprobe())
         .args(["-v", "error", "-select_streams", "v:0", "-of", "json", "-show_entries"])
         .arg("stream=profile,level,pix_fmt,color_transfer:stream_side_data=dv_profile,dv_bl_signal_compatibility_id")
         .arg(path)
@@ -1201,7 +1201,7 @@ mod tests {
         }
     }
 
-    /// Ghost Stories' streams: 1440x1080 H.264; FLAC Japanese (default) and English at 1 and 2;
+    /// Moth Stories' streams: 1440x1080 H.264; FLAC Japanese (default) and English at 1 and 2;
     /// PGS at 3, 4 and 5; SubRip at 6 (default), 7 and 8.
     fn anime() -> SourceInfo {
         SourceInfo {
