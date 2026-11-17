@@ -56041,6 +56041,58 @@ async fn r3dash3_a_library_scan_shows_as_the_scan_task_and_clears() {
     assert_eq!(folder["RefreshStatus"], "Idle", "{folder}");
 }
 
+// The older `/Configuration/MediaEncoding` and `/Configuration/Networking` routes read and save the
+// named configurations `encoding` and `network`: one stored source for each, not a second answer.
+#[tokio::test]
+async fn r3dash3_shadow_configuration_routes_share_the_named_configurations() {
+    let state = test_state().await;
+    let app = app(state.clone());
+    let (owner, _, viewer, _) = g1_owner_and_viewer(&state, &app).await;
+    let mut net = send_authed(&app, "GET", "/System/Configuration/network", &owner, None)
+        .await
+        .1;
+    net["KnownProxies"] = serde_json::json!(["10.0.0.0/8"]);
+    let (status, body) = send_authed(
+        &app,
+        "PUT",
+        "/Configuration/Networking",
+        &owner,
+        Some(&net.to_string()),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+    let (_, named) = send_authed(&app, "GET", "/System/Configuration/network", &owner, None).await;
+    assert_eq!(named, net);
+    let (_, old) = send_authed(&app, "GET", "/Configuration/Networking", &owner, None).await;
+    assert_eq!(old, net);
+    let bad = serde_json::json!({ "KnownProxies": ["0.0.0.0/0"] }).to_string();
+    let (status, _) =
+        send_authed(&app, "PUT", "/Configuration/Networking", &owner, Some(&bad)).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    for token in [&owner, &viewer] {
+        let (_, named) =
+            send_authed(&app, "GET", "/System/Configuration/encoding", token, None).await;
+        let (_, old) = send_authed(&app, "GET", "/Configuration/MediaEncoding", token, None).await;
+        assert_eq!(old, named);
+    }
+    let mut enc = send_authed(&app, "GET", "/System/Configuration/encoding", &owner, None)
+        .await
+        .1;
+    enc["EncodingThreadCount"] = serde_json::json!(3);
+    let (status, body) = send_authed(
+        &app,
+        "PUT",
+        "/Configuration/MediaEncoding",
+        &owner,
+        Some(&enc.to_string()),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+    let (_, named) = send_authed(&app, "GET", "/System/Configuration/encoding", &owner, None).await;
+    assert_eq!(named["EncodingThreadCount"], 3, "{named}");
+}
+
 // A scan the scheduler starts over two libraries shows one percentage everywhere: the library
 // scan task (GET /ScheduledTasks, GET /ScheduledTasks/LibraryScan and the ScheduledTasksInfo
 // frames) is the mean of what /Library/VirtualFolders and the RefreshProgress frames show for each
