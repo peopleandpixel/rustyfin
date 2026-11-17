@@ -154,7 +154,7 @@ pub async fn extract_embedded_cover(
     let out = dir.join(format!("{album_id}.{ext}"));
     let result = async {
         tokio::fs::create_dir_all(dir).await?;
-        let mut cmd = tokio::process::Command::new("ffmpeg");
+        let mut cmd = tokio::process::Command::new(crate::media_tools::ffmpeg());
         cmd.args(["-nostdin", "-loglevel", "error", "-y", "-i"])
             .arg(track)
             .args(["-an", "-map", "0:v:0", "-c", "copy", "-frames:v", "1"])

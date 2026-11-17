@@ -491,21 +491,21 @@ fn the_first_poll_only_records_the_baseline() {
 fn a_poll_reports_new_changed_and_removed_folders() {
     let tree = Tree::new();
     write(&tree.at("Heat (1995)/Heat (1995).mkv"), 10);
-    write(&tree.at("Alien (1979)/Alien (1979).mkv"), 10);
+    write(&tree.at("Alderlune (1979)/Alderlune (1979).mkv"), 10);
     write(&tree.at("Show/Season 1/S01E01.mkv"), 10);
     let mut poller = FolderPoller::new(tree.root(), None);
     assert!(poller.poll().is_empty());
 
     tick();
     write(&tree.at("Heat (1995)/Heat (1995).srt"), 10);
-    std::fs::remove_dir_all(tree.at("Alien (1979)")).unwrap();
+    std::fs::remove_dir_all(tree.at("Alderlune (1979)")).unwrap();
     write(&tree.at("Up (2009)/Up (2009).mkv"), 10);
     write(&tree.at("Up (2009)/extras/Making of.mkv"), 10);
     write(&tree.at("Show/Season 1/S01E02.mkv"), 10);
     assert_eq!(
         poller.poll(),
         sorted(vec![
-            tree.at("Alien (1979)"),
+            tree.at("Alderlune (1979)"),
             tree.at("Heat (1995)"),
             tree.at("Show/Season 1"),
             tree.at("Up (2009)"),
@@ -620,17 +620,17 @@ fn a_copy_that_ended_before_the_next_poll_is_reported_once() {
 fn files_in_the_library_path_are_reported_by_their_own_paths() {
     let tree = Tree::new();
     write(&tree.at("Heat (1995).mkv"), 10);
-    write(&tree.at("Alien (1979).mkv"), 10);
+    write(&tree.at("Alderlune (1979).mkv"), 10);
     let mut poller = FolderPoller::new(tree.root(), None);
     assert!(poller.poll().is_empty());
 
     tick();
-    std::fs::remove_file(tree.at("Alien (1979).mkv")).unwrap();
+    std::fs::remove_file(tree.at("Alderlune (1979).mkv")).unwrap();
     let up = tree.at("Up (2009).mkv");
     write(&up, 1000);
     assert_eq!(
         poller.poll(),
-        sorted(vec![tree.at("Alien (1979).mkv"), up.clone()]),
+        sorted(vec![tree.at("Alderlune (1979).mkv"), up.clone()]),
         "never the library path itself"
     );
     tick();
@@ -697,7 +697,7 @@ fn a_missing_library_path_keeps_its_baseline_until_it_is_back() {
     captured_logs();
     let tree = Tree::new();
     write(&tree.at("Heat (1995)/Heat (1995).mkv"), 10);
-    write(&tree.at("Alien (1979)/Alien (1979).mkv"), 10);
+    write(&tree.at("Alderlune (1979)/Alderlune (1979).mkv"), 10);
     let mut poller = FolderPoller::new(tree.root(), None);
     assert!(poller.poll().is_empty());
     let root = tree.root().display().to_string();
@@ -717,13 +717,13 @@ fn a_missing_library_path_keeps_its_baseline_until_it_is_back() {
     assert!(warnings[0].contains("WARN"), "{warnings:?}");
 
     // Changed while it was away.
-    std::fs::remove_dir_all(away.join("Alien (1979)")).unwrap();
+    std::fs::remove_dir_all(away.join("Alderlune (1979)")).unwrap();
     write(&away.join("Up (2009)/Up (2009).mkv"), 10);
     std::fs::rename(&away, tree.root()).unwrap();
     tick();
     assert_eq!(
         poller.poll(),
-        sorted(vec![tree.at("Alien (1979)"), tree.at("Up (2009)")])
+        sorted(vec![tree.at("Alderlune (1979)"), tree.at("Up (2009)")])
     );
     assert!(poller.available());
     let lines = log_lines(&[&back]);
@@ -741,7 +741,7 @@ fn an_emptied_library_path_counts_as_unavailable() {
     captured_logs();
     let tree = Tree::new();
     write(&tree.at("Heat (1995)/Heat (1995).mkv"), 10);
-    write(&tree.at("Alien (1979)/Alien (1979).mkv"), 10);
+    write(&tree.at("Alderlune (1979)/Alderlune (1979).mkv"), 10);
     let mut poller = FolderPoller::new(tree.root(), None);
     assert!(poller.poll().is_empty());
     let root = tree.root().display().to_string();
@@ -750,7 +750,7 @@ fn an_emptied_library_path_counts_as_unavailable() {
     let away = tree.outside("away");
     std::fs::create_dir(&away).unwrap();
     tick();
-    for name in ["Heat (1995)", "Alien (1979)"] {
+    for name in ["Heat (1995)", "Alderlune (1979)"] {
         std::fs::rename(tree.at(name), away.join(name)).unwrap();
     }
     tick();
@@ -765,7 +765,7 @@ fn an_emptied_library_path_counts_as_unavailable() {
     assert_eq!(
         poller.poll(),
         sorted(vec![
-            tree.at("Alien (1979)"),
+            tree.at("Alderlune (1979)"),
             tree.at("Heat (1995)"),
             tree.at("Up (2009)"),
         ])
@@ -885,10 +885,10 @@ fn a_symlinked_folder_is_polled_and_reported_by_its_path_in_the_library() {
     assert_eq!(poller.poll(), vec![tree.at("Heat (1995)")]);
 
     tick();
-    let alien = tree.outside("elsewhere/Alien (1979)");
-    write(&alien.join("Alien (1979).mkv"), 10);
-    std::os::unix::fs::symlink(&alien, tree.at("Alien (1979)")).unwrap();
-    assert_eq!(poller.poll(), vec![tree.at("Alien (1979)")]);
+    let alderlune = tree.outside("elsewhere/Alderlune (1979)");
+    write(&alderlune.join("Alderlune (1979).mkv"), 10);
+    std::os::unix::fs::symlink(&alderlune, tree.at("Alderlune (1979)")).unwrap();
+    assert_eq!(poller.poll(), vec![tree.at("Alderlune (1979)")]);
     assert_eq!(poller.folders(), 3);
 }
 
@@ -1061,8 +1061,8 @@ fn coalesce_keeps_the_first_path_of_each_unit_in_order() {
         "/media/movies/Heat (1995)",
         "/elsewhere/Heat (1995)",
         "/media/movies/.recycle/Heat (1995)",
-        "/media/movies/Alien (1979).mkv",
-        "/media/movies/Brazil (1985).mkv",
+        "/media/movies/Alderlune (1979).mkv",
+        "/media/movies/Bellmora (1985).mkv",
         "/media/movies/Up (2009)/Up (2009).mkv",
         "/media/movies",
     ]
@@ -1072,7 +1072,7 @@ fn coalesce_keeps_the_first_path_of_each_unit_in_order() {
         [
             "/media/movies/Heat (1995)/Heat (1995).srt",
             "/media/movies/Up (2009)",
-            "/media/movies/Alien (1979).mkv",
+            "/media/movies/Alderlune (1979).mkv",
             "/media/movies",
         ]
         .map(PathBuf::from)
@@ -1085,7 +1085,7 @@ async fn a_polled_library_path_is_logged_and_its_changes_are_queued_by_unit() {
     let tree = Tree::new();
     let (pool, changes) = manager_fixture(&tree).await;
     write(&tree.at("Heat (1995)/Heat (1995).mkv"), 10);
-    write(&tree.at("Brazil (1985)/Brazil (1985).mkv"), 10);
+    write(&tree.at("Bellmora (1985)/Bellmora (1985).mkv"), 10);
     // The data dir lies inside the library path here.
     write(&tree.at("rustyfin-data/images/poster.jpg"), 10);
     let lib = add_library(&pool, "Watch B Films", &[tree.root()]).await;
@@ -1108,7 +1108,7 @@ async fn a_polled_library_path_is_logged_and_its_changes_are_queued_by_unit() {
     assert_eq!(
         (path.folders, path.watches),
         (3, 0),
-        "the library path, Heat (1995) and Brazil (1985)"
+        "the library path, Heat (1995) and Bellmora (1985)"
     );
     let polling = format!(
         "library monitor: polling '{}' of 'Watch B Films' ({fs}, forced): 3 folders, every 100ms, \
@@ -1131,14 +1131,14 @@ async fn a_polled_library_path_is_logged_and_its_changes_are_queued_by_unit() {
     tick();
     write(&tree.at("Heat (1995)/Heat (1995).srt"), 10);
     write(&tree.at("Up (2009)/Up (2009).mkv"), 10);
-    write(&tree.at("Alien (1979).mkv"), 10);
-    std::fs::remove_dir_all(tree.at("Brazil (1985)")).unwrap();
+    write(&tree.at("Alderlune (1979).mkv"), 10);
+    std::fs::remove_dir_all(tree.at("Bellmora (1985)")).unwrap();
     write(&tree.at("rustyfin-data/images/backdrop.jpg"), 10);
     write(&tree.at("rustyfin-data/transcodes/1/segment0.ts"), 10);
     let expected = sorted(vec![
         (lib.id, ScanScope::Folder(tree.at("Heat (1995)"))),
         (lib.id, ScanScope::Folder(tree.at("Up (2009)"))),
-        (lib.id, ScanScope::Folder(tree.at("Brazil (1985)"))),
+        (lib.id, ScanScope::Folder(tree.at("Bellmora (1985)"))),
         (lib.id, ScanScope::RootFiles(tree.root())),
     ]);
     wait_pending(&changes, &expected).await;
@@ -1152,7 +1152,7 @@ async fn a_polled_library_path_is_logged_and_its_changes_are_queued_by_unit() {
     })
     .await;
     tick();
-    write(&tree.at("Dune (2021)/Dune (2021).mkv"), 10);
+    write(&tree.at("Drift (2021)/Drift (2021).mkv"), 10);
     several_polls().await;
     assert_eq!(
         changes.pending(),
@@ -1760,27 +1760,27 @@ mod kernel {
         let watcher = kernel_watcher(&pool, &changes, tree.outside("data"));
         wait_watched(&watcher, &tree.root(), 4).await;
 
-        write(&tree.at("Alien (1979)/Alien (1979).mkv"), 10);
-        let alien = folder_unit(&lib, tree.at("Alien (1979)"));
-        recorder.wait_for(&alien, 1).await;
+        write(&tree.at("Alderlune (1979)/Alderlune (1979).mkv"), 10);
+        let alderlune = folder_unit(&lib, tree.at("Alderlune (1979)"));
+        recorder.wait_for(&alderlune, 1).await;
         wait_watched(&watcher, &tree.root(), 5).await;
         quiet_period().await;
 
         // The new folder's own watch reports what happens in it.
-        let seen = recorder.count(&alien);
-        std::fs::create_dir(tree.at("Alien (1979)/extras")).unwrap();
-        recorder.wait_for(&alien, seen + 1).await;
+        let seen = recorder.count(&alderlune);
+        std::fs::create_dir(tree.at("Alderlune (1979)/extras")).unwrap();
+        recorder.wait_for(&alderlune, seen + 1).await;
         wait_watched(&watcher, &tree.root(), 6).await;
 
         // Folders made at once, each inside the one before: what a walk doesn't list raises an
         // event, and nothing is watched twice.
-        std::fs::create_dir_all(tree.at("Brazil (1985)/extras/Deleted scenes/Uncut")).unwrap();
+        std::fs::create_dir_all(tree.at("Bellmora (1985)/extras/Deleted scenes/Uncut")).unwrap();
         write(
-            &tree.at("Brazil (1985)/extras/Deleted scenes/Scene 1.mkv"),
+            &tree.at("Bellmora (1985)/extras/Deleted scenes/Scene 1.mkv"),
             10,
         );
         recorder
-            .wait_for(&folder_unit(&lib, tree.at("Brazil (1985)")), 1)
+            .wait_for(&folder_unit(&lib, tree.at("Bellmora (1985)")), 1)
             .await;
         let path = wait_watched(&watcher, &tree.root(), 10).await;
         assert_eq!(path.folders, 10);
@@ -1840,9 +1840,12 @@ mod kernel {
         let _logs = captured_logs();
         let tree = Tree::new();
         movie_tree(&tree);
-        write(&tree.outside("incoming/Alien (1979)/Alien (1979).mkv"), 10);
         write(
-            &tree.outside("incoming/Alien (1979)/extras/Trailer.mkv"),
+            &tree.outside("incoming/Alderlune (1979)/Alderlune (1979).mkv"),
+            10,
+        );
+        write(
+            &tree.outside("incoming/Alderlune (1979)/extras/Trailer.mkv"),
             10,
         );
         let (pool, changes, recorder) = kernel_fixture(&tree).await;
@@ -1866,13 +1869,13 @@ mod kernel {
         assert_eq!(recorder.count(&old_up), 1, "{:?}", recorder.calls());
 
         // Moved in from outside the library, with a subfolder.
-        let alien = folder_unit(&lib, tree.at("Alien (1979)"));
+        let alderlune = folder_unit(&lib, tree.at("Alderlune (1979)"));
         std::fs::rename(
-            tree.outside("incoming/Alien (1979)"),
-            tree.at("Alien (1979)"),
+            tree.outside("incoming/Alderlune (1979)"),
+            tree.at("Alderlune (1979)"),
         )
         .unwrap();
-        recorder.wait_for(&alien, 1).await;
+        recorder.wait_for(&alderlune, 1).await;
         wait_watched(&watcher, &tree.root(), 6).await;
 
         // Moved out of the library: rescanned, then no longer watched.
@@ -2033,9 +2036,9 @@ mod kernel {
         );
 
         // It keeps watching.
-        write(&tree.at("Alien (1979)/Alien (1979).mkv"), 10);
+        write(&tree.at("Alderlune (1979)/Alderlune (1979).mkv"), 10);
         recorder
-            .wait_for(&folder_unit(&lib, tree.at("Alien (1979)")), 1)
+            .wait_for(&folder_unit(&lib, tree.at("Alderlune (1979)")), 1)
             .await;
         wait_watched(&watcher, &tree.root(), 5).await;
         watcher.stop();
@@ -2047,7 +2050,7 @@ mod kernel {
         let tree = Tree::new();
         movie_tree(&tree);
         write(
-            &tree.outside("elsewhere/Brazil (1985)/Brazil (1985).mkv"),
+            &tree.outside("elsewhere/Bellmora (1985)/Bellmora (1985).mkv"),
             10,
         );
         write(
@@ -2055,14 +2058,14 @@ mod kernel {
             10,
         );
         symlink(
-            tree.outside("elsewhere/Brazil (1985)"),
-            tree.at("Brazil (1985)"),
+            tree.outside("elsewhere/Bellmora (1985)"),
+            tree.at("Bellmora (1985)"),
         )
         .unwrap();
         // A second link to the same folder: it is watched once, under the name that sorts first.
         symlink(
-            tree.outside("elsewhere/Brazil (1985)"),
-            tree.at("Brazil (1985) copy"),
+            tree.outside("elsewhere/Bellmora (1985)"),
+            tree.at("Bellmora (1985) copy"),
         )
         .unwrap();
         let (pool, changes, recorder) = kernel_fixture(&tree).await;
@@ -2071,13 +2074,13 @@ mod kernel {
         wait_watched(&watcher, &tree.root(), 5).await;
 
         write(
-            &tree.outside("elsewhere/Brazil (1985)/Brazil (1985).en.srt"),
+            &tree.outside("elsewhere/Bellmora (1985)/Bellmora (1985).en.srt"),
             10,
         );
-        let brazil = folder_unit(&lib, tree.at("Brazil (1985)"));
-        recorder.wait_for(&brazil, 1).await;
+        let bellmora = folder_unit(&lib, tree.at("Bellmora (1985)"));
+        recorder.wait_for(&bellmora, 1).await;
         quiet_period().await;
-        assert_rescans_since(&recorder, 0, &[brazil]);
+        assert_rescans_since(&recorder, 0, &[bellmora]);
 
         // A link made later is followed too.
         let before = recorder.calls().len();
@@ -2108,8 +2111,8 @@ mod kernel {
         movie_tree(&tree);
         // A second path of the library, with 6 folders.
         let more = tree.outside("more");
-        write(&more.join("Alien (1979)/extras/Trailer.mkv"), 10);
-        write(&more.join("Brazil (1985)/extras/Trailer.mkv"), 10);
+        write(&more.join("Alderlune (1979)/extras/Trailer.mkv"), 10);
+        write(&more.join("Bellmora (1985)/extras/Trailer.mkv"), 10);
         write(&more.join("Casablanca (1942)/Casablanca (1942).mkv"), 10);
         let (pool, changes, recorder) = kernel_fixture(&tree).await;
         let lib = add_library(&pool, "Kernel K Films", &[tree.root(), more.clone()]).await;
@@ -2158,9 +2161,9 @@ mod kernel {
 
         // A new folder takes the watched path over the limit too. The folder is still rescanned, the
         // path is polled from then on, and the limit is not warned about again.
-        write(&tree.at("Alien (1979)/Alien (1979).mkv"), 10);
-        let alien = folder_unit(&lib, tree.at("Alien (1979)"));
-        recorder.wait_for(&alien, 1).await;
+        write(&tree.at("Alderlune (1979)/Alderlune (1979).mkv"), 10);
+        let alderlune = folder_unit(&lib, tree.at("Alderlune (1979)"));
+        recorder.wait_for(&alderlune, 1).await;
         let monitored = wait_monitored(&watcher, "the watched path polled", |m| {
             monitor_of(m, &tree.root()).is_some_and(|p| p.method == Method::Poll && p.ready)
         })

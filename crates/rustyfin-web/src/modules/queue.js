@@ -104,4 +104,12 @@ function clearQueue() {
     playQueue = null;
 }
 
-export { queueQuery, queueStartIndex, queueStreamType, playContainer, playQueueAt, queueNeighbours, playQueueStep, clearQueue };
+// User data changed (userdata.js): the queued item takes it, so a later step resumes or skips by it
+function queueUserDataChanged(e) {
+    const { id, data } = e.detail;
+    for (const item of playQueue?.items || []) {
+        if (String(item?.Id) === String(id)) item.UserData = { ...item.UserData, ...data };
+    }
+}
+
+export { queueQuery, queueStartIndex, queueStreamType, playContainer, playQueueAt, queueNeighbours, playQueueStep, clearQueue, queueUserDataChanged };

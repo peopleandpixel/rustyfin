@@ -6,13 +6,15 @@ use tokio::net::UdpSocket as TokioUdpSocket;
 use tokio::sync::watch;
 use tracing;
 
+use crate::dlna::LiveConfig;
+
 /// Jellyfin client discovery UDP port
 const DISCOVERY_PORT: u16 = 7359;
 
-/// UDP discovery configuration
+/// UDP discovery configuration. The name in a reply is the configured server name, read for each
+/// request (`LiveConfig`), so a rename shows at once.
 #[derive(Debug, Clone)]
 pub struct UdpDiscoveryConfig {
-    pub server_name: String,
     pub server_id: String,
     pub http_port: u16,
     pub bind_ip: Ipv4Addr,
@@ -20,8 +22,10 @@ pub struct UdpDiscoveryConfig {
     pub endpoint_address: Option<String>,
 }
 
-/// Response sent to clients during UDP discovery
+/// Response sent to clients during UDP discovery: Jellyfin's ServerDiscoveryInfo, with its
+/// PascalCase names, which Jellyfin's client SDKs read
 #[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "PascalCase")]
 struct DiscoveryResponse {
     /// The server's local address with port, e.g. "http://192.168.1.100:8096"
     address: String,
@@ -38,7 +42,8 @@ struct DiscoveryResponse {
 /// Returns when the shutdown signal is received.
 pub async fn run_udp_discovery(
     config: Arc<UdpDiscoveryConfig>,
-    mut shutdown: watch::Receiver<bool>,
+    settings: LiveConfig,
+    shutdown: watch::Receiver<bool>,
 ) {
     let bind_addr: SocketAddr = (Ipv4Addr::UNSPECIFIED, DISCOVERY_PORT).into();
 
@@ -57,7 +62,16 @@ pub async fn run_udp_discovery(
     }
 
     tracing::info!("UDP discovery responder started on port {DISCOVERY_PORT}");
+    serve_udp_discovery(&sock, &config, &settings, shutdown).await;
+}
 
+/// Answers discovery requests on `sock` until the shutdown signal.
+pub async fn serve_udp_discovery(
+    sock: &TokioUdpSocket,
+    config: &UdpDiscoveryConfig,
+    settings: &LiveConfig,
+    mut shutdown: watch::Receiver<bool>,
+) {
     let mut buf = [0u8; 1024];
 
     loop {
@@ -76,7 +90,8 @@ pub async fn run_udp_discovery(
                         // Jellyfin clients send "who is JellyfinServer?" or "Who is Jellyfin Server?"
                         if msg_lower.contains("who is jellyfin") {
                             tracing::debug!("UDP discovery request from {src}: {}", msg.trim());
-                            handle_discovery_request(&sock, src, &config);
+                            let name = server_name(&settings.read().await.server_name);
+                            handle_discovery_request(sock, src, config, name);
                         }
                     }
                     Err(e) => {
@@ -88,11 +103,24 @@ pub async fn run_udp_discovery(
     }
 }
 
-fn handle_discovery_request(sock: &TokioUdpSocket, src: SocketAddr, config: &UdpDiscoveryConfig) {
+/// The name discovery gives: the configured server name, or "Rustyfin" when it is empty.
+fn server_name(configured: &str) -> String {
+    match configured.trim() {
+        "" => "Rustyfin".to_string(),
+        name => name.to_string(),
+    }
+}
+
+fn handle_discovery_request(
+    sock: &TokioUdpSocket,
+    src: SocketAddr,
+    config: &UdpDiscoveryConfig,
+    name: String,
+) {
     let response = DiscoveryResponse {
         address: format!("http://{}:{}", config.bind_ip, config.http_port),
         id: config.server_id.clone(),
-        name: config.server_name.clone(),
+        name,
         endpoint_address: config.endpoint_address.clone(),
     };
 
@@ -109,5 +137,68 @@ fn handle_discovery_request(sock: &TokioUdpSocket, src: SocketAddr, config: &Udp
     // Send to the requester's address
     if let Err(e) = sock.try_send_to(json.as_bytes(), src) {
         tracing::debug!("UDP discovery: failed to send response to {src}: {e}");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rustyfin_model::server_info::ServerConfiguration;
+    use std::time::Duration;
+
+    /// The JSON a discovery request on `server` gets back.
+    async fn ask(client: &TokioUdpSocket, server: SocketAddr) -> serde_json::Value {
+        client
+            .send_to(b"who is JellyfinServer?", server)
+            .await
+            .unwrap();
+        let mut buf = [0u8; 1024];
+        let (len, _) = tokio::time::timeout(Duration::from_secs(5), client.recv_from(&mut buf))
+            .await
+            .expect("a discovery reply")
+            .unwrap();
+        serde_json::from_slice(&buf[..len]).unwrap()
+    }
+
+    #[tokio::test]
+    async fn r3parental_discovery_answers_with_the_configured_name_as_it_is_now() {
+        let settings: LiveConfig = Arc::new(tokio::sync::RwLock::new(ServerConfiguration {
+            server_name: "Living Room".to_string(),
+            ..ServerConfiguration::default()
+        }));
+        let config = UdpDiscoveryConfig {
+            server_id: "server-id".to_string(),
+            http_port: 8096,
+            bind_ip: Ipv4Addr::LOCALHOST,
+            endpoint_address: None,
+        };
+        let sock = TokioUdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let server = sock.local_addr().unwrap();
+        let (stop, shutdown) = watch::channel(false);
+        let serving = settings.clone();
+        let task = tokio::spawn(async move {
+            serve_udp_discovery(&sock, &config, &serving, shutdown).await;
+        });
+        let client = TokioUdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+
+        let reply = ask(&client, server).await;
+        assert_eq!(reply["Name"], "Living Room", "{reply}");
+        assert_eq!(reply["Id"], "server-id", "{reply}");
+        assert_eq!(reply["Address"], "http://127.0.0.1:8096", "{reply}");
+        // A rename shows in the next reply, without a restart; an empty name is "Rustyfin".
+        settings.write().await.server_name = "Den".to_string();
+        assert_eq!(ask(&client, server).await["Name"], "Den");
+        settings.write().await.server_name = "  ".to_string();
+        assert_eq!(ask(&client, server).await["Name"], "Rustyfin");
+
+        stop.send(true).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .unwrap()
+            .unwrap();
     }
 }

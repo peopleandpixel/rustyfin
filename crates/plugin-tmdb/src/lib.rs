@@ -922,7 +922,7 @@ async fn movie_lookup(
 }
 
 /// Search TMDb for a TV show and return full metadata from details endpoint. `year` is the first
-/// air year, which Jellyfin sends from the folder name ("One Night (2023)").
+/// air year, which Jellyfin sends from the folder name ("Owl Hollow (2023)").
 pub async fn search_tv(tmdb: &TmdbApi, name: &str, year: Option<i32>) -> Option<ExternalMetadata> {
     // Step 1: Search to find the TMDb ID
     let year_text = year.map(|y| y.to_string());
@@ -1239,8 +1239,8 @@ async fn season_lookup(
 }
 
 /// The search result whose title (or original title) is the searched name, ignoring case, else
-/// the first one, as Jellyfin picks: "One Night" (2023) is the show "One Night", though TMDb
-/// lists "One Night Stand" first.
+/// the first one, as Jellyfin picks: "Owl Hollow" (2023) is the show "Owl Hollow", though TMDb
+/// lists "Owl Hollow Inn" first.
 fn best_match(results: Vec<TmdbSearchItem>, name: &str) -> Option<TmdbSearchItem> {
     let wanted = name.trim().to_lowercase();
     let exact = results.iter().position(|item| {
@@ -1528,14 +1528,16 @@ mod tests {
             serde_json::from_value(json).unwrap()
         };
         let listed = json!([
-            {"id": 231889, "name": "One Night Stand"},
-            {"id": 228527, "name": "One Night"}
+            {"id": 231889, "name": "Owl Hollow Inn"},
+            {"id": 228527, "name": "Owl Hollow"}
         ]);
         assert_eq!(
-            best_match(results(listed.clone()), "one night").unwrap().id,
+            best_match(results(listed.clone()), "owl hollow")
+                .unwrap()
+                .id,
             228527
         );
-        assert_eq!(best_match(results(listed), "Night").unwrap().id, 231889);
+        assert_eq!(best_match(results(listed), "Hollow").unwrap().id, 231889);
         let original = json!([{"id": 1, "title": "Other"}, {"id": 2, "title": "Didi", "original_title": "弟弟"}]);
         assert_eq!(best_match(results(original), "弟弟").unwrap().id, 2);
         assert!(best_match(Vec::new(), "x").is_none());

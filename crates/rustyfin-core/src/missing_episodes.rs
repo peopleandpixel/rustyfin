@@ -216,6 +216,19 @@ pub async fn run(
     today: NaiveDate,
     progress: &(dyn Fn(f64) + Sync),
 ) -> Result<Outcome, String> {
+    let cancel = crate::trickplay::Cancel::new();
+    run_until_cancelled(pool, source, settings, today, progress, &cancel).await
+}
+
+/// `run`, which stops between series once `cancel` fires.
+pub async fn run_until_cancelled(
+    pool: &SqlitePool,
+    source: Option<Source<'_>>,
+    settings: &Settings,
+    today: NaiveDate,
+    progress: &(dyn Fn(f64) + Sync),
+    cancel: &crate::trickplay::Cancel,
+) -> Result<Outcome, String> {
     let mut outcome = Outcome::default();
     if !settings.active() {
         outcome.add(remove_all(pool).await.map_err(|e| e.to_string())?);
@@ -227,6 +240,10 @@ pub async fn run(
         .map_err(|e| e.to_string())?;
     let total = series.len();
     for (done, row) in series.iter().enumerate() {
+        // A stop ends the run between series
+        if cancel.is_cancelled() {
+            break;
+        }
         match refresh_series(pool, source.as_ref(), row, settings, today).await {
             Ok(one) => outcome.add(one),
             Err(e) => {

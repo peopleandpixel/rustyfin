@@ -186,7 +186,7 @@ async fn get_full_info(
         internal_metadata_path: metadata_path,
         transcoding_temp_path,
         web_path: std::env::var("RUSTYFIN_WEBCLIENT_DIR").unwrap_or_default(),
-        encoder_location: if std::env::var_os("RUSTYFIN_FFMPEG_PATH").is_some() {
+        encoder_location: if rustyfin_core::media_tools::is_custom() {
             "Custom"
         } else {
             "System"
@@ -475,7 +475,9 @@ async fn saved_encoding_options(
 async fn encoding_options(
     state: &AppState,
 ) -> Result<serde_json::Map<String, serde_json::Value>, ApiError> {
-    let ffmpeg = std::env::var("RUSTYFIN_FFMPEG_PATH").unwrap_or_else(|_| "ffmpeg".to_string());
+    let ffmpeg = rustyfin_core::media_tools::ffmpeg()
+        .to_string_lossy()
+        .into_owned();
     let defaults =
         rustyfin_core::encoding::default_options(&ffmpeg, state.transcode_manager.cache_root());
     let saved = saved_encoding_options(state).await?;
@@ -486,7 +488,24 @@ async fn encoding_options(
     ))
 }
 
-async fn save_encoding_configuration(
+/// The encoding options as a caller reads them: any signed-in user, as in Jellyfin, but the
+/// devices and paths only an administrator.
+pub(crate) async fn encoding_json(
+    state: &AppState,
+    is_admin: bool,
+) -> Result<serde_json::Value, ApiError> {
+    let mut options = encoding_options(state).await?;
+    if !is_admin {
+        options.retain(|name, _| {
+            !rustyfin_core::encoding::PRIVATE_FIELDS
+                .iter()
+                .any(|private| name.eq_ignore_ascii_case(private))
+        });
+    }
+    Ok(serde_json::Value::Object(options))
+}
+
+pub(crate) async fn save_encoding_configuration(
     state: &AppState,
     body: serde_json::Value,
 ) -> Result<(), ApiError> {
@@ -1118,6 +1137,22 @@ fn disk_usage(_path: &str) -> Result<(i64, i64), std::io::Error> {
     Ok((0, 0))
 }
 
+/// Saves the named configuration `key` (network, branding), with the matching errors.
+pub(crate) async fn save_named(
+    state: &AppState,
+    key: &str,
+    body: serde_json::Value,
+) -> Result<(), ApiError> {
+    use crate::named_config::SaveError;
+    crate::named_config::save(&state.data_dir, key, body)
+        .await
+        .map_err(|e| match e {
+            SaveError::Invalid(m) => ApiError::BadRequest(m),
+            SaveError::TooLarge(m) => ApiError::PayloadTooLarge(m),
+            SaveError::Io(m) => ApiError::Internal(m),
+        })
+}
+
 /// GET /System/Configuration/{key} - Get configuration by key
 async fn get_configuration_by_key(
     State(state): State<AppState>,
@@ -1125,17 +1160,7 @@ async fn get_configuration_by_key(
     Path(key): Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     if key.eq_ignore_ascii_case(ENCODING_KEY) {
-        // Any signed-in user reads them, as in Jellyfin; the devices and paths only an
-        // administrator
-        let mut options = encoding_options(&state).await?;
-        if !claims.is_admin {
-            options.retain(|name, _| {
-                !rustyfin_core::encoding::PRIVATE_FIELDS
-                    .iter()
-                    .any(|private| name.eq_ignore_ascii_case(private))
-            });
-        }
-        return Ok(Json(serde_json::Value::Object(options)));
+        return Ok(Json(encoding_json(&state, claims.is_admin).await?));
     }
     if crate::named_config::handles(&key) {
         let options = crate::named_config::load(&state.data_dir, &key, claims.is_admin).await;
@@ -1159,14 +1184,7 @@ async fn update_configuration_by_key(
         return Ok(StatusCode::NO_CONTENT);
     }
     if crate::named_config::handles(&key) {
-        use crate::named_config::SaveError;
-        crate::named_config::save(&state.data_dir, &key, body)
-            .await
-            .map_err(|e| match e {
-                SaveError::Invalid(m) => ApiError::BadRequest(m),
-                SaveError::TooLarge(m) => ApiError::PayloadTooLarge(m),
-                SaveError::Io(m) => ApiError::Internal(m),
-            })?;
+        save_named(&state, &key, body).await?;
         tracing::info!("configuration key updated: {}", key);
         return Ok(StatusCode::NO_CONTENT);
     }

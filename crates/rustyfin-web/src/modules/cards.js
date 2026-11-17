@@ -61,6 +61,14 @@ function stateAttrs(state) {
     return STATE_ATTRS.map(key => ` data-${key}="${escapeHtml(String(state[key]))}"`).join('');
 }
 
+// The folders whose unplayed count follows the item: an episode's season and series, a season's
+// series (userdata.js reads them again when the item changes)
+function parentsAttr(item) {
+    const id = String(item.Id || item.id || '');
+    const parents = [...new Set([item.SeasonId, item.SeriesId].filter(p => p && String(p) !== id).map(String))];
+    return parents.length ? ` data-parents="${escapeHtml(parents.join(' '))}"` : '';
+}
+
 function stateFromDataset(ds) {
     return {
         played: ds.played === 'true',
@@ -119,6 +127,7 @@ function applyCardUserData(id, data, root = document) {
         }
         if (data.IsFavorite !== undefined) state.favorite = !!data.IsFavorite;
         if (data.PlayedPercentage !== undefined) state.progress = data.PlayedPercentage || 0;
+        else if (data.PlaybackPositionTicks === 0) state.progress = 0;
         if (data.UnplayedItemCount !== undefined && card.dataset.folder === 'true') state.unplayed = data.UnplayedItemCount || 0;
         if (data.Likes !== undefined) state.likes = data.Likes;
         for (const key of STATE_ATTRS) card.dataset[key] = String(state[key]);
@@ -145,7 +154,7 @@ function itemListRow(item) {
         : [year, type].filter(Boolean).join(' · ');
     const minutes = item.RunTimeTicks ? Math.round(item.RunTimeTicks / 600000000) : 0;
     return `
-    <div class="jf-card jf-list-row group" data-action="navigate" data-page="detail" data-id="${escapeHtml(id)}" data-type="${escapeHtml(type)}" data-folder="${isFolderItem(item)}" data-rating=""${stateAttrs(state)}>
+    <div class="jf-card jf-list-row group" data-action="navigate" data-page="detail" data-id="${escapeHtml(id)}" data-type="${escapeHtml(type)}" data-folder="${isFolderItem(item)}" data-rating=""${stateAttrs(state)}${parentsAttr(item)}>
         <div class="jf-list-thumb">
             ${picture ? `<img alt="" decoding="async" class="jf-thumb-img absolute inset-0 w-full h-full object-cover z-[1] opacity-0" data-img-id="${escapeHtml(picture.id)}" data-img-type="${escapeHtml(picture.type)}" data-img-tag="${escapeHtml(picture.tag)}" onload="posterLoaded(this)" onerror="posterFailed(this)">` : ''}
             ${cardMarksHtml({ ...state, favorite: false }, null)}
@@ -205,7 +214,7 @@ function itemCard(item, options = {}) {
     };
 
     return `
-    <div class="jf-card group" data-action="navigate" data-page="detail" data-id="${escapeHtml(id)}" data-type="${escapeHtml(type)}" data-folder="${isFolderItem(item)}" data-rating="${rating || ''}"${stateAttrs(state)}>
+    <div class="jf-card group" data-action="navigate" data-page="detail" data-id="${escapeHtml(id)}" data-type="${escapeHtml(type)}" data-folder="${isFolderItem(item)}" data-rating="${rating || ''}"${stateAttrs(state)}${parentsAttr(item)}>
         <div class="${isBanner ? 'jf-poster-banner' : isBackdrop ? 'jf-poster-backdrop' : 'jf-poster'}"${tint ? ` style="background:${tint}"` : ''}>
             ${picture ? `
             ${blurhash

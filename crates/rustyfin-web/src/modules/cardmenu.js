@@ -1,7 +1,7 @@
 // A card's played, favourite and like marks, and its context menu (the ⋮ button, or a right click or
 // long press on the card), as Jellyfin Web's card overlay buttons and item context menu
 import { icon, toast, escapeHtml } from './util.js';
-import { applyCardUserData } from './cards.js';
+import { userDataChanged } from './userdata.js';
 import { playQueueAt } from './queue.js';
 import { openPhotoViewer } from './photos.js';
 import { canDownload, downloadItems } from './nativeshell.js';
@@ -172,14 +172,6 @@ function menuContainer(el) {
     };
 }
 
-// User data changed: every card of the item redraws its marks, the cached lists go, and open
-// lists (the library grid) hear of it
-function userDataChanged(id, data) {
-    applyCardUserData(id, data);
-    API.invalidateCache('/Items');
-    API.invalidateCache('/Shows');
-    document.dispatchEvent(new CustomEvent('jf-userdata', { detail: { id, data } }));
-}
 
 // A mark's state from the element: its own data-*, else its card's
 const currentFlag = (el, key) => (el.dataset[key] ?? el.closest('.jf-card')?.dataset[key]) === 'true';
@@ -400,7 +392,7 @@ document.addEventListener('click', cardClickAfterLongPress, true);
 
 export {
     cardMenuCommands, cardMenuHtml, openCardMenu, toggleCardPlayed, toggleCardFavorite, setCardLikes, playCardItem, instantMixUrl, playInstantMix,
-    downloadCardItem, openAddTo, openAddToIds, addTo, userDataChanged, cardPointerDown, cardPointerMove, cardContextMenu,
+    downloadCardItem, openAddTo, openAddToIds, addTo, cardPointerDown, cardPointerMove, cardContextMenu,
     cardClickAfterLongPress,
     cancelLongPress, LONG_PRESS_MS,
 };

@@ -526,7 +526,7 @@ async fn ffmpeg_vtt(
     cp1252: bool,
     muxer: &str,
 ) -> Result<String, ApiError> {
-    let mut command = tokio::process::Command::new("ffmpeg");
+    let mut command = tokio::process::Command::new(rustyfin_core::media_tools::ffmpeg());
     command.args(vtt_args(input, map, demuxer, cp1252, muxer));
     let stderr = match run_capped(&mut command, MAX_SUBTITLE_BYTES, VTT_TIME_LIMIT).await {
         Ok(RunEnd::Exited { status, stdout, .. }) if status.success() => {

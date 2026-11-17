@@ -713,7 +713,7 @@ async fn apply_season(
             };
             let mut meta = first.clone();
             // A file holding several episodes is named after all of them, as Jellyfin names it
-            // ("The Shadow That Devours the Sun / Mushi that Inhale Rain")
+            // ("The Lantern That Swallows the Moon / Moths that Drink Fog")
             if let Some(end) = working.index_number_end.filter(|end| *end > number) {
                 let names: Vec<&str> = (number..=end)
                     .filter_map(|n| season.episodes.iter().find(|(e, _)| *e == n))
@@ -910,8 +910,8 @@ async fn apply_metadata_to_item(
     let before = updated.clone();
     let mut changed = false;
 
-    // A provider's title replaces the name parsed from the path, as in Jellyfin ("Mission:
-    // Impossible - Dead Reckoning Part One", not the folder's "Mission Impossible - ..."), unless
+    // A provider's title replaces the name parsed from the path, as in Jellyfin ("Marble:
+    // Harbor - Low Tide Part One", not the folder's "Marble Harbor - ..."), unless
     // the name is locked or an NFO has a title. An NFO's title (`replace_name` false) replaces
     // only a name that still looks like a file name. Seasons keep "Season N".
     if (replace_name || looks_like_filename(&updated.name))

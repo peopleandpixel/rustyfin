@@ -70,7 +70,9 @@ async fn detect_hardware_acceleration(
 
 async fn get_encoder_path() -> Json<MediaEncoderPath> {
     Json(MediaEncoderPath {
-        value: "ffmpeg".to_string(),
+        value: rustyfin_core::media_tools::ffmpeg()
+            .to_string_lossy()
+            .into_owned(),
     })
 }
 
@@ -78,7 +80,7 @@ async fn test_encoder() -> Result<StatusCode, ApiError> {
     // Test FFmpeg by running a simple command. A hung child is killed after 10 seconds.
     let output = tokio::time::timeout(
         std::time::Duration::from_secs(10),
-        tokio::process::Command::new("ffmpeg")
+        tokio::process::Command::new(rustyfin_core::media_tools::ffmpeg())
             .arg("-version")
             .kill_on_drop(true)
             .output(),

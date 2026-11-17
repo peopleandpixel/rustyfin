@@ -89,8 +89,13 @@ pub struct TaskScheduler {
     on_items_changed: Arc<std::sync::RwLock<Option<OnItemsChanged>>>,
     plugin_manager: crate::plugin_manager::PluginManager,
     http_client: reqwest::Client,
-    /// The image tasks and intro detection running, each with the handle that stops it.
+    /// Every task run going on, each with the handle that stops it. A run stays listed until it
+    /// has wound down, so a stopped one shows Cancelling until then.
     image_runs: Arc<std::sync::Mutex<HashMap<String, crate::trickplay::Cancel>>>,
+    /// Woken each time a run ends (is unlisted), for the starts waiting on it.
+    run_ended: Arc<tokio::sync::Notify>,
+    /// The tasks with a start by hand waiting for their current run to end.
+    queued: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
     /// Each task's percent done, shown while it runs.
     progress: Arc<HashMap<String, TaskProgress>>,
     /// Woken when a task's triggers change, so its loop works out its next run again.
@@ -109,18 +114,46 @@ pub struct TaskScheduler {
     held: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
 }
 
-/// A task's claim on running, from `TaskScheduler::claim` until it is dropped.
+/// A task's claim on running, from `TaskScheduler::claim` until it is dropped. The run is listed
+/// with `cancel` meanwhile, which Stop fires; the run checks it between its units of work.
 struct RunClaim {
     running: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
+    runs: Arc<std::sync::Mutex<HashMap<String, crate::trickplay::Cancel>>>,
+    run_ended: Arc<tokio::sync::Notify>,
     id: String,
+    cancel: crate::trickplay::Cancel,
+}
+
+impl RunClaim {
+    /// Whether Stop has asked this run to end.
+    fn is_cancelled(&self) -> bool {
+        self.cancel.is_cancelled()
+    }
 }
 
 impl Drop for RunClaim {
     fn drop(&mut self) {
+        self.runs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&self.id);
         self.running
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .remove(&self.id);
+        self.run_ended.notify_waiters();
+    }
+}
+
+/// `status`, or Cancelled for a run Stop asked to end that would otherwise have completed.
+fn cancelled_or(
+    status: TaskCompletionStatus,
+    cancel: &crate::trickplay::Cancel,
+) -> TaskCompletionStatus {
+    if status == TaskCompletionStatus::Completed && cancel.is_cancelled() {
+        TaskCompletionStatus::Cancelled
+    } else {
+        status
     }
 }
 
@@ -497,6 +530,8 @@ impl TaskScheduler {
             plugin_manager,
             http_client,
             image_runs: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            run_ended: Arc::default(),
+            queued: Arc::default(),
             progress: Arc::new(progress),
             triggers_changed: Arc::new(tokio::sync::Notify::new()),
             default_triggers: Arc::new(default_triggers),
@@ -507,13 +542,38 @@ impl TaskScheduler {
         }
     }
 
-    /// Claims the task `id` for one run; None when a run of it is going on already.
+    /// Claims the task `id` for one run, listed with a new `Cancel` that Stop fires; None when a
+    /// run of it is going on already.
     fn claim(&self, id: &str) -> Option<RunClaim> {
         let mut running = self.running.lock().unwrap_or_else(|e| e.into_inner());
-        running.insert(id.to_string()).then(|| RunClaim {
+        if !running.insert(id.to_string()) {
+            return None;
+        }
+        let cancel = crate::trickplay::Cancel::new();
+        self.image_runs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(id.to_string(), cancel.clone());
+        Some(RunClaim {
             running: self.running.clone(),
+            runs: self.image_runs.clone(),
+            run_ended: self.run_ended.clone(),
             id: id.to_string(),
+            cancel,
         })
+    }
+
+    /// Whether a run of task `id` is going on (a stopped one included, until it has wound down).
+    fn is_listed(&self, id: &str) -> bool {
+        self.image_runs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains_key(id)
+    }
+
+    /// Whether `id` names a task.
+    pub async fn has_task(&self, id: &str) -> bool {
+        self.tasks.read().await.contains_key(id)
     }
 
     /// The shortest `MaxRuntimeTicks` of the task's triggers, for a task that can be stopped.
@@ -533,7 +593,8 @@ impl TaskScheduler {
             .map(|t| std::time::Duration::from_micros(t / 10))
     }
 
-    /// Stops every image task and intro detection that runs, killing their ffmpeg (at shutdown).
+    /// Stops every task run going on, killing the ffmpeg of the image tasks and intro detection
+    /// (at shutdown).
     pub fn cancel_runs(&self) {
         for cancel in self.image_runs.lock().unwrap().values() {
             cancel.cancel();
@@ -591,10 +652,13 @@ impl TaskScheduler {
 
     /// A task's info, with the percent it has reported while it is not idle.
     ///
-    /// As in Jellyfin, every library scan shows as the library scan task: while any library has a
-    /// scan listed (queued, scanning or probing), wherever it was started (a library's Scan, Scan
-    /// all, the setup wizard), an idle library scan task reads Running, at the listed scans'
-    /// average percent. The scans listed are what the web client's scan rings show.
+    /// As in Jellyfin, every library scan shows as the library scan task. Its `State` and percent
+    /// come only from the scan registry, the source of the web client's scan rings, the
+    /// `RefreshProgress` frames and `RefreshStatus`: Running while any library has a scan listed
+    /// (queued, scanning or probing), wherever it was started (the scheduler, whose run holds
+    /// tickets like any other scan, a library's Scan, Scan all, the setup wizard), at the batch's
+    /// percent (`library_scan_state`); Idle when none is. A stopped scheduler run reads Cancelling while
+    /// its scans are listed. `LastExecutionResult` stays the scheduler's.
     fn info_of(&self, entry: &TaskEntry) -> ScheduledTaskInfo {
         let mut info = entry.info.clone();
         info.current_progress_percentage = match info.state {
@@ -603,16 +667,10 @@ impl TaskScheduler {
                 self.progress.get(&info.id).and_then(TaskProgress::get)
             }
         };
-        if info.id == TASK_LIBRARY_SCAN && info.state == TaskState::Idle {
-            let scans = self.scans.snapshot();
-            if !scans.is_empty() {
-                let sum: f64 = scans
-                    .iter()
-                    .map(|(_, s)| f64::from(s.progress.unwrap_or(0)))
-                    .sum();
-                info.state = TaskState::Running;
-                info.current_progress_percentage = Some(sum / scans.len() as f64);
-            }
+        if info.id == TASK_LIBRARY_SCAN {
+            let (state, percent) = library_scan_state(&self.scans, &info.state);
+            info.state = state;
+            info.current_progress_percentage = percent;
         }
         info
     }
@@ -670,10 +728,48 @@ impl TaskScheduler {
             .remove(id);
     }
 
-    /// Start a task manually (returns true if task exists)
+    /// Starts a task by hand; false for an unknown task. While a run of it is still going (a
+    /// stopped one winding down included), the start waits for that run to end, as Jellyfin
+    /// queues it, rather than being dropped.
     pub async fn start_task(&self, id: &str) -> bool {
+        if !self.has_task(id).await {
+            return false;
+        }
         self.release(id);
-        self.start_run(id).await
+        if !self.is_listed(id) {
+            return self.start_run(id).await;
+        }
+        let first = self
+            .queued
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(id.to_string());
+        if first {
+            tracing::info!(
+                task = id,
+                "the task is still running; it starts again once that run ends"
+            );
+            let sched = self.clone();
+            let id = id.to_string();
+            tokio::spawn(async move {
+                loop {
+                    let ended = sched.run_ended.notified();
+                    tokio::pin!(ended);
+                    ended.as_mut().enable();
+                    if !sched.is_listed(&id) {
+                        break;
+                    }
+                    ended.await;
+                }
+                sched
+                    .queued
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .remove(&id);
+                sched.start_run(&id).await;
+            });
+        }
+        true
     }
 
     /// Starts a run of task `id` in the background; false for an unknown task.
@@ -724,43 +820,78 @@ impl TaskScheduler {
         }
     }
 
-    /// Stops a running task at an admin's request. A library scan's end then doesn't start it
-    /// again until its triggers or a start by hand run it.
+    /// Stops a running task at an admin's request; false for an unknown task. A task with no run
+    /// going is left as it is, as in Jellyfin. A stopped task isn't started again by a library
+    /// scan's end until its triggers or a start by hand run it.
     pub async fn stop_task(&self, id: &str) -> bool {
-        let stopped = self.stop_run(id).await;
+        if !self.has_task(id).await {
+            return false;
+        }
+        let mut stopped = self.stop_run(id).await;
+        // Every scan in the registry is a run of the library scan task, as in Jellyfin: a library's
+        // Scan, Scan all and the setup wizard's scans stop with it
+        if id == TASK_LIBRARY_SCAN && self.scans.cancel_all() > 0 {
+            stopped = true;
+            if !self.is_listed(id) {
+                self.record_stopped_scans();
+            }
+        }
         if stopped {
             self.held
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .insert(id.to_string());
         }
-        stopped
+        true
     }
 
-    /// Stops a running task (an image task winds down as Cancelling, the others go Idle).
+    /// Records the library scan task's result, Cancelled, once the stopped scans that weren't
+    /// its own run have all ended (that run records its own).
+    fn record_stopped_scans(&self) {
+        let sched = self.clone();
+        let start = Utc::now();
+        tokio::spawn(async move {
+            let mut updates = sched.scans.subscribe();
+            while sched.scans.any_cancelled() {
+                // Each run's end sends a frame; the timeout covers a missed one
+                let _ =
+                    tokio::time::timeout(std::time::Duration::from_secs(1), updates.recv()).await;
+            }
+            if sched.is_listed(TASK_LIBRARY_SCAN) {
+                return;
+            }
+            sched
+                .set_task_result(
+                    TASK_LIBRARY_SCAN,
+                    TaskResult {
+                        status: TaskCompletionStatus::Cancelled,
+                        error_message: None,
+                        start_time_utc: start.to_rfc3339(),
+                        end_time_utc: Utc::now().to_rfc3339(),
+                    },
+                )
+                .await;
+        });
+    }
+
+    /// Tells the run of task `id` to stop: it shows Cancelling, as in Jellyfin, until it has wound
+    /// down (between its units of work; an image task also kills the ffmpeg it runs). False when
+    /// no run of it is going. The run is looked up and marked under the tasks lock, as its start
+    /// and end change them, so a run that has just ended stays Idle.
     async fn stop_run(&self, id: &str) -> bool {
-        // An image task stops between videos and kills the ffmpeg it runs; it shows Cancelling,
-        // as in Jellyfin, until it has wound down. The run is looked up and marked under the
-        // tasks lock, as its start and end change them, so a run that has just ended stays Idle.
         let mut tasks = self.tasks.write().await;
-        let image_run = self.image_runs.lock().unwrap().get(id).cloned();
-        if let Some(cancel) = image_run {
-            cancel.cancel();
-            if let Some(entry) = tasks.get_mut(id) {
-                self.apply_state(entry, TaskState::Cancelling);
-            }
-            return true;
+        let run = self.image_runs.lock().unwrap().get(id).cloned();
+        let Some(cancel) = run else {
+            return false;
+        };
+        cancel.cancel();
+        if let Some(entry) = tasks.get_mut(id) {
+            self.apply_state(entry, TaskState::Cancelling);
         }
-        match tasks.get_mut(id) {
-            Some(entry) if entry.info.state == TaskState::Running => {
-                self.apply_state(entry, TaskState::Idle);
-                true
-            }
-            _ => false,
-        }
+        true
     }
 
-    /// Restart all scheduled tasks by resetting their state and triggers
+    /// Resets the state of the tasks with no run going; a running task's own state stands.
     pub async fn restart(&self) {
         tracing::info!("Restarting all scheduled tasks");
         let ids: Vec<String> = {
@@ -768,7 +899,12 @@ impl TaskScheduler {
             tasks.keys().cloned().collect()
         };
         for id in ids {
-            self.set_task_state(&id, TaskState::Idle).await;
+            let mut tasks = self.tasks.write().await;
+            if !self.is_listed(&id)
+                && let Some(entry) = tasks.get_mut(&id)
+            {
+                self.apply_state(entry, TaskState::Idle);
+            }
         }
         tracing::info!("All scheduled tasks restarted");
     }
@@ -793,6 +929,20 @@ impl TaskScheduler {
         if !allowed {
             return;
         }
+        // A run that Stop reached before it showed Running shows Cancelling instead
+        let state = match state {
+            TaskState::Running
+                if self
+                    .image_runs
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .get(&entry.info.id)
+                    .is_some_and(|c| c.is_cancelled()) =>
+            {
+                TaskState::Cancelling
+            }
+            state => state,
+        };
         if state != TaskState::Cancelling {
             self.progress_of(&entry.info.id).clear();
         }
@@ -864,7 +1014,7 @@ impl TaskScheduler {
     /// settings say (Jellyfin 12.4's TmdbRefreshUpcomingEpisodes).
     async fn run_missing_episodes(&self) {
         use crate::missing_episodes::{Settings, Source, TMDB_PLUGIN_ID};
-        let Some(_claim) = self.claim(TASK_MISSING_EPISODES) else {
+        let Some(claim) = self.claim(TASK_MISSING_EPISODES) else {
             return skipped(TASK_MISSING_EPISODES);
         };
         self.set_task_state(TASK_MISSING_EPISODES, TaskState::Running)
@@ -884,12 +1034,13 @@ impl TaskScheduler {
                 })
             });
         let report = |share: f64| progress.report(share);
-        let outcome = crate::missing_episodes::run(
+        let outcome = crate::missing_episodes::run_until_cancelled(
             &self.db,
             source,
             &settings,
             Utc::now().date_naive(),
             &report,
+            &claim.cancel,
         )
         .await;
         let (status, error_message) = match outcome {
@@ -907,26 +1058,26 @@ impl TaskScheduler {
             Err(e) => (TaskCompletionStatus::Failed, Some(e)),
         };
         let result = TaskResult {
-            status,
+            status: cancelled_or(status, &claim.cancel),
             error_message,
             start_time_utc: start.to_rfc3339(),
             end_time_utc: Utc::now().to_rfc3339(),
         };
         self.items_changed();
         self.set_task_result(TASK_MISSING_EPISODES, result).await;
-        self.set_task_state(TASK_MISSING_EPISODES, TaskState::Idle)
-            .await;
+        self.end_run(claim).await;
     }
 
     async fn run_clean_activity_log(&self) {
-        let Some(_claim) = self.claim(TASK_CLEAN_ACTIVITY_LOG) else {
+        let Some(claim) = self.claim(TASK_CLEAN_ACTIVITY_LOG) else {
             return skipped(TASK_CLEAN_ACTIVITY_LOG);
         };
         self.set_task_state(TASK_CLEAN_ACTIVITY_LOG, TaskState::Running)
             .await;
         let start = Utc::now();
         let days = self.activity_log_retention_days().await;
-        let outcome = if days == 0 {
+        // One delete: a stop before it skips it, a stop during it lets it finish
+        let outcome = if days == 0 || claim.is_cancelled() {
             Ok(0)
         } else {
             rustyfin_db::repo_activity::delete_activity_older_than(&self.db, days).await
@@ -941,14 +1092,13 @@ impl TaskScheduler {
             Err(e) => (TaskCompletionStatus::Failed, Some(e.to_string())),
         };
         let result = TaskResult {
-            status,
+            status: cancelled_or(status, &claim.cancel),
             error_message,
             start_time_utc: start.to_rfc3339(),
             end_time_utc: Utc::now().to_rfc3339(),
         };
         self.set_task_result(TASK_CLEAN_ACTIVITY_LOG, result).await;
-        self.set_task_state(TASK_CLEAN_ACTIVITY_LOG, TaskState::Idle)
-            .await;
+        self.end_run(claim).await;
     }
 
     /// When the task's triggers next run it; `clock.last_end` is the later of its loop's last run
@@ -1061,7 +1211,7 @@ impl TaskScheduler {
 
     /// Run the library scan task once
     async fn run_library_scan(&self) {
-        let Some(_claim) = self.claim(TASK_LIBRARY_SCAN) else {
+        let Some(claim) = self.claim(TASK_LIBRARY_SCAN) else {
             return skipped(TASK_LIBRARY_SCAN);
         };
         self.set_task_state(TASK_LIBRARY_SCAN, TaskState::Running)
@@ -1070,11 +1220,6 @@ impl TaskScheduler {
 
         let result = match rustyfin_db::repo_library::get_all_libraries(&self.db).await {
             Ok(libraries) => {
-                let follower = follow_scans(
-                    self.scans.subscribe(),
-                    libraries.iter().map(|lib| lib.id).collect(),
-                    self.progress_of(TASK_LIBRARY_SCAN),
-                );
                 // Every library is listed as queued before the first one starts.
                 let tickets: Vec<_> = libraries
                     .iter()
@@ -1082,12 +1227,16 @@ impl TaskScheduler {
                     .collect();
                 let client = &self.http_client;
                 let mut errors = Vec::new();
-                // The runs another caller scans, which this task waits for before it ends
-                let mut runs = Vec::new();
                 for (lib, ticket) in libraries.iter().zip(tickets) {
-                    // Only the caller that claimed the library's run scans it.
+                    // A stop ends the task between libraries; the libraries not scanned yet
+                    // drop their queued runs
+                    if claim.is_cancelled() {
+                        break;
+                    }
+                    // Only the caller that claimed the library's run scans it. A library another
+                    // caller claimed is left to it: the task neither scans nor waits for it (its
+                    // listing alone keeps the task reading Running).
                     if !ticket.claim() {
-                        runs.push(ticket);
                         continue;
                     }
                     if let Err(e) = crate::scanner::scan_library_with_metadata(
@@ -1103,19 +1252,16 @@ impl TaskScheduler {
                     }
                     // The probes the scan queued keep the library listed until they finish, and
                     // the task Running until then. The next library's scan waits for them anyway
-                    // (the scan lock).
-                    ticket.wait_end().await;
+                    // (the scan lock). A stop doesn't wait for them.
+                    tokio::select! {
+                        _ = ticket.wait_end() => {}
+                        _ = claim.cancel.cancelled() => {}
+                    }
                 }
-                for ticket in runs {
-                    ticket.wait_end().await;
-                }
-                // Waited for, so no late percent lands after the task ends
-                follower.abort();
-                let _ = follower.await;
                 let end = Utc::now();
                 if errors.is_empty() {
                     TaskResult {
-                        status: TaskCompletionStatus::Completed,
+                        status: cancelled_or(TaskCompletionStatus::Completed, &claim.cancel),
                         error_message: None,
                         start_time_utc: start.to_rfc3339(),
                         end_time_utc: end.to_rfc3339(),
@@ -1143,8 +1289,7 @@ impl TaskScheduler {
         self.items_changed();
 
         self.set_task_result(TASK_LIBRARY_SCAN, result).await;
-        self.set_task_state(TASK_LIBRARY_SCAN, TaskState::Idle)
-            .await;
+        self.end_run(claim).await;
     }
 
     /// Starts a run of image task `id`, unless one is still going (a stopped one included, until
@@ -1173,6 +1318,18 @@ impl TaskScheduler {
         let mut tasks = self.tasks.write().await;
         self.image_runs.lock().unwrap().remove(id);
         if let Some(entry) = tasks.get_mut(id) {
+            self.apply_state(entry, TaskState::Idle);
+        }
+        self.run_ended.notify_waiters();
+    }
+
+    /// Ends a claimed run: unlisted and marked Idle in one step under the tasks lock, so the card
+    /// shows Idle only once the run is over.
+    async fn end_run(&self, claim: RunClaim) {
+        let mut tasks = self.tasks.write().await;
+        let id = claim.id.clone();
+        drop(claim);
+        if let Some(entry) = tasks.get_mut(&id) {
             self.apply_state(entry, TaskState::Idle);
         }
     }
@@ -1354,7 +1511,7 @@ impl TaskScheduler {
 
     /// Run metadata refresh for all items across all libraries
     async fn run_metadata_refresh(&self) {
-        let Some(_claim) = self.claim(TASK_METADATA_REFRESH) else {
+        let Some(claim) = self.claim(TASK_METADATA_REFRESH) else {
             return skipped(TASK_METADATA_REFRESH);
         };
         self.set_task_state(TASK_METADATA_REFRESH, TaskState::Running)
@@ -1429,10 +1586,12 @@ impl TaskScheduler {
                     let http_client = http.clone();
                     let item_name = item.name.clone();
                     let pm = self.plugin_manager.clone();
+                    let cancel = claim.cancel.clone();
                     let handle = tokio::spawn(async move {
                         let _permit = sem.acquire().await;
                         use std::sync::atomic::Ordering;
-                        if unauthorized.load(Ordering::Relaxed) {
+                        // A stop skips the items not started yet
+                        if unauthorized.load(Ordering::Relaxed) || cancel.is_cancelled() {
                             return None;
                         }
                         match crate::metadata::refresh_item_metadata_with(
@@ -1477,9 +1636,10 @@ impl TaskScheduler {
                 crate::image_warmer::kick();
 
                 let end = Utc::now();
+                let status = cancelled_or(TaskCompletionStatus::Completed, &claim.cancel);
                 if errors.is_empty() {
                     TaskResult {
-                        status: TaskCompletionStatus::Completed,
+                        status,
                         error_message: None,
                         start_time_utc: start.to_rfc3339(),
                         end_time_utc: end.to_rfc3339(),
@@ -1487,7 +1647,7 @@ impl TaskScheduler {
                 } else {
                     tracing::warn!("metadata refresh had {} errors", errors.len());
                     TaskResult {
-                        status: TaskCompletionStatus::Completed,
+                        status,
                         error_message: Some(format!("{} items had errors", errors.len())),
                         start_time_utc: start.to_rfc3339(),
                         end_time_utc: end.to_rfc3339(),
@@ -1507,13 +1667,12 @@ impl TaskScheduler {
 
         self.items_changed();
         self.set_task_result(TASK_METADATA_REFRESH, result).await;
-        self.set_task_state(TASK_METADATA_REFRESH, TaskState::Idle)
-            .await;
+        self.end_run(claim).await;
     }
 
     /// Clean up old transcode cache files
     async fn run_transcode_cleanup(&self) {
-        let Some(_claim) = self.claim(TASK_TRANSCODE_CLEANUP) else {
+        let Some(claim) = self.claim(TASK_TRANSCODE_CLEANUP) else {
             return skipped(TASK_TRANSCODE_CLEANUP);
         };
         self.set_task_state(TASK_TRANSCODE_CLEANUP, TaskState::Running)
@@ -1522,8 +1681,12 @@ impl TaskScheduler {
 
         let cache_dir = self.data_dir.join("cache").join("transcode");
         let result = if cache_dir.exists() {
-            match cleanup_transcode_cache(&cache_dir, &self.progress_of(TASK_TRANSCODE_CLEANUP))
-                .await
+            match cleanup_transcode_cache(
+                &cache_dir,
+                &self.progress_of(TASK_TRANSCODE_CLEANUP),
+                &claim.cancel,
+            )
+            .await
             {
                 Ok(removed) => {
                     if removed > 0 {
@@ -1531,7 +1694,7 @@ impl TaskScheduler {
                     }
                     let end = Utc::now();
                     TaskResult {
-                        status: TaskCompletionStatus::Completed,
+                        status: cancelled_or(TaskCompletionStatus::Completed, &claim.cancel),
                         error_message: None,
                         start_time_utc: start.to_rfc3339(),
                         end_time_utc: end.to_rfc3339(),
@@ -1558,8 +1721,7 @@ impl TaskScheduler {
         };
 
         self.set_task_result(TASK_TRANSCODE_CLEANUP, result).await;
-        self.set_task_state(TASK_TRANSCODE_CLEANUP, TaskState::Idle)
-            .await;
+        self.end_run(claim).await;
     }
 
     /// Start all scheduled task loops. Call once at startup.
@@ -1680,6 +1842,16 @@ impl TaskScheduler {
         );
     }
 
+    /// Whether the scheduler's own run of task `id` is going, whatever its reported state (the
+    /// library scan task reports the scan registry's).
+    async fn run_active(&self, id: &str) -> bool {
+        self.tasks
+            .read()
+            .await
+            .get(id)
+            .is_some_and(|entry| entry.info.state != TaskState::Idle)
+    }
+
     /// The running work a VACUUM would hold up: it holds the write lock throughout, so their
     /// writes would wait and then fail. `scan_lock_held`: whether `SCAN_LOCK` is held, as by the
     /// scans started outside the scheduler.
@@ -1693,7 +1865,7 @@ impl TaskScheduler {
             TASK_TRICKPLAY,
         ] {
             if let Some(task) = self.get_task(id).await
-                && task.state != TaskState::Idle
+                && (task.state != TaskState::Idle || self.run_active(id).await)
             {
                 blockers.push(task.name);
             }
@@ -1701,7 +1873,8 @@ impl TaskScheduler {
         let scan_listed = self
             .get_task(TASK_LIBRARY_SCAN)
             .await
-            .is_some_and(|task| task.state != TaskState::Idle);
+            .is_some_and(|task| task.state != TaskState::Idle)
+            || self.run_active(TASK_LIBRARY_SCAN).await;
         if !scan_listed && scan_lock_held {
             blockers.push("a library scan".to_string());
         }
@@ -1713,7 +1886,7 @@ impl TaskScheduler {
     /// scan that starts meanwhile waits for it.
     async fn run_db_vacuum(&self) -> bool {
         // A run going on already: this start is done, not put off
-        let Some(_claim) = self.claim(TASK_DB_VACUUM) else {
+        let Some(claim) = self.claim(TASK_DB_VACUUM) else {
             skipped(TASK_DB_VACUUM);
             return true;
         };
@@ -1764,7 +1937,7 @@ impl TaskScheduler {
                     },
                 )
                 .await;
-                self.set_task_state(TASK_DB_VACUUM, TaskState::Idle).await;
+                self.end_run(claim).await;
                 return true;
             }
             Err(e) => {
@@ -1779,11 +1952,26 @@ impl TaskScheduler {
                     },
                 )
                 .await;
-                self.set_task_state(TASK_DB_VACUUM, TaskState::Idle).await;
+                self.end_run(claim).await;
                 return true;
             }
         }
 
+        // VACUUM is one statement: a stop before it skips it, a stop during it lets it finish
+        if claim.is_cancelled() {
+            self.set_task_result(
+                TASK_DB_VACUUM,
+                TaskResult {
+                    status: TaskCompletionStatus::Cancelled,
+                    error_message: None,
+                    start_time_utc: start.to_rfc3339(),
+                    end_time_utc: Utc::now().to_rfc3339(),
+                },
+            )
+            .await;
+            self.end_run(claim).await;
+            return true;
+        }
         let result = match sqlx::query("VACUUM").execute(&self.db).await {
             Ok(_) => {
                 let end = Utc::now();
@@ -1808,7 +1996,7 @@ impl TaskScheduler {
         };
 
         self.set_task_result(TASK_DB_VACUUM, result).await;
-        self.set_task_state(TASK_DB_VACUUM, TaskState::Idle).await;
+        self.end_run(claim).await;
         true
     }
 }
@@ -1828,43 +2016,28 @@ fn no_library_on(id: &str, message: &str) -> String {
     message.to_string()
 }
 
-/// Reports the library scan task's percent from the scans' updates: the mean of each library's
-/// percent, where a library whose scan ended counts as 100. Each library's percent only rises, so
-/// the late updates of a library still probing never move the total back.
-fn follow_scans(
-    mut updates: tokio::sync::broadcast::Receiver<crate::scan_progress::ScanUpdate>,
-    libraries: Vec<uuid::Uuid>,
-    progress: TaskProgress,
-) -> tokio::task::JoinHandle<()> {
-    use crate::scan_progress::ScanStatus;
-    use tokio::sync::broadcast::error::RecvError;
-    let mut percents = vec![0u8; libraries.len()];
-    progress.report_count(0, libraries.len());
-    tokio::spawn(async move {
-        loop {
-            let update = match updates.recv().await {
-                Ok(update) => update,
-                Err(RecvError::Lagged(_)) => continue,
-                Err(RecvError::Closed) => return,
-            };
-            let Some(i) = libraries.iter().position(|id| *id == update.library_id) else {
-                continue;
-            };
-            let percent = match update.status {
-                ScanStatus::Idle => 100,
-                ScanStatus::Active | ScanStatus::Queued => update.progress,
-            };
-            percents[i] = percents[i].max(percent);
-            let sum: usize = percents.iter().map(|&p| usize::from(p)).sum();
-            progress.report(sum as f64 / percents.len() as f64);
-        }
-    })
+/// The library scan task's state and percent from the scan registry: Idle with no percent when no
+/// scan is listed, else Running (Cancelling while the scheduler's run is stopping) at the batch's
+/// percent, the mean of each library's `RefreshProgress` percent, a finished one at 100 until the
+/// batch ends, so the percent never drops as libraries finish.
+fn library_scan_state(scans: &ScanRegistry, run: &TaskState) -> (TaskState, Option<f64>) {
+    let Some(percent) = scans.batch_progress() else {
+        return (TaskState::Idle, None);
+    };
+    // A stopped scan shows Cancelling until it has released its ticket
+    let state = match run {
+        TaskState::Cancelling => TaskState::Cancelling,
+        _ if scans.any_cancelled() => TaskState::Cancelling,
+        _ => TaskState::Running,
+    };
+    (state, Some(percent))
 }
 
 /// Remove transcode cache files older than 24 hours
 async fn cleanup_transcode_cache(
     cache_dir: &std::path::Path,
     progress: &TaskProgress,
+    cancel: &crate::trickplay::Cancel,
 ) -> Result<u32, String> {
     let cutoff = std::time::SystemTime::now()
         .checked_sub(std::time::Duration::from_secs(24 * 3600))
@@ -1881,6 +2054,9 @@ async fn cleanup_transcode_cache(
     }
 
     for (i, entry) in entries.iter().enumerate() {
+        if cancel.is_cancelled() {
+            break;
+        }
         progress.report_count(i, entries.len());
         let path = entry.path();
         if let Ok(meta) = entry.metadata().await {
@@ -2464,6 +2640,35 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// The scheduler's own run of the library scan reads only what the registry lists: not its own
+    /// reported percent, Idle while nothing is listed, Running while scans are, and Cancelling
+    /// once Stop has asked them to end, until they have.
+    #[tokio::test]
+    async fn r3dash3_the_scheduler_run_reads_the_registry_only() {
+        let (sched, dir) = r3tasks_scheduler().await;
+        sched
+            .set_task_state(TASK_LIBRARY_SCAN, TaskState::Running)
+            .await;
+        sched.progress_of(TASK_LIBRARY_SCAN).report(80.0);
+        assert_eq!(r3dash3_scan_task(&sched).await, (TaskState::Idle, None));
+        let ticket = sched.scans().queue(Uuid::new_v4());
+        ticket.add_total(10);
+        ticket.advance(3);
+        assert_eq!(
+            r3dash3_scan_task(&sched).await,
+            (TaskState::Running, Some(30.0))
+        );
+        assert!(sched.stop_task(TASK_LIBRARY_SCAN).await);
+        assert!(ticket.is_cancelled());
+        assert_eq!(
+            r3dash3_scan_task(&sched).await,
+            (TaskState::Cancelling, Some(30.0))
+        );
+        drop(ticket);
+        assert_eq!(r3dash3_scan_task(&sched).await, (TaskState::Idle, None));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// A scan that is cancelled (its task aborted) or fails (panics) clears the library's listing,
     /// so neither the scan ring nor the task stays on.
     #[tokio::test]
@@ -2507,10 +2712,11 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// The scheduled library scan stays Running until the scans it covers have ended, the ones
-    /// another caller is running included, and only then records its result.
+    /// The scheduled library scan leaves a library another caller claimed to it: it neither scans
+    /// nor waits for it, and records its result. The other scan, still listed, keeps the task
+    /// reading Running until it ends.
     #[tokio::test]
-    async fn r3dash3_the_scheduled_scan_waits_for_running_scans() {
+    async fn r3dash3_the_scheduled_scan_skips_a_claimed_library() {
         let (sched, dir) = r3tasks_scheduler().await;
         let media = dir.join("media");
         std::fs::create_dir_all(&media).unwrap();
@@ -2524,23 +2730,21 @@ mod tests {
             .await
             .unwrap();
         // Another caller (a library's Scan) has claimed the library's run, which still waits for
-        // the scan lock, so the task joins that run instead of scanning
+        // the scan lock, so the task joins that run and leaves it to its claimer
         let api_scan = sched.scans().queue(lib.id);
         assert!(api_scan.claim());
-        let task = {
-            let sched = sched.clone();
-            tokio::spawn(async move { sched.run_library_scan().await })
-        };
-        for _ in 0..50 {
-            tokio::task::yield_now().await;
-        }
-        assert!(!task.is_finished(), "the task waits for the other scan");
-        assert_eq!(r3dash3_scan_task(&sched).await.0, TaskState::Running);
-        drop(api_scan);
-        task.await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(10), sched.run_library_scan())
+            .await
+            .expect("the task doesn't wait for the claimed library");
         let info = sched.get_task(TASK_LIBRARY_SCAN).await.unwrap();
-        assert_eq!(info.state, TaskState::Idle);
         assert!(info.last_execution_result.is_some());
+        assert_eq!(
+            info.state,
+            TaskState::Running,
+            "the other scan is still listed"
+        );
+        drop(api_scan);
+        assert_eq!(r3dash3_scan_task(&sched).await, (TaskState::Idle, None));
         assert!(sched.scans().snapshot().is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -2621,7 +2825,8 @@ mod tests {
         let entry = guard.get_mut(TASK_TRICKPLAY).unwrap();
         sched.apply_state(entry, TaskState::Idle);
         drop(guard);
-        assert!(!stopper.await.unwrap(), "nothing was left to stop");
+        assert!(stopper.await.unwrap(), "a known task");
+        assert!(!sched.is_held(TASK_TRICKPLAY), "nothing was left to stop");
         let info = sched.get_task(TASK_TRICKPLAY).await.unwrap();
         assert_eq!(info.state, TaskState::Idle, "never left Cancelling");
         let _ = std::fs::remove_dir_all(&dir);
@@ -2848,45 +3053,201 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    #[tokio::test]
-    async fn r3tasks_scan_progress_follows_the_libraries_scans() {
-        let scans = ScanRegistry::new();
-        let (first, second) = (uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
-        let progress = TaskProgress::new();
-        let follower = follow_scans(scans.subscribe(), vec![first, second], progress.clone());
-        assert_eq!(progress.get(), Some(0.0), "a scan of libraries starts at 0");
+    /// Polls task `id` until `done` holds for it, for up to 10 seconds.
+    async fn r3sched_until(
+        sched: &TaskScheduler,
+        id: &str,
+        done: impl Fn(&ScheduledTaskInfo) -> bool,
+    ) -> ScheduledTaskInfo {
+        for _ in 0..1000 {
+            let task = sched.get_task(id).await.unwrap();
+            if done(&task) {
+                return task;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("{id} never got there: {:?}", sched.get_task(id).await);
+    }
 
-        let wait_for = |want: f64| {
-            let progress = progress.clone();
+    #[tokio::test]
+    async fn r3sched_stop_lets_the_run_end_and_a_start_meanwhile_waits_for_it() {
+        let (sched, dir) = r3tasks_scheduler().await;
+        let id = TASK_METADATA_REFRESH;
+        // A run going on
+        let run = sched.claim(id).unwrap();
+        sched.set_task_state(id, TaskState::Running).await;
+        assert!(sched.stop_task(id).await);
+        assert!(run.is_cancelled(), "the run is told to stop");
+        let task = sched.get_task(id).await.unwrap();
+        assert_eq!(task.state, TaskState::Cancelling, "not Idle while it runs");
+        // A restart of the tasks leaves it as it is
+        sched.restart().await;
+        assert_eq!(
+            sched.get_task(id).await.unwrap().state,
+            TaskState::Cancelling
+        );
+        // A start meanwhile waits; nothing runs yet
+        assert!(sched.start_task(id).await);
+        assert!(sched.start_task(id).await, "a second start joins the first");
+        r3tasks_settle().await;
+        assert!(
+            sched
+                .get_task(id)
+                .await
+                .unwrap()
+                .last_execution_result
+                .is_none()
+        );
+        // The run ends: Idle only now, then the waiting start runs once
+        sched.end_run(run).await;
+        let ran = r3sched_until(&sched, id, |t| {
+            t.state == TaskState::Idle && t.last_execution_result.is_some()
+        })
+        .await;
+        assert_eq!(
+            ran.last_execution_result.unwrap().status,
+            TaskCompletionStatus::Completed,
+            "the new run isn't the stopped one"
+        );
+
+        // A stop that comes before the run shows Running: it shows Cancelling instead
+        let run = sched.claim(TASK_CLEAN_ACTIVITY_LOG).unwrap();
+        assert!(sched.stop_task(TASK_CLEAN_ACTIVITY_LOG).await);
+        sched
+            .set_task_state(TASK_CLEAN_ACTIVITY_LOG, TaskState::Running)
+            .await;
+        assert_eq!(
+            sched.get_task(TASK_CLEAN_ACTIVITY_LOG).await.unwrap().state,
+            TaskState::Cancelling
+        );
+        sched.end_run(run).await;
+        // A stop with nothing running changes nothing; an unknown task is refused
+        assert!(sched.stop_task(TASK_CLEAN_ACTIVITY_LOG).await);
+        assert_eq!(
+            sched.get_task(TASK_CLEAN_ACTIVITY_LOG).await.unwrap().state,
+            TaskState::Idle
+        );
+        assert!(!sched.stop_task("NoSuchTask").await);
+        assert!(!sched.start_task("NoSuchTask").await);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn r3sched_a_stopped_library_scan_ends_as_cancelled() {
+        let (sched, dir) = r3tasks_scheduler().await;
+        let mut ids = Vec::new();
+        for name in ["Library A", "Library B"] {
+            let path = dir.join(name);
+            std::fs::create_dir_all(&path).unwrap();
+            let library = rustyfin_model::library::Library {
+                id: uuid::Uuid::new_v4(),
+                name: name.to_string(),
+                content_type: rustyfin_model::library::LibraryContentType::Movies,
+                paths: vec![path.to_string_lossy().to_string()],
+            };
+            rustyfin_db::repo_library::create_library(&sched.db, &library)
+                .await
+                .unwrap();
+            ids.push(library.id);
+        }
+        // The scheduler's own run, stopped: it ends Cancelled
+        let tickets_before = sched.scans().snapshot().len();
+        assert_eq!(tickets_before, 0);
+        let run = sched.claim(TASK_LIBRARY_SCAN).unwrap();
+        sched
+            .set_task_state(TASK_LIBRARY_SCAN, TaskState::Running)
+            .await;
+        assert!(sched.stop_task(TASK_LIBRARY_SCAN).await);
+        assert!(run.is_cancelled());
+        drop(run);
+        sched.release(TASK_LIBRARY_SCAN);
+        sched
+            .set_task_state(TASK_LIBRARY_SCAN, TaskState::Idle)
+            .await;
+
+        // A start by hand runs it again to the end
+        assert!(sched.start_task(TASK_LIBRARY_SCAN).await);
+        let again = r3sched_until(&sched, TASK_LIBRARY_SCAN, |t| {
+            t.last_execution_result
+                .as_ref()
+                .is_some_and(|r| r.status == TaskCompletionStatus::Completed)
+        })
+        .await;
+        assert!(again.last_execution_result.is_some());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn r3sched_stop_ends_a_scan_started_from_a_library() {
+        let (sched, dir) = r3tasks_scheduler().await;
+        let path = dir.join("Library A");
+        std::fs::create_dir_all(path.join("Made Up Film (2001)")).unwrap();
+        std::fs::write(
+            path.join("Made Up Film (2001)/Made Up Film (2001).mkv"),
+            b"x",
+        )
+        .unwrap();
+        let library = rustyfin_model::library::Library {
+            id: uuid::Uuid::new_v4(),
+            name: "Library A".to_string(),
+            content_type: rustyfin_model::library::LibraryContentType::Movies,
+            paths: vec![path.to_string_lossy().to_string()],
+        };
+        rustyfin_db::repo_library::create_library(&sched.db, &library)
+            .await
+            .unwrap();
+        let items = || async {
+            rustyfin_db::repo_media::get_items_by_library(&sched.db, library.id)
+                .await
+                .unwrap()
+                .len()
+        };
+        let scan = |ticket: crate::scan_progress::ScanTicket| {
+            let sched = sched.clone();
+            let library = library.clone();
             async move {
-                for _ in 0..200 {
-                    if progress.get() == Some(want) {
-                        return;
-                    }
-                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-                }
-                panic!("progress {:?}, want {want}", progress.get());
+                crate::scanner::scan_library_with_metadata(
+                    &sched.db,
+                    &library,
+                    &sched.http_client,
+                    &sched.plugin_manager,
+                    &ticket,
+                )
+                .await
+                .unwrap();
+                ticket.wait_end().await;
             }
         };
-        let one = scans.queue(first);
-        let two = scans.queue(second);
-        one.start();
-        one.add_total(4);
-        one.advance(2);
-        wait_for(25.0).await;
-        drop(one);
-        wait_for(50.0).await;
-        two.start();
-        two.add_total(2);
-        two.advance(1);
-        wait_for(75.0).await;
-        // A late update of a library that has ended never moves the total back.
-        let late = scans.queue(first);
-        late.start();
-        two.advance(1);
-        drop(two);
-        wait_for(100.0).await;
-        drop(late);
-        follower.abort();
+
+        // A library's Scan, as the library route queues it: the ring and the card show it
+        let ticket = sched.scans().queue(library.id);
+        assert!(ticket.claim());
+        let card = sched.get_task(TASK_LIBRARY_SCAN).await.unwrap();
+        assert_eq!(card.state, TaskState::Running);
+        // Stop on the scan task reaches it; the card shows Cancelling until it has ended
+        assert!(sched.stop_task(TASK_LIBRARY_SCAN).await);
+        assert!(ticket.is_cancelled());
+        let card = sched.get_task(TASK_LIBRARY_SCAN).await.unwrap();
+        assert_eq!(card.state, TaskState::Cancelling);
+        scan(ticket).await;
+        assert_eq!(items().await, 0, "the stopped scan read nothing");
+        assert!(sched.scans().snapshot().is_empty(), "the ring is idle");
+        let ended = r3sched_until(&sched, TASK_LIBRARY_SCAN, |t| {
+            t.last_execution_result.is_some()
+        })
+        .await;
+        assert_eq!(ended.state, TaskState::Idle);
+        assert_eq!(
+            ended.last_execution_result.unwrap().status,
+            TaskCompletionStatus::Cancelled
+        );
+
+        // A scan queued after the stop isn't part of it, and reads the library
+        let ticket = sched.scans().queue(library.id);
+        assert!(ticket.claim());
+        assert!(!ticket.is_cancelled());
+        scan(ticket).await;
+        assert_eq!(items().await, 1);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

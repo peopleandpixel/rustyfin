@@ -3892,6 +3892,7 @@ const B124_WEB_MODULES: &[&str] = &[
     "theme-media.js",
     "user-editor.js",
     "user-settings.js",
+    "userdata.js",
     "util.js",
     "wizard.js",
 ];
@@ -5902,7 +5903,7 @@ async fn b152_a_card_index_has_only_what_a_card_shows() {
     );
 }
 
-// R3 sort names: "The Matrix" sorts and files under M, as in Jellyfin
+// R3 sort names: "The Meridian" sorts and files under M, as in Jellyfin
 
 #[tokio::test]
 async fn r3sortname_items_sort_and_filter_by_jellyfins_sort_name() {
@@ -5919,7 +5920,14 @@ async fn r3sortname_items_sort_and_filter_by_jellyfins_sort_name() {
         .unwrap();
     // Stored as before 094: the lowercased name
     let mut ids = HashMap::new();
-    for name in ["Nemo", "The Matrix", "Lion", "28 Days", "Zodiac", "Theory"] {
+    for name in [
+        "Nemo",
+        "The Meridian",
+        "Lion",
+        "28 Days",
+        "Zodiac",
+        "Theory",
+    ] {
         let id = uuid::Uuid::new_v4();
         sqlx::query(
             "INSERT INTO media_items (id, library_id, name, sort_name, media_type, path) \
@@ -5968,20 +5976,27 @@ async fn r3sortname_items_sort_and_filter_by_jellyfins_sort_name() {
     let body = list(String::new()).await;
     assert_eq!(
         names(&body),
-        ["28 Days", "Lion", "The Matrix", "Nemo", "Theory", "Zodiac"]
+        [
+            "28 Days",
+            "Lion",
+            "The Meridian",
+            "Nemo",
+            "Theory",
+            "Zodiac"
+        ]
     );
-    let matrix = body["Items"]
+    let meridian = body["Items"]
         .as_array()
         .unwrap()
         .iter()
-        .find(|item| item["Name"] == "The Matrix")
+        .find(|item| item["Name"] == "The Meridian")
         .unwrap();
-    assert_eq!(matrix["SortName"], "matrix");
+    assert_eq!(meridian["SortName"], "meridian");
     // The letters go by the sort name only, as in Jellyfin; '#' holds what starts with no letter,
     // and Z holds Zodiac
     assert_eq!(
         names(&list("&NameStartsWith=M".into()).await),
-        ["The Matrix"]
+        ["The Meridian"]
     );
     assert_eq!(names(&list("&NameStartsWith=T".into()).await), ["Theory"]);
     assert_eq!(
@@ -5996,14 +6011,14 @@ async fn r3sortname_items_sort_and_filter_by_jellyfins_sort_name() {
 
     // The editor's forced sort name is returned as written and sorts the item; clearing it
     // brings the automatic one back
-    let matrix_id = ids["The Matrix"];
+    let meridian_id = ids["The Meridian"];
     let save = |body: serde_json::Value| {
         let (app, admin) = (app.clone(), admin.clone());
         async move {
             let (status, text) = send_authed(
                 &app,
                 "POST",
-                &format!("/Items/{matrix_id}"),
+                &format!("/Items/{meridian_id}"),
                 &admin,
                 Some(&body.to_string()),
             )
@@ -6011,33 +6026,33 @@ async fn r3sortname_items_sort_and_filter_by_jellyfins_sort_name() {
             assert_eq!(status, StatusCode::NO_CONTENT, "{text}");
         }
     };
-    save(serde_json::json!({"ForcedSortName": "Zzz Matrix"})).await;
+    save(serde_json::json!({"ForcedSortName": "Zzz Meridian"})).await;
     let (status, item) =
-        send_authed(&app, "GET", &format!("/Items/{matrix_id}"), &admin, None).await;
+        send_authed(&app, "GET", &format!("/Items/{meridian_id}"), &admin, None).await;
     assert_eq!(status, StatusCode::OK, "{item}");
-    assert_eq!(item["ForcedSortName"], "Zzz Matrix");
-    assert_eq!(item["SortName"], "zzz matrix");
+    assert_eq!(item["ForcedSortName"], "Zzz Meridian");
+    assert_eq!(item["SortName"], "zzz meridian");
     assert_eq!(
         names(&list(String::new()).await).last().unwrap(),
-        "The Matrix"
+        "The Meridian"
     );
     // A rescan's save keeps it
-    let mut rescanned = rustyfin_db::repo_media::get_item_by_id(&state.db, matrix_id)
+    let mut rescanned = rustyfin_db::repo_media::get_item_by_id(&state.db, meridian_id)
         .await
         .unwrap()
         .unwrap();
-    rescanned.sort_name = Some("matrix".to_string());
+    rescanned.sort_name = Some("meridian".to_string());
     rustyfin_db::repo_media::upsert_media_item(&state.db, &rescanned)
         .await
         .unwrap();
     assert_eq!(
         names(&list(String::new()).await).last().unwrap(),
-        "The Matrix"
+        "The Meridian"
     );
     save(serde_json::json!({"ForcedSortName": ""})).await;
-    let (_, item) = send_authed(&app, "GET", &format!("/Items/{matrix_id}"), &admin, None).await;
+    let (_, item) = send_authed(&app, "GET", &format!("/Items/{meridian_id}"), &admin, None).await;
     assert!(item["ForcedSortName"].is_null(), "{item}");
-    assert_eq!(item["SortName"], "matrix");
+    assert_eq!(item["SortName"], "meridian");
 }
 
 /// The sort lists round-trip through /System/Configuration, and saving other ones makes the
@@ -6897,7 +6912,7 @@ async fn b30_p6_terms_the_index_cannot_parse_still_find_by_name() {
     let state = test_state().await;
     let (token, lib) = b27_seed(&state).await;
     b27_add_item(&state, lib, "Star Trek: Discovery", "Series").await;
-    b27_add_item(&state, lib, "Mr. Robot", "Series").await;
+    b27_add_item(&state, lib, "Mr. Lantern", "Series").await;
     let app = app(state);
 
     // The index reads "Trek:" as a column and rejects "Mr.", so these go by name.
@@ -6906,7 +6921,7 @@ async fn b30_p6_terms_the_index_cannot_parse_still_find_by_name() {
             "Star%20Trek%3A%20Discovery",
             "Star Trek: Discovery (Series)",
         ),
-        ("Mr.%20Robot", "Mr. Robot (Series)"),
+        ("Mr.%20Lantern", "Mr. Lantern (Series)"),
     ] {
         let search = format!("/Search?Term={term}&IncludeItemTypes=Series");
         assert_eq!(b27_found(&app, &search, &token).await, [found]);
@@ -8298,7 +8313,7 @@ async fn j6_hints_survive_odd_terms() {
     let state = test_state().await;
     let lib = j6_seed(&state).await;
     j6_add_item(&state, lib.library, None, "Amélie", "Movie").await;
-    j6_add_item(&state, lib.library, None, "東京物語", "Movie").await;
+    j6_add_item(&state, lib.library, None, "東京灯台", "Movie").await;
     let app = app(state);
 
     // A term that cleans to nothing finds nothing, as in SqlSearchProvider.
@@ -8338,7 +8353,7 @@ async fn j6_hints_survive_odd_terms() {
             &lib.token
         )
         .await,
-        ["東京物語 (Movie)"]
+        ["東京灯台 (Movie)"]
     );
 }
 
@@ -27082,6 +27097,22 @@ async fn r3parental_dlna_browses_as_the_dlna_user_with_its_limits() {
         g1_send_raw(&world.app, req.body(Body::empty()).unwrap())
     };
 
+    // The device description names the server as configured, as it is now.
+    for name in ["Living Room", "Den & Co"] {
+        w.configure(serde_json::json!({ "ServerName": name })).await;
+        let req = Request::builder()
+            .uri("/dlna/description.xml")
+            .body(Body::empty())
+            .unwrap();
+        let (status, xml) = g1_send_raw(&w.app, req).await;
+        assert_eq!(status, StatusCode::OK);
+        let escaped = name.replace('&', "&amp;");
+        assert!(
+            xml.contains(&format!("<friendlyName>{escaped}</friendlyName>")),
+            "{xml}"
+        );
+    }
+
     // No DLNA user: DLNA devices don't sign in, so nothing is listed or streamed.
     let root = w.dlna_browse("0", "BrowseDirectChildren").await;
     assert!(root.contains("<TotalMatches>0</TotalMatches>"), "{root}");
@@ -29383,6 +29414,13 @@ fn r3metadata_web() {
 #[test]
 fn r3cards_cards() {
     b124_node_test("r3cards_cards.mjs");
+}
+
+// The web client follows the server's UserDataChanged: cards, their folders' counts, the cached
+// lists, and this tab's own marks on the same path (tests/web/r3sync_userdata.mjs)
+#[test]
+fn r3sync_userdata() {
+    b124_node_test("r3sync_userdata.mjs");
 }
 
 // The sign-in page's user tiles, Manual login, Forgot password and its PIN step, and Switch user
@@ -35029,9 +35067,9 @@ async fn b23_comma_lists_apply_in_order_on_both_item_lists() {
 #[tokio::test]
 async fn b23_toolbar_sorts_reverse_exactly_and_page_stably() {
     let state = test_state().await;
-    let dune = |name, year| B23Item {
+    let drift = |name, year| B23Item {
         name,
-        sort_name: "dune",
+        sort_name: "drift",
         media_type: "Movie",
         year,
         added: "2021-03-01T10:00:00+00:00",
@@ -35039,10 +35077,10 @@ async fn b23_toolbar_sorts_reverse_exactly_and_page_stably() {
     };
     let mut items = b23_movies();
     items.extend([
-        dune("Dune", Some(2021)),
-        dune("Dune", Some(2021)),
-        dune("DUNE", None),
-        dune("Dune", Some(1984)),
+        drift("Drift", Some(2021)),
+        drift("Drift", Some(2021)),
+        drift("DRIFT", None),
+        drift("Drift", Some(1984)),
     ]);
     let movies = rustyfin_model::library::LibraryContentType::Movies;
     let (token, _, ids) = b23_library(&state, movies, &items).await;
@@ -39840,6 +39878,69 @@ async fn b18_manual_scan_of_a_library_scan_all_has_queued_runs_once() {
     b18_assert_one_run(&lines, "Second");
 }
 
+/// Stop on the library scan task ends a scan started from a library's Scan, as in Jellyfin, where
+/// every scan is a run of that task: the card shows Cancelling until the scan has ended, then
+/// Idle with the result Cancelled, and the ring clears.
+#[tokio::test]
+async fn r3sched_stop_ends_a_scan_started_from_the_library_route() {
+    use rustyfin_model::scheduled_task::TaskState;
+    use std::time::Duration;
+    let state = test_state().await;
+    let app = app(state.clone());
+    let (owner, _, _, _) = g1_owner_and_viewer(&state, &app).await;
+    let library = create_library_via_api(&app, &state, &owner, "R3sched One", "Movies").await;
+    b17_movies(&media_folder(&state, "r3sched one"), 2);
+    let sched = state.task_scheduler.clone();
+    let card = || async { sched.get_task("LibraryScan").await.unwrap() };
+
+    // The scan waits for the scan lock, listed (its ring shows) and claimed by the route
+    let lock = rustyfin_core::scanner::SCAN_LOCK.lock().await;
+    let uri = format!("/Library/VirtualFolders/{library}/Refresh");
+    let manual = b18_spawn_request(&app, "POST", uri, &owner);
+    for _ in 0..500 {
+        if sched.scans().state(library).is_some() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(sched.scans().state(library).is_some(), "the scan is listed");
+    assert_eq!(card().await.state, TaskState::Running);
+
+    let (status, _) = send_authed(
+        &app,
+        "DELETE",
+        "/ScheduledTasks/Running/LibraryScan",
+        &owner,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    assert_eq!(
+        card().await.state,
+        TaskState::Cancelling,
+        "until the scan ends"
+    );
+    drop(lock);
+
+    let (status, body) = manual.await.unwrap();
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["items_scanned"], 0, "the stopped scan read nothing");
+    let mut ended = card().await;
+    for _ in 0..500 {
+        if ended.last_execution_result.is_some() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        ended = card().await;
+    }
+    assert!(sched.scans().snapshot().is_empty(), "the ring is idle");
+    assert_eq!(ended.state, TaskState::Idle);
+    assert_eq!(
+        ended.last_execution_result.map(|r| r.status),
+        Some(rustyfin_model::scheduled_task::TaskCompletionStatus::Cancelled)
+    );
+}
+
 #[tokio::test]
 async fn b18_second_manual_scan_of_a_waiting_library_joins_the_first() {
     let state = test_state().await;
@@ -41641,6 +41742,86 @@ async fn g4_active_encodings_needs_a_name() {
     let uri = "/Videos/ActiveEncodings?playSessionId=g4-psid";
     let (status, _) = send(&app, request("DELETE", uri, None, None)).await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
+// r3hwaccel: a reported playback stop ends that play session's transcodes, as Jellyfin 12.4's
+// `/Sessions/Playing/Stopped` does, instead of leaving them to the stall sweep; another play
+// session's transcode runs on, and the stopped play session may start again.
+#[tokio::test]
+async fn r3hwaccel_playback_stop_kills_the_play_sessions_transcodes() {
+    if !g4_have_ffmpeg("r3hwaccel_playback_stop_kills_the_play_sessions_transcodes") {
+        return;
+    }
+    let state = test_state().await;
+    let _dir = G4Dir(state.data_dir.to_path_buf());
+    let (token, _) = admin_session(&state).await;
+    let folder = media_folder(&state, "r3-stop");
+    let mut ids = Vec::new();
+    for name in ["Movie A", "Movie B"] {
+        let file = std::path::Path::new(&folder).join(format!("{name}.mp4"));
+        g4_make_media(&[
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc=size=320x240:rate=25",
+            "-t",
+            "8",
+            "-c:v",
+            "libx264",
+            "-pix_fmt",
+            "yuv420p",
+            file.to_str().unwrap(),
+        ]);
+        let id = g4_insert_item(&state, "Movie", &file).await;
+        rustyfin_core::probe::probe_and_save(&state.db, &id, file.to_str().unwrap())
+            .await
+            .unwrap();
+        ids.push(id);
+    }
+    let manager = state.transcode_manager.clone();
+    let app = app(state);
+    let hls = |id: uuid::Uuid, psid: &str| {
+        format!("/Videos/{id}/main.m3u8?VideoCodec=h264&VideoBitrate=500000&PlaySessionId={psid}")
+    };
+    for (id, psid) in [(ids[0], "r3-stop-a"), (ids[1], "r3-stop-b")] {
+        let (status, body) = send(&app, request("GET", &hls(id, psid), Some(&token), None)).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(manager.is_active(id).await);
+    }
+
+    let stop = serde_json::json!({
+        "ItemId": ids[0],
+        "PositionTicks": 10_000_000,
+        "PlaySessionId": "R3-STOP-A",
+    });
+    let (status, body) = send(
+        &app,
+        request(
+            "POST",
+            "/Sessions/Playing/Stopped",
+            Some(&token),
+            Some(stop),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+    assert!(
+        !manager.is_active(ids[0]).await,
+        "the stopped playback's transcode is gone"
+    );
+    assert!(
+        manager.is_active(ids[1]).await,
+        "another play session's runs on"
+    );
+
+    // The play session isn't refused afterwards
+    let (status, body) = send(
+        &app,
+        request("GET", &hls(ids[0], "r3-stop-a"), Some(&token), None),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    manager.stop_all().await;
 }
 
 /// Stores a media source for `item` at `file` with one stream per (CodecType, codec) pair.
@@ -56135,4 +56316,166 @@ async fn r3dash3_a_library_scan_shows_as_the_scan_task_and_clears() {
     let (task, folder) = r3dash3_scan_views(&app, &owner, lib).await;
     assert_eq!(task["State"], "Idle", "{task}");
     assert_eq!(folder["RefreshStatus"], "Idle", "{folder}");
+}
+
+// The older `/Configuration/MediaEncoding` and `/Configuration/Networking` routes read and save the
+// named configurations `encoding` and `network`: one stored source for each, not a second answer.
+#[tokio::test]
+async fn r3dash3_shadow_configuration_routes_share_the_named_configurations() {
+    let state = test_state().await;
+    let app = app(state.clone());
+    let (owner, _, viewer, _) = g1_owner_and_viewer(&state, &app).await;
+    let mut net = send_authed(&app, "GET", "/System/Configuration/network", &owner, None)
+        .await
+        .1;
+    net["KnownProxies"] = serde_json::json!(["10.0.0.0/8"]);
+    let (status, body) = send_authed(
+        &app,
+        "PUT",
+        "/Configuration/Networking",
+        &owner,
+        Some(&net.to_string()),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+    let (_, named) = send_authed(&app, "GET", "/System/Configuration/network", &owner, None).await;
+    assert_eq!(named, net);
+    let (_, old) = send_authed(&app, "GET", "/Configuration/Networking", &owner, None).await;
+    assert_eq!(old, net);
+    let bad = serde_json::json!({ "KnownProxies": ["0.0.0.0/0"] }).to_string();
+    let (status, _) =
+        send_authed(&app, "PUT", "/Configuration/Networking", &owner, Some(&bad)).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    for token in [&owner, &viewer] {
+        let (_, named) =
+            send_authed(&app, "GET", "/System/Configuration/encoding", token, None).await;
+        let (_, old) = send_authed(&app, "GET", "/Configuration/MediaEncoding", token, None).await;
+        assert_eq!(old, named);
+    }
+    let mut enc = send_authed(&app, "GET", "/System/Configuration/encoding", &owner, None)
+        .await
+        .1;
+    enc["EncodingThreadCount"] = serde_json::json!(3);
+    let (status, body) = send_authed(
+        &app,
+        "PUT",
+        "/Configuration/MediaEncoding",
+        &owner,
+        Some(&enc.to_string()),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+    let (_, named) = send_authed(&app, "GET", "/System/Configuration/encoding", &owner, None).await;
+    assert_eq!(named["EncodingThreadCount"], 3, "{named}");
+}
+
+// A scan the scheduler starts over two libraries shows one percentage everywhere: the library
+// scan task (GET /ScheduledTasks, GET /ScheduledTasks/LibraryScan and the ScheduledTasksInfo
+// frames) is the mean of what /Library/VirtualFolders and the RefreshProgress frames show for each
+// library, because all of them read the scan registry. The task's result is still the scheduler's.
+#[tokio::test]
+async fn r3dash3_a_scheduled_scan_shows_one_percentage_everywhere() {
+    let state = test_state().await;
+    let app = app(state.clone());
+    let (owner, _, _, _) = g1_owner_and_viewer(&state, &app).await;
+    let first = create_library_via_api(&app, &state, &owner, "Movies A", "Movies").await;
+    let second = create_library_via_api(&app, &state, &owner, "Shows B", "TvShows").await;
+    let addr = b17_serve(&app).await;
+    let scans = state.task_scheduler.scans().clone();
+    while scans.state(first).is_some() || scans.state(second).is_some() {
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+
+    // The scheduler's scan waits for the scan lock in its first library, both libraries queued
+    let lock = rustyfin_core::scanner::SCAN_LOCK.lock().await;
+    let (status, body) = send_authed(
+        &app,
+        "POST",
+        "/ScheduledTasks/Running/LibraryScan",
+        &owner,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+    for _ in 0..500 {
+        if scans.state(first).is_some() && scans.state(second).is_some() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    let mut socket = G1cSocket::open(addr, &owner).await;
+    r3tasks_send(
+        &mut socket,
+        r#"{"MessageType":"ScheduledTasksInfoStart","Data":"0,500"}"#,
+    )
+    .await;
+
+    // Work reported on each library's run: 1 of 2 in the first, 1 of 4 in the second
+    let a = scans.queue(first);
+    a.add_total(2);
+    a.advance(1);
+    let b = scans.queue(second);
+    b.add_total(4);
+    b.advance(1);
+
+    // The RefreshProgress frames reach 50 and 25, and a ScheduledTasksInfo frame the mean
+    let (mut ring_a, mut ring_b, mut frame_task) = (None, None, None);
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while ring_a != Some(50.0) || ring_b != Some(25.0) || frame_task != Some(37.5) {
+            let frame = socket.next().await;
+            match frame["MessageType"].as_str() {
+                Some("RefreshProgress") => {
+                    let percent = frame["Data"]["Progress"]
+                        .as_str()
+                        .and_then(|p| p.parse::<f64>().ok());
+                    if frame["Data"]["ItemId"] == first.to_string() {
+                        ring_a = percent;
+                    } else if frame["Data"]["ItemId"] == second.to_string() {
+                        ring_b = percent;
+                    }
+                }
+                Some("ScheduledTasksInfo") => {
+                    frame_task = frame["Data"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .find(|t| t["Id"] == "LibraryScan")
+                        .and_then(|t| t["CurrentProgressPercentage"].as_f64());
+                }
+                _ => {}
+            }
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("frames: {ring_a:?} {ring_b:?} {frame_task:?}"));
+
+    let (task, folder_a) = r3dash3_scan_views(&app, &owner, first).await;
+    let (_, folder_b) = r3dash3_scan_views(&app, &owner, second).await;
+    let (_, one) = send_authed(&app, "GET", "/ScheduledTasks/LibraryScan", &owner, None).await;
+    assert_eq!(task["State"], "Running", "{task}");
+    assert_eq!(task["CurrentProgressPercentage"], 37.5, "{task}");
+    assert_eq!(one["CurrentProgressPercentage"], 37.5, "{one}");
+    assert_eq!(folder_a["RefreshProgress"], 50.0, "{folder_a}");
+    assert_eq!(folder_b["RefreshProgress"], 25.0, "{folder_b}");
+    let mean = (folder_a["RefreshProgress"].as_f64().unwrap()
+        + folder_b["RefreshProgress"].as_f64().unwrap())
+        / 2.0;
+    assert_eq!(task["CurrentProgressPercentage"].as_f64(), Some(mean));
+
+    // The scans run and end: the task is Idle, with the scheduler's result
+    drop(a);
+    drop(b);
+    drop(lock);
+    let mut task = serde_json::Value::Null;
+    for _ in 0..1000 {
+        task = r3dash3_scan_views(&app, &owner, first).await.0;
+        if task["State"] == "Idle" && task["LastExecutionResult"].is_object() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert_eq!(task["State"], "Idle", "{task}");
+    assert!(task["CurrentProgressPercentage"].is_null(), "{task}");
+    assert_eq!(task["LastExecutionResult"]["Status"], "Completed", "{task}");
 }
