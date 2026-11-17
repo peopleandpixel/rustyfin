@@ -3334,6 +3334,102 @@ async fn r3rel_deleting_an_item_with_play_state_works_and_unknown_ids_are_404() 
     }
 }
 
+/// A series with one season of two episodes in a new library `library`: (series, season,
+/// episodes).
+async fn r3rel_series(
+    app: &axum::Router,
+    state: &AppState,
+    token: &str,
+    library: &str,
+) -> (uuid::Uuid, uuid::Uuid, [uuid::Uuid; 2]) {
+    let shows = create_library_via_api(app, state, token, library, "TvShows").await;
+    let series = r3rel_insert_item(state, shows, "Sample Show", "Series", None, None).await;
+    let season = r3rel_insert_item(state, shows, "Season 1", "Season", Some(series), None).await;
+    let e1 = r3rel_insert_item(state, shows, "Episode 1", "Episode", Some(season), None).await;
+    let e2 = r3rel_insert_item(state, shows, "Episode 2", "Episode", Some(season), None).await;
+    (series, season, [e1, e2])
+}
+
+/// A cached image of `item`, as the image route keys them.
+fn r3rel_cache_image(state: &AppState, item: uuid::Uuid) -> String {
+    let key = format!("{item}:Primary:0:1:orig");
+    state.image_cache.insert(key.clone(), vec![1, 2, 3]);
+    key
+}
+
+#[tokio::test]
+async fn r3rel_deleting_items_drops_their_cached_details_images_and_their_parents() {
+    let state = test_state().await;
+    let (token, _) = admin_session(&state).await;
+    let app = app(state.clone());
+    let (series, season, [e1, e2]) = r3rel_series(&app, &state, &token, "Shows").await;
+    let other = r3rel_series(&app, &state, &token, "More Shows").await.0;
+    for id in [series, season, other] {
+        let (status, body) = send_authed(&app, "GET", &format!("/Items/{id}"), &token, None).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(state.cache.item_details.get(&id.to_string()).is_some());
+    }
+    let e2_image = r3rel_cache_image(&state, e2);
+    let other_image = r3rel_cache_image(&state, other);
+
+    // An episode: its season's and series' cached details (their counts) go
+    let (status, body) = send_authed(&app, "DELETE", &format!("/Items/{e1}"), &token, None).await;
+    assert!(status.is_success(), "{status} {body}");
+    for id in [series, season] {
+        assert!(state.cache.item_details.get(&id.to_string()).is_none());
+    }
+
+    // The series: none of it is served from a cache again, its episodes' images neither
+    for id in [series, season] {
+        send_authed(&app, "GET", &format!("/Items/{id}"), &token, None).await;
+    }
+    let (status, body) =
+        send_authed(&app, "DELETE", &format!("/Items/{series}"), &token, None).await;
+    assert!(status.is_success(), "{status} {body}");
+    for id in [series, season] {
+        let (status, body) = send_authed(&app, "GET", &format!("/Items/{id}"), &token, None).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{id}: {body}");
+    }
+    assert!(state.image_cache.get(&e2_image).is_none());
+    assert!(
+        state.image_cache.get(&other_image).is_some(),
+        "another item's image stays"
+    );
+}
+
+#[tokio::test]
+async fn r3rel_refreshing_a_series_drops_its_seasons_and_episodes_from_the_caches() {
+    let state = test_state().await;
+    let (token, _) = admin_session(&state).await;
+    let app = app(state.clone());
+    let (series, season, [e1, _]) = r3rel_series(&app, &state, &token, "Shows").await;
+    let (_, body) = send_authed(&app, "GET", &format!("/Items/{season}"), &token, None).await;
+    assert_eq!(body["Name"], "Season 1", "{body}");
+    let e1_image = r3rel_cache_image(&state, e1);
+
+    // A refresh writes the season (a provider's name for it); the cached copy is still the old one
+    sqlx::query("UPDATE media_items SET name = 'Season One' WHERE id = ?")
+        .bind(season.to_string())
+        .execute(&state.db)
+        .await
+        .unwrap();
+    let (_, body) = send_authed(&app, "GET", &format!("/Items/{season}"), &token, None).await;
+    assert_eq!(body["Name"], "Season 1", "the season is cached: {body}");
+
+    let (status, body) = send_authed(
+        &app,
+        "POST",
+        &format!("/Items/{series}/Refresh"),
+        &token,
+        None,
+    )
+    .await;
+    assert!(status.is_success(), "{status} {body}");
+    let (_, body) = send_authed(&app, "GET", &format!("/Items/{season}"), &token, None).await;
+    assert_eq!(body["Name"], "Season One", "{body}");
+    assert!(state.image_cache.get(&e1_image).is_none());
+}
+
 #[tokio::test]
 async fn r3rel_a_partial_configuration_post_keeps_every_other_setting() {
     let state = test_state().await;
