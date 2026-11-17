@@ -53029,6 +53029,102 @@ async fn r3cast_a_token_keeps_at_most_four_receiver_sessions() {
     assert!(!r3s_session(&app, &ctl, "r3s-ctl").await.is_null());
 }
 
+// Jellyfin 12.4's session key is the client, the device and the user: two users naming one device,
+// or one user's two clients on it, get a session each, and the same three again reuse theirs
+#[tokio::test]
+async fn r3cast_sessions_are_keyed_by_client_device_and_user() {
+    let state = test_state().await;
+    let app = app(state.clone());
+    let (ctl, owner, _) = r3s_owner(&app).await;
+    add_user(&state, "guest", "guestpass", false).await;
+    let (guest, _) = r3s_login(&app, "guest", "guestpass", "r3cast-guest").await;
+    let caps = |client: &str, token: &str| {
+        let auth = format!(
+            r#"MediaBrowser Client="{client}", Device="Shared", DeviceId="r3cast-shared", Version="1", Token="{token}""#
+        );
+        Request::builder()
+            .method("POST")
+            .uri("/Sessions/Capabilities/Full")
+            .header("Authorization", auth)
+            .header("Content-Type", "application/json")
+            .body(Body::from(r#"{"PlayableMediaTypes":["Video"]}"#))
+            .unwrap()
+    };
+    let owner_of = |id: &str| {
+        let state = state.clone();
+        let id = id.to_string();
+        async move {
+            sqlx::query_scalar::<_, String>("SELECT user_id FROM sessions WHERE id = ?1")
+                .bind(id)
+                .fetch_one(&state.db)
+                .await
+                .unwrap()
+        }
+    };
+
+    assert_eq!(
+        send(&app, caps("Chromecast", &owner)).await.0,
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(
+        send(&app, caps("Chromecast", &guest)).await.0,
+        StatusCode::NO_CONTENT
+    );
+    let shared = r3cast_sessions_on(&state, "r3cast-shared").await;
+    assert_eq!(shared.len(), 2, "one session per user on the shared device");
+    let mut users = Vec::new();
+    for id in &shared {
+        users.push(owner_of(id).await);
+    }
+    users.sort();
+    users.dedup();
+    assert_eq!(
+        users.len(),
+        2,
+        "the guest didn't take over the owner's session"
+    );
+
+    // Another client of the owner on the same device id: a third session
+    assert_eq!(
+        send(&app, caps("Other Client", &owner)).await.0,
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(r3cast_sessions_on(&state, "r3cast-shared").await.len(), 3);
+    // The same client, device and user again: no new session
+    assert_eq!(
+        send(&app, caps("Chromecast", &owner)).await.0,
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(r3cast_sessions_on(&state, "r3cast-shared").await.len(), 3);
+
+    // A sign-in of one client on a device leaves the user's other clients' sessions there
+    let (_, _) = r3s_login(&app, "owner", "ownerpass", "r3s-tgt").await;
+    assert!(!r3s_session(&app, &ctl, "r3s-tgt").await.is_null());
+    let sign_in = |client: &str| {
+        Request::builder()
+            .method("POST")
+            .uri("/Users/AuthenticateByName")
+            .header("Content-Type", "application/json")
+            .header(
+                "X-Emby-Authorization",
+                format!(r#"MediaBrowser Client="{client}", Device="Box", DeviceId="r3cast-box", Version="1""#),
+            )
+            .body(Body::from(
+                serde_json::json!({ "Username": "owner", "Pw": "ownerpass" }).to_string(),
+            ))
+            .unwrap()
+    };
+    assert_eq!(send(&app, sign_in("App A")).await.0, StatusCode::OK);
+    assert_eq!(send(&app, sign_in("App B")).await.0, StatusCode::OK);
+    assert_eq!(r3cast_sessions_on(&state, "r3cast-box").await.len(), 2);
+    assert_eq!(send(&app, sign_in("App A")).await.0, StatusCode::OK);
+    assert_eq!(
+        r3cast_sessions_on(&state, "r3cast-box").await.len(),
+        2,
+        "App A keeps one"
+    );
+}
+
 // A receiver's session ends with the token it was made with: on sign-out, and on revocation
 #[tokio::test]
 async fn r3cast_receiver_sessions_end_with_their_token() {
