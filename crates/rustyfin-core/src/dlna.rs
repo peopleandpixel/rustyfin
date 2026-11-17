@@ -1,4 +1,4 @@
-use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -25,6 +25,39 @@ pub struct DlnaConfig {
     pub server_id: String,
     pub http_port: u16,
     pub bind_ip: Ipv4Addr,
+    /// The published server URL, which the SSDP `LOCATION` uses when it is set
+    pub published_url: Option<String>,
+}
+
+impl DlnaConfig {
+    /// The device description's URL for a client at `peer`: under the published server URL, else
+    /// at the address of the interface toward `peer` (`net_addr::smart_api_url`).
+    fn location(&self, peer: IpAddr) -> String {
+        let base = crate::net_addr::smart_api_url(
+            self.published_url.as_deref(),
+            self.bind_ip.into(),
+            self.http_port,
+            peer,
+        );
+        format!("{base}/dlna/description.xml")
+    }
+
+    /// The ssdp:alive announcement for clients reached through `peer`.
+    fn alive(&self, peer: IpAddr) -> String {
+        let location = self.location(peer);
+        let usn = format!("uuid:{}", self.server_id);
+        format!(
+            "NOTIFY * HTTP/1.1\r\n\
+             HOST: 239.255.255.250:1900\r\n\
+             CACHE-CONTROL: max-age=1800\r\n\
+             LOCATION: {location}\r\n\
+             NT: upnp:rootdevice\r\n\
+             NTS: ssdp:alive\r\n\
+             SERVER: {SSDP_SERVER}\r\n\
+             USN: {usn}::upnp:rootdevice\r\n\
+             \r\n"
+        )
+    }
 }
 
 /// The server configuration as it is now: SSDP reads `EnableDlnaServer` from it on every request
@@ -137,10 +170,7 @@ pub async fn serve_ssdp(
 }
 
 async fn handle_msearch(sock: &TokioUdpSocket, src: SocketAddr, config: &DlnaConfig) {
-    let location = format!(
-        "http://{}:{}/dlna/description.xml",
-        config.bind_ip, config.http_port
-    );
+    let location = config.location(src.ip());
     let usn = format!("uuid:{}", config.server_id);
 
     let response = format!(
@@ -188,24 +218,7 @@ pub async fn run_ssdp_advertiser_to(
         }
     };
 
-    let location = format!(
-        "http://{}:{}/dlna/description.xml",
-        config.bind_ip, config.http_port
-    );
     let usn = format!("uuid:{}", config.server_id);
-
-    let notify = format!(
-        "NOTIFY * HTTP/1.1\r\n\
-         HOST: 239.255.255.250:1900\r\n\
-         CACHE-CONTROL: max-age=1800\r\n\
-         LOCATION: {location}\r\n\
-         NT: upnp:rootdevice\r\n\
-         NTS: ssdp:alive\r\n\
-         SERVER: {SSDP_SERVER}\r\n\
-         USN: {usn}::upnp:rootdevice\r\n\
-         \r\n"
-    );
-
     let byebye = format!(
         "NOTIFY * HTTP/1.1\r\n\
          HOST: 239.255.255.250:1900\r\n\
@@ -232,10 +245,12 @@ pub async fn run_ssdp_advertiser_to(
             }
             _ = interval.tick() => {
                 let on = dlna_on(&settings).await;
+                // The alive's LOCATION is the address of the interface toward the multicast
+                // group, looked up for each announcement as interfaces come and go
                 let message = match alive_at {
                     Some(at) if on && at.elapsed() < ALIVE_EVERY => None,
-                    _ if on => Some(&notify),
-                    Some(_) => Some(&byebye),
+                    _ if on => Some(config.alive(target.ip())),
+                    Some(_) => Some(byebye.clone()),
                     None => None,
                 };
                 alive_at = match (on, alive_at) {
@@ -388,6 +403,7 @@ mod tests {
             server_id: "test-id".to_string(),
             http_port: 8096,
             bind_ip: Ipv4Addr::LOCALHOST,
+            published_url: None,
         }
     }
 
@@ -454,6 +470,73 @@ mod tests {
         tokio::time::timeout(long, task).await.unwrap().unwrap();
     }
 
+    /// Bound to every interface (`0.0.0.0`), the search answer and the alive announcement name the
+    /// address of the interface toward the client, or the published URL when one is set; never
+    /// `0.0.0.0`.
+    #[tokio::test]
+    async fn r3security_ssdp_location_is_a_reachable_address() {
+        for (published, expected) in [
+            (
+                None,
+                "LOCATION: http://127.0.0.1:8096/dlna/description.xml\r\n",
+            ),
+            (
+                Some("https://media.example/jf/"),
+                "LOCATION: https://media.example/jf/dlna/description.xml\r\n",
+            ),
+        ] {
+            let config = DlnaConfig {
+                bind_ip: Ipv4Addr::UNSPECIFIED,
+                published_url: published.map(str::to_string),
+                ..r3parental_config()
+            };
+            let settings = r3parental_settings(true);
+            let sock = TokioUdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+                .await
+                .unwrap();
+            let server = sock.local_addr().unwrap();
+            let (stop, mut shutdown) = watch::channel(false);
+            let (serving, searched) = (settings.clone(), config.clone());
+            let responder =
+                tokio::spawn(
+                    async move { serve_ssdp(&sock, &searched, &serving, &mut shutdown).await },
+                );
+            let client = TokioUdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+                .await
+                .unwrap();
+            let search = "M-SEARCH * HTTP/1.1\r\nMAN: \"ssdp:discover\"\r\nST: ssdp:all\r\n\r\n";
+            client.send_to(search.as_bytes(), server).await.unwrap();
+            let answer = next_message(&client, Duration::from_secs(5))
+                .await
+                .expect("a search answer");
+            assert!(answer.contains(expected), "{answer}");
+
+            let target = client.local_addr().unwrap();
+            let advertiser = tokio::spawn(run_ssdp_advertiser_to(
+                Arc::new(config),
+                settings,
+                target,
+                Duration::from_millis(20),
+                stop.subscribe(),
+            ));
+            let alive = next_message(&client, Duration::from_secs(5))
+                .await
+                .expect("an alive announcement");
+            assert!(alive.contains("NTS: ssdp:alive"), "{alive}");
+            assert!(alive.contains(expected), "{alive}");
+            stop.send(true).unwrap();
+            let long = Duration::from_secs(5);
+            tokio::time::timeout(long, advertiser)
+                .await
+                .unwrap()
+                .unwrap();
+            tokio::time::timeout(long, responder)
+                .await
+                .unwrap()
+                .unwrap();
+        }
+    }
+
     #[tokio::test]
     async fn r3parental_ssdp_answers_searches_only_while_dlna_is_on() {
         let settings = r3parental_settings(true);
@@ -503,6 +586,7 @@ mod tests {
             server_id: "test-id".to_string(),
             http_port: 8096,
             bind_ip: Ipv4Addr::LOCALHOST,
+            published_url: None,
         };
         let xml = device_description_xml(&config);
         let model_number = format!("<modelNumber>{}</modelNumber>", env!("CARGO_PKG_VERSION"));

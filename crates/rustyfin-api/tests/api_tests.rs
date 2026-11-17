@@ -41521,6 +41521,45 @@ async fn r3security_dlna_stream_refuses_files_out_of_the_library() {
     );
 }
 
+/// A server bound to `0.0.0.0` gives DLNA renderers stream URLs at the address of the interface
+/// they reach it on (here loopback), or under the published server URL when one is set; never
+/// at `0.0.0.0`.
+#[tokio::test]
+async fn r3security_dlna_stream_urls_use_a_reachable_address() {
+    let mut state = test_state().await;
+    assert_eq!(state.bind_addr.as_str(), "0.0.0.0:8096");
+    let (_, admin) = admin_session(&state).await;
+    {
+        let mut config = state.config.write().await;
+        config.enable_dlna_server = true;
+        config.dlna_default_user_id = Some(admin.to_string());
+    }
+    let lib = std::path::PathBuf::from(media_folder(&state, "r3security-urls"));
+    let film = lib.join("Film.mkv");
+    std::fs::write(&film, b"film").unwrap();
+    let id = r3playback_insert_item(&state, &lib, film.to_str().unwrap()).await;
+    let path = format!("/Dlna/{}/Items/{id}/Stream", state.server_id);
+
+    let browse = |app: axum::Router| async move {
+        let req = R2Parental::dlna_browse_request(&id.to_string(), "BrowseMetadata");
+        g1_send_raw(&app, req).await
+    };
+    let (status, xml) = browse(app(state.clone())).await;
+    assert_eq!(status, StatusCode::OK, "{xml}");
+    assert!(
+        xml.contains(&format!("http://127.0.0.1:8096{path}")),
+        "{xml}"
+    );
+    assert!(!xml.contains("0.0.0.0"), "{xml}");
+
+    state.published_url = Some(Arc::new("https://media.example/jf/".to_string()));
+    let (_, xml) = browse(app(state)).await;
+    assert!(
+        xml.contains(&format!("https://media.example/jf{path}")),
+        "{xml}"
+    );
+}
+
 #[tokio::test]
 async fn r3playback_subtitle_routes_refuse_files_out_of_the_library() {
     let state = test_state().await;

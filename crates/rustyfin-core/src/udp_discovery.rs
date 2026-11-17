@@ -117,8 +117,15 @@ fn handle_discovery_request(
     config: &UdpDiscoveryConfig,
     name: String,
 ) {
+    // Jellyfin's GetSmartApiUrl for the sender: the published URL, else the address of the
+    // interface toward it (never 0.0.0.0, which no client can connect to)
     let response = DiscoveryResponse {
-        address: format!("http://{}:{}", config.bind_ip, config.http_port),
+        address: crate::net_addr::smart_api_url(
+            config.endpoint_address.as_deref(),
+            config.bind_ip.into(),
+            config.http_port,
+            src.ip(),
+        ),
         id: config.server_id.clone(),
         name,
         endpoint_address: config.endpoint_address.clone(),
@@ -200,5 +207,44 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
+    }
+
+    /// Bound to every interface, the reply's Address is the interface toward the client, or the
+    /// published URL when one is set; never `0.0.0.0`.
+    #[tokio::test]
+    async fn r3security_discovery_address_is_a_reachable_address() {
+        for (published, expected) in [
+            (None, "http://127.0.0.1:8096"),
+            (
+                Some("https://media.example/jf/"),
+                "https://media.example/jf",
+            ),
+        ] {
+            let settings: LiveConfig = Arc::default();
+            let config = UdpDiscoveryConfig {
+                server_id: "server-id".to_string(),
+                http_port: 8096,
+                bind_ip: Ipv4Addr::UNSPECIFIED,
+                endpoint_address: published.map(str::to_string),
+            };
+            let sock = TokioUdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+                .await
+                .unwrap();
+            let server = sock.local_addr().unwrap();
+            let (stop, shutdown) = watch::channel(false);
+            let task = tokio::spawn(async move {
+                serve_udp_discovery(&sock, &config, &settings, shutdown).await;
+            });
+            let client = TokioUdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+                .await
+                .unwrap();
+            let reply = ask(&client, server).await;
+            assert_eq!(reply["Address"], expected, "{reply}");
+            stop.send(true).unwrap();
+            tokio::time::timeout(Duration::from_secs(5), task)
+                .await
+                .unwrap()
+                .unwrap();
+        }
     }
 }

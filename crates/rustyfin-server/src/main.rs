@@ -620,6 +620,7 @@ async fn main() {
             server_id: state.server_id.to_string(),
             http_port,
             bind_ip: std::net::Ipv4Addr::UNSPECIFIED,
+            published_url: state.published_url.as_deref().cloned(),
         });
         let shutdown_rx = state.shutdown_tx.subscribe();
         let (cfg, settings) = (dlna_config.clone(), state.config.clone());
