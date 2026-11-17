@@ -53770,6 +53770,11 @@ fn r3item2_web() {
     b124_node_test("r3item2_web.mjs");
 }
 
+#[test]
+fn r3item2_web_stale() {
+    b124_node_test("r3item2_stale.mjs");
+}
+
 /// A library in the test's data dir with one movie whose file holds 4000 known bytes, and one
 /// series (a folder). Returns the library folder, the movie, the series and the file's bytes.
 async fn r3item2_library(
