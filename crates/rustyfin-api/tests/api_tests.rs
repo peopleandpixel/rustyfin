@@ -29835,6 +29835,67 @@ async fn r3missing_next_up_skips_virtual_episodes() {
 }
 
 #[tokio::test]
+async fn r3missing_marking_a_series_played_skips_virtual_episodes() {
+    let w = r3missing_world().await;
+    let uri = format!("/Users/{}/PlayedItems/{}", w.owner_id, w.ids["series"]);
+    let (status, _) = send_authed(&w.app, "POST", &uri, &w.owner, None).await;
+    assert!(status.is_success());
+    for (key, played) in [
+        ("s1e1", true),
+        ("s1e3", true),
+        ("s1e2", false),
+        ("s2e1", false),
+    ] {
+        let item = w
+            .get(&format!("/Users/{}/Items/{}", w.owner_id, w.ids[key]))
+            .await;
+        assert_eq!(item["UserData"]["Played"], played, "{key}: {item}");
+    }
+    let series = w
+        .get(&format!("/Users/{}/Items/{}", w.owner_id, w.ids["series"]))
+        .await;
+    assert_eq!(series["UserData"]["Played"], true, "{series}");
+
+    // Unmarking leaves them alone too
+    let (status, _) = send_authed(&w.app, "DELETE", &uri, &w.owner, None).await;
+    assert!(status.is_success());
+    let s1e1 = w
+        .get(&format!("/Users/{}/Items/{}", w.owner_id, w.ids["s1e1"]))
+        .await;
+    assert_eq!(s1e1["UserData"]["Played"], false);
+}
+
+#[tokio::test]
+async fn r3missing_search_and_playback_skip_virtual_episodes() {
+    let w = r3missing_world().await;
+    // 12.4's SqlSearchProvider leaves virtual items out
+    let hints = w
+        .get(&format!(
+            "/Search/Hints?SearchTerm=Episode&userId={}",
+            w.owner_id
+        ))
+        .await;
+    let mut names: Vec<&str> = hints["SearchHints"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|h| h["Name"].as_str())
+        .collect();
+    names.sort();
+    assert_eq!(names, vec!["Episode One", "Episode Three"], "{hints}");
+
+    // No file, no stream: MediaSources empty and NoCompatibleStream (12.4 MediaInfoHelper)
+    let uri = format!(
+        "/Items/{}/PlaybackInfo?userId={}",
+        w.ids["s1e2"], w.owner_id
+    );
+    let (status, info) = send_authed(&w.app, "POST", &uri, &w.owner, Some("{}")).await;
+    assert_eq!(status, StatusCode::OK, "{info}");
+    assert_eq!(info["MediaSources"], serde_json::json!([]), "{info}");
+    assert_eq!(info["ErrorCode"], "NoCompatibleStream", "{info}");
+}
+
+#[tokio::test]
 async fn r3missing_counts_leave_virtual_items_out() {
     let w = r3missing_world().await;
     let series = w

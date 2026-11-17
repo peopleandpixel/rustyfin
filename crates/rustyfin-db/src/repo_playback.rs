@@ -395,14 +395,18 @@ pub async fn get_stream_choice(
 
 /// The episodes under a Series (through its seasons) or a Season, as a CTE `eps(id)` over `?1`.
 /// Other items have none. Jellyfin's Folder.MarkPlayed/MarkUnplayed reach these episodes.
+// Virtual episodes (missing and unaired, no file) are left out, as Jellyfin 12.4's
+// Folder.MarkPlayed leaves them: a file that later takes one over must not arrive played.
 const EPISODES_UNDER_FOLDER: &str = "WITH eps(id) AS ( \
      SELECT e.id FROM media_items f \
      JOIN media_items s ON s.parent_id = f.id AND s.media_type = 'Season' \
      JOIN media_items e ON e.parent_id = s.id AND e.media_type = 'Episode' \
+       AND e.is_virtual_item = 0 \
      WHERE f.id = ?1 AND f.media_type = 'Series' \
      UNION \
      SELECT e.id FROM media_items f \
      JOIN media_items e ON e.parent_id = f.id AND e.media_type = 'Episode' \
+       AND e.is_virtual_item = 0 \
      WHERE f.id = ?1 AND f.media_type = 'Season' ) ";
 
 /// Marks an item played for the user now. See `mark_played_on`.
