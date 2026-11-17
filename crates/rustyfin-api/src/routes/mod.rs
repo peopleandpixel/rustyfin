@@ -16,6 +16,7 @@ mod instant_mix;
 mod item_download;
 pub(crate) mod items;
 mod jellyfin_import;
+mod latest;
 pub(crate) mod library;
 mod library_monitor;
 mod live_tv;

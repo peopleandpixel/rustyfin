@@ -51546,9 +51546,9 @@ fn r3queues_ids(body: &serde_json::Value) -> Vec<uuid::Uuid> {
         .collect()
 }
 
-/// Jellyfin's `TvShowsController.GetEpisodes`: `startItemId` drops the episodes before it,
-/// `adjacentTo` keeps it and its neighbours (only the first episode when it is not in the list),
-/// `isMissing` filters on Virtual episodes, and the count is of the filtered list.
+/// Jellyfin 12.4's `TvShowsController.GetEpisodes`: `startItemId` drops the episodes before it,
+/// `adjacentTo` keeps it and its neighbours (nothing when it is not in the list), `isMissing`
+/// filters on Virtual episodes, and the count is of the filtered list.
 #[tokio::test]
 async fn r3queues_episodes_start_item_adjacent_and_missing() {
     let state = test_state().await;
@@ -51569,7 +51569,7 @@ async fn r3queues_episodes_start_item_adjacent_and_missing() {
         (format!("{base}&adjacentTo={e2}"), vec![e1, e2, e3]),
         (format!("{base}&adjacentTo={e1}"), vec![e1, e2]),
         (format!("{base}&adjacentTo={e3}&limit=3"), vec![e2, e3]),
-        (format!("{base}&adjacentTo={stranger}"), vec![e1]),
+        (format!("{base}&adjacentTo={stranger}"), vec![]),
         (
             format!("{base}&startItemId={e2}&adjacentTo={e3}"),
             vec![e2, e3],
@@ -51701,9 +51701,10 @@ async fn r3queues_next_up_date_cutoff_and_rewatching() {
     }
 }
 
-/// Latest groups new episodes under their series with `ChildCount` (`groupItems`, default true),
-/// hides played items while the user's `HidePlayedInLatest` is on (the default), and takes
-/// `isPlayed` and every `includeItemTypes` value.
+/// Latest in a TV library (Jellyfin 12.4): new episodes of a one-season series show as the
+/// series, a single one as itself; played items are hidden while the user's
+/// `HidePlayedInLatest` is on (the default); `isPlayed`, `groupItems=false` and every
+/// `includeItemTypes` value are read.
 #[tokio::test]
 async fn r3queues_latest_group_items_and_is_played() {
     let state = test_state().await;
@@ -51714,7 +51715,6 @@ async fn r3queues_latest_group_items_and_is_played() {
     let (status, body) = r3queues_get(&app, &token, "/Items/Latest").await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(r3queues_ids(&body), vec![series]);
-    assert_eq!(body[0]["ChildCount"], 3);
 
     let (_, body) = r3queues_get(&app, &token, "/Items/Latest?groupItems=false").await;
     let mut ids = r3queues_ids(&body);
@@ -51722,12 +51722,6 @@ async fn r3queues_latest_group_items_and_is_played() {
     let mut all = vec![e1, e2, e3];
     all.sort();
     assert_eq!(ids, all);
-    assert!(
-        body.as_array()
-            .unwrap()
-            .iter()
-            .all(|i| i["ChildCount"] == 0)
-    );
 
     let (_, body) = r3queues_get(
         &app,
@@ -51737,18 +51731,22 @@ async fn r3queues_latest_group_items_and_is_played() {
     .await;
     assert_eq!(body.as_array().unwrap().len(), 2, "limit and both types");
 
-    rustyfin_db::repo_playback::mark_played(&state.db, user, e1)
-        .await
-        .unwrap();
+    for played in [e1, e2] {
+        rustyfin_db::repo_playback::mark_played(&state.db, user, played)
+            .await
+            .unwrap();
+    }
+    // One unplayed new episode out of three is shown as itself.
     let (_, body) = r3queues_get(&app, &token, "/Items/Latest").await;
-    assert_eq!(r3queues_ids(&body), vec![series]);
-    assert_eq!(body[0]["ChildCount"], 2, "the played episode is hidden");
-    // One new item in a group is shown as itself.
-    let (_, body) = r3queues_get(&app, &token, "/Items/Latest?isPlayed=true").await;
-    assert_eq!(r3queues_ids(&body), vec![e1]);
-    assert_eq!(body[0]["ChildCount"], 0);
+    assert_eq!(
+        r3queues_ids(&body),
+        vec![e3],
+        "the played episodes are hidden"
+    );
     let (_, body) = r3queues_get(&app, &token, &format!("/Users/{user}/Items/Latest")).await;
-    assert_eq!(body[0]["ChildCount"], 2, "the legacy route");
+    assert_eq!(r3queues_ids(&body), vec![e3], "the legacy route");
+    let (_, body) = r3queues_get(&app, &token, "/Items/Latest?isPlayed=true").await;
+    assert_eq!(r3queues_ids(&body), vec![series], "two played: the series");
 
     // With HidePlayedInLatest off, played items count again.
     rustyfin_db::repo_user::update_configuration(
@@ -51759,7 +51757,7 @@ async fn r3queues_latest_group_items_and_is_played() {
     .await
     .unwrap();
     let (_, body) = r3queues_get(&app, &token, "/Items/Latest").await;
-    assert_eq!(body[0]["ChildCount"], 3);
+    assert_eq!(r3queues_ids(&body), vec![series]);
 }
 
 /// UserViews leaves out the user's `MyMediaExcludes` unless `includeHidden=true`.
@@ -51889,76 +51887,251 @@ async fn r3queues_library_of(state: &AppState, item: uuid::Uuid) -> String {
         .unwrap()
 }
 
-/// A series with many new episodes doesn't leave the Latest row short: candidates are read until
-/// there are `limit` entries.
+/// A made-up library of `content_type`; returns its id.
+async fn r3queues_library(
+    state: &AppState,
+    name: &str,
+    content_type: rustyfin_model::library::LibraryContentType,
+) -> String {
+    let library = rustyfin_model::library::Library {
+        id: uuid::Uuid::new_v4(),
+        name: name.to_string(),
+        content_type,
+        paths: vec![media_folder(state, name)],
+    };
+    rustyfin_db::repo_library::create_library(&state.db, &library)
+        .await
+        .unwrap();
+    library.id.to_string()
+}
+
+/// Jellyfin 12.4's TV "Latest": per series, its episodes added within 24 hours of its newest
+/// one. One gives that episode; several in one season give the season when the series has more
+/// seasons, else the series; several seasons give the series. Newest series first.
 #[tokio::test]
-async fn r3queues_latest_fills_the_limit_past_a_busy_series() {
+async fn r3queues_latest_tv_picks_episode_season_or_series() {
+    use rustyfin_model::library::LibraryContentType;
     let state = test_state().await;
     let app = app(state.clone());
     let (token, _) = admin_session(&state).await;
-    let (series, [e1, _, _]) = g1f_insert_show(&state).await;
-    let season = b93_season_of(&state, e1).await;
-    let library = r3queues_library_of(&state, e1).await;
-    for n in 0..50 {
-        let created = format!("2030-02-01T00:{:02}:00+00:00", n);
-        r3queues_insert(&state, &library, "Episode", Some(season), 10 + n, &created).await;
+    let tv = r3queues_library(&state, "r3q-tv", LibraryContentType::TvShows).await;
+    let old = "2020-01-01T00:00:00+00:00";
+    // Two seasons, two new episodes in the second: the season.
+    let two_new = r3queues_insert(&state, &tv, "Series", None, 0, old).await;
+    let s1 = r3queues_insert(&state, &tv, "Season", Some(two_new), 1, old).await;
+    let s2 = r3queues_insert(&state, &tv, "Season", Some(two_new), 2, old).await;
+    r3queues_insert(&state, &tv, "Episode", Some(s1), 1, old).await;
+    r3queues_insert(
+        &state,
+        &tv,
+        "Episode",
+        Some(s2),
+        1,
+        "2030-03-01T00:00:00+00:00",
+    )
+    .await;
+    r3queues_insert(
+        &state,
+        &tv,
+        "Episode",
+        Some(s2),
+        2,
+        "2030-03-01T05:00:00+00:00",
+    )
+    .await;
+    // One season, one new episode out of two: the episode.
+    let one_new = r3queues_insert(&state, &tv, "Series", None, 0, old).await;
+    let s = r3queues_insert(&state, &tv, "Season", Some(one_new), 1, old).await;
+    r3queues_insert(&state, &tv, "Episode", Some(s), 1, old).await;
+    let lone = r3queues_insert(
+        &state,
+        &tv,
+        "Episode",
+        Some(s),
+        2,
+        "2030-02-01T00:00:00+00:00",
+    )
+    .await;
+    // One season, two new episodes: the series.
+    let single_season = r3queues_insert(&state, &tv, "Series", None, 0, old).await;
+    let s = r3queues_insert(&state, &tv, "Season", Some(single_season), 1, old).await;
+    for n in 1..=2 {
+        r3queues_insert(
+            &state,
+            &tv,
+            "Episode",
+            Some(s),
+            n,
+            "2030-02-10T00:00:00+00:00",
+        )
+        .await;
     }
-    let mut movies = Vec::new();
-    for n in 0..5 {
-        let created = format!("2030-01-0{}T00:00:00+00:00", n + 1);
-        movies.push(r3queues_insert(&state, &library, "Movie", None, n, &created).await);
+    // New episodes in two seasons: the series.
+    let across = r3queues_insert(&state, &tv, "Series", None, 0, old).await;
+    for n in 1..=2 {
+        let s = r3queues_insert(&state, &tv, "Season", Some(across), n, old).await;
+        r3queues_insert(
+            &state,
+            &tv,
+            "Episode",
+            Some(s),
+            1,
+            "2030-02-15T00:00:00+00:00",
+        )
+        .await;
     }
-    let (status, body) = r3queues_get(&app, &token, "/Items/Latest?limit=6").await;
+
+    let (status, body) = r3queues_get(&app, &token, &format!("/Items/Latest?parentId={tv}")).await;
     assert_eq!(status, StatusCode::OK);
-    let ids = r3queues_ids(&body);
-    assert_eq!(ids.len(), 6, "{body}");
-    assert_eq!(ids[0], series);
-    let mut rest = ids[1..].to_vec();
-    rest.sort();
-    movies.sort();
-    assert_eq!(rest, movies);
-    assert!(body[0]["ChildCount"].as_i64().unwrap() >= 50);
+    assert_eq!(r3queues_ids(&body), vec![s2, across, single_season, lone]);
+    let (_, body) = r3queues_get(
+        &app,
+        &token,
+        &format!("/Items/Latest?parentId={tv}&limit=2"),
+    )
+    .await;
+    assert_eq!(r3queues_ids(&body), vec![s2, across]);
 }
 
-/// Without `parentId`, the played filter is ignored when one of the user's libraries is music;
-/// with a non-music `parentId` it applies.
+/// Jellyfin 12.4's other "Latest" paths: a movie library lists its newest items, a music
+/// library its newest albums (the played filter doesn't apply), and a mixed library its newest
+/// non-episodes merged with the TV result.
 #[tokio::test]
-async fn r3queues_latest_ignores_is_played_with_a_music_library() {
+async fn r3queues_latest_movies_music_and_mixed() {
+    use rustyfin_model::library::LibraryContentType;
     let state = test_state().await;
     let app = app(state.clone());
     let (token, user) = admin_session(&state).await;
-    let (_, [e1, _, _]) = g1f_insert_show(&state).await;
-    let tv = r3queues_library_of(&state, e1).await;
-    rustyfin_db::repo_playback::mark_played(&state.db, user, e1)
-        .await
-        .unwrap();
-    let (_, body) = r3queues_get(&app, &token, "/Items/Latest").await;
-    assert_eq!(body[0]["ChildCount"], 2, "no music library: played hidden");
-    let music = rustyfin_model::library::Library {
-        id: uuid::Uuid::new_v4(),
-        name: "R3Q Music".to_string(),
-        content_type: rustyfin_model::library::LibraryContentType::Music,
-        paths: vec![media_folder(&state, "r3q-music")],
-    };
-    rustyfin_db::repo_library::create_library(&state.db, &music)
-        .await
-        .unwrap();
-    let (_, body) = r3queues_get(&app, &token, "/Items/Latest").await;
-    assert_eq!(body[0]["ChildCount"], 3, "a music library: played kept");
-    let (_, body) = r3queues_get(&app, &token, "/Items/Latest?isPlayed=false").await;
-    assert_eq!(body[0]["ChildCount"], 3, "even when asked for");
-    let (_, body) = r3queues_get(&app, &token, &format!("/Items/Latest?parentId={tv}")).await;
-    assert_eq!(body[0]["ChildCount"], 2, "the TV library alone");
-    // Excluded from Latest, the music library no longer counts.
-    rustyfin_db::repo_user::update_configuration(
-        &state.db,
-        user,
-        &serde_json::json!({ "LatestItemsExcludes": [music.id.to_string()] }),
+
+    let movies = r3queues_library(&state, "r3q-movies", LibraryContentType::Movies).await;
+    let m1 = r3queues_insert(
+        &state,
+        &movies,
+        "Movie",
+        None,
+        1,
+        "2030-01-01T00:00:00+00:00",
     )
-    .await
-    .unwrap();
-    let (_, body) = r3queues_get(&app, &token, "/Items/Latest").await;
-    assert_eq!(body[0]["ChildCount"], 2);
+    .await;
+    let m2 = r3queues_insert(
+        &state,
+        &movies,
+        "Movie",
+        None,
+        2,
+        "2030-01-02T00:00:00+00:00",
+    )
+    .await;
+    let m3 = r3queues_insert(
+        &state,
+        &movies,
+        "Movie",
+        None,
+        3,
+        "2030-01-03T00:00:00+00:00",
+    )
+    .await;
+    let uri = format!("/Items/Latest?parentId={movies}");
+    assert_eq!(
+        r3queues_ids(&r3queues_get(&app, &token, &uri).await.1),
+        vec![m3, m2, m1]
+    );
+    let uri = format!("/Items/Latest?parentId={movies}&limit=2");
+    assert_eq!(
+        r3queues_ids(&r3queues_get(&app, &token, &uri).await.1),
+        vec![m3, m2]
+    );
+
+    let music = r3queues_library(&state, "r3q-music", LibraryContentType::Music).await;
+    let older = r3queues_insert(
+        &state,
+        &music,
+        "MusicAlbum",
+        None,
+        1,
+        "2029-01-01T00:00:00+00:00",
+    )
+    .await;
+    let newer = r3queues_insert(
+        &state,
+        &music,
+        "MusicAlbum",
+        None,
+        2,
+        "2030-01-01T00:00:00+00:00",
+    )
+    .await;
+    let track = r3queues_insert(
+        &state,
+        &music,
+        "Audio",
+        Some(newer),
+        1,
+        "2030-01-01T00:00:00+00:00",
+    )
+    .await;
+    r3queues_insert(
+        &state,
+        &music,
+        "Audio",
+        Some(older),
+        1,
+        "2029-01-01T00:00:00+00:00",
+    )
+    .await;
+    rustyfin_db::repo_playback::mark_played(&state.db, user, track)
+        .await
+        .unwrap();
+    for uri in [
+        format!("/Items/Latest?parentId={music}"),
+        format!("/Items/Latest?parentId={music}&isPlayed=false"),
+    ] {
+        let (_, body) = r3queues_get(&app, &token, &uri).await;
+        assert_eq!(r3queues_ids(&body), vec![newer, older], "{uri}");
+    }
+
+    let mixed = r3queues_library(&state, "r3q-mixed", LibraryContentType::Mixed).await;
+    let film = r3queues_insert(
+        &state,
+        &mixed,
+        "Movie",
+        None,
+        1,
+        "2030-05-02T00:00:00+00:00",
+    )
+    .await;
+    let series = r3queues_insert(
+        &state,
+        &mixed,
+        "Series",
+        None,
+        0,
+        "2030-05-03T00:00:00+00:00",
+    )
+    .await;
+    let season = r3queues_insert(
+        &state,
+        &mixed,
+        "Season",
+        Some(series),
+        1,
+        "2020-01-01T00:00:00+00:00",
+    )
+    .await;
+    for n in 1..=2 {
+        r3queues_insert(
+            &state,
+            &mixed,
+            "Episode",
+            Some(season),
+            n,
+            "2030-05-01T00:00:00+00:00",
+        )
+        .await;
+    }
+    // Merged by date added: the series' own date is the newest.
+    let (_, body) = r3queues_get(&app, &token, &format!("/Items/Latest?parentId={mixed}")).await;
+    assert_eq!(r3queues_ids(&body), vec![series, film]);
 }
 
 /// `LatestItemsExcludes` leaves its libraries out of Latest without `parentId`, and only them.
@@ -52044,10 +52217,9 @@ async fn r3queues_user_id_lists_follow_that_users_access() {
     assert_eq!(r3queues_ids(&body), vec![e2]);
 }
 
-/// `nextUpDateCutoff` reads the newest finished play: a later play still in progress doesn't
-/// keep the series in.
+/// `nextUpDateCutoff` reads the newest play, a partial one included, as Jellyfin 12.4 does.
 #[tokio::test]
-async fn r3queues_next_up_cutoff_reads_finished_plays() {
+async fn r3queues_next_up_cutoff_counts_partial_plays() {
     let state = test_state().await;
     let app = app(state.clone());
     let (token, user) = admin_session(&state).await;
@@ -52063,7 +52235,7 @@ async fn r3queues_next_up_cutoff_reads_finished_plays() {
         .await
         .unwrap();
     let (_, body) = r3queues_get(&app, &token, "/Shows/NextUp?nextUpDateCutoff=2020-01-01").await;
+    assert_eq!(r3queues_ids(&body), vec![e2], "the partial play is today");
+    let (_, body) = r3queues_get(&app, &token, "/Shows/NextUp?nextUpDateCutoff=2999-01-01").await;
     assert_eq!(r3queues_ids(&body), Vec::<uuid::Uuid>::new());
-    let (_, body) = r3queues_get(&app, &token, "/Shows/NextUp?nextUpDateCutoff=2010-01-01").await;
-    assert_eq!(r3queues_ids(&body), vec![e2]);
 }

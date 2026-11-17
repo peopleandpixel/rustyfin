@@ -705,89 +705,208 @@ pub async fn delete_item(pool: &SqlitePool, id: Uuid) -> Result<bool, sqlx::Erro
     Ok(root_deleted)
 }
 
-/// What `get_latest_items` lists: Jellyfin's `UserViewManager.GetItemsForLatestItems` query.
+/// What a "Latest" row reads: Jellyfin 12.4's `UserViewManager.GetItemsForLatestItems` query.
 #[derive(Debug, Clone, Default)]
 pub struct LatestFilter {
     /// The user whose played state `is_played` reads.
     pub user_id: Option<Uuid>,
-    /// Stored kinds to list (`Movie`, `Episode`, ...). Empty means every non-folder kind.
+    /// Stored kinds to list (`Movie`, `Episode`, ...).
     pub item_types: Vec<String>,
-    /// Only this library.
-    pub library_id: Option<Uuid>,
-    /// Leave these libraries out (the user's `LatestItemsExcludes`).
-    pub exclude_libraries: Vec<Uuid>,
+    /// The libraries read (Jellyfin's parents).
+    pub library_ids: Vec<Uuid>,
     /// Only played (true) or unplayed (false) items.
     pub is_played: Option<bool>,
-    pub limit: i64,
-    /// Rows to skip, to read the next page.
-    pub offset: i64,
     pub hidden_ids_json: Option<String>,
 }
 
-/// The newest items for a "Latest" row, newest first (then sort name and year, descending, as
-/// Jellyfin orders them), each with the item Jellyfin groups it under: an episode's series, a
-/// track's album.
-pub async fn get_latest_items(
-    pool: &SqlitePool,
-    filter: &LatestFilter,
-) -> Result<Vec<(MediaItem, Option<Uuid>)>, sqlx::Error> {
-    // Jellyfin's IsFolder=false when no type is asked for.
-    const NON_FOLDER_KINDS: [&str; 5] = ["Movie", "Episode", "Audio", "Photo", "Video"];
-    let kinds: Vec<&str> = if filter.item_types.is_empty() {
-        NON_FOLDER_KINDS.to_vec()
-    } else {
-        filter.item_types.iter().map(String::as_str).collect()
-    };
-    let excluded: Vec<String> = filter
-        .exclude_libraries
-        .iter()
-        .map(Uuid::to_string)
-        .collect();
-    let rows = sqlx::query(sqlx::AssertSqlSafe(format!(
+/// A candidate of a "Latest" row, with the items Jellyfin groups it under.
+#[derive(Debug, Clone)]
+pub struct LatestRow {
+    pub item: MediaItem,
+    /// An episode's series.
+    pub series_id: Option<Uuid>,
+    /// An episode's season.
+    pub season_id: Option<Uuid>,
+    /// A track's album.
+    pub album_id: Option<Uuid>,
+}
+
+/// How `get_latest_items` orders and narrows the candidates.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LatestOrder {
+    /// Date added, then sort name and year, newest first (`GetItemsForLatestItems`).
+    Added,
+    /// Date added, then id, newest first (`GetLatestItemList`).
+    AddedThenId,
+}
+
+/// The candidates' SELECT (no ORDER or LIMIT) as a CTE body; binds ?1 to ?6.
+fn latest_candidates_sql() -> String {
+    format!(
         "SELECT m.id, m.name, m.sort_name, m.overview, m.media_type, m.path, m.parent_id, m.library_id, \
          m.production_year, m.community_rating, m.official_rating, m.genres, m.date_created, \
          m.premiere_date, m.runtime_ticks, m.index_number, m.parent_index_number, m.index_number_end, \
          m.location_type, m.tmdb_id, m.tvdb_id, \
          m.tags, m.status, m.original_language, m.tagline, m.production_countries, m.budget, m.revenue, \
          m.homepage, m.end_date, m.vote_count, m.popularity, \
-         CASE m.media_type \
-           WHEN 'Episode' THEN COALESCE( \
+         CASE WHEN m.media_type = 'Episode' THEN COALESCE( \
              (SELECT se.parent_id FROM media_items se WHERE se.id = m.parent_id AND se.media_type = 'Season'), \
              (SELECT s.id FROM media_items s WHERE s.id = m.parent_id AND s.media_type = 'Series')) \
-           WHEN 'Audio' THEN \
+         END AS series_id, \
+         CASE WHEN m.media_type = 'Episode' THEN \
+             (SELECT se.id FROM media_items se WHERE se.id = m.parent_id AND se.media_type = 'Season') \
+         END AS season_id, \
+         CASE WHEN m.media_type = 'Audio' THEN \
              (SELECT a.id FROM media_items a WHERE a.id = m.parent_id AND a.media_type = 'MusicAlbum') \
-         END AS container_id \
+         END AS album_id \
          FROM media_items m \
          WHERE m.media_type IN (SELECT value FROM json_each(?1)) \
-         AND (?2 IS NULL OR m.library_id = ?2) \
-         AND (m.library_id IS NULL OR m.library_id NOT IN (SELECT value FROM json_each(?3))) \
+         AND m.library_id IN (SELECT value FROM json_each(?2)) \
          AND m.extra_type IS NULL \
          AND m.location_type IS NOT 'Virtual' \
-         AND (?4 IS NULL OR EXISTS (SELECT 1 FROM user_item_data ud \
-              WHERE ud.item_id = m.id AND ud.user_id = ?5 AND ud.played = 1) = ?4) \
-         AND {visible} \
-         ORDER BY m.date_created DESC, m.sort_name DESC, m.production_year DESC, m.id \
-         LIMIT ?7 OFFSET ?8",
-        visible = crate::repo_parental::visible_sql("m.id", "m.library_id", "?6"),
-    )))
-    .bind(serde_json::to_string(&kinds).unwrap_or_default())
-    .bind(filter.library_id.map(|u| u.to_string()))
-    .bind(serde_json::to_string(&excluded).unwrap_or_default())
-    .bind(filter.is_played)
-    .bind(filter.user_id.map(|u| u.to_string()))
-    .bind(filter.hidden_ids_json.as_deref())
-    .bind(filter.limit)
-    .bind(filter.offset)
-    .fetch_all(pool)
-    .await?;
+         AND (?3 IS NULL OR EXISTS (SELECT 1 FROM user_item_data ud \
+              WHERE ud.item_id = m.id AND ud.user_id = ?4 AND ud.played = 1) = ?3) \
+         AND {visible}",
+        visible = crate::repo_parental::visible_sql("m.id", "m.library_id", "?5"),
+    )
+}
 
+fn bind_latest<'q>(
+    query: sqlx::query::Query<'q, Sqlite, sqlx::sqlite::SqliteArguments>,
+    filter: &'q LatestFilter,
+) -> sqlx::query::Query<'q, Sqlite, sqlx::sqlite::SqliteArguments> {
+    let libraries: Vec<String> = filter.library_ids.iter().map(Uuid::to_string).collect();
+    query
+        .bind(serde_json::to_string(&filter.item_types).unwrap_or_default())
+        .bind(serde_json::to_string(&libraries).unwrap_or_default())
+        .bind(filter.is_played)
+        .bind(filter.user_id.map(|u| u.to_string()))
+        .bind(filter.hidden_ids_json.as_deref())
+}
+
+fn uuid_col(row: &sqlx::sqlite::SqliteRow, name: &str) -> Result<Option<Uuid>, sqlx::Error> {
+    let value: Option<String> = row.try_get(name)?;
+    Ok(value.and_then(|v| Uuid::parse_str(&v).ok()))
+}
+
+/// The newest candidates of a "Latest" row, in `order`, at most `limit` (negative: all).
+/// `without_series` leaves episodes out (Jellyfin's `SeriesName == null`); `in_series` keeps only
+/// episodes of those series.
+pub async fn get_latest_items(
+    pool: &SqlitePool,
+    filter: &LatestFilter,
+    order: LatestOrder,
+    without_series: bool,
+    in_series: Option<&[Uuid]>,
+    limit: i64,
+) -> Result<Vec<LatestRow>, sqlx::Error> {
+    let order_sql = match order {
+        LatestOrder::Added => "date_created DESC, sort_name DESC, production_year DESC, id DESC",
+        LatestOrder::AddedThenId => "date_created DESC, id DESC",
+    };
+    let series: Option<String> = in_series.map(|ids| {
+        let ids: Vec<String> = ids.iter().map(Uuid::to_string).collect();
+        serde_json::to_string(&ids).unwrap_or_default()
+    });
+    let sql = format!(
+        "WITH c AS ({candidates}) SELECT * FROM c \
+         WHERE (?6 = 0 OR series_id IS NULL) \
+         AND (?7 IS NULL OR series_id IN (SELECT value FROM json_each(?7))) \
+         ORDER BY {order_sql} LIMIT ?8",
+        candidates = latest_candidates_sql(),
+    );
+    let rows = bind_latest(sqlx::query(sqlx::AssertSqlSafe(sql)), filter)
+        .bind(without_series)
+        .bind(series)
+        .bind(limit)
+        .fetch_all(pool)
+        .await?;
     let mut items = Vec::with_capacity(rows.len());
     for row in rows {
-        let item: MediaItem = <MediaItemRow as sqlx::FromRow<_>>::from_row(&row)?.into();
-        let container: Option<String> = row.try_get("container_id")?;
-        items.push((item, container.and_then(|c| Uuid::parse_str(&c).ok())));
+        items.push(LatestRow {
+            item: <MediaItemRow as sqlx::FromRow<_>>::from_row(&row)?.into(),
+            series_id: uuid_col(&row, "series_id")?,
+            season_id: uuid_col(&row, "season_id")?,
+            album_id: uuid_col(&row, "album_id")?,
+        });
     }
     Ok(items)
+}
+
+/// The series of the candidates with the newest additions, at most `limit`, each with its
+/// newest episode's `date_created` (Jellyfin 12.4's `GetLatestTvShowItems` step 1).
+pub async fn get_latest_series(
+    pool: &SqlitePool,
+    filter: &LatestFilter,
+    limit: i64,
+) -> Result<Vec<(Uuid, String)>, sqlx::Error> {
+    let sql = format!(
+        "WITH c AS ({candidates}) SELECT series_id, MAX(date_created) AS newest FROM c \
+         WHERE series_id IS NOT NULL GROUP BY series_id \
+         ORDER BY newest DESC, series_id DESC LIMIT ?6",
+        candidates = latest_candidates_sql(),
+    );
+    let rows: Vec<(String, String)> = bind_latest(sqlx::query(sqlx::AssertSqlSafe(sql)), filter)
+        .bind(limit)
+        .fetch_all(pool)
+        .await?
+        .iter()
+        .map(|row| Ok((row.try_get(0)?, row.try_get(1)?)))
+        .collect::<Result<_, sqlx::Error>>()?;
+    Ok(rows
+        .into_iter()
+        .filter_map(|(id, newest)| Some((Uuid::parse_str(&id).ok()?, newest)))
+        .collect())
+}
+
+/// How many children of `kind` each of `parents` has (all of them, whoever sees them).
+pub async fn count_children_of_kind(
+    pool: &SqlitePool,
+    parents: &[Uuid],
+    kind: &str,
+) -> Result<HashMap<Uuid, i64>, sqlx::Error> {
+    let ids: Vec<String> = parents.iter().map(Uuid::to_string).collect();
+    let rows: Vec<(String, i64)> = sqlx::query_as(
+        "SELECT parent_id, COUNT(*) FROM media_items \
+         WHERE parent_id IN (SELECT value FROM json_each(?1)) AND media_type = ?2 \
+         GROUP BY parent_id",
+    )
+    .bind(serde_json::to_string(&ids).unwrap_or_default())
+    .bind(kind)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .filter_map(|(id, n)| Some((Uuid::parse_str(&id).ok()?, n)))
+        .collect())
+}
+
+/// The newest albums of `filter`'s libraries, at most `limit`, by date added then id (Jellyfin
+/// 12.4's music "Latest", which reads the albums themselves and not their tracks).
+pub async fn get_latest_albums(
+    pool: &SqlitePool,
+    filter: &LatestFilter,
+    limit: i64,
+) -> Result<Vec<MediaItem>, sqlx::Error> {
+    let libraries: Vec<String> = filter.library_ids.iter().map(Uuid::to_string).collect();
+    let rows = sqlx::query_as::<_, MediaItemRow>(sqlx::AssertSqlSafe(format!(
+        "SELECT id, name, sort_name, overview, media_type, path, parent_id, library_id, \
+         production_year, community_rating, official_rating, genres, date_created, \
+         premiere_date, runtime_ticks, index_number, parent_index_number, index_number_end, location_type, tmdb_id, tvdb_id, \
+         tags, status, original_language, tagline, production_countries, budget, revenue, \
+         homepage, end_date, vote_count, popularity \
+         FROM media_items \
+         WHERE media_type = 'MusicAlbum' AND location_type IS NOT 'Virtual' \
+         AND library_id IN (SELECT value FROM json_each(?1)) AND {visible} \
+         ORDER BY date_created DESC, id DESC LIMIT ?3",
+        visible = crate::repo_parental::visible_sql("id", "library_id", "?2"),
+    )))
+    .bind(serde_json::to_string(&libraries).unwrap_or_default())
+    .bind(filter.hidden_ids_json.as_deref())
+    .bind(limit)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows.into_iter().map(Into::into).collect())
 }
 
 /// Query plan cache for `get_items_filtered`.
@@ -2970,21 +3089,19 @@ pub async fn get_next_up(
     let uid = user_id.map(|u| u.to_string());
 
     // Candidate series, each with its newest qualifying play.
-    // Each candidate with its newest qualifying play and its newest finished play.
-    let candidates: Vec<(String, Option<String>, Option<String>)> =
-        match (series_id, uid.as_deref()) {
-            (Some(sid), _) => sqlx::query_scalar::<_, String>(
-                "SELECT id FROM media_items WHERE id = ? AND media_type = 'Series'",
-            )
-            .bind(sid.to_string())
-            .fetch_optional(pool)
-            .await?
-            .map(|id| vec![(id, None, None)])
-            .unwrap_or_default(),
-            (None, Some(user)) => {
-                sqlx::query_as::<_, (String, Option<String>, Option<String>)>(
-                    "SELECT se.parent_id, MAX(ud.last_played_date), \
-                 MAX(CASE WHEN ud.played = 1 THEN ud.last_played_date END) \
+    // Each candidate with its newest qualifying play.
+    let candidates: Vec<(String, Option<String>)> = match (series_id, uid.as_deref()) {
+        (Some(sid), _) => sqlx::query_scalar::<_, String>(
+            "SELECT id FROM media_items WHERE id = ? AND media_type = 'Series'",
+        )
+        .bind(sid.to_string())
+        .fetch_optional(pool)
+        .await?
+        .map(|id| vec![(id, None)])
+        .unwrap_or_default(),
+        (None, Some(user)) => {
+            sqlx::query_as::<_, (String, Option<String>)>(
+                "SELECT se.parent_id, MAX(ud.last_played_date) \
                  FROM user_item_data ud \
                  JOIN media_items e ON e.id = ud.item_id AND e.media_type = 'Episode' \
                  JOIN media_items se ON se.id = e.parent_id AND se.media_type = 'Season' \
@@ -2992,30 +3109,27 @@ pub async fn get_next_up(
                  AND (ud.played = 1 OR ud.playback_position_ticks > 0) \
                  AND se.parent_id IS NOT NULL \
                  GROUP BY se.parent_id",
-                )
-                .bind(user)
-                .fetch_all(pool)
-                .await?
-            }
-            (None, None) => Vec::new(),
-        };
-    // Jellyfin's `nextUpDateCutoff`: a series whose newest finished play is older (or that has
-    // none) is left out. It does not apply to `series_id`.
+            )
+            .bind(user)
+            .fetch_all(pool)
+            .await?
+        }
+        (None, None) => Vec::new(),
+    };
+    // Jellyfin 12.4's `nextUpDateCutoff` (`NextUpService.GetNextUpSeriesKeys`): a series whose
+    // newest play, partial plays included, is older is left out. It does not apply to
+    // `series_id`.
     let candidates: Vec<(String, Option<String>)> = match options.date_cutoff {
         Some(cutoff) if series_id.is_none() => candidates
             .into_iter()
-            .filter(|(_, _, finished)| {
-                finished
+            .filter(|(_, newest)| {
+                newest
                     .as_deref()
                     .and_then(|d| DateTime::parse_from_rfc3339(d).ok())
                     .is_some_and(|d| d.with_timezone(&Utc) >= cutoff)
             })
-            .map(|(series, newest, _)| (series, newest))
             .collect(),
-        _ => candidates
-            .into_iter()
-            .map(|(series, newest, _)| (series, newest))
-            .collect(),
+        _ => candidates,
     };
 
     let mut entries = Vec::new();
