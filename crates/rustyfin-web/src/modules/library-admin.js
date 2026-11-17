@@ -523,10 +523,14 @@ function initScanProgressWebSocket() {
                 const p = Number(data.Data?.Progress ?? NaN);
                 const state = data.Data?.State;
                 if (id && Number.isFinite(p)) {
+                    const was = id in scanStatuses;
                     // Taken as is, not maxed: a new run of the same library can start lower than the last one
                     if (state === 'Idle' || p >= 100) delete scanStatuses[id];
                     else scanStatuses[id] = { percent: p, queued: state === 'Queued' };
                     updateScanRings(id);
+                    // Every library scan is the library scan task, as in Jellyfin: the dashboard's
+                    // task list follows a scan that starts or ends, wherever it was started
+                    if (was !== (id in scanStatuses) && currentPage === 'admin') refreshTasks(true);
                 }
             } else if (data.MessageType === 'LibraryChanged') {
                 refreshViewAfterLibraryChange();

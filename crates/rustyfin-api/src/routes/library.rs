@@ -405,18 +405,28 @@ struct LibraryWithOptions {
     item_id: Uuid,
     collection_type: Option<&'static str>,
     locations: Vec<String>,
+    /// Jellyfin's `RefreshStatus`: `Active` while a scan of the library is listed (queued,
+    /// scanning or probing), else `Idle`, from the same registry as the scan rings and the
+    /// library scan task.
     refresh_status: &'static str,
+    /// The listed scan's percent, while there is one.
+    refresh_progress: Option<f64>,
 }
 
 impl LibraryWithOptions {
-    fn new(library: Library, library_options: LibraryOptions) -> Self {
+    fn new(
+        library: Library,
+        library_options: LibraryOptions,
+        scan: Option<rustyfin_core::scan_progress::ScanState>,
+    ) -> Self {
         Self {
+            refresh_status: if scan.is_some() { "Active" } else { "Idle" },
+            refresh_progress: scan.map(|s| f64::from(s.progress.unwrap_or(0))),
             item_id: library.id,
             // Jellyfin gives a mixed library no collection type.
             collection_type: Some(library.content_type.jellyfin_collection_type())
                 .filter(|t| *t != "mixed"),
             locations: library.paths.clone(),
-            refresh_status: "Idle",
             library,
             library_options: options_json(&library_options),
         }
@@ -431,7 +441,8 @@ async fn get_libraries(
     for library in libs {
         let library_options =
             rustyfin_db::repo_library::get_library_options(&state.db_ro, library.id).await?;
-        items.push(LibraryWithOptions::new(library, library_options));
+        let scan = state.task_scheduler.scans().state(library.id);
+        items.push(LibraryWithOptions::new(library, library_options, scan));
     }
     Ok(Json(items))
 }

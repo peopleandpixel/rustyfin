@@ -576,6 +576,11 @@ impl TaskScheduler {
     }
 
     /// A task's info, with the percent it has reported while it is not idle.
+    ///
+    /// As in Jellyfin, every library scan shows as the library scan task: while any library has a
+    /// scan listed (queued, scanning or probing), wherever it was started (a library's Scan, Scan
+    /// all, the setup wizard), an idle library scan task reads Running, at the listed scans'
+    /// average percent. The scans listed are what the web client's scan rings show.
     fn info_of(&self, entry: &TaskEntry) -> ScheduledTaskInfo {
         let mut info = entry.info.clone();
         info.current_progress_percentage = match info.state {
@@ -584,6 +589,17 @@ impl TaskScheduler {
                 self.progress.get(&info.id).and_then(TaskProgress::get)
             }
         };
+        if info.id == TASK_LIBRARY_SCAN && info.state == TaskState::Idle {
+            let scans = self.scans.snapshot();
+            if !scans.is_empty() {
+                let sum: f64 = scans
+                    .iter()
+                    .map(|(_, s)| f64::from(s.progress.unwrap_or(0)))
+                    .sum();
+                info.state = TaskState::Running;
+                info.current_progress_percentage = Some(sum / scans.len() as f64);
+            }
+        }
         info
     }
 
@@ -1051,9 +1067,12 @@ impl TaskScheduler {
                     .collect();
                 let client = &self.http_client;
                 let mut errors = Vec::new();
+                // The runs another caller scans, which this task waits for before it ends
+                let mut runs = Vec::new();
                 for (lib, ticket) in libraries.iter().zip(tickets) {
                     // Only the caller that claimed the library's run scans it.
                     if !ticket.claim() {
+                        runs.push(ticket);
                         continue;
                     }
                     if let Err(e) = crate::scanner::scan_library_with_metadata(
@@ -1067,8 +1086,13 @@ impl TaskScheduler {
                     {
                         errors.push(format!("{}: {}", lib.name, e));
                     }
-                    // The probes the scan queued keep the library listed until they finish.
-                    drop(ticket);
+                    // The probes the scan queued keep the library listed until they finish, and
+                    // the task Running until then. The next library's scan waits for them anyway
+                    // (the scan lock).
+                    ticket.wait_end().await;
+                }
+                for ticket in runs {
+                    ticket.wait_end().await;
                 }
                 // Waited for, so no late percent lands after the task ends
                 follower.abort();
@@ -2387,6 +2411,129 @@ mod tests {
             r3perf_last(&sched, TASK_INTRO_DETECTION).await,
             (TaskCompletionStatus::Completed, "done".to_string())
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    use uuid::Uuid;
+
+    async fn r3dash3_scan_task(sched: &TaskScheduler) -> (TaskState, Option<f64>) {
+        let info = sched.get_task(TASK_LIBRARY_SCAN).await.unwrap();
+        (info.state, info.current_progress_percentage)
+    }
+
+    /// Any listed library scan shows as the library scan task, at its percent, and the task reads
+    /// Idle again when the scan ends.
+    #[tokio::test]
+    async fn r3dash3_a_listed_scan_shows_as_the_library_scan_task() {
+        let (sched, dir) = r3tasks_scheduler().await;
+        assert_eq!(r3dash3_scan_task(&sched).await, (TaskState::Idle, None));
+        // A scan started outside the scheduler (a library's Scan, Scan all, the wizard)
+        let ticket = sched.scans().queue(Uuid::new_v4());
+        assert_eq!(
+            r3dash3_scan_task(&sched).await,
+            (TaskState::Running, Some(0.0))
+        );
+        assert!(ticket.claim());
+        ticket.start();
+        ticket.add_total(4);
+        ticket.advance(1);
+        let other = sched.scans().queue(Uuid::new_v4());
+        // The average of the listed scans: 25 and 0
+        assert_eq!(
+            r3dash3_scan_task(&sched).await,
+            (TaskState::Running, Some(12.5))
+        );
+        let json = serde_json::to_value(sched.get_task(TASK_LIBRARY_SCAN).await.unwrap()).unwrap();
+        assert_eq!(json["State"], "Running", "{json}");
+        drop(other);
+        // The probes of a scan that has returned keep it listed, and the task Running
+        let probes = ticket.clone();
+        drop(ticket);
+        assert_eq!(r3dash3_scan_task(&sched).await.0, TaskState::Running);
+        drop(probes);
+        assert_eq!(r3dash3_scan_task(&sched).await, (TaskState::Idle, None));
+        assert!(sched.scans().snapshot().is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A scan that is cancelled (its task aborted) or fails (panics) clears the library's listing,
+    /// so neither the scan ring nor the task stays on.
+    #[tokio::test]
+    async fn r3dash3_a_cancelled_or_failed_scan_clears() {
+        let (sched, dir) = r3tasks_scheduler().await;
+        let library = Uuid::new_v4();
+        let mut frames = sched.scans().subscribe();
+        let scans = sched.scans().clone();
+        let cancelled = tokio::spawn(async move {
+            let ticket = scans.queue(library);
+            ticket.claim();
+            ticket.start();
+            std::future::pending::<()>().await;
+            drop(ticket);
+        });
+        while sched.scans().state(library).is_none() {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(r3dash3_scan_task(&sched).await.0, TaskState::Running);
+        cancelled.abort();
+        let _ = cancelled.await;
+        assert!(sched.scans().state(library).is_none());
+        assert_eq!(r3dash3_scan_task(&sched).await, (TaskState::Idle, None));
+
+        let scans = sched.scans().clone();
+        let failed = tokio::spawn(async move {
+            let ticket = scans.queue(library);
+            ticket.claim();
+            ticket.start();
+            panic!("the scan failed");
+        });
+        assert!(failed.await.is_err());
+        assert!(sched.scans().state(library).is_none());
+        assert_eq!(r3dash3_scan_task(&sched).await, (TaskState::Idle, None));
+        // Each run ended with the Idle frame at 100, which clears the web client's ring
+        let mut last = None;
+        while let Ok(update) = frames.try_recv() {
+            last = Some((update.status, update.progress));
+        }
+        assert_eq!(last, Some((crate::scan_progress::ScanStatus::Idle, 100)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The scheduled library scan stays Running until the scans it covers have ended, the ones
+    /// another caller is running included, and only then records its result.
+    #[tokio::test]
+    async fn r3dash3_the_scheduled_scan_waits_for_running_scans() {
+        let (sched, dir) = r3tasks_scheduler().await;
+        let media = dir.join("media");
+        std::fs::create_dir_all(&media).unwrap();
+        let lib = rustyfin_model::library::Library {
+            id: Uuid::new_v4(),
+            name: "Shows A".into(),
+            content_type: rustyfin_model::library::LibraryContentType::TvShows,
+            paths: vec![media.to_string_lossy().to_string()],
+        };
+        rustyfin_db::repo_library::create_library(&sched.db, &lib)
+            .await
+            .unwrap();
+        // Another caller (a library's Scan) has claimed the library's run, which still waits for
+        // the scan lock, so the task joins that run instead of scanning
+        let api_scan = sched.scans().queue(lib.id);
+        assert!(api_scan.claim());
+        let task = {
+            let sched = sched.clone();
+            tokio::spawn(async move { sched.run_library_scan().await })
+        };
+        for _ in 0..50 {
+            tokio::task::yield_now().await;
+        }
+        assert!(!task.is_finished(), "the task waits for the other scan");
+        assert_eq!(r3dash3_scan_task(&sched).await.0, TaskState::Running);
+        drop(api_scan);
+        task.await.unwrap();
+        let info = sched.get_task(TASK_LIBRARY_SCAN).await.unwrap();
+        assert_eq!(info.state, TaskState::Idle);
+        assert!(info.last_execution_result.is_some());
+        assert!(sched.scans().snapshot().is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -55947,3 +55947,96 @@ fn r3dash3_web_server_admin() {
 fn r3dash3_web_library_options() {
     b124_node_test("r3dash3_library_options.mjs");
 }
+
+/// The library scan task's state and percent in `GET /ScheduledTasks`, and the library's
+/// `RefreshStatus` and `RefreshProgress` in `GET /Library/VirtualFolders`.
+async fn r3dash3_scan_views(
+    app: &axum::Router,
+    token: &str,
+    lib: uuid::Uuid,
+) -> (serde_json::Value, serde_json::Value) {
+    let (_, tasks) = send_authed(app, "GET", "/ScheduledTasks", token, None).await;
+    let task = tasks
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["Id"] == "LibraryScan")
+        .cloned()
+        .unwrap();
+    let (_, folders) = send_authed(app, "GET", "/Library/VirtualFolders", token, None).await;
+    let folder = folders
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|f| f["ItemId"] == lib.to_string())
+        .cloned()
+        .unwrap();
+    (task, folder)
+}
+
+// A library scan started outside the scheduler (a library's Scan, Scan all, the wizard) shows in
+// the dashboard as the library scan task while the library shows as refreshing, as in Jellyfin;
+// both clear when the scan ends, also when it is cancelled.
+#[tokio::test]
+async fn r3dash3_a_library_scan_shows_as_the_scan_task_and_clears() {
+    let state = test_state().await;
+    let app = app(state.clone());
+    let (owner, _, _, _) = g1_owner_and_viewer(&state, &app).await;
+    let lib = create_library_via_api(&app, &state, &owner, "Shows A", "TvShows").await;
+    // Settle any scan the library's creation started
+    rustyfin_core::scanner::wait_for_idle().await;
+    while state.task_scheduler.scans().state(lib).is_some() {
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    let (task, folder) = r3dash3_scan_views(&app, &owner, lib).await;
+    assert_eq!(task["State"], "Idle", "{task}");
+    assert_eq!(folder["RefreshStatus"], "Idle", "{folder}");
+    assert!(folder["RefreshProgress"].is_null(), "{folder}");
+
+    // A scan of the library, from outside the scheduler, at 50 %
+    let ticket = state.task_scheduler.scans().queue(lib);
+    assert!(ticket.claim());
+    ticket.start();
+    ticket.add_total(2);
+    ticket.advance(1);
+    let (task, folder) = r3dash3_scan_views(&app, &owner, lib).await;
+    assert_eq!(task["State"], "Running", "{task}");
+    assert_eq!(task["CurrentProgressPercentage"], 50.0, "{task}");
+    assert_eq!(folder["RefreshStatus"], "Active", "{folder}");
+    assert_eq!(folder["RefreshProgress"], 50.0, "{folder}");
+
+    // Its probes outlive the scan call: still listed, still Running
+    let probes = ticket.clone();
+    drop(ticket);
+    let (task, folder) = r3dash3_scan_views(&app, &owner, lib).await;
+    assert_eq!(task["State"], "Running", "{task}");
+    assert_eq!(folder["RefreshStatus"], "Active", "{folder}");
+
+    // Ended (or cancelled: the scan's future dropped with its tickets)
+    drop(probes);
+    let (task, folder) = r3dash3_scan_views(&app, &owner, lib).await;
+    assert_eq!(task["State"], "Idle", "{task}");
+    assert!(task["CurrentProgressPercentage"].is_null(), "{task}");
+    assert_eq!(folder["RefreshStatus"], "Idle", "{folder}");
+
+    let scans = state.task_scheduler.scans().clone();
+    let cancelled = tokio::spawn(async move {
+        let ticket = scans.queue(lib);
+        ticket.claim();
+        ticket.start();
+        std::future::pending::<()>().await;
+        drop(ticket);
+    });
+    while state.task_scheduler.scans().state(lib).is_none() {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(
+        r3dash3_scan_views(&app, &owner, lib).await.0["State"],
+        "Running"
+    );
+    cancelled.abort();
+    let _ = cancelled.await;
+    let (task, folder) = r3dash3_scan_views(&app, &owner, lib).await;
+    assert_eq!(task["State"], "Idle", "{task}");
+    assert_eq!(folder["RefreshStatus"], "Idle", "{folder}");
+}
