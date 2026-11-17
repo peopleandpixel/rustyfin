@@ -64,8 +64,14 @@ pub fn admin_routes() -> Router<AppState> {
 }
 
 async fn description(State(state): State<AppState>) -> Response {
+    // The configured server name, as it is now
+    let name = state.config.read().await.server_name.trim().to_string();
     let config = dlna::DlnaConfig {
-        server_name: "Rustyfin".to_string(),
+        server_name: if name.is_empty() {
+            "Rustyfin".to_string()
+        } else {
+            name
+        },
         server_id: state.server_id.to_string(),
         http_port: parse_port(&state.bind_addr),
         bind_ip: std::net::Ipv4Addr::UNSPECIFIED,

@@ -607,44 +607,54 @@ async fn main() {
         .and_then(|p| p.parse().ok())
         .unwrap_or(8096);
 
-    // Background task: SSDP discovery (DLNA), only when the DLNA server is on
-    if state.config.read().await.enable_dlna_server {
+    // Background tasks: SSDP discovery (DLNA). They follow EnableDlnaServer as it is now: the
+    // responder holds port 1900 and the advertiser announces only while the DLNA server is on, so
+    // the dashboard's switch applies without a restart.
+    {
         let dlna_config = std::sync::Arc::new(rustyfin_core::dlna::DlnaConfig {
-            server_name: "Rustyfin".to_string(),
+            server_name: String::new(),
             server_id: state.server_id.to_string(),
             http_port,
             bind_ip: std::net::Ipv4Addr::UNSPECIFIED,
         });
         let shutdown_rx = state.shutdown_tx.subscribe();
-        let cfg = dlna_config.clone();
+        let (cfg, settings) = (dlna_config.clone(), state.config.clone());
         tokio::spawn(async move {
-            rustyfin_core::dlna::run_ssdp_responder(cfg, shutdown_rx).await;
+            rustyfin_core::dlna::run_ssdp_responder(cfg, settings, shutdown_rx).await;
         });
         let shutdown_rx = state.shutdown_tx.subscribe();
+        let settings = state.config.clone();
         tokio::spawn(async move {
-            rustyfin_core::dlna::run_ssdp_advertiser(dlna_config, shutdown_rx).await;
+            rustyfin_core::dlna::run_ssdp_advertiser(dlna_config, settings, shutdown_rx).await;
         });
     }
 
-    // Background task: UDP discovery (Jellyfin client auto-discovery on port 7359)
+    // Background task: UDP discovery (Jellyfin client auto-discovery on port 7359), answering with
+    // the configured server name as it is now
     {
         let udp_config = std::sync::Arc::new(rustyfin_core::udp_discovery::UdpDiscoveryConfig {
-            server_name: "Rustyfin".to_string(),
             server_id: state.server_id.to_string(),
             http_port,
             bind_ip: std::net::Ipv4Addr::UNSPECIFIED,
             endpoint_address: state.published_url.as_deref().cloned(),
         });
         let shutdown_rx = state.shutdown_tx.subscribe();
+        let settings = state.config.clone();
         tokio::spawn(async move {
-            rustyfin_core::udp_discovery::run_udp_discovery(udp_config, shutdown_rx).await;
+            rustyfin_core::udp_discovery::run_udp_discovery(udp_config, settings, shutdown_rx)
+                .await;
         });
     }
 
     // Background task: mDNS/Bonjour service discovery
     {
+        // The service is registered once: a rename shows here at the next start.
+        let mdns_name = match state.config.read().await.server_name.trim() {
+            "" => "Rustyfin".to_string(),
+            name => name.to_string(),
+        };
         let mdns_config = std::sync::Arc::new(rustyfin_core::mdns::MdnsConfig {
-            server_name: "Rustyfin".to_string(),
+            server_name: mdns_name,
             server_id: state.server_id.to_string(),
             http_port,
             bind_ip: std::net::Ipv4Addr::UNSPECIFIED,

@@ -26986,6 +26986,22 @@ async fn r3parental_dlna_browses_as_the_dlna_user_with_its_limits() {
         g1_send_raw(&world.app, req.body(Body::empty()).unwrap())
     };
 
+    // The device description names the server as configured, as it is now.
+    for name in ["Living Room", "Den & Co"] {
+        w.configure(serde_json::json!({ "ServerName": name })).await;
+        let req = Request::builder()
+            .uri("/dlna/description.xml")
+            .body(Body::empty())
+            .unwrap();
+        let (status, xml) = g1_send_raw(&w.app, req).await;
+        assert_eq!(status, StatusCode::OK);
+        let escaped = name.replace('&', "&amp;");
+        assert!(
+            xml.contains(&format!("<friendlyName>{escaped}</friendlyName>")),
+            "{xml}"
+        );
+    }
+
     // No DLNA user: DLNA devices don't sign in, so nothing is listed or streamed.
     let root = w.dlna_browse("0", "BrowseDirectChildren").await;
     assert!(root.contains("<TotalMatches>0</TotalMatches>"), "{root}");
