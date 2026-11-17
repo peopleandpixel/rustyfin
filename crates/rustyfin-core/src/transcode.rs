@@ -1531,7 +1531,7 @@ fn image_overlay_graph(
     let main = if plan.decode {
         format!(
             "{},hwdownload,format=nv12",
-            hw_scale(plan.accel, &w.to_string(), &h.to_string(), false)
+            hw_scale(plan.accel, &w.to_string(), &h.to_string())
         )
     } else {
         format!("scale={w}:{h},format=yuv420p")
@@ -1727,16 +1727,23 @@ fn to_hw_encoder(plan: HwPlan) -> &'static str {
     }
 }
 
-/// The device's scale within `max_width`×`max_height`, to 8-bit NV12 (`w`/`h` are expressions).
-fn hw_scale(accel: HwAccel, w: &str, h: &str, keep_aspect: bool) -> String {
-    let aspect = if keep_aspect {
-        ":force_original_aspect_ratio=decrease"
-    } else {
-        ""
-    };
+/// The scale's width and height expressions for a video of unknown size within
+/// `max_width`×`max_height`: at most its own size, its aspect kept, each truncated to an even
+/// number as 4:2:0 frames and the encoders need, as Jellyfin's `EncodingHelper` writes them
+/// (`trunc(…/2)*2`). Only `iw` and `ih` are used, which every scale filter (software, VAAPI,
+/// CUDA, QSV) evaluates.
+fn even_fit(max_width: u32, max_height: u32) -> (String, String) {
+    (
+        format!("'trunc(min(min(iw,{max_width}),{max_height}*iw/ih)/2)*2'"),
+        format!("'trunc(min(min(ih,{max_height}),{max_width}*ih/iw)/2)*2'"),
+    )
+}
+
+/// The device's scale to `w`×`h` (numbers or `even_fit` expressions), to 8-bit NV12.
+fn hw_scale(accel: HwAccel, w: &str, h: &str) -> String {
     match accel {
-        HwAccel::Vaapi => format!("scale_vaapi=w={w}:h={h}{aspect}:format=nv12"),
-        HwAccel::Nvenc => format!("scale_cuda=w={w}:h={h}{aspect}:format=nv12"),
+        HwAccel::Vaapi => format!("scale_vaapi=w={w}:h={h}:format=nv12"),
+        HwAccel::Nvenc => format!("scale_cuda=w={w}:h={h}:format=nv12"),
         HwAccel::Qsv => format!("scale_qsv=w={w}:h={h}:format=nv12"),
         HwAccel::None => format!("scale={w}:{h}"),
     }
@@ -1846,22 +1853,20 @@ fn ffmpeg_args(input: &str, output: Output<'_>, profile: &TranscodeProfile) -> V
         // Scale filter. Its last step makes the frames 8-bit 4:2:0 (NV12 on the hardware
         // encoders): libx264 would keep a 10-bit or 4:2:2 source's format, which browsers
         // can't decode. HDR video is tonemapped to SDR after the scale, in software.
-        let (w, h) = (
-            format!("'min({},iw)'", profile.max_width),
-            format!("'min({},ih)'", profile.max_height),
-        );
+        // Even dimensions, the aspect kept: an odd width (1280×720 at 480 lines is 853.3
+        // wide) makes libx264 and the hardware encoders refuse to start
+        let (w, h) = even_fit(profile.max_width, profile.max_height);
         // The device scales to the exact output size when the source's is known; else by
-        // expression, QSV (which can't keep the aspect within both limits) by height
+        // expression
         let device_scale = match profile.source_size {
             Some(size) => {
                 let (w, h) = output_size(size, profile.max_width, profile.max_height);
-                hw_scale(plan.accel, &w.to_string(), &h.to_string(), false)
+                hw_scale(plan.accel, &w.to_string(), &h.to_string())
             }
-            None if plan.accel == HwAccel::Qsv => hw_scale(plan.accel, "-1", &h, false),
-            None => hw_scale(plan.accel, &w, &h, true),
+            None => hw_scale(plan.accel, &w, &h),
         };
         let software_scale = format!(
-            "{}{}scale={w}:{h}:force_original_aspect_ratio=decrease,{}",
+            "{}{}scale={w}:{h},{}",
             if profile.deinterlace { "bwdif=0," } else { "" },
             if profile.square_pixels {
                 "scale=trunc(iw*sar/2)*2:ih,setsar=1,"
@@ -2693,7 +2698,7 @@ mod tests {
             has_pair(
                 &args,
                 "-filter_complex",
-                "[0:V:0][1:3]overlay=eof_action=pass:repeatlast=0,scale='min(1920,iw)':'min(1080,ih)':force_original_aspect_ratio=decrease,format=yuv420p[v]"
+                "[0:V:0][1:3]overlay=eof_action=pass:repeatlast=0,scale='trunc(min(min(iw,1920),1080*iw/ih)/2)*2':'trunc(min(min(ih,1080),1920*ih/iw)/2)*2',format=yuv420p[v]"
             ),
             "{args:?}"
         );
@@ -2852,7 +2857,7 @@ mod tests {
 
     /// The software scale for the default 1920x1080 limit.
     const SW_SCALE: &str =
-        "scale='min(1920,iw)':'min(1080,ih)':force_original_aspect_ratio=decrease";
+        "scale='trunc(min(min(iw,1920),1080*iw/ih)/2)*2':'trunc(min(min(ih,1080),1920*ih/iw)/2)*2'";
 
     /// Each hardware encoder with its scale for the default limit, ending in the 8-bit 4:2:0
     /// format the encoder takes.
@@ -2860,17 +2865,17 @@ mod tests {
         (
             HwAccel::Vaapi,
             "h264_vaapi",
-            "scale_vaapi=w='min(1920,iw)':h='min(1080,ih)':force_original_aspect_ratio=decrease:format=nv12",
+            "scale_vaapi=w='trunc(min(min(iw,1920),1080*iw/ih)/2)*2':h='trunc(min(min(ih,1080),1920*ih/iw)/2)*2':format=nv12",
         ),
         (
             HwAccel::Nvenc,
             "h264_nvenc",
-            "scale_cuda=w='min(1920,iw)':h='min(1080,ih)':force_original_aspect_ratio=decrease:format=nv12",
+            "scale_cuda=w='trunc(min(min(iw,1920),1080*iw/ih)/2)*2':h='trunc(min(min(ih,1080),1920*ih/iw)/2)*2':format=nv12",
         ),
         (
             HwAccel::Qsv,
             "h264_qsv",
-            "scale_qsv=w=-1:h='min(1080,ih)':format=nv12",
+            "scale_qsv=w='trunc(min(min(iw,1920),1080*iw/ih)/2)*2':h='trunc(min(min(ih,1080),1920*ih/iw)/2)*2':format=nv12",
         ),
     ];
 
@@ -2895,10 +2900,111 @@ mod tests {
             has_pair(
                 &args,
                 "-vf",
-                "scale='min(1280,iw)':'min(720,ih)':force_original_aspect_ratio=decrease,format=yuv420p"
+                "scale='trunc(min(min(iw,1280),720*iw/ih)/2)*2':'trunc(min(min(ih,720),1280*ih/iw)/2)*2',format=yuv420p"
             ),
             "{args:?}"
         );
+    }
+
+    /// Evaluates an `even_fit` expression (without its quotes) for an `iw`×`ih` source: the
+    /// four operations it uses, enough to check the sizes ffmpeg computes from it.
+    fn eval_even(expr: &str, iw: f64, ih: f64) -> f64 {
+        fn parse(s: &mut &str, iw: f64, ih: f64) -> f64 {
+            let mut value = term(s, iw, ih);
+            while let Some(rest) = s.strip_prefix('*').or_else(|| s.strip_prefix('/')) {
+                let op = s.as_bytes()[0];
+                *s = rest;
+                let rhs = term(s, iw, ih);
+                value = if op == b'*' { value * rhs } else { value / rhs };
+            }
+            value
+        }
+        fn term(s: &mut &str, iw: f64, ih: f64) -> f64 {
+            for (name, f) in [("trunc(", 1), ("min(", 2)] {
+                if let Some(rest) = s.strip_prefix(name) {
+                    *s = rest;
+                    let a = parse(s, iw, ih);
+                    let v = if f == 2 {
+                        *s = s.strip_prefix(',').unwrap();
+                        a.min(parse(s, iw, ih))
+                    } else {
+                        a.trunc()
+                    };
+                    *s = s.strip_prefix(')').unwrap();
+                    return v;
+                }
+            }
+            for (name, v) in [("iw", iw), ("ih", ih)] {
+                if let Some(rest) = s.strip_prefix(name) {
+                    *s = rest;
+                    return v;
+                }
+            }
+            let end = s.find(|c: char| !c.is_ascii_digit()).unwrap_or(s.len());
+            let (n, rest) = s.split_at(end);
+            *s = rest;
+            n.parse().unwrap()
+        }
+        let mut s = expr;
+        let v = parse(&mut s, iw, ih);
+        assert!(s.is_empty(), "left over: {s}");
+        v
+    }
+
+    /// A 1280×720 source at a 480- and a 360-line limit gets even widths and heights, its
+    /// aspect kept, in software and on VAAPI, as Jellyfin 12.4's `trunc(…/2)*2` computes them:
+    /// 852×480 and 640×360. A known source size gives the same.
+    #[test]
+    fn r3hwaccel_scales_give_even_dimensions() {
+        for (max_height, want) in [(480, (852.0, 480.0)), (360, (640.0, 360.0))] {
+            let (w, h) = even_fit(1920, max_height);
+            let got = (
+                eval_even(w.trim_matches('\''), 1280.0, 720.0),
+                eval_even(h.trim_matches('\''), 1280.0, 720.0),
+            );
+            assert_eq!(got, want, "{max_height}");
+            assert_eq!(
+                output_size((1280, 720), 1920, max_height),
+                (want.0 as u32, want.1 as u32)
+            );
+            for accel in [HwAccel::None, HwAccel::Vaapi] {
+                let profile = TranscodeProfile {
+                    hw_accel: accel,
+                    max_height,
+                    ..Default::default()
+                };
+                let args = args_for(&profile);
+                let vf = &args[position(&args, "-vf") + 1];
+                assert!(
+                    vf.contains(&format!("w={w}:h={h}")) || vf.contains(&format!("scale={w}:{h},")),
+                    "{accel:?}: {vf}"
+                );
+                assert!(!vf.contains("force_original_aspect_ratio"), "{vf}");
+                // With the source size known, the exact even size
+                let sized = TranscodeProfile {
+                    source_size: Some((1280, 720)),
+                    ..profile
+                };
+                let args = args_for(&sized);
+                let vf = &args[position(&args, "-vf") + 1];
+                let exact = format!("{}:{}", want.0, want.1);
+                if accel == HwAccel::Vaapi {
+                    assert!(
+                        vf.contains(&format!("scale_vaapi=w={}:h={}", want.0, want.1)),
+                        "{vf}"
+                    );
+                } else {
+                    assert!(
+                        vf.contains(&format!("scale={w}:{h}")) || vf.contains(&exact),
+                        "{vf}"
+                    );
+                }
+            }
+        }
+        // A wide source limited by width keeps its aspect: 1920×800 in 1280×720 is 1280×532
+        let (w, h) = even_fit(1280, 720);
+        assert_eq!(eval_even(w.trim_matches('\''), 1920.0, 800.0), 1280.0);
+        assert_eq!(eval_even(h.trim_matches('\''), 1920.0, 800.0), 532.0);
     }
 
     #[test]
