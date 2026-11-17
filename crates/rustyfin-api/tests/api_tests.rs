@@ -18720,7 +18720,8 @@ async fn r3extras2_id(
 /// A show's `Extras` folder holds the series' extras, as in Jellyfin, while `Specials` is season 0. An
 /// episode's suffix files and its episode folder's extras folders are its extras, never episodes; a suffix
 /// file that names no episode next to it stays an episode. The episode pages' counts and lists show them,
-/// and `HasSpecialFeature` finds the series and episodes that have some.
+/// and, as in Jellyfin 12.4, `HasSpecialFeature` and `HasTrailer` find the items that have some and the
+/// season and series above them; the series' own `Unknown` extra (`Extras/`) is no special feature there.
 #[tokio::test]
 async fn r3extras2_tv_extras_belong_to_series_seasons_and_episodes() {
     let state = test_state().await;
@@ -18816,7 +18817,7 @@ async fn r3extras2_tv_extras_belong_to_series_seasons_and_episodes() {
     .await;
     assert_eq!(
         r3extras2_names(&with),
-        ["S01E01", "S01E02", "Show"],
+        ["S01E01", "S01E02", "Season 1", "Show"],
         "{with}"
     );
     let trailers = get(format!(
@@ -18824,11 +18825,16 @@ async fn r3extras2_tv_extras_belong_to_series_seasons_and_episodes() {
         lib.id
     ))
     .await;
-    assert_eq!(r3extras2_names(&trailers), ["Season 1"], "{trailers}");
+    assert_eq!(
+        r3extras2_names(&trailers),
+        ["Season 1", "Show"],
+        "{trailers}"
+    );
 }
 
 /// `/Items?HasTrailer`, `HasSpecialFeature`, `HasThemeSong` and `HasThemeVideo` keep the items with (true) or
-/// without (false) that kind of extra, each counted as `LocalTrailerCount` and `SpecialFeatureCount` count them.
+/// without (false) that kind of extra, as Jellyfin 12.4 does: an `Unknown` extra (`extras/`) is no special
+/// feature for the filter.
 #[tokio::test]
 async fn r3extras2_has_filters_find_items_by_their_extras() {
     let state = test_state().await;
@@ -18846,6 +18852,7 @@ async fn r3extras2_has_filters_find_items_by_their_extras() {
             "Gamma/Gamma.mkv",
             "Gamma/featurettes/Making Of.mkv",
             "Delta/Delta.mkv",
+            "Delta/extras/Bonus.mkv",
         ],
     )
     .await

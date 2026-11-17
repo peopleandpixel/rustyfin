@@ -313,17 +313,31 @@ pub async fn extra_counts(
         .collect())
 }
 
-/// The ids of the items that own an extra with one of `types`: `/Items?HasTrailer`, `HasSpecialFeature`,
-/// `HasThemeSong` and `HasThemeVideo` keep (true) or leave out (false) these. Only owners are read, so the
-/// list is as long as the items that have such extras, never the whole library.
+/// The ids of the items that own an extra with one of `types`, with every item above them (a season and
+/// series over an episode) and the collections and playlists that hold them: `/Items?HasTrailer`,
+/// `HasSpecialFeature`, `HasThemeSong` and `HasThemeVideo` keep (true) or leave out (false) these, as
+/// Jellyfin 12.4's `WhereItemOrDescendantMatches` does (`BaseItemRepository.TranslateQuery.cs:1211-1272`,
+/// `FolderAwareFilterExtensions.cs`). Jellyfin also counts an extra of an alternate version for its main
+/// item; here versions are sources of one item, which owns the extras itself. The list is as long as the
+/// items that have such extras and their parents, never the whole library.
 pub async fn owners_with_extras(
     pool: &SqlitePool,
     types: &[&str],
 ) -> Result<Vec<String>, sqlx::Error> {
     let types = serde_json::to_string(types).unwrap_or_else(|_| "[]".to_string());
     sqlx::query_scalar(
-        "SELECT DISTINCT owner_id FROM media_items
-         WHERE owner_id IS NOT NULL AND extra_type IN (SELECT value FROM json_each(?1))",
+        "WITH RECURSIVE
+             owners(id) AS (
+                 SELECT owner_id FROM media_items
+                 WHERE owner_id IS NOT NULL AND extra_type IN (SELECT value FROM json_each(?1))),
+             up(id) AS (
+                 SELECT id FROM owners
+                 UNION
+                 SELECT m.parent_id FROM media_items AS m JOIN up ON m.id = up.id
+                 WHERE m.parent_id IS NOT NULL)
+         SELECT id FROM up
+         UNION SELECT collection_id FROM collection_items WHERE item_id IN (SELECT id FROM owners)
+         UNION SELECT playlist_id FROM playlist_items WHERE item_id IN (SELECT id FROM owners)",
     )
     .bind(types)
     .fetch_all(pool)
