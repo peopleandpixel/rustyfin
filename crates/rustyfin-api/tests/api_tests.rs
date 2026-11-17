@@ -52874,7 +52874,9 @@ async fn r3items_library(state: &AppState) -> R3ItemsLibrary {
             "UPDATE media_items SET overview = '', premiere_date = '1990-01-01T00:00:00Z' WHERE id = '{c}'"
         ),
         format!("UPDATE media_items SET tags = 'News', tvdb_id = 22 WHERE id = '{show}'"),
-        format!("UPDATE media_items SET location_type = 'Virtual' WHERE id = '{e3}'"),
+        format!(
+            "UPDATE media_items SET location_type = 'Virtual', is_virtual_item = 1 WHERE id = '{e3}'"
+        ),
         format!(
             "INSERT INTO item_metadata_extras (item_id, imdb_id, lock_data) VALUES ('{a}', 'tt0000001', 1)"
         ),
