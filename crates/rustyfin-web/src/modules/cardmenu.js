@@ -3,6 +3,8 @@
 import { icon, toast, escapeHtml } from './util.js';
 import { applyCardUserData } from './cards.js';
 import { playQueueAt } from './queue.js';
+import { openPhotoViewer } from './photos.js';
+import { canDownload, downloadItems } from './nativeshell.js';
 
 const PLAYABLE = ['Movie', 'Episode', 'Audio', 'MusicVideo', 'Video', 'AudioBook', 'Trailer'];
 const CONTAINERS = ['Series', 'Season', 'MusicAlbum', 'MusicArtist', 'BoxSet', 'Playlist', 'Folder', 'CollectionFolder'];
@@ -50,6 +52,8 @@ function cardMenuCommands(item, isAdmin, shownIn = null) {
     commands.push('separator');
     if (PLAYLIST_TYPES.includes(type)) commands.push({ action: 'card-add-playlist', label: t('cards.add_to_playlist'), icon: 'ListPlus' });
     if (isAdmin && COLLECTION_TYPES.includes(type)) commands.push({ action: 'card-add-collection', label: t('cards.add_to_collection'), icon: 'FolderPlus' });
+    // In the Jellyfin Android app, into its downloads
+    if (canDownload(item)) commands.push({ action: 'card-download', label: t('native.download'), icon: 'Download' });
     if (shownIn?.canEdit && shownIn.id !== item.Id) {
         const playlist = shownIn.type === 'Playlist';
         commands.push({
@@ -221,7 +225,8 @@ async function setCardLikes(el, likes) {
 // Play from the menu: the item alone, through the queue (resume or start over, as any Play asks)
 function playCardItem(el) {
     const item = menuItems.get(el.dataset.id);
-    if (item) playQueueAt([item], 0);
+    if (item?.Type === 'Photo') openPhotoViewer([item], 0);
+    else if (item) playQueueAt([item], 0);
 }
 
 // The request for an item's Instant mix: similar songs, the item itself first for a song
@@ -245,6 +250,12 @@ async function playInstantMix(el) {
     } catch (e) {
         toast(t('common.error_message', { message: e.message }), 'error');
     }
+}
+
+// Download from the menu, into the Jellyfin Android app's downloads
+function downloadCardItem(el) {
+    const item = menuItems.get(el.dataset.id);
+    if (item && downloadItems([item])) toast(t('native.download_started'));
 }
 
 // Add to playlist or collection: a dialog with the existing ones and a new one by name
@@ -389,6 +400,7 @@ document.addEventListener('click', cardClickAfterLongPress, true);
 
 export {
     cardMenuCommands, cardMenuHtml, openCardMenu, toggleCardPlayed, toggleCardFavorite, setCardLikes, playCardItem, instantMixUrl, playInstantMix,
-    openAddTo, openAddToIds, addTo, userDataChanged, cardPointerDown, cardPointerMove, cardContextMenu, cardClickAfterLongPress,
+    downloadCardItem, openAddTo, openAddToIds, addTo, userDataChanged, cardPointerDown, cardPointerMove, cardContextMenu,
+    cardClickAfterLongPress,
     cancelLongPress, LONG_PRESS_MS,
 };

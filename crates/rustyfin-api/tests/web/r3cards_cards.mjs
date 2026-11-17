@@ -23,6 +23,7 @@ function sandbox({ isAdmin = false, item = null } = {}) {
         icon: name => `<svg data-icon="${name}"></svg>`,
         escapeHtml,
         blurhashTint: () => null,
+        canDownload: () => false,
         toast: (msg, type) => toasts.push([msg, type]),
         playQueueAt: (items, index) => calls.push(['queue', items.map(i => i.Id), index]),
         CSS: { escape: s => s },

@@ -1,154 +1,149 @@
+//! Jellyfin 10.11's backup API (`BackupController`), administrators only. See `backup_archive`
+//! for what a backup holds. Rustyfin adds `GET /Backup/Download?path=` and `DELETE /Backup/{name}`.
+
+use axum::body::Body;
 use axum::extract::{Path, State};
-use axum::http::StatusCode;
+use axum::http::{StatusCode, header};
+use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
-use serde::{Deserialize, Serialize};
-use uuid::Uuid;
+use serde::Deserialize;
+use serde_json::Value;
 
+use crate::backup_archive as archive;
 use crate::error::ApiError;
+use crate::query::Query;
 use crate::state::AppState;
-
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "PascalCase")]
-struct BackupDto {
-    id: String,
-    name: String,
-    #[serde(rename = "BackupPath")]
-    backup_path: String,
-    #[serde(rename = "SizeBytes")]
-    size_bytes: i64,
-    #[serde(rename = "CreatedAt")]
-    created_at: String,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "PascalCase")]
-struct CreateBackupRequest {
-    #[serde(default)]
-    name: String,
-}
 
 pub fn routes() -> Router<AppState> {
     Router::new()
         .route("/Backup", get(get_backups).post(create_backup))
-        .route("/Backup/{backupId}", delete(delete_backup))
+        .route("/Backup/Create", post(create_backup))
+        .route("/Backup/Manifest", get(get_manifest))
+        .route("/Backup/Download", get(download_backup))
         .route("/Backup/Restore", post(restore_backup))
+        .route("/Backup/{name}", delete(delete_backup))
 }
 
-async fn get_backups(State(state): State<AppState>) -> Result<Json<Vec<BackupDto>>, ApiError> {
-    let backups = rustyfin_db::repo_misc::get_backups(&state.db_ro)
+/// GET /Backup - every backup's `BackupManifestDto`, newest first
+async fn get_backups(State(state): State<AppState>) -> Json<Vec<Value>> {
+    Json(archive::list(&state.data_dir).await)
+}
+
+/// POST /Backup/Create - Jellyfin's `BackupOptionsDto` body (optional) is accepted; the database
+/// and settings are always backed up, the images, trickplay tiles and subtitles never, and the
+/// manifest says so. Answers the new backup's manifest.
+async fn create_backup(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
+    let manifest = archive::create(&state.db, &state.data_dir)
         .await
-        .map_err(|e| ApiError::Internal(e.to_string()))?;
-
-    let items: Vec<BackupDto> = backups
-        .into_iter()
-        .map(|b| BackupDto {
-            id: b.id,
-            name: b.name,
-            backup_path: b.backup_path,
-            size_bytes: b.size_bytes,
-            created_at: b.created_at,
-        })
-        .collect();
-
-    Ok(Json(items))
+        .map_err(|e| ApiError::Internal(format!("backup failed: {e}")))?;
+    tracing::info!(
+        "backup created: {}",
+        manifest["Path"].as_str().unwrap_or("")
+    );
+    Ok(Json(manifest))
 }
 
-async fn create_backup(
+fn named_backup(
+    state: &AppState,
+    params: &[(String, String)],
+) -> Result<std::path::PathBuf, ApiError> {
+    let name = crate::query::first_value(params, "path")
+        .ok_or_else(|| ApiError::BadRequest("path is required".to_string()))?;
+    archive::backup_path(&state.data_dir, name)
+        .ok_or_else(|| ApiError::NotFound("Backup not found".to_string()))
+}
+
+/// GET /Backup/Manifest?path= - one backup's manifest
+async fn get_manifest(
     State(state): State<AppState>,
-    Json(req): Json<CreateBackupRequest>,
-) -> Result<StatusCode, ApiError> {
-    let id = Uuid::new_v4().to_string();
-    let name = if req.name.is_empty() {
-        format!("backup_{}", id)
-    } else {
-        req.name.clone()
-    };
-
-    // Create a backup of the database file
-    let db_path = state.data_dir.join("rustyfin.db");
-    let backup_dir = state.data_dir.join("backups");
-    std::fs::create_dir_all(&backup_dir).ok();
-
-    let backup_path = backup_dir.join(format!("{}.db", id));
-
-    // Copy the database file
-    if let Ok(content) = std::fs::read(&db_path)
-        && std::fs::write(&backup_path, &content).is_ok()
-    {
-        let size_bytes = content.len() as i64;
-
-        rustyfin_db::repo_misc::create_backup(
-            &state.db,
-            &id,
-            &name,
-            &backup_path.to_string_lossy(),
-            size_bytes,
-        )
+    Query(params): Query<Vec<(String, String)>>,
+) -> Result<Json<Value>, ApiError> {
+    let path = named_backup(&state, &params)?;
+    archive::manifest(&path)
         .await
-        .map_err(|e| ApiError::Internal(e.to_string()))?;
-
-        tracing::info!(
-            "Backup created: {} ({} bytes)",
-            backup_path.display(),
-            size_bytes
-        );
-    }
-
-    Ok(StatusCode::OK)
+        .map(Json)
+        .ok_or_else(|| ApiError::NotFound("Backup not found".to_string()))
 }
 
+/// GET /Backup/Download?path= - the backup file, as an attachment
+async fn download_backup(
+    State(state): State<AppState>,
+    Query(params): Query<Vec<(String, String)>>,
+) -> Result<Response, ApiError> {
+    let path = named_backup(&state, &params)?;
+    let file = tokio::fs::File::open(&path)
+        .await
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
+    let len = file.metadata().await.map(|m| m.len()).unwrap_or(0);
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_default();
+    Ok((
+        [
+            (header::CONTENT_TYPE, "application/vnd.sqlite3".to_string()),
+            (header::CONTENT_LENGTH, len.to_string()),
+            (
+                header::CONTENT_DISPOSITION,
+                format!("attachment; filename=\"{name}\""),
+            ),
+        ],
+        Body::from_stream(tokio_util::io::ReaderStream::new(file)),
+    )
+        .into_response())
+}
+
+/// DELETE /Backup/{name} - removes a backup file: 204, or 404
 async fn delete_backup(
     State(state): State<AppState>,
-    Path(backup_id): Path<String>,
+    Path(name): Path<String>,
 ) -> Result<StatusCode, ApiError> {
-    rustyfin_db::repo_misc::delete_backup(&state.db, &backup_id)
+    let path = archive::backup_path(&state.data_dir, &name)
+        .ok_or_else(|| ApiError::NotFound("Backup not found".to_string()))?;
+    tokio::fs::remove_file(&path)
         .await
         .map_err(|e| ApiError::Internal(e.to_string()))?;
-
-    Ok(StatusCode::OK)
+    Ok(StatusCode::NO_CONTENT)
 }
 
+/// Jellyfin's `BackupRestoreRequestDto`.
+#[derive(Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct RestoreRequest {
+    #[serde(default)]
+    archive_file_name: String,
+}
+
+/// POST /Backup/Restore - stages the backup for a restore at the next start (204). Refused (409)
+/// when the database is not the data directory's (`RUSTYFIN_DB` is set).
 async fn restore_backup(
     State(state): State<AppState>,
-    Json(body): Json<serde_json::Value>,
+    Json(body): Json<RestoreRequest>,
 ) -> Result<StatusCode, ApiError> {
-    let backup_id = body["Id"]
-        .as_str()
-        .or_else(|| body["backupId"].as_str())
-        .unwrap_or("");
-
-    if backup_id.is_empty() {
-        return Err(ApiError::BadRequest("Backup ID is required".to_string()));
+    if body.archive_file_name.trim().is_empty() {
+        return Err(ApiError::BadRequest(
+            "ArchiveFileName is required".to_string(),
+        ));
     }
-
-    // Get the backup info
-    let backups = rustyfin_db::repo_misc::get_backups(&state.db_ro)
+    let path = archive::backup_path(&state.data_dir, body.archive_file_name.trim())
+        .ok_or_else(|| ApiError::NotFound("Backup not found".to_string()))?;
+    if archive::manifest(&path).await.is_none() {
+        return Err(ApiError::BadRequest("not a Rustyfin backup".to_string()));
+    }
+    if std::env::var_os("RUSTYFIN_DB").is_some() {
+        return Err(ApiError::Conflict(
+            "the database is set by RUSTYFIN_DB, outside the data directory; restore it by hand"
+                .to_string(),
+        ));
+    }
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_default();
+    archive::stage_restore(&state.data_dir, &name)
         .await
-        .map_err(|e| ApiError::Internal(e.to_string()))?;
-
-    let backup = backups
-        .iter()
-        .find(|b| b.id == backup_id)
-        .ok_or(ApiError::NotFound("Backup not found".to_string()))?;
-
-    // Restore the database from backup
-    let db_path = state.data_dir.join("rustyfin.db");
-    if let Ok(content) = std::fs::read(&backup.backup_path) {
-        if std::fs::write(&db_path, &content).is_ok() {
-            tracing::info!(
-                "Database restored from backup: {} ({} bytes)",
-                backup.backup_path,
-                content.len()
-            );
-        } else {
-            return Err(ApiError::Internal(
-                "Failed to write database file".to_string(),
-            ));
-        }
-    } else {
-        return Err(ApiError::Internal("Failed to read backup file".to_string()));
-    }
-
-    Ok(StatusCode::OK)
+        .map_err(ApiError::Internal)?;
+    tracing::info!("restore of {name} staged for the next start");
+    Ok(StatusCode::NO_CONTENT)
 }

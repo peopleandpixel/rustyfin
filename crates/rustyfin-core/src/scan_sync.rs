@@ -152,6 +152,8 @@ pub async fn remove_not_collected(
     let containers: &[&str] = match library.content_type {
         LibraryContentType::TvShows => &["Season", "Series"],
         LibraryContentType::Music => &["MusicAlbum", "MusicArtist"],
+        // A photo or mixed library's folders (scan_folders.rs), which a folder pass deletes too
+        LibraryContentType::Photos | LibraryContentType::Mixed => &["Folder"],
         _ => &[],
     };
     if !matches!(scope, PathScope::All) {
@@ -247,7 +249,7 @@ async fn remove_empty_containers_in_scope(
 }
 
 /// The media types that a scan of a library with this content type collects.
-fn scanned_types(content_type: &LibraryContentType) -> &'static [&'static str] {
+pub(crate) fn scanned_types(content_type: &LibraryContentType) -> &'static [&'static str] {
     match content_type {
         LibraryContentType::Movies => &["Movie"],
         LibraryContentType::Photos => &["Photo", "Video"],

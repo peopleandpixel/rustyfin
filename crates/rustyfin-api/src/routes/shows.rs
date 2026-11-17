@@ -49,7 +49,7 @@ struct NextUpQuery {
 
 /// `GET /Shows/NextUp`, with Jellyfin's `enableResumable` (default true), `enableRewatching`
 /// (default false), `nextUpDateCutoff` and `enableTotalRecordCount` (default true).
-/// `disableFirstEpisode` is obsolete in Jellyfin 10.11 and ignored there too.
+/// Jellyfin 12.4 has no `disableFirstEpisode`; it is ignored.
 async fn next_up(
     State(state): State<AppState>,
     Query(q): Query<NextUpQuery>,
@@ -238,9 +238,11 @@ struct EpisodesQuery {
     limit: Option<i64>,
 }
 
-/// `GET /Shows/{seriesId}/Episodes`, filtered as Jellyfin's `TvShowsController.GetEpisodes` does:
-/// `isMissing`, then `startItemId` (drop the episodes before it), then `adjacentTo` (it and its
-/// neighbours), then `sortBy=Random`, then paging. The count is of the filtered list.
+/// `GET /Shows/{seriesId}/Episodes`, filtered as Jellyfin 12.4's `TvShowsController.GetEpisodes`
+/// does: `isMissing`, then `startItemId` (drop the episodes before it), then `adjacentTo` (it and
+/// its neighbours), then `sortBy=Random`, then paging. The count is of the filtered list.
+/// Jellyfin maps an alternate version's `startItemId` to its primary version; Rustyfin stores no
+/// alternate versions, so every id is already a primary one.
 async fn get_episodes(
     State(state): State<AppState>,
     Path(series_id): Path<Uuid>,
@@ -372,15 +374,13 @@ async fn hidden_for(
     }
 }
 
-/// Jellyfin's `UserViewBuilder.FilterForAdjacency`: the episode `id` and the ones just before
-/// and after it. When `id` is not in the list Jellyfin's index is -1, which leaves only the
-/// first episode.
+/// Jellyfin 12.4's `UserViewBuilder.FilterForAdjacency`: the episode `id` and the ones just
+/// before and after it, or nothing when `id` is not in the list.
 fn adjacent(episodes: Vec<MediaItem>, id: Uuid) -> Vec<MediaItem> {
-    let index = episodes.iter().position(|e| e.id == id);
-    let keep = |i: usize| match index {
-        Some(at) => i + 1 >= at && i <= at + 1,
-        None => i == 0,
+    let Some(at) = episodes.iter().position(|e| e.id == id) else {
+        return Vec::new();
     };
+    let keep = |i: usize| i + 1 >= at && i <= at + 1;
     episodes
         .into_iter()
         .enumerate()

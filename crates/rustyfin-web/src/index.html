@@ -385,6 +385,25 @@
                         <span data-i18n="nav.server_dashboard">Server Dashboard</span>
                     </a>
                 </div>
+                <!-- The Jellyfin Android app's own screens (modules/nativeshell.js shows the ones it offers) -->
+                <div id="native-menu" class="hidden border-t border-white/10 py-1">
+                    <a class="hidden jf-menu-item flex items-center gap-2" data-native-feature="clientsettings" onclick="nativeShellCommand('clientsettings');closeUserMenu()">
+                        <i data-lucide="smartphone" class="w-4 h-4 text-white/50"></i>
+                        <span data-i18n="native.client_settings">Client Settings</span>
+                    </a>
+                    <a class="hidden jf-menu-item flex items-center gap-2" data-native-feature="downloadmanagement" onclick="nativeShellCommand('downloadmanagement');closeUserMenu()">
+                        <i data-lucide="download" class="w-4 h-4 text-white/50"></i>
+                        <span data-i18n="native.downloads">Downloads</span>
+                    </a>
+                    <a class="hidden jf-menu-item flex items-center gap-2" data-native-feature="multiserver" onclick="nativeShellCommand('multiserver');closeUserMenu()">
+                        <i data-lucide="server" class="w-4 h-4 text-white/50"></i>
+                        <span data-i18n="native.select_server">Select Server</span>
+                    </a>
+                    <a class="hidden jf-menu-item flex items-center gap-2" data-native-feature="exitmenu" onclick="nativeShellCommand('exitmenu')">
+                        <i data-lucide="power" class="w-4 h-4 text-white/50"></i>
+                        <span data-i18n="native.exit">Exit</span>
+                    </a>
+                </div>
                 <div class="border-t border-white/10 py-1">
                     <a class="jf-menu-item flex items-center gap-2" onclick="switchUser()">
                         <i data-lucide="users" class="w-4 h-4 text-white/50"></i>
@@ -841,7 +860,7 @@
 
 <!-- Library Options Modal -->
 <dialog id="library-options-modal" class="modal bg-black/70 backdrop-blur-md">
-    <div class="modal-box max-w-md jf-menu rounded-2xl p-6">
+    <div class="modal-box max-w-2xl max-h-[85vh] overflow-y-auto jf-menu rounded-2xl p-6">
         <div class="flex items-center justify-between mb-4 border-b border-white/10 pb-3">
             <h3 class="text-base font-bold text-white flex items-center gap-2">
                 <span class="w-2 h-2 rounded-full bg-[#00a4dc]"></span>
@@ -852,6 +871,7 @@
         <form id="library-options-form" onsubmit="submitLibraryOptions(event)" class="space-y-4">
             <input type="hidden" name="libraryId">
             <div id="library-options-images" class="space-y-3"></div>
+            <div id="library-options-more" class="space-y-3"></div>
             <div class="flex justify-end gap-2 pt-3 border-t border-white/10">
                 <button type="button" onclick="closeLibraryOptions()" class="jf-btn-ghost text-xs" data-i18n="common.cancel">Cancel</button>
                 <button type="submit" id="library-options-submit" class="jf-btn-primary text-xs" data-i18n="library.options_save">Save</button>
@@ -1043,10 +1063,13 @@
 
 <script type="module" src="./main.js"></script>
 <script src="/web/assets/hls.min.js"></script>
+<!-- Lets the Jellyfin Android app add its bridge (public/main.jellyfin.bundle.js, modules/nativeshell.js) -->
+<script src="/web/main.jellyfin.bundle.js"></script>
 <script src="./api.js"></script>
 <script type="module" src="./app.js"></script>
 <script>
-if('serviceWorker' in navigator){
+// Not in the Jellyfin Android app: its WebView sees no request a service worker answers
+if('serviceWorker' in navigator && !window.NativeInterface){
   window.addEventListener('load',()=>{
     navigator.serviceWorker.register('/web/sw.js?v=__CACHE_VERSION__').then(function(reg){
       // Check for updates on every load

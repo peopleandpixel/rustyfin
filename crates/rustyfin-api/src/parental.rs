@@ -393,6 +393,16 @@ impl HiddenItems {
     pub fn json(&self) -> Option<String> {
         rustyfin_db::repo_parental::filter_json(&self.stored, self.folder_ids.as_deref())
     }
+
+    /// `json`, with the items `excluded` hidden too (a list's ExcludeItemIds).
+    pub fn json_excluding(&self, excluded: &[Uuid]) -> Option<String> {
+        if excluded.is_empty() {
+            return self.json();
+        }
+        let mut hidden = self.stored.clone();
+        hidden.extend(excluded.iter().map(Uuid::to_string));
+        rustyfin_db::repo_parental::filter_json(&hidden, self.folder_ids.as_deref())
+    }
 }
 
 /// The path parameters that name an item.
