@@ -300,12 +300,14 @@ fn attempts() -> &'static std::sync::Mutex<std::collections::HashMap<String, u32
 }
 
 /// Makes the tile set of the video at `path`, an item's file, and saves it. The old set, if any,
-/// is replaced only once the new one is complete. Waits for an `image_job` (`make_tiles`).
+/// is replaced only once the new one is complete. Waits for an `image_job` (`make_tiles`). Tiles
+/// are decoded on a device as `decoding` says.
 pub async fn generate(
     pool: &SqlitePool,
     data_dir: &Path,
     item_id: Uuid,
     path: &str,
+    decoding: &TileDecoding,
     cancel: &Cancel,
 ) -> Result<TrickplayInfo, String> {
     *attempts()
@@ -321,7 +323,7 @@ pub async fn generate(
         .await
         .map_err(|e| format!("could not make {}: {e}", tiles.display()))?;
 
-    let result = make_tiles(path, &work, &tiles, Reading::Auto, cancel).await;
+    let result = make_tiles(path, &work, &tiles, Reading::Auto, decoding, cancel).await;
     let made = match result {
         Ok(made) => made,
         Err(e) => {
@@ -418,6 +420,10 @@ struct RawVideo {
     crop: Option<[u64; 4]>,
     /// A Matroska file's Cues, which find the key frames without ffprobe.
     index: Option<Arc<MkvIndex>>,
+    /// More than 8 bits a sample.
+    deep: bool,
+    /// The device that decodes it, where the admin chose one (`TileDecoding`).
+    vaapi: Option<Arc<Vaapi>>,
 }
 
 impl RawVideo {
@@ -546,7 +552,7 @@ async fn probe(path: &str, cancel: &Cancel) -> Result<Option<Probe>, String> {
             "-show_data",
             "-show_entries",
             "format=start_time,duration,size,format_name:stream=codec_name,avg_frame_rate,\
-             width,height,sample_aspect_ratio,extradata:stream_side_data=rotation,crop_top,\
+             width,height,pix_fmt,sample_aspect_ratio,extradata:stream_side_data=rotation,crop_top,\
              crop_bottom,crop_left,crop_right:packet=pts_time,pos",
             // The first packet, and the last key frame, which a seek past the end lands on
             "-read_intervals",
@@ -614,6 +620,10 @@ async fn probe(path: &str, cancel: &Cancel) -> Result<Option<Probe>, String> {
             sar,
             crop,
             index: None,
+            deep: stream["pix_fmt"]
+                .as_str()
+                .is_some_and(|f| ["p10", "p12", "p14", "p16"].iter().any(|d| f.contains(d))),
+            vaapi: None,
         })
         .filter(|raw| KeyFrameStream::new(raw.codec, &raw.config).is_some());
     let mut raw = raw;
@@ -778,7 +788,127 @@ async fn seek_tile(
     }
 }
 
+/// How many tiles are decoded on a device at once over all videos: one per image job.
+fn device_tile_slots() -> &'static Semaphore {
+    static SLOTS: OnceLock<Semaphore> = OnceLock::new();
+    SLOTS.get_or_init(|| Semaphore::new(image_jobs() + 1))
+}
+
+/// How many tiles may fail on the device before a run makes the rest in software: one.
+const HW_FAILURES_MOST: usize = 1;
+
+/// Whether trickplay decodes tiles on a device: as the transcoder does, by the encoding settings
+/// in effect (`encoding::current`: the administrator's choice, or the detected device while the
+/// type is automatic), VA-API only (its device, the codecs it decodes and the 10-bit HEVC
+/// switch), where ffmpeg has the VA-API hwaccel and scaler. Read once a run. Tiles decoded on
+/// a device show the same frames as software ones but aren't byte-identical: the device's
+/// decoder doesn't skip the loop filter.
+#[derive(Clone, Debug, Default)]
+pub struct TileDecoding {
+    vaapi: Option<Arc<Vaapi>>,
+}
+
+/// The VA-API device tiles are decoded on, and the codecs the admin lets it decode.
+#[derive(Debug)]
+struct Vaapi {
+    device: String,
+    codecs: Vec<String>,
+    hevc_10bit: bool,
+    failures: std::sync::atomic::AtomicUsize,
+}
+
+impl TileDecoding {
+    /// The encoding settings in effect.
+    pub async fn current() -> Self {
+        Self::from_settings(crate::encoding::current()).await
+    }
+
+    async fn from_settings(settings: crate::encoding::EncodingSettings) -> Self {
+        if settings.hardware_acceleration != crate::encoding::HardwareAccelerationType::Vaapi {
+            return Self::default();
+        }
+        let caps = crate::encoding::probe_capabilities(Path::new("ffmpeg")).await;
+        if !caps.has_hwaccel("vaapi") || !caps.has_filter("scale_vaapi") {
+            warn!("ffmpeg has no VA-API hwaccel or scaler: trickplay decodes in software");
+            return Self::default();
+        }
+        Self {
+            vaapi: Some(Arc::new(Vaapi {
+                device: settings.vaapi_device,
+                codecs: settings.hardware_decoding_codecs,
+                hevc_10bit: settings.enable_decoding_color_depth_10_hevc,
+                failures: Default::default(),
+            })),
+        }
+    }
+
+    /// The device for a video in `codec`, more than 8 bits a sample where `deep`, if the
+    /// admin lets it decode that: as the transcoder, never 10-bit H.264, and 10-bit HEVC only
+    /// with its switch.
+    fn device_for(&self, codec: Codec, deep: bool) -> Option<Arc<Vaapi>> {
+        let vaapi = self.vaapi.as_ref()?;
+        let allowed = vaapi.codecs.iter().any(|c| c == codec.format())
+            && !(deep && codec == Codec::H264)
+            && !(deep && codec == Codec::Hevc && !vaapi.hevc_10bit);
+        allowed.then(|| vaapi.clone())
+    }
+}
+
+impl Vaapi {
+    /// Whether tiles still go to the device this run: not once one failed there.
+    fn usable(&self) -> bool {
+        self.failures.load(std::sync::atomic::Ordering::Relaxed) < HW_FAILURES_MOST
+    }
+
+    fn failed(&self, error: &str) {
+        let failed = 1 + self
+            .failures
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if failed == HW_FAILURES_MOST {
+            warn!(device = %self.device, error, "trickplay stops decoding on the device this run");
+        }
+    }
+
+    /// The input arguments that open the device and decode on it, as the transcoder writes
+    /// them.
+    fn input_args(&self) -> Vec<String> {
+        [
+            "-init_hw_device",
+            &format!("vaapi=va:{}", self.device),
+            "-filter_hw_device",
+            "va",
+            "-hwaccel",
+            "vaapi",
+            "-hwaccel_output_format",
+            "vaapi",
+            "-hwaccel_device",
+            "va",
+        ]
+        .map(String::from)
+        .to_vec()
+    }
+
+    /// The filters from the device's frames to software ones `WIDTH` wide: made 8-bit on the
+    /// device and scaled there to 3 times `WIDTH`, brought down, then scaled as in software.
+    /// The device's scaler alone (`scale_vaapi`, whose modes the driver may ignore) leaves fine
+    /// detail such as credits jagged going straight to `WIDTH`; brought down whole, a 2160p
+    /// frame takes more memory. A container that crops has its frames brought down whole and
+    /// cropped and scaled as in software.
+    fn filters(raw: &RawVideo) -> String {
+        let device = if raw.crop.is_some() {
+            "scale_vaapi=format=nv12".to_string()
+        } else {
+            format!("scale_vaapi=w='min(iw,{})':h=-2:format=nv12", 3 * WIDTH)
+        };
+        format!(
+            "{device},hwdownload,format=nv12,{}scale={WIDTH}:-2",
+            raw.container_filters()
+        )
+    }
+}
+
 /// Where `raw_tile` gets a tile's key frame packets.
+#[derive(Clone, Copy)]
 enum PacketSource<'a> {
     /// From ffprobe, which seeks to each of these intervals (`-read_intervals`).
     Probe(&'a str),
@@ -791,12 +921,10 @@ enum PacketSource<'a> {
 
 /// The ffmpeg arguments that decode one input into tile image `tile`, and list each frame
 /// it decoded in `frames` (framecrc), after the input arguments `input`. Frames go through the
-/// filters `first` (`RawVideo::container_filters`) before they are scaled.
-fn tile_args(input: Vec<String>, first: &str, tile: &Tile<'_>, frames: &Path) -> Vec<String> {
+/// filters `chain`, which end with them `WIDTH` wide, before they are laid out.
+fn tile_args(input: Vec<String>, chain: &str, tile: &Tile<'_>, frames: &Path) -> Vec<String> {
     let output = tile.tiles.join(format!("{}.jpg", tile.index));
-    let graph = format!(
-        "[0:V:0]{first}scale={WIDTH}:-2,split[t][n];[t]tile={TILE_SIDE}x{TILE_SIDE}[tiles]"
-    );
+    let graph = format!("[0:V:0]{chain},split[t][n];[t]tile={TILE_SIDE}x{TILE_SIDE}[tiles]");
     let mut args = input;
     args.extend(
         [
@@ -846,7 +974,9 @@ async fn frame_times(frames: &Path) -> Result<Vec<i64>, String> {
 /// order is the stream's own (see `key_frames`), so this checks that each key frame gave one
 /// frame, and that the decoder met no error: ffmpeg conceals a damaged slice and still hands
 /// out a frame, so a decode error stops it (`-xerror`) and any error it prints fails the tile
-/// (`pipe_key_frames`).
+/// (`pipe_key_frames`). Where the video has a device (`RawVideo::vaapi`), it decodes and scales
+/// the tile first; any failure there is counted against the device and the tile made again in
+/// software.
 async fn raw_tile(
     tile: &Tile<'_>,
     from: PacketSource<'_>,
@@ -854,23 +984,50 @@ async fn raw_tile(
     raw: &RawVideo,
     cancel: &Cancel,
 ) -> Result<(), String> {
+    if let Some(vaapi) = raw.vaapi.as_deref().filter(|v| v.usable()) {
+        // One tile on the device per image job: it decodes one at a time anyway, and each
+        // ffmpeg on it holds more memory than one in software
+        let _slot = tokio::select! {
+            slot = device_tile_slots().acquire() => slot.expect("the semaphore is never closed"),
+            _ = cancel.cancelled() => return Err("cancelled".to_string()),
+        };
+        match raw_tile_on(tile, from, wanted, raw, Some(vaapi), cancel).await {
+            Ok(()) => return Ok(()),
+            Err(e) if cancel.is_cancelled() => return Err(e),
+            Err(e) => {
+                vaapi.failed(&e);
+                info!(path = tile.path, error = %e, "trickplay decodes the tile in software");
+            }
+        }
+    }
+    raw_tile_on(tile, from, wanted, raw, None, cancel).await
+}
+
+/// `raw_tile` on `vaapi`'s device, or in software.
+async fn raw_tile_on(
+    tile: &Tile<'_>,
+    from: PacketSource<'_>,
+    wanted: usize,
+    raw: &RawVideo,
+    vaapi: Option<&Vaapi>,
+    cancel: &Cancel,
+) -> Result<(), String> {
     let stream = KeyFrameStream::new(raw.codec, &raw.config)
         .ok_or("the decoder configuration can't be read")?;
     let frames = tile.work.join(format!("seek-{}.crc", tile.index));
-    let input = [
-        "-xerror",
-        "-threads",
-        "1",
-        "-skip_loop_filter",
-        "all",
-        "-f",
-        raw.codec.format(),
-        "-i",
-        "pipe:0",
-    ]
-    .map(String::from)
-    .to_vec();
-    let ffmpeg_args = tile_args(input, &raw.container_filters(), tile, &frames);
+    let mut input = vec!["-xerror".to_string()];
+    let chain = match vaapi {
+        Some(vaapi) => {
+            input.extend(vaapi.input_args());
+            Vaapi::filters(raw)
+        }
+        None => {
+            input.extend(["-skip_loop_filter", "all"].map(String::from));
+            format!("{}scale={WIDTH}:-2", raw.container_filters())
+        }
+    };
+    input.extend(["-threads", "1", "-f", raw.codec.format(), "-i", "pipe:0"].map(String::from));
+    let ffmpeg_args = tile_args(input, &chain, tile, &frames);
     let fed = pipe_key_frames(from, tile.path, &ffmpeg_args, stream, cancel).await?;
     if fed != wanted {
         return Err(format!("ffprobe found {fed} of {wanted} key frames"));
@@ -1169,7 +1326,7 @@ async fn concat_tile(
     ]
     .map(String::from)
     .to_vec();
-    let args = tile_args(input, "", tile, &frames);
+    let args = tile_args(input, &format!("scale={WIDTH}:-2"), tile, &frames);
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
     run_ffmpeg(&args, cancel).await?;
     let times = frame_times(&frames).await?;
@@ -1213,9 +1370,13 @@ async fn make_tiles(
     work: &Path,
     tiles: &Path,
     reading: Reading,
+    decoding: &TileDecoding,
     cancel: &Cancel,
 ) -> Result<TrickplayInfo, String> {
-    let probed = probe(path, cancel).await?;
+    let mut probed = probe(path, cancel).await?;
+    if let Some(raw) = probed.as_mut().and_then(|p| p.raw.as_mut()) {
+        raw.vaapi = decoding.device_for(raw.codec, raw.deep);
+    }
     let mut count = 0;
     let seek = probed.as_ref().and_then(|p| match reading {
         Reading::Auto => Some((p, p.seeking()?)),
@@ -1417,6 +1578,8 @@ pub async fn generate_for_libraries_with_progress(
     // Every video the task covers, and those already done: with a tile set, or a failure on
     // record. A video with a failure is counted done here, so it isn't counted again when it
     // is skipped or tried again. The bar so starts where the last run left it.
+    // Whether tiles are decoded on a device, as the transcoder's are
+    let decoding = TileDecoding::current().await;
     let (total, done) =
         rustyfin_db::repo_trickplay::trickplay_progress(pool, library_ids, WIDTH, FAILURE_KIND)
             .await
@@ -1477,14 +1640,16 @@ pub async fn generate_for_libraries_with_progress(
                 continue;
             }
             let counted = failure.is_some();
-            let (pool, data_dir, cancel, file) = (
+            let (pool, data_dir, cancel, file, decoding) = (
                 pool.clone(),
                 data_dir.to_path_buf(),
                 cancel.clone(),
                 path.clone(),
+                decoding.clone(),
             );
-            let task = running
-                .spawn(async move { generate(&pool, &data_dir, item_id, &file, &cancel).await });
+            let task = running.spawn(async move {
+                generate(&pool, &data_dir, item_id, &file, &decoding, &cancel).await
+            });
             started.insert(task.id(), (item_id, path, version, counted));
         }
         let Some(joined) = running.join_next_with_id().await else {
@@ -1555,6 +1720,9 @@ pub async fn generate_for_libraries_with_progress(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// No device: tiles decoded in software, as most tests want them.
+    const SOFTWARE: TileDecoding = TileDecoding { vaapi: None };
 
     thread_local! {
         /// Set by a test: seeking pays for every video (`Probe::seeking`), so `Reading::Auto`
@@ -1739,7 +1907,7 @@ mod tests {
                         .unwrap();
                     Ok(count)
                 } else {
-                    make_tiles(&clip, &work, &tiles, reading, &Cancel::new())
+                    make_tiles(&clip, &work, &tiles, reading, &SOFTWARE, &Cancel::new())
                         .await
                         .map(|i| i.thumbnail_count)
                 };
@@ -1780,7 +1948,7 @@ mod tests {
                 let clip = clip.to_string_lossy();
                 let count = if raw {
                     let raw = Reading::Seek(Seeking::Raw);
-                    make_tiles(&clip, &work, &tiles, raw, &Cancel::new())
+                    make_tiles(&clip, &work, &tiles, raw, &SOFTWARE, &Cancel::new())
                         .await
                         .unwrap()
                         .thumbnail_count
@@ -1915,6 +2083,7 @@ mod tests {
             &work,
             &tiles,
             Reading::Seek(Seeking::Raw),
+            &SOFTWARE,
             &Cancel::new(),
         )
         .await
@@ -1922,9 +2091,16 @@ mod tests {
         assert!(raw.contains("ffmpeg"), "{raw}");
         // So the video is read whole, and its tiles are the streaming pass's
         let (work, auto) = run("auto");
-        let info = make_tiles(&clip, &work, &auto, Reading::Auto, &Cancel::new())
-            .await
-            .unwrap();
+        let info = make_tiles(
+            &clip,
+            &work,
+            &auto,
+            Reading::Auto,
+            &SOFTWARE,
+            &Cancel::new(),
+        )
+        .await
+        .unwrap();
         key_frames::DAMAGE.set(false);
         SEEK_PAYS.set(false);
         let (work, streamed) = run("stream");
@@ -2172,6 +2348,143 @@ mod tests {
         packets
     }
 
+    /// Decoding on the VA-API device `device`, for H.264 and HEVC (10-bit too).
+    fn on_device(device: &str) -> TileDecoding {
+        TileDecoding {
+            vaapi: Some(Arc::new(Vaapi {
+                device: device.to_string(),
+                codecs: vec!["h264".into(), "hevc".into()],
+                hevc_10bit: true,
+                failures: Default::default(),
+            })),
+        }
+    }
+
+    #[tokio::test]
+    async fn r3trickplay_only_the_settings_in_effect_decode_on_a_device() {
+        use crate::encoding::{EncodingSettings, HardwareAccelerationType};
+        // None, as by default, or another acceleration: software
+        let settings = |accel| EncodingSettings {
+            hardware_acceleration: accel,
+            hardware_decoding_codecs: vec!["h264".into()],
+            ..EncodingSettings::default()
+        };
+        for accel in [
+            HardwareAccelerationType::None,
+            HardwareAccelerationType::Nvenc,
+        ] {
+            let decoding = TileDecoding::from_settings(settings(accel)).await;
+            assert!(decoding.vaapi.is_none(), "{accel:?}");
+        }
+        // VA-API in effect: its device and codecs, where ffmpeg has VA-API
+        let vaapi = TileDecoding::from_settings(settings(HardwareAccelerationType::Vaapi)).await;
+        if let Some(vaapi) = &vaapi.vaapi {
+            assert_eq!(vaapi.codecs, ["h264"]);
+            assert_eq!(vaapi.device, EncodingSettings::default().vaapi_device);
+        }
+        // The codecs and bit depths the settings let the device decode, as the transcoder
+        let device = TileDecoding {
+            vaapi: Some(Arc::new(Vaapi {
+                device: "/dev/dri/renderD128".to_string(),
+                codecs: vec!["h264".into()],
+                hevc_10bit: false,
+                failures: Default::default(),
+            })),
+        };
+        assert!(device.device_for(Codec::H264, false).is_some());
+        assert!(
+            device.device_for(Codec::H264, true).is_none(),
+            "10-bit H.264"
+        );
+        assert!(
+            device.device_for(Codec::Hevc, false).is_none(),
+            "not a listed codec"
+        );
+        let hevc = on_device("/dev/dri/renderD128");
+        assert!(hevc.device_for(Codec::Hevc, true).is_some());
+        // A device that fails is given up on for the run
+        let vaapi = hevc.vaapi.as_ref().unwrap();
+        for _ in 0..HW_FAILURES_MOST {
+            assert!(vaapi.usable());
+            vaapi.failed("test");
+        }
+        assert!(!vaapi.usable());
+    }
+
+    #[tokio::test]
+    async fn r3trickplay_device_tiles_show_the_frames_and_fall_back() {
+        let test = "r3trickplay_device_tiles_show_the_frames_and_fall_back";
+        if !have_ffmpeg(test) || !have_encoder("libx264") {
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("r3trickplay-va-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let x264 = ["-x264-params", "keyint=20:min-keyint=20:scenecut=0"];
+        let clip = timed_clip(&dir, "libx264", &x264, &[], "va.mkv");
+        let clip = clip.to_string_lossy();
+        let raw = Reading::Seek(Seeking::Raw);
+        let run = async |name: &str, decoding: &TileDecoding| {
+            let work = dir.join(name);
+            let tiles = work.join("tiles");
+            std::fs::create_dir_all(&tiles).unwrap();
+            let info = make_tiles(&clip, &work, &tiles, raw, decoding, &Cancel::new())
+                .await
+                .unwrap();
+            (info, tiles)
+        };
+        let (soft, soft_tiles) = run("soft", &SOFTWARE).await;
+        // A device that can't be opened: every tile is made again in software, the same
+        let broken = on_device("/nonexistent/renderD999");
+        let (info, tiles) = run("broken", &broken).await;
+        assert_eq!(info, soft);
+        assert_eq!(
+            std::fs::read(tiles.join("0.jpg")).unwrap(),
+            std::fs::read(soft_tiles.join("0.jpg")).unwrap()
+        );
+        assert!(
+            broken
+                .vaapi
+                .as_ref()
+                .unwrap()
+                .failures
+                .load(std::sync::atomic::Ordering::Relaxed)
+                > 0
+        );
+        // A real device, where there is one: the same frames, scaled there
+        let device = "/dev/dri/renderD128";
+        if std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(device)
+            .is_ok()
+        {
+            let real = on_device(device);
+            let (info, tiles) = run("device", &real).await;
+            assert_eq!(info.thumbnail_count, soft.thumbnail_count);
+            assert_eq!((info.width, info.height), (soft.width, soft.height));
+            let failures = real
+                .vaapi
+                .as_ref()
+                .unwrap()
+                .failures
+                .load(std::sync::atomic::Ordering::Relaxed);
+            if failures == 0 {
+                let (a, b) = (
+                    thumbnail_times(&soft_tiles, soft.thumbnail_count),
+                    thumbnail_times(&tiles, info.thumbnail_count),
+                );
+                for (k, (a, b)) in a.iter().zip(&b).enumerate() {
+                    assert!((a - b).abs() <= 1.0, "thumbnail {k}: {a} {b}");
+                }
+            } else {
+                eprintln!("SKIPPED {test} on the device: it failed there, and fell back");
+            }
+        } else {
+            eprintln!("SKIPPED {test} on a device: {device} can't be opened");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[tokio::test]
     async fn r3trickplay_raw_tiles_keep_the_containers_cropping() {
         let test = "r3trickplay_raw_tiles_keep_the_containers_cropping";
@@ -2195,9 +2508,16 @@ mod tests {
             let work = dir.join(format!("work-{how:?}"));
             let tiles = work.join("tiles");
             std::fs::create_dir_all(&tiles).unwrap();
-            let info = make_tiles(&cropped, &work, &tiles, Reading::Seek(how), &Cancel::new())
-                .await
-                .unwrap();
+            let info = make_tiles(
+                &cropped,
+                &work,
+                &tiles,
+                Reading::Seek(how),
+                &SOFTWARE,
+                &Cancel::new(),
+            )
+            .await
+            .unwrap();
             made.push((info, std::fs::read(tiles.join("0.jpg")).unwrap()));
         }
         // ffmpeg crops the file to 249 x 150, which scales to 320 x 194, not 320 x 180
@@ -2268,7 +2588,7 @@ mod tests {
                         .await
                         .unwrap()
                 } else {
-                    let info = make_tiles(&clip, &work, &tiles, reading, &Cancel::new())
+                    let info = make_tiles(&clip, &work, &tiles, reading, &SOFTWARE, &Cancel::new())
                         .await
                         .unwrap_or_else(|e| panic!("{name}: {e}"));
                     let tile_count = std::fs::read_dir(&tiles).unwrap().count();
