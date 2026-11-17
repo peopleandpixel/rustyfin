@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 /// Configuration for the Local NFO plugin.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -47,13 +47,14 @@ impl Default for LocalNfoConfig {
 
 /// Local NFO metadata provider plugin.
 pub struct LocalNfoPlugin {
-    config: Mutex<LocalNfoConfig>,
+    /// Shared with the registered provider, which reads the current config on each call
+    config: Arc<Mutex<LocalNfoConfig>>,
 }
 
 impl Default for LocalNfoPlugin {
     fn default() -> Self {
         Self {
-            config: Mutex::new(LocalNfoConfig::default()),
+            config: Arc::new(Mutex::new(LocalNfoConfig::default())),
         }
     }
 }
@@ -97,12 +98,6 @@ impl Plugin for LocalNfoPlugin {
 
     fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
         self
-    }
-}
-
-impl LocalNfoPlugin {
-    fn config(&self) -> LocalNfoConfig {
-        self.config.lock().unwrap().clone()
     }
 }
 
@@ -433,9 +428,8 @@ pub async fn register_local_nfo_provider<P>(plugin: &LocalNfoPlugin, plugin_mana
 where
     P: MetadataProviderRegistrar,
 {
-    let config = plugin.config();
-    let config1 = config.clone();
-    let config2 = config.clone();
+    let config1 = plugin.config.clone();
+    let config2 = plugin.config.clone();
 
     let plugin_id = plugin.id().to_string();
     plugin_manager
@@ -446,7 +440,7 @@ where
                   name: &str,
                   _year: Option<i32>|
                   -> Pin<Box<dyn Future<Output = Option<ExternalMetadata>> + Send>> {
-                let config = config1.clone();
+                let config = config1.lock().unwrap().clone();
                 let media_path = name.to_string();
                 let client = client.clone();
                 Box::pin(async move { search_movie(&client, &config, &media_path).await })
@@ -454,7 +448,7 @@ where
             move |client: &reqwest::Client,
                   name: &str|
                   -> Pin<Box<dyn Future<Output = Option<ExternalMetadata>> + Send>> {
-                let config = config2.clone();
+                let config = config2.lock().unwrap().clone();
                 let media_path = name.to_string();
                 let client = client.clone();
                 Box::pin(async move { search_tv(&client, &config, &media_path).await })
