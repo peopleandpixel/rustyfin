@@ -180,21 +180,24 @@ async fn join_group(
         .map_err(|e| ApiError::Internal(e.to_string()))?
         .ok_or(ApiError::NotFound("Group not found".to_string()))?;
 
-    if group.is_locked {
-        return Err(ApiError::BadRequest("Group is locked".to_string()));
-    }
-    // A user joins a group once: joining again changes nothing
+    // A user joins a group once: joining again changes nothing, also once the group is locked,
+    // which keeps out only new members
     if is_member(&state, &group.id, &claims).await? {
         return Ok(StatusCode::OK);
+    }
+    if group.is_locked {
+        return Err(ApiError::BadRequest("Group is locked".to_string()));
     }
 
     let member_id = Uuid::new_v4().to_string();
     let session_id = Uuid::new_v4().to_string();
 
-    rustyfin_db::repo_sync_play::add_member(
+    // Adds the membership only if there is none yet, in one statement: two joins at once still
+    // make one
+    rustyfin_db::repo_sync_play::add_member_once(
         &state.db,
         &member_id,
-        &req.group_id,
+        &group.id,
         &claims.sub.to_string(),
         &session_id,
     )

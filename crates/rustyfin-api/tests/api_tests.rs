@@ -22962,6 +22962,25 @@ async fn r3security_sync_play_groups_are_managed_by_their_creator_or_an_admin() 
     let members = members.as_array().unwrap();
     assert_eq!(members.len(), 1, "{members:?}");
     assert_eq!(members[0]["UserId"], bob_id.to_string());
+    // Two joins at once still make one membership
+    let join = serde_json::json!({ "GroupId": id });
+    let (a, b) = tokio::join!(
+        call(
+            "POST",
+            "/SyncPlay/JoinGroup".into(),
+            carol.clone(),
+            join.clone()
+        ),
+        call(
+            "POST",
+            "/SyncPlay/JoinGroup".into(),
+            carol.clone(),
+            join.clone()
+        ),
+    );
+    assert_eq!((a.0, b.0), (StatusCode::OK, StatusCode::OK));
+    let (_, members) = call("GET", path("/Members"), bob.clone(), none.clone()).await;
+    assert_eq!(members.as_array().unwrap().len(), 2, "{members}");
     let (status, _) = call("DELETE", path(""), bob.clone(), none.clone()).await;
     assert_eq!(status, StatusCode::FORBIDDEN);
     // A member's playback commands aren't carried out yet: 501, not a 200 that did nothing
@@ -22974,6 +22993,18 @@ async fn r3security_sync_play_groups_are_managed_by_their_creator_or_an_admin() 
     // The creator and an administrator may
     let (status, _) = call("POST", path("/Lock"), alice.clone(), none.clone()).await;
     assert_eq!(status, StatusCode::OK);
+    // Locked: a member may join again, anyone else is turned away
+    let join = serde_json::json!({ "GroupId": id });
+    let (status, _) = call(
+        "POST",
+        "/SyncPlay/JoinGroup".into(),
+        bob.clone(),
+        join.clone(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "a member rejoins a locked group");
+    let (status, _) = call("POST", "/SyncPlay/JoinGroup".into(), admin.clone(), join).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "a new member is kept out");
     let (status, _) = call("GET", path("/Members"), alice.clone(), none.clone()).await;
     assert_eq!(status, StatusCode::OK);
     let (status, _) = call("POST", path("/Unlock"), admin.clone(), none.clone()).await;
