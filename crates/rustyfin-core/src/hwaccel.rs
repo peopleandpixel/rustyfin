@@ -424,15 +424,84 @@ async fn nvidia_smi_lists_a_gpu() -> bool {
 /// Probes with the machine's ffmpeg, on clips it writes into `clip_dir`.
 pub struct FfmpegProber {
     ffmpeg: PathBuf,
+    /// The server's data directory, for the drivers' cache (`ffmpeg_env`)
+    data_dir: PathBuf,
     clips: Vec<(Clip, PathBuf)>,
+}
+
+/// The group id that owns `device`, as `stat -c %g` prints it.
+fn device_gid(device: &str) -> Option<u32> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        std::fs::metadata(device).ok().map(|m| m.gid())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = device;
+        None
+    }
+}
+
+/// What to do about a device the server's user may not open: join its group, or, in a
+/// container, be given the group's id.
+pub fn permission_hint(device: &str) -> String {
+    let gid = device_gid(device).map_or("<gid>".to_string(), |g| g.to_string());
+    format!(
+        "permission denied on {device}: add the server's user to the device's group (often \
+         render or video); in a container, pass the device's group id with --group-add {gid} \
+         (stat -c %g {device}), or group_add in docker-compose"
+    )
+}
+
+/// The folder GPU drivers cache in while ffmpeg runs (Mesa's shader cache, among others):
+/// `gpu` in the server's cache folder (`cache` in the data directory).
+pub fn gpu_cache_dir(data_dir: &Path) -> PathBuf {
+    data_dir.join("cache").join("gpu")
+}
+
+/// The environment every ffmpeg child gets, so GPU drivers cache in `gpu_cache_dir` (created
+/// here when missing) rather than under a `$HOME` that may be unset or not writable, as in a
+/// container run as another user (Mesa then prints "Failed to create //.cache for shader
+/// cache"). Transcodes, the hardware detection and trickplay pass it with `Command::envs`.
+pub fn ffmpeg_env(data_dir: &Path) -> [(&'static str, PathBuf); 2] {
+    let dir = gpu_cache_dir(data_dir);
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        let key = format!("gpu-cache|{}", dir.display());
+        if logged()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(key)
+        {
+            warn!(
+                "cannot make the GPU drivers' cache folder {}: {e}",
+                dir.display()
+            );
+        }
+    }
+    [
+        ("XDG_CACHE_HOME", dir.clone()),
+        ("MESA_SHADER_CACHE_DIR", dir),
+    ]
+}
+
+/// Whether an ffmpeg stderr line is a GPU driver's notice rather than ffmpeg's own error: the
+/// AMD driver's note on shared DRM file descriptors and Mesa's shader cache warning. These are
+/// harmless, so they are left out of the reasons a run gives; a run fails only by its exit.
+pub fn driver_chatter(line: &str) -> bool {
+    let line = line.trim();
+    line.starts_with("amdgpu:")
+        || line.starts_with("If they do, bad things may happen")
+        || (line.contains("shader cache") && line.starts_with("Failed to create"))
 }
 
 /// The longest one probe run may take.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(20);
 
-async fn run(ffmpeg: &Path, args: &[String]) -> Result<(), String> {
+async fn run(ffmpeg: &Path, data_dir: &Path, args: &[String]) -> Result<(), String> {
     let mut cmd = Command::new(ffmpeg);
-    cmd.args(["-nostdin", "-hide_banner", "-v", "error", "-y"])
+    cmd.envs(ffmpeg_env(data_dir))
+        .args(["-nostdin", "-hide_banner", "-v", "error", "-y"])
         .args(args)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
@@ -447,7 +516,7 @@ async fn run(ffmpeg: &Path, args: &[String]) -> Result<(), String> {
             let last = stderr
                 .lines()
                 .map(str::trim)
-                .filter(|l| !l.is_empty())
+                .filter(|l| !l.is_empty() && !driver_chatter(l))
                 .take(3)
                 .collect::<Vec<_>>()
                 .join("; ");
@@ -467,7 +536,7 @@ fn strings(args: &[&str]) -> Vec<String> {
 impl FfmpegProber {
     /// Writes the test clips (256×144, 3 frames) with the software encoders ffmpeg has; a codec
     /// without one is left out, so no device is said to decode it.
-    pub async fn new(ffmpeg: &Path, clip_dir: &Path) -> Self {
+    pub async fn new(ffmpeg: &Path, data_dir: &Path, clip_dir: &Path) -> Self {
         let _ = tokio::fs::create_dir_all(clip_dir).await;
         let mut clips = Vec::new();
         for clip in Clip::ALL {
@@ -482,7 +551,7 @@ impl FfmpegProber {
                 args.extend(strings(encoder));
                 args.extend(strings(&["-pix_fmt", pix_fmt, "-an"]));
                 args.push(path.to_string_lossy().into_owned());
-                if run(ffmpeg, &args).await.is_ok() {
+                if run(ffmpeg, data_dir, &args).await.is_ok() {
                     clips.push((clip, path));
                     break;
                 }
@@ -490,6 +559,7 @@ impl FfmpegProber {
         }
         Self {
             ffmpeg: ffmpeg.to_path_buf(),
+            data_dir: data_dir.to_path_buf(),
             clips,
         }
     }
@@ -539,11 +609,7 @@ impl Prober for FfmpegProber {
                 .open(&candidate.device)
             {
                 return Err(if e.kind() == std::io::ErrorKind::PermissionDenied {
-                    format!(
-                        "permission denied on {}: add the server's user to the device's group \
-                         (often render or video)",
-                        candidate.device
-                    )
+                    permission_hint(&candidate.device)
                 } else {
                     format!("cannot open {}: {e}", candidate.device)
                 });
@@ -561,7 +627,7 @@ impl Prober for FfmpegProber {
             "null",
             "-",
         ]));
-        run(&self.ffmpeg, &args).await
+        run(&self.ffmpeg, &self.data_dir, &args).await
     }
 
     async fn decodes(&self, candidate: &Candidate, clip: Clip) -> bool {
@@ -580,7 +646,7 @@ impl Prober for FfmpegProber {
             "null".to_string(),
             "-".to_string(),
         ]);
-        run(&self.ffmpeg, &args).await.is_ok()
+        run(&self.ffmpeg, &self.data_dir, &args).await.is_ok()
     }
 
     async fn encodes(&self, candidate: &Candidate) -> Result<(), String> {
@@ -600,7 +666,7 @@ impl Prober for FfmpegProber {
         ]));
         args.push(crate::transcode::hw_encoder_upload(accel).to_string());
         args.extend(strings(&["-c:v", encoder, "-f", "null", "-"]));
-        run(&self.ffmpeg, &args).await
+        run(&self.ffmpeg, &self.data_dir, &args).await
     }
 }
 
@@ -623,13 +689,13 @@ fn logged() -> &'static Mutex<HashSet<String>> {
 
 /// Finds this machine's devices and probes each with `ffmpeg`, on clips written under
 /// `work_dir` (removed afterwards). Logs what was found, and why a device isn't usable once.
-pub async fn detect(ffmpeg: &Path, work_dir: &Path) -> HardwareDetection {
+pub async fn detect(ffmpeg: &Path, data_dir: &Path, work_dir: &Path) -> HardwareDetection {
     let candidates = candidates().await;
     let detection = if candidates.is_empty() {
         detect_with(&NoDevices, &[]).await
     } else {
         let _cleanup = RemoveOnDrop(work_dir.to_path_buf());
-        let prober = FfmpegProber::new(ffmpeg, work_dir).await;
+        let prober = FfmpegProber::new(ffmpeg, data_dir, work_dir).await;
         detect_with(&prober, &candidates).await
     };
     for device in &detection.devices {
@@ -978,6 +1044,33 @@ mod tests {
         assert!(type_is_automatic(Some(&body)));
         assert!(!body.contains_key("VaapiDevice"));
         assert_eq!(body["HardwareDecodingCodecs"], json!(["h264"]));
+    }
+
+    #[test]
+    fn hwaccel_driver_chatter_and_the_permission_hint() {
+        for line in [
+            "amdgpu: os_same_file_description couldn't determine if two DRM fds reference the same file description.",
+            "If they do, bad things may happen!",
+            "Failed to create //.cache for shader cache (Permission denied)---disabling.",
+        ] {
+            assert!(driver_chatter(line), "{line}");
+        }
+        for line in [
+            "Device creation failed: -22.",
+            "Failed to initialise VAAPI connection: -1 (unknown libva error).",
+            "Failed to create a VAAPI device",
+        ] {
+            assert!(!driver_chatter(line), "{line}");
+        }
+        let hint = permission_hint("/dev/null");
+        assert!(hint.contains("--group-add"), "{hint}");
+        assert!(hint.contains("stat -c %g /dev/null"), "{hint}");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let gid = std::fs::metadata("/dev/null").unwrap().gid();
+            assert!(hint.contains(&format!("--group-add {gid} ")), "{hint}");
+        }
     }
 
     #[test]

@@ -195,7 +195,9 @@ const MAX_WAIT_FACTOR: u32 = 10;
 pub struct TranscodeManager {
     sessions: Arc<DashMap<Uuid, TranscodeSession>>, // keyed by playback id
     cache_root: PathBuf,
-    ffmpeg: PathBuf,         // "ffmpeg"; unit tests point it at a fake script
+    ffmpeg: PathBuf, // "ffmpeg"; unit tests point it at a fake script
+    /// The data directory: ffmpeg's GPU drivers cache under it (`hwaccel::ffmpeg_env`)
+    data_dir: PathBuf,
     playlist_wait: Duration, // 30 s; unit tests shorten it
     start_lock: Arc<tokio::sync::Mutex<()>>,
     /// Set under `start_lock` by `shutdown`: no transcode starts after it
@@ -302,6 +304,7 @@ impl TranscodeManager {
             warned: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
             reasons: Arc::new(std::sync::Mutex::new(HashMap::new())),
             detection: Arc::new(std::sync::RwLock::new(None)),
+            data_dir: data_dir.to_path_buf(),
             detecting: Arc::new(tokio::sync::Mutex::new(())),
         }
     }
@@ -347,7 +350,7 @@ impl TranscodeManager {
         _guard: tokio::sync::MutexGuard<'_, ()>,
     ) -> crate::hwaccel::HardwareDetection {
         let work = data_dir.join("hwaccel-probe");
-        let detection = crate::hwaccel::detect(&self.ffmpeg, &work).await;
+        let detection = crate::hwaccel::detect(&self.ffmpeg, data_dir, &work).await;
         self.set_hardware_detection(data_dir, detection.clone());
         detection
     }
@@ -875,6 +878,7 @@ impl TranscodeManager {
     fn ffmpeg_command(&self, args: &[String], stdout: Stdio) -> Command {
         let mut command = Command::new(&self.ffmpeg);
         command
+            .envs(crate::hwaccel::ffmpeg_env(&self.data_dir))
             .args(args)
             .stdin(Stdio::null())
             .stdout(stdout)
@@ -1374,6 +1378,10 @@ async fn drain_stderr<R: tokio::io::AsyncRead + Unpin>(
             continue;
         }
         debug!(playback_id = %playback_id, "ffmpeg: {line}");
+        // A GPU driver's notice isn't why a run failed: it stays out of the reported tail
+        if crate::hwaccel::driver_chatter(line) {
+            continue;
+        }
         let kept: String = line.chars().take(300).collect();
         let mut tail = tail.lock().unwrap();
         tail.push_back(kept);
@@ -3437,6 +3445,20 @@ printf 'r3gaps2'
 exec sleep 30
 "#;
 
+    /// Prints the AMD driver's and Mesa's notices on stderr, notes its GPU cache variables next
+    /// to its output, then serves like `good`.
+    const FAKE_CHATTY: &str = r#"#!/bin/sh
+echo "amdgpu: os_same_file_description couldn't determine if two DRM fds reference the same file description." >&2
+echo "If they do, bad things may happen!" >&2
+echo "Failed to create //.cache for shader cache (Permission denied)---disabling." >&2
+for last; do :; done
+dir=$(dirname "$last")
+printf '%s\n%s\n' "$XDG_CACHE_HOME" "$MESA_SHADER_CACHE_DIR" > "$dir/env.txt"
+printf 'g4' > "$dir/segment_0000.ts"
+printf '#EXTM3U\n#EXTINF:6.0,\nsegment_0000.ts\n' > "$last"
+exec sleep 30
+"#;
+
     /// Never writes a playlist.
     const FAKE_SLOW: &str = "#!/bin/sh\nexec sleep 30\n";
 
@@ -3513,6 +3535,7 @@ exec sleep 30
                 ("piped", FAKE_PIPED),
                 ("hwfail", FAKE_HWFAIL),
                 ("hwfail-piped", FAKE_HWFAIL_PIPED),
+                ("chatty", FAKE_CHATTY),
                 ("hwhang-piped", FAKE_HWHANG_PIPED),
             ] {
                 // Rename into place: another test process may be running the old file.
@@ -4572,6 +4595,36 @@ exec sleep 30
         // Saving the options tries the hardware again
         mgr.set_encoding_settings(mgr.encoding_settings());
         assert!(hw("/in.mkv").await && hw("/other.mkv").await);
+        mgr.stop_all().await;
+    }
+
+    /// GPU driver notices on stderr don't make a hardware transcode a failure, and every ffmpeg
+    /// gets the GPU drivers' cache folder under the data directory, which exists.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn r3hwaccel_driver_chatter_is_no_failure_and_the_gpu_cache_is_set() {
+        let (dir, mgr) = fake_manager("chatty", Duration::from_secs(10));
+        mgr.capabilities.set(FfmpegCapabilities::default()).unwrap();
+        mgr.set_encoding_settings(EncodingSettings {
+            hardware_acceleration: encoding::HardwareAccelerationType::Vaapi,
+            ..Default::default()
+        });
+        let (playlist, id) = start(&mgr, Uuid::new_v4(), "ps-chat", "dev").await.unwrap();
+        let used = mgr.sessions.get(&id).unwrap().profile.clone();
+        assert!(uses_hardware(&used), "{used:?}");
+        assert!(mgr.hardware_health().failed_inputs.is_empty());
+        assert_eq!(mgr.hardware_health().device_failures, 0);
+        let gpu = dir.0.join("cache").join("gpu");
+        let env = std::fs::read_to_string(playlist.parent().unwrap().join("env.txt")).unwrap();
+        assert_eq!(env, format!("{}\n{}\n", gpu.display(), gpu.display()));
+        assert!(gpu.is_dir());
+        // The notices never count as the device failing to open
+        for line in [
+            "amdgpu: os_same_file_description couldn't determine if two DRM fds reference the same file description.",
+            "Failed to create //.cache for shader cache (Permission denied)---disabling.",
+        ] {
+            assert!(!device_setup_failed(line), "{line}");
+        }
         mgr.stop_all().await;
     }
 
