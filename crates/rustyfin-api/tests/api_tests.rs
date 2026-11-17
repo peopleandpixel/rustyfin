@@ -7279,9 +7279,19 @@ async fn r1auth_parent_id_filters_seasons_and_episodes() {
             .await,
             r1auth_sorted(&[lib.episode, other_episode])
         );
+        // With item types, a library lists its contents recursively unless Recursive is given,
+        // as Jellyfin 12.4's ItemsController does (`recursive ??= true` for a collection folder).
         assert_eq!(
             get(format!(
                 "ParentId={}&IncludeItemTypes=Movie,Series",
+                lib.library
+            ))
+            .await,
+            r1auth_sorted(&[lib.movie, lib.series, other, shelved])
+        );
+        assert_eq!(
+            get(format!(
+                "ParentId={}&IncludeItemTypes=Movie,Series&Recursive=false",
                 lib.library
             ))
             .await,
@@ -52121,6 +52131,12 @@ async fn r3items_movies(state: &AppState) -> (uuid::Uuid, Vec<uuid::Uuid>) {
     for name in ["Alpha", "Bravo", "Charlie", "Delta"] {
         ids.push(j6_add_item(state, lib, None, name, "Movie").await);
     }
+    // Sort names as a scan stores them, so name orders don't fall back to the random ids.
+    r3items_sql(
+        state,
+        &format!("UPDATE media_items SET sort_name = lower(name) WHERE library_id = '{lib}'"),
+    )
+    .await;
     (lib, ids)
 }
 
@@ -52494,6 +52510,12 @@ async fn r3items_library(state: &AppState) -> R3ItemsLibrary {
             r3items_sql(state, &format!("INSERT INTO media_streams (id, source_id, codec_type, stream_index, language) VALUES ('{}', '{source}', 'Subtitle', 2, 'eng')", uuid::Uuid::new_v4())).await;
         }
     }
+    // Sort names as a scan stores them, so name orders don't fall back to the random ids.
+    r3items_sql(
+        state,
+        &format!("UPDATE media_items SET sort_name = lower(name) WHERE library_id = '{lib}'"),
+    )
+    .await;
     R3ItemsLibrary {
         library: lib,
         ids,

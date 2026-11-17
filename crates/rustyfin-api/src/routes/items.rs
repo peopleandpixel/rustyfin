@@ -2681,10 +2681,21 @@ fn query_instant(name: &str, value: Option<&str>) -> Result<Option<String>, ApiE
     Ok(Some(instant.format("%Y-%m-%d %H:%M:%S").to_string()))
 }
 
-/// The item types whose Jellyfin `MediaType` (`MediaType::media_kind`) is one of `kinds`; a kind
-/// no item has (`Book`) keeps a type no item has, so it lists nothing.
-fn item_types_of_media_kinds(kinds: &[String]) -> Vec<String> {
+/// The item types whose Jellyfin `MediaType` (`MediaType::media_kind`) is one of `kinds`, or
+/// `None` to filter nothing. As Jellyfin 12.4's comma-delimited binder drops a value that isn't a
+/// `MediaType` (`Unknown`, `Video`, `Audio`, `Photo`, `Book`), only those count, and with none
+/// left nothing is filtered; a kind no item has (`Book`) keeps a type no item has, so it lists
+/// nothing.
+fn item_types_of_media_kinds(kinds: &[String]) -> Option<Vec<String>> {
     use rustyfin_model::media::MediaType;
+    const KINDS: [&str; 5] = ["Unknown", "Video", "Audio", "Photo", "Book"];
+    let kinds: Vec<&String> = kinds
+        .iter()
+        .filter(|k| KINDS.iter().any(|known| known.eq_ignore_ascii_case(k)))
+        .collect();
+    if kinds.is_empty() {
+        return None;
+    }
     const TYPES: [MediaType; 12] = [
         MediaType::Movie,
         MediaType::Series,
@@ -2707,7 +2718,7 @@ fn item_types_of_media_kinds(kinds: &[String]) -> Vec<String> {
     if types.is_empty() {
         types.push("Book".to_string());
     }
-    types
+    Some(types)
 }
 
 /// The `InternalItemsQuery` conditions of a list request that `repo_item_filter` answers.
@@ -2910,7 +2921,7 @@ async fn get_items(
     // MediaTypes names Jellyfin's media kinds (Video, Audio, …), kept as the item types of them.
     let media_types_filter: Option<Vec<String>> = query
         .media_types()
-        .map(|s| item_types_of_media_kinds(&comma_list(Some(s))));
+        .and_then(|s| item_types_of_media_kinds(&comma_list(Some(s))));
     let conditions = item_filter(&query)?;
     let runtime_parts: Option<(i32, i32)> = query.runtime().map(|s| {
         let parts: Vec<&str> = s.split('-').collect();
