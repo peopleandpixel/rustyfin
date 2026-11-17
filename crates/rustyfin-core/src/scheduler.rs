@@ -1059,12 +1059,11 @@ impl TaskScheduler {
                     .collect();
                 let client = &self.http_client;
                 let mut errors = Vec::new();
-                // The runs another caller scans, which this task waits for before it ends
-                let mut runs = Vec::new();
                 for (lib, ticket) in libraries.iter().zip(tickets) {
-                    // Only the caller that claimed the library's run scans it.
+                    // Only the caller that claimed the library's run scans it. A library another
+                    // caller claimed is left to it: the task neither scans nor waits for it (its
+                    // listing alone keeps the task reading Running).
                     if !ticket.claim() {
-                        runs.push(ticket);
                         continue;
                     }
                     if let Err(e) = crate::scanner::scan_library_with_metadata(
@@ -1081,9 +1080,6 @@ impl TaskScheduler {
                     // The probes the scan queued keep the library listed until they finish, and
                     // the task Running until then. The next library's scan waits for them anyway
                     // (the scan lock).
-                    ticket.wait_end().await;
-                }
-                for ticket in runs {
                     ticket.wait_end().await;
                 }
                 let end = Utc::now();
@@ -2509,10 +2505,11 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// The scheduled library scan stays Running until the scans it covers have ended, the ones
-    /// another caller is running included, and only then records its result.
+    /// The scheduled library scan leaves a library another caller claimed to it: it neither scans
+    /// nor waits for it, and records its result. The other scan, still listed, keeps the task
+    /// reading Running until it ends.
     #[tokio::test]
-    async fn r3dash3_the_scheduled_scan_waits_for_running_scans() {
+    async fn r3dash3_the_scheduled_scan_skips_a_claimed_library() {
         let (sched, dir) = r3tasks_scheduler().await;
         let media = dir.join("media");
         std::fs::create_dir_all(&media).unwrap();
@@ -2526,23 +2523,21 @@ mod tests {
             .await
             .unwrap();
         // Another caller (a library's Scan) has claimed the library's run, which still waits for
-        // the scan lock, so the task joins that run instead of scanning
+        // the scan lock, so the task joins that run and leaves it to its claimer
         let api_scan = sched.scans().queue(lib.id);
         assert!(api_scan.claim());
-        let task = {
-            let sched = sched.clone();
-            tokio::spawn(async move { sched.run_library_scan().await })
-        };
-        for _ in 0..50 {
-            tokio::task::yield_now().await;
-        }
-        assert!(!task.is_finished(), "the task waits for the other scan");
-        assert_eq!(r3dash3_scan_task(&sched).await.0, TaskState::Running);
-        drop(api_scan);
-        task.await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(10), sched.run_library_scan())
+            .await
+            .expect("the task doesn't wait for the claimed library");
         let info = sched.get_task(TASK_LIBRARY_SCAN).await.unwrap();
-        assert_eq!(info.state, TaskState::Idle);
         assert!(info.last_execution_result.is_some());
+        assert_eq!(
+            info.state,
+            TaskState::Running,
+            "the other scan is still listed"
+        );
+        drop(api_scan);
+        assert_eq!(r3dash3_scan_task(&sched).await, (TaskState::Idle, None));
         assert!(sched.scans().snapshot().is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
