@@ -865,26 +865,129 @@ fn sweep_vtt_cache_daily(dir: &std::path::Path) {
     }
 }
 
-/// `GET /Items/{id}/RemoteSearch/Subtitles/{language}`: Jellyfin's `RemoteSubtitleInfo` list.
-/// Rustyfin has no subtitle provider, so the list is empty, as Jellyfin's is with none installed;
-/// no outside service is asked.
+/// `GET /Items/{id}/RemoteSearch/Subtitles/{language}`: Jellyfin's `RemoteSubtitleInfo` list, from
+/// every enabled subtitle provider (OpenSubtitles, Podnapisi). With none enabled the list is
+/// empty, as Jellyfin's is with none installed, and no outside service is asked. A result's `Id`
+/// names its provider, language and format, so the download knows where to ask and what it gets.
 async fn search_remote_subtitles(
     State(state): State<AppState>,
-    Path((id, _language)): Path<(Uuid, String)>,
+    Path((id, language)): Path<(Uuid, String)>,
 ) -> Result<Json<Vec<serde_json::Value>>, ApiError> {
-    rustyfin_db::repo_media::get_item_by_id(&state.db_ro, id)
+    let item = rustyfin_db::repo_media::get_item_by_id(&state.db_ro, id)
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("Item {id} not found")))?;
-    Ok(Json(Vec::new()))
+    let language = subtitle_language(&language)?;
+    let mut results = Vec::new();
+    for provider in state.plugin_manager.subtitle_providers().await {
+        let found = (provider.search_subtitles)(&state.http_client, &item, &language).await;
+        for hit in found {
+            let format = subtitle_format(&hit.name);
+            results.push(serde_json::json!({
+                "Id": format!("{}_{}_{}_{}", provider.plugin_id, language, format, hit.id),
+                "ProviderName": provider.plugin_id,
+                "Name": hit.name,
+                "Format": format,
+                "ThreeLetterISOLanguageName": language,
+                "Comment": hit.description,
+                "IsHashMatch": false,
+            }));
+        }
+    }
+    Ok(Json(results))
 }
 
-/// `POST /Items/{id}/RemoteSearch/Subtitles/{subtitleId}`: no provider can have given the id.
+/// `POST /Items/{id}/RemoteSearch/Subtitles/{subtitleId}`: the provider that gave the id downloads
+/// the file, which is saved beside the video (as an upload is) and becomes one of its streams.
 async fn download_remote_subtitle(
-    Path((_id, _subtitle_id)): Path<(Uuid, String)>,
+    State(state): State<AppState>,
+    Path((id, subtitle_id)): Path<(Uuid, String)>,
 ) -> Result<StatusCode, ApiError> {
-    Err(ApiError::NotFound(
-        "No subtitle provider is configured".into(),
-    ))
+    let mut parts = subtitle_id.splitn(4, '_');
+    let (Some(plugin), Some(language), Some(format), Some(remote_id)) =
+        (parts.next(), parts.next(), parts.next(), parts.next())
+    else {
+        return Err(ApiError::NotFound(format!(
+            "Unknown subtitle id {subtitle_id}"
+        )));
+    };
+    let language = subtitle_language(language)?;
+    if !UPLOAD_FORMATS.contains(&format) {
+        return Err(ApiError::NotFound(format!(
+            "Unknown subtitle id {subtitle_id}"
+        )));
+    }
+    let provider = state
+        .plugin_manager
+        .subtitle_providers()
+        .await
+        .into_iter()
+        .find(|p| p.plugin_id == plugin)
+        .ok_or_else(|| ApiError::NotFound(format!("No enabled subtitle provider '{plugin}'")))?;
+    let item = video_item(&state, id).await?;
+    validate_path_against_library(&state, &item.path).await?;
+    let video = std::path::Path::new(&item.path);
+    let (Some(dir), Some(video_stem)) =
+        (video.parent(), video.file_stem().and_then(|s| s.to_str()))
+    else {
+        return Err(ApiError::BadRequest("The item is not a video".into()));
+    };
+
+    // The provider writes to a file of its own under the data dir; the bytes then go beside the
+    // video under a name no other file has
+    let temp_dir = state.data_dir.join("cache").join("subtitles");
+    tokio::fs::create_dir_all(&temp_dir)
+        .await
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
+    let temp = temp_dir.join(format!("download-{}.tmp", Uuid::new_v4()));
+    let fetched = (provider.download_subtitle)(&state.http_client, remote_id, &temp).await;
+    let bytes = match fetched {
+        Ok(()) => tokio::fs::read(&temp).await.ok(),
+        Err(e) => {
+            tracing::warn!(item = %id, provider = plugin, "subtitle download failed: {e}");
+            None
+        }
+    };
+    let _ = tokio::fs::remove_file(&temp).await;
+    let bytes = bytes
+        .filter(|b| !b.is_empty() && b.len() <= UPLOAD_MAX_BYTES)
+        .ok_or_else(|| ApiError::BadGateway(format!("{plugin} gave no subtitle file")))?;
+    let path = write_new_file(dir, &format!("{video_stem}.{language}"), format, &bytes)
+        .await
+        .map_err(|e| {
+            ApiError::Internal(format!(
+                "The subtitle could not be saved beside the video: {e}"
+            ))
+        })?;
+    add_subtitle_stream(&state, &item, id, &path).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// A subtitle language from a request: letters, digits and '-', lower case.
+fn subtitle_language(language: &str) -> Result<String, ApiError> {
+    let language = language.trim().to_ascii_lowercase();
+    if language.is_empty()
+        || language.len() > 32
+        || !language
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+    {
+        return Err(ApiError::BadRequest(
+            "Language contains invalid characters.".into(),
+        ));
+    }
+    Ok(language)
+}
+
+/// A provider's subtitle format by its file name: one a scan reads, else srt.
+fn subtitle_format(name: &str) -> &'static str {
+    let ext = std::path::Path::new(name)
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(str::to_ascii_lowercase);
+    UPLOAD_FORMATS
+        .into_iter()
+        .find(|f| ext.as_deref() == Some(*f))
+        .unwrap_or("srt")
 }
 
 /// The subtitle formats an upload may have: the ones a scan finds beside a video.
@@ -1030,10 +1133,22 @@ async fn upload_subtitle(
             ))
         })?;
 
-    // The stream, as a scan reads the file's name, on the source of the item's own file
+    add_subtitle_stream(&state, &item, id, &path).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Adds the subtitle file at `path`, beside `item`'s video, as a stream of the item's own source,
+/// as a scan reads the file's name.
+async fn add_subtitle_stream(
+    state: &AppState,
+    item: &rustyfin_model::media::MediaItem,
+    id: Uuid,
+    path: &std::path::Path,
+) -> Result<(), ApiError> {
+    let video = std::path::Path::new(&item.path);
     let found = rustyfin_core::subtitle::discover_external_subtitles(video)
         .into_iter()
-        .filter(|sub| sub.path == path)
+        .filter(|sub| sub.path.as_path() == path)
         .collect::<Vec<_>>();
     let sources = rustyfin_db::repo_media_source::get_media_sources(&state.db, &id).await?;
     if let Some(mut source) = sources
@@ -1054,7 +1169,7 @@ async fn upload_subtitle(
         .cache
         .item_changed(&state.db, &state.image_cache, id)
         .await;
-    Ok(StatusCode::NO_CONTENT)
+    Ok(())
 }
 
 /// `DELETE /Videos/{id}/Subtitles/{index}`: deletes the external subtitle file that stream

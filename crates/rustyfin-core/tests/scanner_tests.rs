@@ -6592,6 +6592,111 @@ async fn b18_tv_rescan_removes_gone_episodes_seasons_and_series() {
     assert_eq!(paths(pool, &lib, "Series").await, ["Show A"]);
 }
 
+// R3 core reliability: a scan keeps what a locked item holds, as Jellyfin's IsLocked does.
+
+/// Locks the item at `rel` (LockData), and returns its id.
+async fn r3rel_lock(pool: &SqlitePool, lib: &Library, media_type: &str, rel: &str) -> String {
+    let path = root_of(lib).join(rel).to_string_lossy().into_owned();
+    let id: String = sqlx::query_scalar(
+        "SELECT id FROM media_items WHERE library_id = ?1 AND media_type = ?2 AND path = ?3",
+    )
+    .bind(lib.id.to_string())
+    .bind(media_type)
+    .bind(&path)
+    .fetch_one(pool)
+    .await
+    .unwrap_or_else(|e| panic!("{media_type} at {path}: {e}"));
+    sqlx::query(
+        "INSERT INTO item_metadata_extras (item_id, lock_data) VALUES (?1, 1)
+         ON CONFLICT(item_id) DO UPDATE SET lock_data = 1",
+    )
+    .bind(&id)
+    .execute(pool)
+    .await
+    .unwrap();
+    id
+}
+
+/// (index_number, parent_index_number, production_year) of the item `id`.
+async fn r3rel_numbers(pool: &SqlitePool, id: &str) -> (Option<i32>, Option<i32>, Option<i32>) {
+    sqlx::query_as(
+        "SELECT index_number, parent_index_number, production_year FROM media_items WHERE id = ?",
+    )
+    .bind(id)
+    .fetch_one(pool)
+    .await
+    .unwrap()
+}
+
+#[tokio::test]
+async fn r3rel_a_rescan_keeps_the_numbers_of_locked_episodes_and_seasons() {
+    let fx = Fixture::new().await;
+    let lib = fx.library("tv", LibraryContentType::TvShows).await;
+    let pool = &fx.pool;
+    let root = root_of(&lib);
+    let locked_file = "Sample Show/Season 1/Sample Show S01E02.mkv";
+    let open_file = "Sample Show/Season 1/Sample Show S01E03.mkv";
+    touch(&root, locked_file);
+    touch(&root, open_file);
+    scan(pool, &lib).await;
+
+    // An admin corrects the numbers; the locked items keep them, an unlocked episode follows its
+    // file again.
+    let locked = r3rel_lock(pool, &lib, "Episode", locked_file).await;
+    let season = r3rel_lock(pool, &lib, "Season", "Sample Show/Season 1").await;
+    let open_path = root.join(open_file).to_string_lossy().into_owned();
+    for (sql, id) in [
+        (
+            "UPDATE media_items SET index_number = 5, parent_index_number = 3 WHERE id = ?",
+            locked.clone(),
+        ),
+        (
+            "UPDATE media_items SET index_number = 7 WHERE id = ?",
+            season.clone(),
+        ),
+    ] {
+        sqlx::query(sql).bind(id).execute(pool).await.unwrap();
+    }
+    sqlx::query("UPDATE media_items SET index_number = 9 WHERE path = ?")
+        .bind(&open_path)
+        .execute(pool)
+        .await
+        .unwrap();
+    scan(pool, &lib).await;
+
+    assert_eq!(r3rel_numbers(pool, &locked).await, (Some(5), Some(3), None));
+    assert_eq!(r3rel_numbers(pool, &season).await.0, Some(7));
+    let open: Option<i32> =
+        sqlx::query_scalar("SELECT index_number FROM media_items WHERE path = ?")
+            .bind(&open_path)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+    assert_eq!(open, Some(3));
+}
+
+#[tokio::test]
+async fn r3rel_a_rescan_keeps_the_year_of_a_locked_movie() {
+    let fx = Fixture::new().await;
+    let lib = fx.library("films", LibraryContentType::Movies).await;
+    let pool = &fx.pool;
+    let root = root_of(&lib);
+    let file = "Sample Film (2001)/Sample Film (2001).mkv";
+    touch(&root, file);
+    scan(pool, &lib).await;
+    let film = r3rel_lock(pool, &lib, "Movie", file).await;
+    assert_eq!(r3rel_numbers(pool, &film).await.2, Some(2001));
+
+    // An admin clears the year and locks the item; a scan doesn't fill it again.
+    sqlx::query("UPDATE media_items SET production_year = NULL WHERE id = ?")
+        .bind(&film)
+        .execute(pool)
+        .await
+        .unwrap();
+    scan(pool, &lib).await;
+    assert_eq!(r3rel_numbers(pool, &film).await.2, None);
+}
+
 /// B18 criterion 5: a music rescan removes the tracks of a removed album folder, then the album,
 /// and the tracks of a removed artist folder, then its album and the artist. It also removes an
 /// album row that has no tracks.
@@ -9820,6 +9925,7 @@ async fn b32_rescans_settle_series_folders_and_tvshow_nfo() {
     };
     insert_marks(&fx.pool, &user, hotel, &favorite).await;
     insert_marks(&fx.pool, &user, season, &favorite).await;
+    stored_under_the_older_rule(&fx.pool).await;
 
     scan(&fx.pool, &lib).await;
 
@@ -9884,6 +9990,18 @@ async fn b32_images(pool: &SqlitePool, lib: &Library) -> Vec<(String, String, St
         .collect();
     rows.sort();
     rows
+}
+
+/// Lists every stored season and episode as stored under the older tvshow.nfo rule, as migration
+/// 114 lists those of a database from before it.
+async fn stored_under_the_older_rule(pool: &SqlitePool) {
+    sqlx::query(
+        "INSERT OR IGNORE INTO show_nfo_cleanup (item_id)
+         SELECT id FROM media_items WHERE media_type IN ('Season', 'Episode')",
+    )
+    .execute(pool)
+    .await
+    .unwrap();
 }
 
 #[tokio::test]
@@ -9983,6 +10101,7 @@ async fn b32_f4_rescans_clear_tvshow_nfo_from_loose_episodes_and_images() {
     let user = insert_user(&fx.pool).await;
     let marks = at(600_000_000, Some(EARLY));
     insert_marks(&fx.pool, &user, loose, &marks).await;
+    stored_under_the_older_rule(&fx.pool).await;
 
     scan(&fx.pool, &lib).await;
 
@@ -10048,6 +10167,106 @@ async fn b33_episode_ends(
 
 const B33_DOUBLE: &str = "Hotel Series/Season 01/Hotel Series - S01E03-E04 - Double Booking.mkv";
 const B33_SINGLE: &str = "Hotel Series/Season 01/Hotel Series - S01E05.mkv";
+
+// R3 core reliability: Jellyfin gives a season or an episode nothing of its series' NFO, so a scan
+// clears only what the older rule gave, once, and never a locked field.
+
+const R3REL_TVSHOW_NFO: &str = "<tvshow><title>Sample Show</title><year>2015</year>\
+    <plot>Synthetic plot.</plot><mpaa>TV-14</mpaa><genre>Drama</genre></tvshow>";
+const R3REL_SEASON: &str = "Sample Show (2015)/Season 01";
+const R3REL_LOOSE: &str = "Sample Show (2015)/Sample Show S01E02.mkv";
+
+/// A TV library with one series that has a tvshow.nfo, a season folder and an episode file beside
+/// the season, scanned once.
+async fn r3rel_show(fx: &Fixture) -> Library {
+    let lib = fx.library("tv", LibraryContentType::TvShows).await;
+    let root = root_of(&lib);
+    touch(&root, &format!("{R3REL_SEASON}/Sample Show S01E01.mkv"));
+    touch(&root, R3REL_LOOSE);
+    std::fs::write(root.join("Sample Show (2015)/tvshow.nfo"), R3REL_TVSHOW_NFO).unwrap();
+    scan(&fx.pool, &lib).await;
+    lib
+}
+
+/// Gives the item at `rel` the series NFO's overview, year, rating and genres, as a provider or an
+/// admin can.
+async fn r3rel_give_show_values(pool: &SqlitePool, lib: &Library, rel: &str) -> String {
+    let id = item_at(pool, lib, rel).await.to_string();
+    exec(
+        pool,
+        "UPDATE media_items SET overview = 'Synthetic plot.', production_year = 2015,
+             official_rating = 'TV-14', genres = 'Drama' WHERE id = ?1",
+        &[&id],
+    )
+    .await;
+    id
+}
+
+#[tokio::test]
+async fn r3rel_a_rescan_keeps_season_and_episode_values_that_equal_the_series_nfo() {
+    let fx = Fixture::new().await;
+    let lib = r3rel_show(&fx).await;
+    for rel in [R3REL_SEASON, R3REL_LOOSE] {
+        r3rel_give_show_values(&fx.pool, &lib, rel).await;
+    }
+    scan(&fx.pool, &lib).await;
+    for rel in [R3REL_SEASON, R3REL_LOOSE] {
+        let shown = b32_shown(&fx.pool, &lib, rel).await;
+        assert_eq!(shown.overview.as_deref(), Some("Synthetic plot."), "{rel}");
+        assert_eq!(shown.year, Some(2015), "{rel}");
+        assert_eq!(shown.official_rating.as_deref(), Some("TV-14"), "{rel}");
+        assert_eq!(shown.genres, "Drama", "{rel}");
+    }
+}
+
+#[tokio::test]
+async fn r3rel_the_older_rule_is_cleared_once_and_never_from_locked_or_refreshed_items() {
+    let fx = Fixture::new().await;
+    let lib = r3rel_show(&fx).await;
+    // Stored under the older rule: the season locked its overview, and a provider has answered for
+    // the loose episode since.
+    let season = r3rel_give_show_values(&fx.pool, &lib, R3REL_SEASON).await;
+    let loose = r3rel_give_show_values(&fx.pool, &lib, R3REL_LOOSE).await;
+    exec(
+        &fx.pool,
+        "INSERT INTO item_metadata_extras (item_id, locked_fields) VALUES (?1, 'Overview')",
+        &[&season],
+    )
+    .await;
+    exec(
+        &fx.pool,
+        "INSERT INTO item_metadata_extras (item_id, provider_refreshed_at)
+         VALUES (?1, '2026-01-01T00:00:00Z')",
+        &[&loose],
+    )
+    .await;
+    stored_under_the_older_rule(&fx.pool).await;
+    scan(&fx.pool, &lib).await;
+
+    let shown = b32_shown(&fx.pool, &lib, R3REL_SEASON).await;
+    assert_eq!(shown.overview.as_deref(), Some("Synthetic plot."), "locked");
+    assert_eq!(shown.year, None);
+    assert_eq!(shown.official_rating, None);
+    assert_eq!(shown.genres, "");
+    let shown = b32_shown(&fx.pool, &lib, R3REL_LOOSE).await;
+    assert_eq!(shown.official_rating.as_deref(), Some("TV-14"), "refreshed");
+    assert_eq!(shown.genres, "Drama", "refreshed");
+    let left: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM show_nfo_cleanup WHERE item_id IN (?1, ?2)")
+            .bind(&season)
+            .bind(&loose)
+            .fetch_one(&fx.pool)
+            .await
+            .unwrap();
+    assert_eq!(left, 0, "each is settled once");
+
+    // Values the season gets later are its own.
+    r3rel_give_show_values(&fx.pool, &lib, R3REL_SEASON).await;
+    scan(&fx.pool, &lib).await;
+    let shown = b32_shown(&fx.pool, &lib, R3REL_SEASON).await;
+    assert_eq!(shown.official_rating.as_deref(), Some("TV-14"));
+    assert_eq!(shown.genres, "Drama");
+}
 
 #[tokio::test]
 async fn b33_multi_episode_files_store_their_last_episode() {

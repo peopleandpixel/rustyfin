@@ -1106,6 +1106,7 @@
         "reason_ambiguous": "mehrere Rustyfin-Benutzer haben diesen Namen",
         "reason_not_selected": "nicht ausgewählt",
         "reason_not_confirmed": "das vorhandene Konto wurde nicht bestätigt",
+        "reason_invalid_name": "der Name ist leer oder zu lang",
         "reason_confirmed_other": "das bestätigte Konto ist nicht mehr der vorgeschlagene Treffer",
         "confirm_match": "In das vorhandene Konto {{name}} importieren",
         "into_mine": "In mein Konto importieren",

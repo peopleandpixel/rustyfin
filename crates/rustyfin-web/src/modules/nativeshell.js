@@ -67,7 +67,7 @@ const playbackManager = {
     nextTrack: () => call('playAdjacentEpisode', 1),
     rewind: () => call('skipTime', -10),
     fastForward: () => call('skipTime', 30),
-    stop: () => (nowPlaying?.session.streamType === 'Audio' ? call('stopNowPlaying') : call('closePlayer')),
+    stop: () => call('stopNowPlaying'),
     volumeUp: () => stepVolume(0.05),
     volumeDown: () => stepVolume(-0.05),
     seekMs(ms) {

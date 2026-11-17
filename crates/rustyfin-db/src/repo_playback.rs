@@ -68,29 +68,15 @@ pub async fn get_unplayed_counts(
         .collect();
     let placeholder_str = placeholders.join(",");
     // The filter comes after the folder ids.
-    let shown = crate::repo_parental::visible_sql(
-        "e.id",
-        "e.library_id",
+    let episodes = folder_episodes_sql(
+        |folder| format!("{folder} IN ({placeholder_str})"),
         &format!("?{}", folder_ids.len() + 2),
     );
     let sql = format!(
         "SELECT ef.folder_id, COUNT(*), SUM(CASE WHEN ud.played = 1 THEN 0 ELSE 1 END) \
-         FROM ( \
-             SELECT e.id AS episode_id, p.id AS folder_id \
-             FROM media_items e JOIN media_items p ON p.id = e.parent_id \
-             WHERE e.media_type = 'Episode' AND p.media_type = 'Season' AND p.id IN ({ph}) \
-               AND e.is_virtual_item = 0 AND {shown} \
-             UNION ALL \
-             SELECT e.id, g.id \
-             FROM media_items e \
-             JOIN media_items p ON p.id = e.parent_id AND p.media_type = 'Season' \
-             JOIN media_items g ON g.id = p.parent_id \
-             WHERE e.media_type = 'Episode' AND g.media_type = 'Series' AND g.id IN ({ph}) \
-               AND e.is_virtual_item = 0 AND {shown} \
-         ) ef \
+         FROM ({episodes}) ef \
          LEFT JOIN user_item_data ud ON ud.item_id = ef.episode_id AND ud.user_id = ?1 \
-         GROUP BY ef.folder_id",
-        ph = placeholder_str
+         GROUP BY ef.folder_id"
     );
 
     let mut query = sqlx::query_as::<_, (String, i64, i64)>(sqlx::AssertSqlSafe(sql));
@@ -105,6 +91,31 @@ pub async fn get_unplayed_counts(
         .into_iter()
         .map(|(folder_id, episodes, unplayed)| (folder_id, (episodes, unplayed)))
         .collect())
+}
+
+/// The episodes that decide whether a Series or Season is played, as rows `(episode_id,
+/// folder_id)`: a season's episodes, and a series' through its seasons, specials included. As in
+/// Jellyfin 12.4, a virtual episode (missing or unaired, with no file) never counts, nor one the
+/// user may not see: only those that pass the `repo_parental::filter_json` filter bound at
+/// `visible_param` (NULL lets every episode pass). `scope` gives the condition on the folder's id
+/// column it is handed (`s.id` for a season, `g.id` for a series); the episode is `e`. The one
+/// definition behind the played badges and counts (`get_unplayed_counts`) and the IsPlayed and
+/// IsUnplayed filters (`repo_media::get_items_filtered`).
+pub(crate) fn folder_episodes_sql(scope: impl Fn(&str) -> String, visible_param: &str) -> String {
+    let shown = crate::repo_parental::visible_sql("e.id", "e.library_id", visible_param);
+    format!(
+        "SELECT e.id AS episode_id, s.id AS folder_id \
+         FROM media_items e JOIN media_items s ON s.id = e.parent_id AND s.media_type = 'Season' \
+         WHERE e.media_type = 'Episode' AND e.is_virtual_item = 0 AND {shown} AND {season} \
+         UNION ALL \
+         SELECT e.id, g.id \
+         FROM media_items e \
+         JOIN media_items s ON s.id = e.parent_id AND s.media_type = 'Season' \
+         JOIN media_items g ON g.id = s.parent_id AND g.media_type = 'Series' \
+         WHERE e.media_type = 'Episode' AND e.is_virtual_item = 0 AND {shown} AND {series}",
+        season = scope("s.id"),
+        series = scope("g.id"),
+    )
 }
 
 /// Whether a Series or Season counts as played from its `(episodes, unplayed)` counts: it has

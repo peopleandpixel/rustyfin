@@ -8,6 +8,10 @@ import { albumTrackList } from './music.js';
 import { containerSectionHtml, renderContainerItems } from './collections.js';
 import { playThemeSong } from './theme-media.js';
 let currentDetailId = null;
+// Each item and person page draw takes the next number; a response for a draw that isn't the latest
+// (the user went on to another item, or the page drew again) is dropped, so it can't draw over it
+let detailRender = 0;
+let personRender = 0;
 let activeItem = null;
 // The detail page's version, audio and subtitle choice: { itemId, sources, mediaSourceId, audioIndex,
 // subtitleIndex }. A null index is untouched, so the player picks its own default for it.
@@ -334,6 +338,8 @@ function specialFeaturesHtml(features) {
 // --- Detail View Renderer (Movies, TV Series, Music) ---
 async function renderDetail(itemId) {
     const session = API.token;
+    const render = ++detailRender;
+    const stale = () => render !== detailRender || API.token !== session;
     currentDetailId = itemId;
     const page = $('page-detail');
     // Show skeleton for detail view
@@ -362,7 +368,7 @@ async function renderDetail(itemId) {
 
     try {
         const item = await API.getItem(itemId);
-        if (API.token !== session) return;
+        if (stale()) return;
         activeItem = item;
         const name = item.Name || item.name || '';
         const overview = item.Overview || item.overview || '';
@@ -404,7 +410,7 @@ async function renderDetail(itemId) {
             item.LocalTrailerCount > 0 ? API.getLocalTrailers(id).catch(() => []) : Promise.resolve([]),
             showsSpecials && item.SpecialFeatureCount > 0 ? API.getSpecialFeatures(id).catch(() => []) : Promise.resolve([]),
         ]);
-        if (API.token !== session) return;
+        if (stale()) return;
 
         // Children / Seasons / Episodes
         let seasonsOrEpisodesHtml = '';
@@ -646,13 +652,15 @@ async function renderDetail(itemId) {
         if (type === 'BoxSet' || type === 'Playlist') renderContainerItems(item);
         playThemeSong(id, () => currentDetailId === itemId && API.token === session);
     } catch (e) {
-        if (API.token !== session) return;
+        if (stale()) return;
         page.innerHTML = `<div class="p-6 rounded-xl bg-red-500/10 text-red-400">${escapeHtml(e.message)}</div>`;
     }
 }
 
 // --- Person Detail View ---
 async function renderPerson(personId) {
+    const render = ++personRender;
+    const stale = () => render !== personRender;
     const page = $('page-person');
     page.innerHTML = '<div class="flex justify-center items-center py-24"><div class="w-10 h-10 border-3 border-[#00a4dc] border-t-transparent rounded-full animate-spin"></div></div>';
     try {
@@ -660,6 +668,7 @@ async function renderPerson(personId) {
             API.getPerson(personId),
             API.getPersonItems(personId).catch(() => ({ Items: [] }))
         ]);
+        if (stale()) return;
         const pName = person.Name || person.name || t('person.fallback_name');
         const pOverview = person.Overview || person.overview || '';
         const items = itemsData.Items || itemsData.items || [];
@@ -695,6 +704,7 @@ async function renderPerson(personId) {
             }
         }
     } catch (e) {
+        if (stale()) return;
         page.innerHTML = `<div class="p-6 rounded-xl bg-red-500/10 text-red-400">${escapeHtml(e.message)}</div>`;
     }
 }

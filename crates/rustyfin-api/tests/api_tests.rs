@@ -3862,6 +3862,7 @@ const B124_WEB_MODULES: &[&str] = &[
     "collections.js",
     "dashboard.js",
     "dlna-admin.js",
+    "drawer.js",
     "genres.js",
     "home.js",
     "item.js",
@@ -3872,6 +3873,7 @@ const B124_WEB_MODULES: &[&str] = &[
     "libtabs.js",
     "lyrics.js",
     "metadata-admin.js",
+    "mobile.js",
     "multiselect.js",
     "music.js",
     "nativeshell.js",
@@ -29311,6 +29313,18 @@ fn r3prefs_player() {
     b124_node_test("r3prefs_player.mjs");
 }
 
+// The web player reports progress every 10 s, paused too, and on pause and unpause with IsPaused
+#[test]
+fn r3prefs_progress() {
+    b124_node_test("r3prefs_progress.mjs");
+}
+
+// Every stop and hand-off path (remote Stop, Play on, Cast, the OS stop key) stops local music and video
+#[test]
+fn r3prefs_stop() {
+    b124_node_test("r3prefs_stop.mjs");
+}
+
 // The album page's Play queues every track in disc and track order; a track plays the album from it
 #[test]
 fn r3player_album() {
@@ -29383,6 +29397,24 @@ fn r3item_play() {
 #[test]
 fn r3android_shell() {
     b124_node_test("r3android_shell.mjs");
+}
+
+// R3 web client on phones: the desktop sidebar stays hidden below lg, and the drawer opens, closes on
+// an item, Escape and navigation (tests/web/r3mobile_*.mjs)
+#[test]
+fn r3mobile_drawer() {
+    b124_node_test("r3mobile_drawer.mjs");
+}
+
+#[test]
+fn r3mobile_touch() {
+    b124_node_test("r3mobile_touch.mjs");
+}
+
+// In-app navigation draws the page once, not again on the hashchange it causes (tests/web/r3mobile_navigate_once.mjs)
+#[test]
+fn r3mobile_navigate_once() {
+    b124_node_test("r3mobile_navigate_once.mjs");
 }
 
 #[test]
@@ -53917,6 +53949,11 @@ fn r3item2_web() {
     b124_node_test("r3item2_web.mjs");
 }
 
+#[test]
+fn r3item2_web_stale() {
+    b124_node_test("r3item2_stale.mjs");
+}
+
 /// A library in the test's data dir with one movie whose file holds 4000 known bytes, and one
 /// series (a folder). Returns the library folder, the movie, the series and the file's bytes.
 async fn r3item2_library(
@@ -54315,6 +54352,117 @@ async fn r3item2_subtitle_upload_delete_and_search() {
     )
     .await;
     assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+/// The remote subtitle search asks every enabled subtitle provider, and a download asks the
+/// provider that gave the id: the file is saved beside the video and becomes one of its streams.
+/// A disabled provider is not asked.
+#[tokio::test]
+async fn r3meta_remote_subtitles_ask_the_enabled_providers() {
+    use rustyfin_model::plugin::{PluginStatus, SubtitleResult};
+    use std::future::Future;
+    use std::pin::Pin;
+    type Found = Pin<Box<dyn Future<Output = Vec<SubtitleResult>> + Send>>;
+    type Fetched = Pin<Box<dyn Future<Output = Result<(), String>> + Send>>;
+    let state = test_state().await;
+    let asked: Arc<std::sync::Mutex<Vec<String>>> = Arc::default();
+    for (plugin, status) in [
+        ("mocksubs", PluginStatus::Active),
+        ("offsubs", PluginStatus::Disabled),
+    ] {
+        let seen = asked.clone();
+        let fetched = asked.clone();
+        state
+            .plugin_manager
+            .register_subtitle_provider(
+                plugin.to_string(),
+                status,
+                move |_: &reqwest::Client,
+                      item: &rustyfin_model::media::MediaItem,
+                      lang: &str|
+                      -> Found {
+                    seen.lock()
+                        .unwrap()
+                        .push(format!("search {plugin} {} {lang}", item.name));
+                    Box::pin(async move {
+                        vec![SubtitleResult {
+                            id: "991".to_string(),
+                            name: "Quill.Harbor.2031.eng.srt".to_string(),
+                            language: "eng".to_string(),
+                            description: Some("from the mock".to_string()),
+                        }]
+                    })
+                },
+                move |_: &reqwest::Client, id: &str, path: &std::path::Path| -> Fetched {
+                    fetched
+                        .lock()
+                        .unwrap()
+                        .push(format!("download {plugin} {id}"));
+                    let path = path.to_path_buf();
+                    Box::pin(async move {
+                        std::fs::write(path, "1\n00:00:01,000 --> 00:00:02,000\nMock\n")
+                            .map_err(|e| e.to_string())
+                    })
+                },
+            )
+            .await;
+    }
+    let app = app(state.clone());
+    let (owner, _, _, _) = g1_owner_and_viewer(&state, &app).await;
+    let (library, movie, _, _) = r3item2_library(&state).await;
+
+    let search = format!("/Items/{movie}/RemoteSearch/Subtitles/eng");
+    let (status, _, body) = r3item2_send(&app, "GET", &search, &owner, None).await;
+    assert_eq!(status, StatusCode::OK);
+    let found = r3item2_json(&body);
+    assert_eq!(found.as_array().unwrap().len(), 1, "{found}");
+    assert_eq!(found[0]["Id"], "mocksubs_eng_srt_991");
+    assert_eq!(found[0]["ProviderName"], "mocksubs");
+    assert_eq!(found[0]["Format"], "srt");
+    assert_eq!(found[0]["ThreeLetterISOLanguageName"], "eng");
+    assert_eq!(found[0]["Comment"], "from the mock");
+
+    let download = format!("/Items/{movie}/RemoteSearch/Subtitles/mocksubs_eng_srt_991");
+    let (status, _, body) = r3item2_send(&app, "POST", &download, &owner, None).await;
+    assert_eq!(
+        status,
+        StatusCode::NO_CONTENT,
+        "{}",
+        String::from_utf8_lossy(&body)
+    );
+    let saved = library
+        .join("Quill Harbor (2031)")
+        .join("Quill Harbor (2031).eng.srt");
+    assert!(std::fs::read_to_string(&saved).unwrap().contains("Mock"));
+    let sources = rustyfin_db::repo_media_source::get_media_sources(&state.db, &movie)
+        .await
+        .unwrap();
+    assert!(
+        sources[0]
+            .media_streams
+            .iter()
+            .any(|s| s.is_external && s.path.as_deref() == saved.to_str()),
+        "{:?}",
+        sources[0].media_streams
+    );
+    let calls = asked.lock().unwrap().clone();
+    assert_eq!(calls.len(), 2, "{calls:?}");
+    assert!(calls[0].starts_with("search mocksubs "), "{calls:?}");
+    assert_eq!(calls[1], "download mocksubs 991");
+
+    // An id from no enabled provider, or a format a scan doesn't read, is not asked for
+    for id in ["offsubs_eng_srt_991", "mocksubs_eng_exe_991"] {
+        let (status, _, _) = r3item2_send(
+            &app,
+            "POST",
+            &format!("/Items/{movie}/RemoteSearch/Subtitles/{id}"),
+            &owner,
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{id}");
+    }
+    assert_eq!(asked.lock().unwrap().len(), 2);
 }
 
 /// A subtitle file of about 3 MB uploads: the JSON body (the file in base64, about 4 MB) is past
