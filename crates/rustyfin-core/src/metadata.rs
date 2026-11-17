@@ -713,7 +713,7 @@ async fn apply_season(
             };
             let mut meta = first.clone();
             // A file holding several episodes is named after all of them, as Jellyfin names it
-            // ("The Shadow That Devours the Sun / Mushi that Inhale Rain")
+            // ("The Lantern That Swallows the Moon / Moths that Drink Fog")
             if let Some(end) = working.index_number_end.filter(|end| *end > number) {
                 let names: Vec<&str> = (number..=end)
                     .filter_map(|n| season.episodes.iter().find(|(e, _)| *e == n))
@@ -730,6 +730,43 @@ async fn apply_season(
     let meta = &meta;
     apply_metadata_to_item(pool, working, meta, replace_name).await?;
     store_images_batch(pool, working.id, &working.path, &meta.image_urls, provider).await
+}
+
+/// Fills a virtual episode (no file) from its season's listing: its name, overview, air date, still
+/// and people. The missing-episode task owns these fields, so they are taken from the listing anew.
+pub(crate) async fn apply_virtual_episode(
+    pool: &SqlitePool,
+    item: &mut MediaItem,
+    season: &SeasonMetadata,
+    provider: &str,
+) -> Result<(), String> {
+    // The listing's overview and air date replace the stored ones, which an ordinary refresh only
+    // fills; then the name, still and people come as for any episode.
+    if let Some(number) = item.index_number
+        && let Some((_, meta)) = season.episodes.iter().find(|(n, _)| *n == number)
+    {
+        let before = item.clone();
+        if let Some(overview) = meta.overview.as_deref().filter(|o| !o.trim().is_empty()) {
+            item.overview = Some(overview.to_string());
+        }
+        if let Some(day) = meta
+            .premiere_date
+            .as_deref()
+            .and_then(|d| chrono::NaiveDate::parse_from_str(d.get(..10)?, "%Y-%m-%d").ok())
+        {
+            item.premiere_date = Some(day.and_time(chrono::NaiveTime::MIN).and_utc());
+            item.production_year = Some(chrono::Datelike::year(&day));
+        }
+        if before.overview != item.overview
+            || before.premiere_date != item.premiere_date
+            || before.production_year != item.production_year
+        {
+            rustyfin_db::repo_media::save_refresh_changes(pool, &before, item)
+                .await
+                .map_err(|e| e.to_string())?;
+        }
+    }
+    apply_season(pool, item, season, provider, true).await
 }
 
 /// After a series is identified, fill its seasons and episodes: one season lookup per season.
@@ -873,8 +910,8 @@ async fn apply_metadata_to_item(
     let before = updated.clone();
     let mut changed = false;
 
-    // A provider's title replaces the name parsed from the path, as in Jellyfin ("Mission:
-    // Impossible - Dead Reckoning Part One", not the folder's "Mission Impossible - ..."), unless
+    // A provider's title replaces the name parsed from the path, as in Jellyfin ("Marble:
+    // Harbor - Low Tide Part One", not the folder's "Marble Harbor - ..."), unless
     // the name is locked or an NFO has a title. An NFO's title (`replace_name` false) replaces
     // only a name that still looks like a file name. Seasons keep "Season N".
     if (replace_name || looks_like_filename(&updated.name))

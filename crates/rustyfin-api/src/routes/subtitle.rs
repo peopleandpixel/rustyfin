@@ -526,7 +526,7 @@ async fn ffmpeg_vtt(
     cp1252: bool,
     muxer: &str,
 ) -> Result<String, ApiError> {
-    let mut command = tokio::process::Command::new("ffmpeg");
+    let mut command = tokio::process::Command::new(rustyfin_core::media_tools::ffmpeg());
     command.args(vtt_args(input, map, demuxer, cp1252, muxer));
     let stderr = match run_capped(&mut command, MAX_SUBTITLE_BYTES, VTT_TIME_LIMIT).await {
         Ok(RunEnd::Exited { status, stdout, .. }) if status.success() => {
@@ -1050,7 +1050,10 @@ async fn upload_subtitle(
                 .await?;
         }
     }
-    state.cache.invalidate_item(&id.to_string());
+    state
+        .cache
+        .item_changed(&state.db, &state.image_cache, id)
+        .await;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -1073,7 +1076,10 @@ async fn delete_subtitle(
         }
     }
     rustyfin_db::repo_media_source::delete_external_stream(&state.db, &id, &stored).await?;
-    state.cache.invalidate_item(&id.to_string());
+    state
+        .cache
+        .item_changed(&state.db, &state.image_cache, id)
+        .await;
     Ok(StatusCode::NO_CONTENT)
 }
 

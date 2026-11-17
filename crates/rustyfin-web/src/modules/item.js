@@ -2,7 +2,8 @@
 import { $, icon, toast, escapeHtml, formatRuntime } from './util.js';
 import { backdropUrl, createCardElement, sectionRow } from './cards.js';
 import { resumePositionTicks } from './player.js';
-import { navigate } from './router.js';
+import { navigate, currentPage } from './router.js';
+import { userDataChanged } from './userdata.js';
 import { albumTrackList } from './music.js';
 import { containerSectionHtml, renderContainerItems } from './collections.js';
 import { playThemeSong } from './theme-media.js';
@@ -698,13 +699,27 @@ async function renderPerson(personId) {
     }
 }
 
+// The open item page draws again when its item's user data changes (its own buttons, another card,
+// or the server's UserDataChanged from another device), once for changes close together
+const DETAIL_REDRAW_DELAY_MS = 150;
+let detailRedraw = 0;
+function detailUserDataChanged(e) {
+    const id = e?.detail?.id;
+    if (currentPage !== 'detail' || !currentDetailId || String(id) !== String(currentDetailId)) return;
+    clearTimeout(detailRedraw);
+    detailRedraw = setTimeout(() => {
+        if (currentPage === 'detail' && String(currentDetailId) === String(id)) renderDetail(currentDetailId);
+    }, DETAIL_REDRAW_DELAY_MS);
+}
+
 // --- Action Helpers (Favorites / Played) ---
 async function toggleFavorite(id, current) {
     try {
         if (current) await API.unsetFavorite(id);
         else await API.setFavorite(id);
         toast(current ? t('detail.favorite_removed') : t('detail.favorite_added'));
-        if (currentDetailId === id) renderDetail(id);
+        // The page redraws from the change, as from the server's (detailUserDataChanged)
+        userDataChanged(id, { IsFavorite: !current });
     } catch (e) {
         toast(e.message, 'error');
     }
@@ -718,14 +733,12 @@ function playedButtonTitle(all, played) {
 
 async function togglePlayed(id, current, all = false) {
     try {
-        if (current) await API.markUnplayed(id);
-        else await API.markPlayed(id);
-        // Marking changes the item's (and a show's episodes') watch data, so drop the cached lists before re-rendering
-        API.invalidateCache('/Items');
-        API.invalidateCache('/Shows');
+        const answer = current ? await API.markUnplayed(id) : await API.markPlayed(id);
         if (all) toast(current ? t('detail.all_marked_unplayed') : t('detail.all_marked_played'));
         else toast(current ? t('detail.marked_unplayed') : t('detail.marked_played'));
-        if (currentDetailId === id) renderDetail(id);
+        // The page redraws from the change, as from the server's (detailUserDataChanged); a show's
+        // episodes follow from the server's message
+        userDataChanged(id, { ...(answer && answer.Played !== undefined ? answer : {}), Played: !current });
     } catch (e) {
         toast(e.message, 'error');
     }
@@ -819,6 +832,7 @@ document.addEventListener('change', e => {
 });
 
 export {
+    detailUserDataChanged,
     currentDetailId, renderDetail, renderPerson, toggleFavorite, togglePlayed, deleteItemFromDetail, detailSelection,
     versionLabels, shareItem,
 };

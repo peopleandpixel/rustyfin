@@ -201,6 +201,8 @@ pub async fn scan_with_metadata(
                 _ => {}
             }
         }
+        // A stop skips the lookups not started yet
+        let stop = std::sync::Arc::new(ticket.clone());
         for wave in [first, later] {
             let mut handles = Vec::new();
             for item in wave {
@@ -208,8 +210,12 @@ pub async fn scan_with_metadata(
                 let pool = pool.clone();
                 let client = http_client.clone();
                 let pm = plugin_manager.clone();
+                let stop = stop.clone();
                 let handle = tokio::spawn(async move {
                     let _perm = sem.acquire().await;
+                    if stop.is_cancelled() {
+                        return;
+                    }
                     if let Err(e) = crate::metadata::refresh_item_metadata_with(
                         &pool,
                         &client,
@@ -920,6 +926,17 @@ async fn remove_uncollected(
 }
 
 /// Flat scan for Movies, Photos, Mixed libraries
+/// Whether the scan was stopped (Stop on the library scan task) before its walk: it then ends
+/// with no change. A walk that has begun runs to its end, as its removal of missing items needs
+/// the whole walk; the metadata lookups after it stop.
+fn stopped_before_walk(library: &Library, ticket: &ScanTicket) -> bool {
+    let stopped = ticket.is_cancelled();
+    if stopped {
+        tracing::info!("the scan of library '{}' was stopped", library.name);
+    }
+    stopped
+}
+
 async fn scan_flat_library(
     pool: &SqlitePool,
     library: &Library,
@@ -928,6 +945,9 @@ async fn scan_flat_library(
 ) -> Result<(ScanChanges, Vec<Uuid>), sqlx::Error> {
     let guard = SCAN_LOCK.lock().await;
     ticket.start();
+    if stopped_before_walk(library, ticket) {
+        return Ok(Default::default());
+    }
     let filter = path_scope(scope);
     let mut count = 0u32;
     let mut existing_count = 0u32;
@@ -1371,6 +1391,9 @@ async fn scan_tv_library(
 ) -> Result<(ScanChanges, Vec<Uuid>), sqlx::Error> {
     let guard = SCAN_LOCK.lock().await;
     ticket.start();
+    if stopped_before_walk(library, ticket) {
+        return Ok(Default::default());
+    }
     let filter = path_scope(scope);
     let mut count = 0u32;
     let mut plans: Vec<(Uuid, Vec<probe::ProbeStep>)> = Vec::new();
@@ -1378,6 +1401,11 @@ async fn scan_tv_library(
     let mut reread = 0u32;
     let rereads = scan_sync::RereadGate::new();
     let mut new_item_ids: Vec<Uuid> = Vec::new();
+    // Virtual items that a file arriving for them takes over: their ids are kept, and they are
+    // materialized once their rows are stored.
+    let mut virtuals = rustyfin_db::repo_virtual::library_virtuals(pool, library.id).await?;
+    let mut reused_season_ids: Vec<Uuid> = Vec::new();
+    let mut reused_episode_ids: Vec<Uuid> = Vec::new();
 
     // Load all existing paths into a HashSet for O(1) existence checks.
     let existing_paths: HashSet<String> =
@@ -1579,7 +1607,9 @@ async fn scan_tv_library(
                 season_map.insert(season_path.clone(), id);
                 id
             } else {
-                let id = Uuid::new_v4();
+                let reused = season_number.and_then(|n| virtuals.seasons.remove(&(series_id, n)));
+                reused_season_ids.extend(reused);
+                let id = reused.unwrap_or_else(Uuid::new_v4);
                 let season_item = MediaItem {
                     id,
                     name: season_name.clone(),
@@ -1637,6 +1667,8 @@ async fn scan_tv_library(
         // library need their seasons, so this runs before any episode is reconciled.
         if !new_items.is_empty() {
             upsert_items(pool, &new_items).await?;
+            rustyfin_db::repo_virtual::materialize(pool, &reused_season_ids, chrono::Utc::now())
+                .await?;
             // Find and save local images for series and seasons
             let mut all_images: Vec<rustyfin_model::image::ItemImage> = Vec::new();
             for item in &new_items {
@@ -1801,8 +1833,17 @@ async fn scan_tv_library(
                     .unwrap_or("Unknown")
                     .to_string();
                 let date_created = date_added(Path::new(&path)).await;
+                let reused = match (group.parent_index_number, group.index_number) {
+                    (Some(season), Some(episode)) => {
+                        virtuals
+                            .episodes
+                            .remove(&(group.series_id, season, episode))
+                    }
+                    _ => None,
+                };
+                reused_episode_ids.extend(reused);
                 let item = MediaItem {
-                    id: Uuid::new_v4(),
+                    id: reused.unwrap_or_else(Uuid::new_v4),
                     sort_name: auto_sort_name(
                         MediaType::Episode,
                         &name,
@@ -1843,6 +1884,8 @@ async fn scan_tv_library(
             plans.append(&mut new_episode_plans);
             count += new_episodes.len() as u32;
             new_item_ids.extend(new_episodes.iter().map(|item| item.id));
+            rustyfin_db::repo_virtual::materialize(pool, &reused_episode_ids, chrono::Utc::now())
+                .await?;
         }
     }
 
@@ -2112,6 +2155,9 @@ async fn scan_music_library(
 ) -> Result<(ScanChanges, Vec<Uuid>), sqlx::Error> {
     let guard = SCAN_LOCK.lock().await;
     ticket.start();
+    if stopped_before_walk(library, ticket) {
+        return Ok(Default::default());
+    }
     let filter = path_scope(scope);
     let mut count = 0u32;
     let mut existing_count = 0u32;

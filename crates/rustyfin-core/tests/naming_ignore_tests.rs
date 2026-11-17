@@ -30,13 +30,13 @@ fn ignored_dir_names() {
         "sample",
         "Sample",
         "MINTA",
-        "Argo (2012).trickplay",
+        "Arvel (2012).trickplay",
     ] {
         assert!(is_ignored_dir(name), "{name:?} should be ignored");
     }
     for name in [
         "Season 1",
-        "Argo (2012)",
+        "Arvel (2012)",
         "Featurettes",
         "Extras",
         "Samples",
@@ -55,32 +55,32 @@ fn ignored_dir_names() {
 fn ignored_file_names() {
     for name in [
         ".DS_Store",
-        "._Argo (2012).mkv",
+        "._Arvel (2012).mkv",
         ".hidden.mkv",
         "small.jpg",
         "Small.JPG",
         "albumart.jpg",
         "Thumbs.db",
         "thumbs.db",
-        "Argo.bts",
-        "Argo.mkv.sync",
-        "Argo.trickplay",
+        "Arvel.bts",
+        "Arvel.mkv.sync",
+        "Arvel.trickplay",
         "sample.mkv",
         "Sample.avi",
         "sample.m2ts",
-        "Argo.sample.mkv",
-        "Argo (2012).Sample.MKV",
+        "Arvel.sample.mkv",
+        "Arvel (2012).Sample.MKV",
         "minta.mp4",
-        "Argo.minta.m2ts",
+        "Arvel.minta.m2ts",
     ] {
         assert!(is_ignored_file(name), "{name:?} should be ignored");
     }
     for name in [
-        "Argo (2012).mkv",
+        "Arvel (2012).mkv",
         "Sample Movie (2010).mkv",
-        "Argo-sample.mkv",
+        "Arvel-sample.mkv",
         "sample.toolong",
-        "Amadeus (1984) - Sampler.mkv",
+        "Velloran (1984) - Sampler.mkv",
         "poster.jpg",
         "albumart.png",
         "Show - S01E01.mkv",

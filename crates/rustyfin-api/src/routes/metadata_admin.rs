@@ -51,10 +51,13 @@ async fn item_or_404(state: &AppState, id: Uuid) -> Result<MediaItem, ApiError> 
         .ok_or_else(|| ApiError::NotFound("item not found".into()))
 }
 
-/// Drops the answers and pictures that show the item's old metadata.
-fn item_changed(state: &AppState, id: Uuid) {
-    state.cache.invalidate_item(&id.to_string());
-    state.image_cache.invalidate_item(&id.to_string());
+/// Drops the answers and pictures that show the item's old metadata, the ones of everything
+/// under it too: a series' refresh fills its seasons and episodes.
+async fn item_changed(state: &AppState, id: Uuid) {
+    state
+        .cache
+        .item_changed(&state.db, &state.image_cache, id)
+        .await;
     rustyfin_core::image_warmer::kick();
 }
 
@@ -172,7 +175,7 @@ async fn run_refresh(
     )
     .await
     .map_err(ApiError::Internal)?;
-    item_changed(state, item.id);
+    item_changed(state, item.id).await;
     Ok(())
 }
 
@@ -817,6 +820,6 @@ async fn update_item(
         &locks,
     )
     .await?;
-    item_changed(&state, id);
+    item_changed(&state, id).await;
     Ok(StatusCode::NO_CONTENT)
 }

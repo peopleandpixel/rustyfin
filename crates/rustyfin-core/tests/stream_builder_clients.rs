@@ -110,7 +110,7 @@ fn subtitle(index: i32, codec: &str, is_default: bool) -> StreamFacts {
     }
 }
 
-/// "Compartment No. 6": 1080p H.264 High 4.1 in Matroska with E-AC-3 5.1, SubRip and ASS.
+/// "Carriage No. 6": 1080p H.264 High 4.1 in Matroska with E-AC-3 5.1, SubRip and ASS.
 fn h264_eac3_ass() -> SourceFacts {
     source(
         "mkv",
@@ -124,7 +124,7 @@ fn h264_eac3_ass() -> SourceFacts {
     )
 }
 
-/// "Predator": 2160p HEVC Main 10 at level 5.1 in Matroska with DTS 5.1, SubRip (default) and
+/// "Pellinor": 2160p HEVC Main 10 at level 5.1 in Matroska with DTS 5.1, SubRip (default) and
 /// PGS subtitles.
 fn hevc10_dts_pgs() -> SourceFacts {
     source(
@@ -252,8 +252,8 @@ fn r3decisions_android_subrip_keeps_its_name() {
 
 #[test]
 fn r3decisions_android_burns_in_a_default_ass_subtitle() {
-    // "Mushi-Shi": HEVC Main 10 with Opus and a default ASS subtitle, which ExoPlayer can't show
-    let mushishi = source(
+    // "Mori-Shu": HEVC Main 10 with Opus and a default ASS subtitle, which ExoPlayer can't show
+    let morishu = source(
         "mkv",
         8_000_000,
         vec![
@@ -265,7 +265,7 @@ fn r3decisions_android_burns_in_a_default_ass_subtitle() {
             subtitle(2, "ass", true),
         ],
     );
-    let data = device_data(&mushishi, &client("android-exoplayer"), &request(None));
+    let data = device_data(&morishu, &client("android-exoplayer"), &request(None));
 
     assert!(!data.supports_direct_play);
     assert_eq!(delivery(&data, 2), (M::Encode, None));
@@ -280,7 +280,7 @@ fn r3decisions_android_burns_in_a_default_ass_subtitle() {
 
 #[test]
 fn r3decisions_swiftfin_transcodes_anamorphic_video() {
-    // "Throne of Blood": anamorphic 480p H.264 Main 4.0 with mono AAC
+    // "Thicket of Ash": anamorphic 480p H.264 Main 4.0 with mono AAC
     let mut throne = video("h264", "Main", 40.0, 8, 720, 480, 23.976_023);
     throne.is_anamorphic = Some(true);
     let source = source(

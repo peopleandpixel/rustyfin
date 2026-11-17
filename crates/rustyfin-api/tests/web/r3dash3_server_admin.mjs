@@ -225,3 +225,69 @@ test('the branding CSS goes into a style element, and the login disclaimer is sh
     assert.match(auth, /<p id="login-disclaimer"/);
     assert.match(auth, /loadOidcSignIn\(\);\n\s*showLoginDisclaimer\(\$\('login-disclaimer'\)\);/);
 });
+
+test('the dashboard\'s task list follows a library scan that starts or ends, wherever it started', () => {
+    const libraryAdmin = read('modules/library-admin.js');
+    const from = libraryAdmin.indexOf('// One server message');
+    const to = libraryAdmin.indexOf('// After a sign-in');
+    // remote.js's session socket: its subscribers by message type
+    const listeners = new Map();
+    const refreshes = [];
+    const rings = [];
+    const context = vm.createContext({
+        onSocketMessage: (type, fn) => listeners.set(type, [...(listeners.get(type) || []), fn]),
+        queueMicrotask: fn => fn(),
+        updateScanRings: id => rings.push(id),
+        refreshTasks: quiet => refreshes.push(quiet),
+        currentPage: 'admin',
+        toast: () => {}, t: k => k, libraries: [], refreshViewAfterLibraryChange: () => {},
+        console,
+    });
+    vm.runInContext(`let scanStatuses = { stale: { percent: 5 } };\n${libraryAdmin.slice(from, to)}\nthis.fns = { statuses: () => scanStatuses };`, context);
+    // No socket of its own: it listens on the session socket
+    assert.doesNotMatch(libraryAdmin, /new WebSocket\(/);
+    const emit = message => (listeners.get(message.MessageType) || []).forEach(fn => fn(message.Data, message));
+    listeners.get('SocketOpen').forEach(fn => fn());
+    same(context.fns.statuses(), {}, 'a (re)connect starts the rings over');
+    const frame = (id, progress, state) => emit({ MessageType: 'RefreshProgress', Data: { ItemId: id, Progress: String(progress), State: state } });
+    frame('tv', 0, 'Queued');
+    same(refreshes, [true], 'a scan that starts');
+    frame('tv', 40, 'Active');
+    same(refreshes, [true], 'not on every percent');
+    frame('tv', 100, 'Idle');
+    same(refreshes, [true, true], 'a scan that ends');
+    same(context.fns.statuses(), {}, 'its ring cleared');
+    context.currentPage = 'home';
+    frame('tv', 0, 'Queued');
+    same(refreshes, [true, true], 'only on the dashboard');
+    // Task events carry their fields at the top, without Data
+    context.currentPage = 'admin';
+    emit({ MessageType: 'ScheduledTaskCompleted', Name: 'Library scan: TV', State: 'Completed', ItemId: 'tv' });
+    assert.equal(refreshes.length, 3, 'a task that ends refreshes the list');
+});
+
+test('the drawer lists the user\'s views for everyone, administrators too', async () => {
+    const libraryAdmin = read('modules/library-admin.js');
+    const from = libraryAdmin.indexOf('async function loadSidebar(');
+    const to = libraryAdmin.indexOf('\n}\n', from) + 3;
+    const calls = [];
+    const list = { innerHTML: '' };
+    const all = [{ id: 'a', name: 'Movies A', content_type: 'Movies' }, { id: 'h', name: 'Hidden H', content_type: 'Mixed' }];
+    const context = vm.createContext({
+        API: {
+            isAdmin: true,
+            isLoggedIn: () => true,
+            getUserViews: async ({ includeHidden = false } = {}) => { calls.push(includeHidden); return includeHidden ? all : all.slice(0, 1); },
+            getLibraries: async () => { throw new Error('the drawer must not read VirtualFolders'); },
+        },
+        $: id => (id === 'sidebar-lib-list' ? list : null),
+        show: () => {}, hide: () => {}, toast: () => {}, t: k => k, escapeHtml, icon: () => '',
+        scanRing: () => '', currentLibraryId: null, currentPage: 'home',
+    });
+    vm.runInContext(`let libraries = [];\n${libraryAdmin.slice(from, to)}\nthis.fns = { loadSidebar, libs: () => libraries };`, context);
+    await context.fns.loadSidebar();
+    same(calls.sort(), [false, true]);
+    assert.match(list.innerHTML, /Movies A/);
+    assert.doesNotMatch(list.innerHTML, /Hidden H/, 'hidden from My Media, hidden here');
+    same(context.fns.libs().map(l => l.id), ['a', 'h'], 'the pages still find a hidden library');
+});

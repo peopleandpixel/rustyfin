@@ -85,8 +85,13 @@ pub struct ItemFilter {
     pub is_locked: Option<bool>,
     /// No item is a placeholder, so true keeps none.
     pub is_placeholder: Option<bool>,
-    /// `IsMissing`, or `LocationTypes`/`ExcludeLocationTypes` as Jellyfin reads them.
+    /// `IsMissing`, or `LocationTypes`/`ExcludeLocationTypes` as Jellyfin reads them: Jellyfin
+    /// 12.4's `IsVirtualItem` (`is_virtual_item`, a missing or unaired episode or a season of
+    /// only those), not `LocationType` Virtual, which a real season with no folder has too.
     pub is_virtual: Option<bool>,
+    /// A series' virtual seasons are left out (its children, unless the user's
+    /// `DisplayMissingEpisodes`; Jellyfin 12.4 `Series.SetSeasonQueryOptions`).
+    pub hide_virtual_seasons: bool,
     /// Jellyfin's `VideoType` names; every video here is a `VideoFile`.
     pub video_types: Vec<String>,
     /// Sort names before this one, any case (`NameLessThan`).
@@ -136,6 +141,7 @@ impl ItemFilter {
             && self.is_locked.is_none()
             && self.is_placeholder.is_none()
             && self.is_virtual.is_none()
+            && !self.hide_virtual_seasons
             && self.video_types.is_empty()
             && self.name_less_than.is_none()
             && self.index_number.is_none()
@@ -528,7 +534,10 @@ pub async fn filter_sql(
          WHERE e.item_id = media_items.id), 0) != 0",
         f.is_locked,
     );
-    q.flag("location_type = 'Virtual'", f.is_virtual);
+    q.flag("is_virtual_item", f.is_virtual);
+    if f.hide_virtual_seasons {
+        q.push(" AND NOT (is_virtual_item = 1 AND media_type = 'Season')");
+    }
     if !f.video_types.is_empty() {
         let video_file = f
             .video_types
@@ -670,7 +679,7 @@ mod tests {
                 "UPDATE media_items SET date_created = '2026-01-01T00:00:00+00:00' WHERE id = 'a'",
                 "INSERT INTO item_metadata_extras (item_id, provider_refreshed_at) VALUES ('b', '2026-02-01T10:00:00.123456+00:00')",
                 "UPDATE media_items SET index_number = CAST(substr(id, 2) AS INTEGER), parent_index_number = 1 WHERE id LIKE 'e_'",
-                "UPDATE media_items SET location_type = 'Virtual' WHERE id = 'e3'",
+                "UPDATE media_items SET location_type = 'Virtual', is_virtual_item = 1 WHERE id = 'e3'",
                 "UPDATE media_items SET extra_type = 'Trailer', owner_id = 'a', tags = 'Kids' WHERE id = 'x'",
                 "INSERT INTO item_metadata_extras (item_id, imdb_id, lock_data) VALUES ('a', 'tt1', 1)",
                 "INSERT INTO item_images (item_id, image_type, image_index, path) VALUES ('a', 'Primary', 0, '/x/a.jpg')",

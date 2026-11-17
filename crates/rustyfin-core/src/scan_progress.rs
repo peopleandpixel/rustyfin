@@ -51,11 +51,14 @@ struct Inner {
     tx: broadcast::Sender<ScanUpdate>,
 }
 
-/// What the lock guards: the libraries with runs, and how many runs have been made.
+/// What the lock guards: the libraries with runs, how many runs have been made, and the batch.
 #[derive(Default)]
 struct Libraries {
     runs_made: u64,
     entries: BTreeMap<Uuid, Entry>,
+    /// The batch: every library with a scan listed since no scan was, at the highest percent its
+    /// frames have shown, 100 once its scan has ended. Cleared when no scan is listed any more.
+    batch: BTreeMap<Uuid, u8>,
 }
 
 /// A library with at least one run: its runs, oldest first, and the frame last sent for it.
@@ -77,6 +80,8 @@ struct Run {
     claimed: bool,
     /// Whether a caller sends the run's Started and Completed. See `ScanTicket::announce`.
     announced: bool,
+    /// Whether Stop on the library scan task asked the run to end. See `ScanRegistry::cancel_all`.
+    cancelled: bool,
     /// The tickets that claimed the run, clones included.
     holders: usize,
     /// The tickets waiting for the run, clones included.
@@ -124,15 +129,26 @@ impl Inner {
             .unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Sends the library's frame when it differs from the last one sent. The frame is the oldest
-    /// run's state, or `Idle` at 100 when no run is left.
-    fn publish(&self, library_id: Uuid, entry: &mut Entry) {
+    /// Sends the library's frame when it differs from the last one sent, and notes it in the
+    /// batch. The frame is the oldest run's state, or `Idle` at 100 when no run is left.
+    fn publish(&self, libraries: &mut Libraries, library_id: Uuid) {
+        let Some(entry) = libraries.entries.get_mut(&library_id) else {
+            return;
+        };
         let shown = match entry.runs.first() {
             Some(run) => (run.status, run.progress.unwrap_or(0)),
             None => (ScanStatus::Idle, 100),
         };
-        if shown != entry.sent {
-            entry.sent = shown;
+        let changed = shown != entry.sent;
+        entry.sent = shown;
+        let percent = if shown.0 == ScanStatus::Idle {
+            100
+        } else {
+            shown.1
+        };
+        let seen = libraries.batch.entry(library_id).or_insert(0);
+        *seen = (*seen).max(percent);
+        if changed {
             // A send fails only when nothing is subscribed, which is fine.
             let _ = self.tx.send(ScanUpdate {
                 library_id,
@@ -145,10 +161,7 @@ impl Inner {
     /// Changes a run of the library, then publishes the library's frame.
     fn change(&self, library_id: Uuid, run_id: u64, change: impl FnOnce(&mut Run)) {
         let mut libraries = self.lock();
-        let Some(entry) = libraries.entries.get_mut(&library_id) else {
-            return;
-        };
-        let Some(run) = entry.runs.iter_mut().find(|run| run.id == run_id) else {
+        let Some(run) = libraries.run_mut(library_id, run_id) else {
             return;
         };
         change(run);
@@ -156,7 +169,7 @@ impl Inner {
             // The percent never goes down, and a run whose work is not known yet has none.
             run.progress = Some(run.progress.unwrap_or(0).max(percent));
         }
-        self.publish(library_id, entry);
+        self.publish(&mut libraries, library_id);
     }
 
     /// Ends a run: it leaves the list, the frame goes out, and its `at_end` callbacks run. Only then
@@ -170,9 +183,17 @@ impl Inner {
             return;
         };
         let mut run = entry.runs.remove(index);
-        self.publish(library_id, entry);
-        if entry.runs.is_empty() {
+        self.publish(libraries, library_id);
+        if libraries
+            .entries
+            .get(&library_id)
+            .is_some_and(|entry| entry.runs.is_empty())
+        {
             libraries.entries.remove(&library_id);
+        }
+        // The batch ends with its last scan
+        if libraries.entries.is_empty() {
+            libraries.batch.clear();
         }
         for at_end in run.at_end.drain(..) {
             at_end();
@@ -222,6 +243,18 @@ impl ScanRegistry {
             .map(Run::state)
     }
 
+    /// The batch's percent while any scan is listed: the mean over every library scanned since no
+    /// scan was, a listed one at the highest percent its frames have shown and an ended one at 100,
+    /// so a library that finishes never pulls it down. `None` when no scan is listed.
+    pub fn batch_progress(&self) -> Option<f64> {
+        let libraries = self.inner.lock();
+        if libraries.entries.is_empty() || libraries.batch.is_empty() {
+            return None;
+        }
+        let sum: f64 = libraries.batch.values().map(|&p| f64::from(p)).sum();
+        Some(sum / libraries.batch.len() as f64)
+    }
+
     /// The oldest run of every library that has one.
     pub fn snapshot(&self) -> Vec<(Uuid, ScanState)> {
         snapshot_of(&self.inner.lock())
@@ -251,8 +284,9 @@ impl ScanRegistry {
                 runs: Vec::new(),
                 sent: (ScanStatus::Idle, 100),
             });
+        // A scan queued after a stop is a run of its own, not part of the stopped one
         let run_id = match entry.runs.last_mut() {
-            Some(newest) if newest.status == ScanStatus::Queued => {
+            Some(newest) if newest.status == ScanStatus::Queued && !newest.cancelled => {
                 newest.waiters += 1;
                 newest.id
             }
@@ -267,6 +301,7 @@ impl ScanRegistry {
                     done: 0,
                     claimed: false,
                     announced: false,
+                    cancelled: false,
                     holders: 0,
                     waiters: 1,
                     ended,
@@ -275,13 +310,39 @@ impl ScanRegistry {
                 libraries.runs_made
             }
         };
-        self.inner.publish(library_id, entry);
+        self.inner.publish(libraries, library_id);
         ScanTicket {
             inner: Some(self.inner.clone()),
             library_id,
             run: run_id,
             holder: AtomicBool::new(false),
         }
+    }
+
+    /// Asks every listed run to end, as Stop on the library scan task does in Jellyfin, where
+    /// every scan is a run of that task. A run's scan sees it at its next check; the run stays
+    /// listed until its tickets are dropped. Returns how many runs were asked.
+    pub fn cancel_all(&self) -> usize {
+        let mut libraries = self.inner.lock();
+        let mut asked = 0;
+        for entry in libraries.entries.values_mut() {
+            for run in &mut entry.runs {
+                if !run.cancelled {
+                    run.cancelled = true;
+                    asked += 1;
+                }
+            }
+        }
+        asked
+    }
+
+    /// Whether a listed run has been asked to end and hasn't yet.
+    pub fn any_cancelled(&self) -> bool {
+        let libraries = self.inner.lock();
+        libraries
+            .entries
+            .values()
+            .any(|entry| entry.runs.iter().any(|run| run.cancelled))
     }
 }
 
@@ -401,6 +462,18 @@ impl ScanTicket {
         }
     }
 
+    /// Whether the run was asked to end (`ScanRegistry::cancel_all`). False for an untracked
+    /// ticket and once the run has ended.
+    pub fn is_cancelled(&self) -> bool {
+        let Some(inner) = &self.inner else {
+            return false;
+        };
+        let mut libraries = inner.lock();
+        libraries
+            .run_mut(self.library_id, self.run)
+            .is_some_and(|run| run.cancelled)
+    }
+
     /// `n` more units of work.
     pub fn add_total(&self, n: usize) {
         self.change(|run| run.total += n);
@@ -476,5 +549,44 @@ impl ScanTicket {
         }
         run.announced |= announces;
         true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The batch's percent only rises while its libraries finish one by one, and the batch ends
+    /// with its last scan.
+    #[test]
+    fn r3dash3_the_batch_percent_never_drops_as_libraries_finish() {
+        let scans = ScanRegistry::new();
+        assert_eq!(scans.batch_progress(), None);
+        let (a, b) = (Uuid::new_v4(), Uuid::new_v4());
+        let first = scans.queue(a);
+        let second = scans.queue(b);
+        assert_eq!(scans.batch_progress(), Some(0.0));
+        first.start();
+        first.add_total(10);
+        first.advance(9);
+        assert_eq!(scans.batch_progress(), Some(45.0));
+        // The first library finishes: it counts as 100, not as gone (which would read 0)
+        drop(first);
+        assert_eq!(scans.batch_progress(), Some(50.0));
+        second.start();
+        second.add_total(4);
+        second.advance(1);
+        assert_eq!(scans.batch_progress(), Some(62.5));
+        // A new scan of the finished library within the batch doesn't pull it back to 0
+        let again = scans.queue(a);
+        assert_eq!(scans.batch_progress(), Some(62.5));
+        drop(again);
+        drop(second);
+        // The batch has ended; the next one starts from its own libraries
+        assert_eq!(scans.batch_progress(), None);
+        let next = scans.queue(b);
+        assert_eq!(scans.batch_progress(), Some(0.0));
+        drop(next);
+        assert_eq!(scans.batch_progress(), None);
     }
 }

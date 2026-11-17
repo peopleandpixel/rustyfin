@@ -54,7 +54,8 @@ pub async fn upsert_media_item(pool: &SqlitePool, item: &MediaItem) -> Result<()
           original_language = excluded.original_language, tagline = excluded.tagline, \
           production_countries = excluded.production_countries, budget = excluded.budget, \
           revenue = excluded.revenue, homepage = excluded.homepage, end_date = excluded.end_date, \
-          vote_count = excluded.vote_count, popularity = excluded.popularity",
+          vote_count = excluded.vote_count, popularity = excluded.popularity, \
+          is_virtual_item = CASE WHEN excluded.path <> '' THEN 0 ELSE media_items.is_virtual_item END",
     )
     .bind(&id)
     .bind(&item.name)
@@ -498,7 +499,9 @@ pub async fn batch_upsert_media_items(
               production_countries = excluded.production_countries, budget = excluded.budget, \
               revenue = excluded.revenue, homepage = excluded.homepage, \
               end_date = excluded.end_date, vote_count = excluded.vote_count, \
-              popularity = excluded.popularity",
+              popularity = excluded.popularity, \
+              is_virtual_item = CASE WHEN excluded.path <> '' THEN 0 \
+                                     ELSE media_items.is_virtual_item END",
         )
         .bind(&id)
         .bind(&item.name)
@@ -675,6 +678,26 @@ pub async fn delete_item_rows_in(
         .execute(&mut *conn)
         .await?;
     Ok(result.rows_affected() > 0)
+}
+
+/// The item `id` and all its descendants (a series' seasons and episodes, an album's tracks), or
+/// nothing for an unknown id.
+pub async fn subtree_ids(pool: &SqlitePool, id: Uuid) -> Result<Vec<Uuid>, sqlx::Error> {
+    let ids: Vec<String> = sqlx::query_scalar(
+        "WITH RECURSIVE tree(id) AS (
+            SELECT id FROM media_items WHERE id = ?1
+            UNION
+            SELECT m.id FROM media_items m JOIN tree t ON m.parent_id = t.id
+        )
+        SELECT id FROM tree",
+    )
+    .bind(id.to_string())
+    .fetch_all(pool)
+    .await?;
+    Ok(ids
+        .iter()
+        .filter_map(|id| Uuid::parse_str(id).ok())
+        .collect())
 }
 
 /// Deletes the item `id` and all its descendants, deepest first, in one write transaction.
@@ -3134,7 +3157,7 @@ pub async fn get_next_up(
             sqlx::query_as::<_, (String, Option<String>)>(
                 "SELECT se.parent_id, MAX(ud.last_played_date) \
                  FROM user_item_data ud \
-                 JOIN media_items e ON e.id = ud.item_id AND e.media_type = 'Episode' \
+                 JOIN media_items e ON e.id = ud.item_id AND e.media_type = 'Episode' AND e.is_virtual_item = 0 \
                  JOIN media_items se ON se.id = e.parent_id AND se.media_type = 'Season' \
                  WHERE ud.user_id = ? AND ud.last_played_date IS NOT NULL \
                  AND (ud.played = 1 OR ud.playback_position_ticks > 0) \
@@ -3181,7 +3204,7 @@ pub async fn get_next_up(
              FROM media_items e \
              JOIN media_items se ON se.id = e.parent_id AND se.media_type = 'Season' \
              LEFT JOIN user_item_data ud ON ud.item_id = e.id AND ud.user_id = ? \
-             WHERE se.parent_id = ? AND e.media_type = 'Episode' \
+             WHERE se.parent_id = ? AND e.media_type = 'Episode' AND e.is_virtual_item = 0 \
              AND (e.parent_index_number IS NULL OR e.parent_index_number <> 0)",
         )
         .bind(uid.as_deref())
@@ -3776,18 +3799,39 @@ pub async fn count_items_by_type(
     pool: &SqlitePool,
     parent_id: uuid::Uuid,
     visible: Option<&str>,
+    include_virtual: bool,
 ) -> Result<Vec<(String, i64)>, sqlx::Error> {
     let pid = parent_id.to_string();
+    // Virtual items (`is_virtual_item`) count only with DisplayMissingEpisodes
     let sql = format!(
         "SELECT media_type, COUNT(*) FROM media_items WHERE parent_id = ?1 AND {} \
-         GROUP BY media_type",
+         AND (?3 = 1 OR is_virtual_item = 0) GROUP BY media_type",
         crate::repo_parental::visible_sql("id", "library_id", "?2"),
     );
     sqlx::query_as::<_, (String, i64)>(sqlx::AssertSqlSafe(sql))
         .bind(&pid)
         .bind(visible)
+        .bind(include_virtual)
         .fetch_all(pool)
         .await
+}
+
+/// The virtual items (`is_virtual_item`) of a series: its virtual seasons and episodes.
+pub async fn virtual_item_ids(
+    pool: &SqlitePool,
+    series_id: Uuid,
+) -> Result<std::collections::HashSet<Uuid>, sqlx::Error> {
+    let ids: Vec<String> = sqlx::query_scalar(
+        "SELECT id FROM media_items WHERE is_virtual_item = 1 AND (parent_id = ?1 \
+         OR parent_id IN (SELECT id FROM media_items WHERE parent_id = ?1))",
+    )
+    .bind(series_id.to_string())
+    .fetch_all(pool)
+    .await?;
+    Ok(ids
+        .iter()
+        .filter_map(|id| Uuid::parse_str(id).ok())
+        .collect())
 }
 
 /// Get a parent item by ID (for inherited image tags and series info).
@@ -4395,6 +4439,7 @@ pub async fn get_folder_counts_batch(
     pool: &SqlitePool,
     parent_ids: &[uuid::Uuid],
     visible: Option<&str>,
+    include_virtual: bool,
 ) -> Result<std::collections::HashMap<String, std::collections::HashMap<String, i64>>, sqlx::Error>
 {
     if parent_ids.is_empty() {
@@ -4403,7 +4448,7 @@ pub async fn get_folder_counts_batch(
     let mut results: std::collections::HashMap<String, std::collections::HashMap<String, i64>> =
         std::collections::HashMap::new();
     for pid in parent_ids {
-        let counts = count_items_by_type(pool, *pid, visible).await?;
+        let counts = count_items_by_type(pool, *pid, visible, include_virtual).await?;
         let mut map = std::collections::HashMap::new();
         for (media_type, count) in counts {
             map.insert(media_type, count);

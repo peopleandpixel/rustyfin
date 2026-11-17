@@ -405,18 +405,28 @@ struct LibraryWithOptions {
     item_id: Uuid,
     collection_type: Option<&'static str>,
     locations: Vec<String>,
+    /// Jellyfin's `RefreshStatus`: `Active` while a scan of the library is listed (queued,
+    /// scanning or probing), else `Idle`, from the same registry as the scan rings and the
+    /// library scan task.
     refresh_status: &'static str,
+    /// The listed scan's percent, while there is one.
+    refresh_progress: Option<f64>,
 }
 
 impl LibraryWithOptions {
-    fn new(library: Library, library_options: LibraryOptions) -> Self {
+    fn new(
+        library: Library,
+        library_options: LibraryOptions,
+        scan: Option<rustyfin_core::scan_progress::ScanState>,
+    ) -> Self {
         Self {
+            refresh_status: if scan.is_some() { "Active" } else { "Idle" },
+            refresh_progress: scan.map(|s| f64::from(s.progress.unwrap_or(0))),
             item_id: library.id,
             // Jellyfin gives a mixed library no collection type.
             collection_type: Some(library.content_type.jellyfin_collection_type())
                 .filter(|t| *t != "mixed"),
             locations: library.paths.clone(),
-            refresh_status: "Idle",
             library,
             library_options: options_json(&library_options),
         }
@@ -431,7 +441,8 @@ async fn get_libraries(
     for library in libs {
         let library_options =
             rustyfin_db::repo_library::get_library_options(&state.db_ro, library.id).await?;
-        items.push(LibraryWithOptions::new(library, library_options));
+        let scan = state.task_scheduler.scans().state(library.id);
+        items.push(LibraryWithOptions::new(library, library_options, scan));
     }
     Ok(Json(items))
 }
@@ -543,7 +554,8 @@ async fn remove_library(
     }
     rustyfin_core::local_images::remove_orphaned_covers(&state.db, &covers).await;
     rustyfin_core::lyrics::remove_orphaned_uploads(&state.db, &lyrics).await;
-    state.cache.invalidate_library_lists();
+    // Its items are gone: none of them may be served from a cache
+    state.cache.library_changed(&state.image_cache);
     crate::routes::streaming::forget_library_roots(&state);
     state.task_scheduler.watcher().libraries_changed();
     Ok(Json(json!({ "status": "ok" })))
@@ -641,8 +653,7 @@ pub(crate) async fn run_claimed_scan(
     .map_err(|e| ApiError::Internal(e.to_string()))?;
 
     // Invalidate caches after scan
-    state.cache.invalidate_on_scan();
-    state.image_cache.invalidate_all();
+    state.cache.library_changed(&state.image_cache);
     broadcast_event(
         state,
         WsEvent::LibraryChanged {
@@ -724,8 +735,7 @@ async fn refresh_all(State(state): State<AppState>) -> Result<Json<Value>, ApiEr
         )
         .await;
         // Caches are cleared after each library's scan, before its LibraryChanged, as scan_library does.
-        state.cache.invalidate_on_scan();
-        state.image_cache.invalidate_all();
+        state.cache.library_changed(&state.image_cache);
         match result {
             Ok(count) => {
                 tracing::info!(
@@ -1044,7 +1054,7 @@ async fn remove_folders(
             rustyfin_core::scan_sync::remove_items_under(&state.db, lib.id, folder, &kept).await?;
         tracing::info!(library = %lib.id, folder, gone, "removed the items of a folder taken out of the library");
     }
-    state.cache.invalidate_library_lists();
+    state.cache.library_changed(&state.image_cache);
     Ok(())
 }
 

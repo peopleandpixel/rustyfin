@@ -72,8 +72,7 @@ impl RescanRunner for LibraryMonitorRunner {
             .await
             .map_err(|e| e.to_string())?;
             if changes.changed() {
-                runner.cache.invalidate_on_scan();
-                runner.image_cache.invalidate_all();
+                runner.cache.library_changed(&runner.image_cache);
                 let _ = runner.ws_broadcast.send(WsEvent::LibraryChanged {
                     data: json!({
                         "LibraryId": library.id.to_string(),

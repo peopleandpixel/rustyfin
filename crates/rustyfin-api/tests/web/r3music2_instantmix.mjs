@@ -31,6 +31,7 @@ function sandbox(api) {
         escapeHtml: s => String(s),
         toast: (message, kind) => calls.toast.push([message, kind]),
         playQueueAt: (items, index) => calls.queue.push({ items, index }),
+        canDownload: () => false,
         API: api,
         URLSearchParams,
         String,
