@@ -844,15 +844,18 @@ struct Vaapi {
     codecs: Vec<String>,
     hevc_10bit: bool,
     failures: std::sync::atomic::AtomicUsize,
+    /// The variables that give the driver its cache folder (`hwaccel::ffmpeg_env`).
+    env: Vec<(&'static str, PathBuf)>,
 }
 
 impl TileDecoding {
     /// The encoding settings in effect.
-    pub async fn current() -> Self {
-        Self::from_settings(crate::encoding::current()).await
+    /// The encoding settings in effect; the driver caches under `data_dir`.
+    pub async fn current(data_dir: &Path) -> Self {
+        Self::from_settings(crate::encoding::current(), data_dir).await
     }
 
-    async fn from_settings(settings: crate::encoding::EncodingSettings) -> Self {
+    async fn from_settings(settings: crate::encoding::EncodingSettings, data_dir: &Path) -> Self {
         if settings.hardware_acceleration != crate::encoding::HardwareAccelerationType::Vaapi {
             return Self::default();
         }
@@ -867,6 +870,7 @@ impl TileDecoding {
                 codecs: settings.hardware_decoding_codecs,
                 hevc_10bit: settings.enable_decoding_color_depth_10_hevc,
                 failures: Default::default(),
+                env: crate::hwaccel::ffmpeg_env(data_dir).to_vec(),
             })),
         }
     }
@@ -1245,6 +1249,11 @@ impl Feed<'_> {
 
 /// A `run_tool`-like command for `program` whose output is piped.
 fn tool(program: &str) -> Command {
+    #[cfg(test)]
+    let program = tests::FAKE_FFMPEG
+        .with_borrow(|fake| fake.clone())
+        .filter(|_| program == "ffmpeg")
+        .unwrap_or_else(|| program.into());
     let mut cmd = Command::new(program);
     cmd.args(["-hide_banner", "-loglevel", "error"])
         .stdout(Stdio::piped())
@@ -1254,8 +1263,11 @@ fn tool(program: &str) -> Command {
     cmd
 }
 
-/// `Ok` where `program` exited well, and where `quiet`, printed nothing (it runs at the error
-/// log level).
+/// `Ok` where `program` exited well, and where `quiet`, logged none of its own errors (it runs
+/// at the error log level). Its own are the lines ffmpeg's components prefix with their name
+/// and address (`[h264 @ 0x55d0…] error while decoding MB …`). Other lines on stderr come from
+/// libraries it loads, such as a GPU driver's ("amdgpu: …", a shader cache it can't make),
+/// and say nothing of the decode: they are logged, not counted.
 fn exited(
     program: &str,
     output: std::io::Result<std::process::Output>,
@@ -1264,12 +1276,34 @@ fn exited(
     let output = output.map_err(|e| format!("{program} failed: {e}"))?;
     let stderr = String::from_utf8_lossy(&output.stderr);
     if !output.status.success() {
-        Err(format!("{program} failed: {}", stderr.trim()))
-    } else if quiet && !stderr.trim().is_empty() {
-        Err(format!("{program} met an error: {}", stderr.trim()))
-    } else {
-        Ok(())
+        return Err(format!("{program} failed: {}", stderr.trim()));
     }
+    if !quiet {
+        return Ok(());
+    }
+    let (own, other): (Vec<&str>, Vec<&str>) = stderr
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .partition(|l| ffmpeg_logged(l));
+    if !other.is_empty() {
+        debug!(program, lines = %other.join(" | "), "not ffmpeg's own lines on stderr");
+    }
+    if own.is_empty() {
+        Ok(())
+    } else {
+        Err(format!("{program} met an error: {}", own.join("\n")))
+    }
+}
+
+/// Whether `line` is one ffmpeg logged for one of its components: `[name @ 0x…] …`.
+fn ffmpeg_logged(line: &str) -> bool {
+    line.strip_prefix('[')
+        .and_then(|rest| rest.split_once(']'))
+        .is_some_and(|(context, _)| {
+            context
+                .split_once(" @ 0x")
+                .is_some_and(|(_, address)| address.chars().all(|c| c.is_ascii_hexdigit()))
+        })
 }
 
 /// Runs ffmpeg with `ffmpeg_args`, which reads the key frame packets of the video at `path`
@@ -1307,6 +1341,9 @@ async fn pipe_key_frames(
         None => None,
     };
     let mut ffmpeg = tool("ffmpeg");
+    if let Some(vaapi) = device {
+        ffmpeg.envs(vaapi.env.iter().map(|(k, v)| (k, v)));
+    }
     ffmpeg
         .args(["-nostdin", "-y"])
         .args(ffmpeg_args)
@@ -1698,7 +1735,7 @@ pub async fn generate_for_libraries_with_progress(
     // record. A video with a failure is counted done here, so it isn't counted again when it
     // is skipped or tried again. The bar so starts where the last run left it.
     // Whether tiles are decoded on a device, as the transcoder's are
-    let decoding = TileDecoding::current().await;
+    let decoding = TileDecoding::current(data_dir).await;
     let (total, done) =
         rustyfin_db::repo_trickplay::trickplay_progress(pool, library_ids, WIDTH, FAILURE_KIND)
             .await
@@ -1848,6 +1885,99 @@ mod tests {
 
     /// No device: tiles decoded in software, as most tests want them.
     const SOFTWARE: TileDecoding = TileDecoding { vaapi: None };
+
+    thread_local! {
+        /// Set by a test: the program run as ffmpeg (`tool`).
+        pub(super) static FAKE_FFMPEG: std::cell::RefCell<Option<PathBuf>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    /// The lines an AMD GPU's driver writes to stderr in a container: `kcmp` blocked by
+    /// seccomp, and a `HOME` of `/` with no cache folder.
+    const DRIVER_CHATTER: &str = "amdgpu: os_same_file_description couldn't determine if two \
+        DRM fds reference the same file description.\nIf they do, bad things may happen!\n\
+        Failed to create //.cache for shader cache (Permission denied)---disabling.\n";
+
+    #[test]
+    fn r3trickplay_only_ffmpegs_own_errors_fail_a_tile() {
+        use std::os::unix::process::ExitStatusExt;
+        let output = |stderr: &str, code: i32| {
+            Ok(std::process::Output {
+                status: std::process::ExitStatus::from_raw(code << 8),
+                stdout: Vec::new(),
+                stderr: stderr.as_bytes().to_vec(),
+            })
+        };
+        assert!(exited("ffmpeg", output(DRIVER_CHATTER, 0), true).is_ok());
+        assert!(exited("ffmpeg", output("", 0), true).is_ok());
+        let damaged = "[h264 @ 0x5d8a2c0] error while decoding MB 28 18, bytestream 175729\n";
+        let e = exited(
+            "ffmpeg",
+            output(&format!("{DRIVER_CHATTER}{damaged}"), 0),
+            true,
+        );
+        assert!(e.unwrap_err().contains("error while decoding MB"));
+        let nested = "[vist#0:0/h264 @ 0x5fd6] [dec:h264 @ 0x5fd6] corrupt decoded frame\n";
+        assert!(exited("ffmpeg", output(nested, 0), true).is_err());
+        // A failed run fails whatever it printed; ffprobe's lines aren't counted
+        assert!(exited("ffmpeg", output(DRIVER_CHATTER, 1), true).is_err());
+        assert!(exited("ffprobe", output(damaged, 0), false).is_ok());
+        assert!(!ffmpeg_logged("[not a context] x"));
+        assert!(!ffmpeg_logged("[h264 @ 0xzz] x"));
+    }
+
+    #[tokio::test]
+    async fn r3trickplay_driver_chatter_leaves_a_device_tile_good() {
+        let test = "r3trickplay_driver_chatter_leaves_a_device_tile_good";
+        if !have_ffmpeg(test) || !have_encoder("libx264") {
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("r3trickplay-chatter-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // An ffmpeg that decodes as the real one does in software, then prints the driver's
+        // lines and succeeds, as on a GPU in a container
+        let fake = dir.join("ffmpeg");
+        std::fs::write(
+            &fake,
+            format!(
+                "#!/bin/sh\nfor a; do\n  shift\n  case \"$skip$a\" in\n    \
+                 SKIP*) skip=; continue ;;\n    \
+                 -init_hw_device|-filter_hw_device|-hwaccel|-hwaccel_output_format|\
+                 -hwaccel_device) skip=SKIP; continue ;;\n  esac\n  \
+                 a=$(printf '%s' \"$a\" | sed 's/scale_vaapi=.*hwdownload,format=nv12,//')\n  \
+                 set -- \"$@\" \"$a\"\ndone\nffmpeg \"$@\" || exit $?\nprintf '%s' '{}' >&2\n",
+                DRIVER_CHATTER.replace('\'', "'\\''")
+            ),
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let x264 = ["-x264-params", "keyint=20:min-keyint=20:scenecut=0"];
+        let clip = timed_clip(&dir, "libx264", &x264, &[], "chatter.mkv");
+        let device = on_device("/dev/dri/renderD128");
+        FAKE_FFMPEG.set(Some(fake));
+        let work = dir.join("work");
+        let tiles = work.join("tiles");
+        std::fs::create_dir_all(&tiles).unwrap();
+        let raw = Reading::Seek(Seeking::Raw);
+        let made = make_tiles(
+            &clip.to_string_lossy(),
+            &work,
+            &tiles,
+            raw,
+            &device,
+            &Cancel::new(),
+        )
+        .await;
+        FAKE_FFMPEG.set(None);
+        let info = made.unwrap();
+        assert_eq!(info.thumbnail_count, 9);
+        // The tile counted as good on the device: nothing charged, the device still on
+        let vaapi = device.vaapi.as_ref().unwrap();
+        assert_eq!(vaapi.failures.load(std::sync::atomic::Ordering::Relaxed), 0);
+        assert!(vaapi.usable());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     thread_local! {
         /// Set by a test: seeking pays for every video (`Probe::seeking`), so `Reading::Auto`
@@ -2528,6 +2658,7 @@ mod tests {
                 codecs: vec!["h264".into(), "hevc".into()],
                 hevc_10bit: true,
                 failures: Default::default(),
+                env: Vec::new(),
             })),
         }
     }
@@ -2535,6 +2666,7 @@ mod tests {
     #[tokio::test]
     async fn r3trickplay_only_the_settings_in_effect_decode_on_a_device() {
         use crate::encoding::{EncodingSettings, HardwareAccelerationType};
+        let dir = std::env::temp_dir().join(format!("r3trickplay-hw-{}", Uuid::new_v4()));
         // None, as by default, or another acceleration: software
         let settings = |accel| EncodingSettings {
             hardware_acceleration: accel,
@@ -2545,13 +2677,16 @@ mod tests {
             HardwareAccelerationType::None,
             HardwareAccelerationType::Nvenc,
         ] {
-            let decoding = TileDecoding::from_settings(settings(accel)).await;
+            let decoding = TileDecoding::from_settings(settings(accel), &dir).await;
             assert!(decoding.vaapi.is_none(), "{accel:?}");
         }
         // VA-API in effect: its device and codecs, where ffmpeg has VA-API
-        let vaapi = TileDecoding::from_settings(settings(HardwareAccelerationType::Vaapi)).await;
+        let vaapi =
+            TileDecoding::from_settings(settings(HardwareAccelerationType::Vaapi), &dir).await;
         if let Some(vaapi) = &vaapi.vaapi {
             assert_eq!(vaapi.codecs, ["h264"]);
+            // The driver caches under the data dir
+            assert_eq!(vaapi.env[0], ("XDG_CACHE_HOME", dir.join("cache/gpu")));
             assert_eq!(vaapi.device, EncodingSettings::default().vaapi_device);
         }
         // The codecs and bit depths the settings let the device decode, as the transcoder
@@ -2561,6 +2696,7 @@ mod tests {
                 codecs: vec!["h264".into()],
                 hevc_10bit: false,
                 failures: Default::default(),
+                env: Vec::new(),
             })),
         };
         assert!(device.device_for(Codec::H264, false, true).is_some());
@@ -2585,6 +2721,7 @@ mod tests {
             vaapi.failed("test");
         }
         assert!(!vaapi.usable());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
