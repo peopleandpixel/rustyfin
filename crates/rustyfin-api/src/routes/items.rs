@@ -6,7 +6,7 @@ use axum::routing::{delete, get};
 use axum::{Extension, Json, Router};
 use rustyfin_core::tmdb_client::TmdbApi;
 use rustyfin_model::auth::Claims;
-use rustyfin_model::media::{FiltersResult, MediaItem, MediaType, QueryResult};
+use rustyfin_model::media::{FiltersResult, MediaItem, QueryResult};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use sqlx::SqlitePool;
@@ -784,7 +784,8 @@ async fn enrich_item(
     // --- Folder counts (for Series, Season, MusicAlbum, Folder), of every child: `media_item`
     // caches this item for every user and counts again for a user with limits ---
     if item.media_type.is_folder() {
-        if let Ok(counts) = rustyfin_db::repo_media::count_items_by_type(pool, item.id, None).await
+        if let Ok(counts) =
+            rustyfin_db::repo_media::count_items_by_type(pool, item.id, None, false).await
         {
             set_folder_counts(item, counts);
         }
@@ -1161,7 +1162,8 @@ pub(crate) async fn enrich_items_with(
         );
     }
 
-    // Batch query 5: Folder counts for folder items
+    // Batch query 5: Folder counts for folder items (virtual items only with DisplayMissingEpisodes)
+    let include_virtual = crate::routes::shows::display_missing_episodes(pool, user_id).await;
     let folder_ids: Vec<Uuid> = items
         .iter()
         .filter(|item| item.media_type.is_folder())
@@ -1170,9 +1172,14 @@ pub(crate) async fn enrich_items_with(
     let folder_counts_map = if folder_ids.is_empty() {
         std::collections::HashMap::new()
     } else {
-        rustyfin_db::repo_media::get_folder_counts_batch(pool, &folder_ids, visible.as_deref())
-            .await
-            .unwrap_or_default()
+        rustyfin_db::repo_media::get_folder_counts_batch(
+            pool,
+            &folder_ids,
+            visible.as_deref(),
+            include_virtual,
+        )
+        .await
+        .unwrap_or_default()
     };
 
     // Batch query 6: All images for all items - populates image_tags. Only the image types and
@@ -1977,6 +1984,7 @@ struct ItemsQuery {
     exclude_item_types: Option<String>,
     #[serde(rename = "excludeItemTypes")]
     exclude_item_types_lower: Option<String>,
+    #[serde(alias = "genres")]
     genres: Option<String>,
     years: Option<String>,
     #[serde(rename = "years")]
@@ -1993,6 +2001,7 @@ struct ItemsQuery {
     start_index: Option<i64>,
     #[serde(rename = "startIndex")]
     start_index_lower: Option<i64>,
+    #[serde(alias = "limit")]
     limit: Option<i64>,
     name_starts_with: Option<String>,
     #[serde(rename = "nameStartsWith")]
@@ -2066,7 +2075,9 @@ struct ItemsQuery {
     album_ids: Option<String>,
     #[serde(rename = "albumIds")]
     album_ids_lower: Option<String>,
+    #[serde(alias = "tags")]
     tags: Option<String>,
+    #[serde(alias = "features")]
     features: Option<String>,
     official_ratings: Option<String>,
     #[serde(rename = "officialRatings")]
@@ -2092,6 +2103,7 @@ struct ItemsQuery {
     date_created: Option<String>,
     #[serde(rename = "dateCreated")]
     date_created_lower: Option<String>,
+    #[serde(alias = "runtime")]
     runtime: Option<String>,
     video_codecs: Option<String>,
     #[serde(rename = "videoCodecs")]
@@ -2136,6 +2148,112 @@ struct ItemsQuery {
     group_projects: Option<bool>,
     #[serde(rename = "groupProjects")]
     group_projects_lower: Option<bool>,
+    /// Jellyfin's Ids: only these items, in this order when no SortBy is given
+    ids: Option<String>,
+    #[serde(rename = "ids")]
+    ids_lower: Option<String>,
+    exclude_item_ids: Option<String>,
+    #[serde(rename = "excludeItemIds")]
+    exclude_item_ids_lower: Option<String>,
+    // The other `InternalItemsQuery` conditions (`repo_item_filter::ItemFilter`).
+    #[serde(alias = "personIds")]
+    person_ids: Option<String>,
+    #[serde(alias = "person")]
+    person: Option<String>,
+    /// The credit kinds `PersonIds` and `Person` keep (Actor, Director, …), as in Jellyfin 12.4.
+    #[serde(alias = "personTypes")]
+    person_types: Option<String>,
+    #[serde(alias = "studios")]
+    studios: Option<String>,
+    #[serde(alias = "artists")]
+    artists: Option<String>,
+    #[serde(alias = "albumArtistIds")]
+    album_artist_ids: Option<String>,
+    #[serde(alias = "contributingArtistIds")]
+    contributing_artist_ids: Option<String>,
+    #[serde(alias = "excludeArtistIds")]
+    exclude_artist_ids: Option<String>,
+    #[serde(alias = "albums")]
+    albums: Option<String>,
+    #[serde(alias = "minCommunityRating")]
+    min_community_rating: Option<f64>,
+    /// Accepted and, as in Jellyfin 12.4's item query, without effect.
+    #[serde(alias = "minCriticRating")]
+    min_critic_rating: Option<f64>,
+    #[serde(alias = "minPremiereDate")]
+    min_premiere_date: Option<String>,
+    #[serde(alias = "maxPremiereDate")]
+    max_premiere_date: Option<String>,
+    #[serde(alias = "isUnaired")]
+    is_unaired: Option<bool>,
+    #[serde(alias = "isMissing")]
+    is_missing: Option<bool>,
+    #[serde(alias = "hasImdbId")]
+    has_imdb_id: Option<bool>,
+    #[serde(alias = "hasTmdbId")]
+    has_tmdb_id: Option<bool>,
+    #[serde(alias = "hasTvdbId")]
+    has_tvdb_id: Option<bool>,
+    #[serde(rename = "IsHD", alias = "IsHd", alias = "isHd", alias = "isHD")]
+    is_hd: Option<bool>,
+    #[serde(rename = "Is4K", alias = "is4K", alias = "is4k")]
+    is_4k: Option<bool>,
+    #[serde(rename = "Is3D", alias = "is3D", alias = "is3d")]
+    is_3d: Option<bool>,
+    #[serde(alias = "minWidth")]
+    min_width: Option<i64>,
+    #[serde(alias = "minHeight")]
+    min_height: Option<i64>,
+    #[serde(alias = "maxWidth")]
+    max_width: Option<i64>,
+    #[serde(alias = "maxHeight")]
+    max_height: Option<i64>,
+    #[serde(alias = "hasOverview")]
+    has_overview: Option<bool>,
+    #[serde(alias = "hasOfficialRating")]
+    has_official_rating: Option<bool>,
+    #[serde(alias = "hasParentalRating")]
+    has_parental_rating: Option<bool>,
+    #[serde(alias = "minOfficialRating")]
+    min_official_rating: Option<String>,
+    #[serde(alias = "maxOfficialRating")]
+    max_official_rating: Option<String>,
+    #[serde(alias = "isLocked")]
+    is_locked: Option<bool>,
+    #[serde(alias = "isPlaceHolder")]
+    is_place_holder: Option<bool>,
+    #[serde(alias = "locationTypes")]
+    location_types: Option<String>,
+    #[serde(alias = "excludeLocationTypes")]
+    exclude_location_types: Option<String>,
+    #[serde(alias = "videoTypes")]
+    video_types: Option<String>,
+    #[serde(alias = "nameLessThan")]
+    name_less_than: Option<String>,
+    #[serde(alias = "indexNumber")]
+    index_number: Option<i64>,
+    #[serde(alias = "parentIndexNumber")]
+    parent_index_number: Option<i64>,
+    #[serde(alias = "imageTypes")]
+    image_types: Option<String>,
+    #[serde(alias = "adjacentTo")]
+    adjacent_to: Option<Uuid>,
+    #[serde(alias = "isKids")]
+    is_kids: Option<bool>,
+    #[serde(alias = "isNews")]
+    is_news: Option<bool>,
+    #[serde(alias = "isSports")]
+    is_sports: Option<bool>,
+    /// False: TotalRecordCount is the number of items returned, as in Jellyfin.
+    #[serde(alias = "enableTotalRecordCount")]
+    enable_total_record_count: Option<bool>,
+    #[serde(alias = "minDateLastSaved")]
+    min_date_last_saved: Option<String>,
+    #[serde(alias = "minDateLastSavedForUser")]
+    min_date_last_saved_for_user: Option<String>,
+    /// Jellyfin 12.4's AudioLanguages: items with an audio stream in one of these languages
+    #[serde(alias = "audioLanguages")]
+    audio_languages: Option<String>,
 }
 
 #[allow(dead_code)]
@@ -2167,6 +2285,14 @@ impl ItemsQuery {
     fn sort_by(&self) -> Option<&str> {
         self.sort_by.as_deref().or(self.sort_by_lower.as_deref())
     }
+    fn ids(&self) -> Option<&str> {
+        self.ids.as_deref().or(self.ids_lower.as_deref())
+    }
+    fn exclude_item_ids(&self) -> Option<&str> {
+        self.exclude_item_ids
+            .as_deref()
+            .or(self.exclude_item_ids_lower.as_deref())
+    }
     fn sort_order(&self) -> Option<&str> {
         self.sort_order
             .as_deref()
@@ -2196,7 +2322,10 @@ impl ItemsQuery {
             .or(self.name_starts_with_or_greater_lower.as_deref())
     }
     fn recursive(&self) -> bool {
-        self.recursive.or(self.recursive_lower).unwrap_or(false)
+        self.recursive_given().unwrap_or(false)
+    }
+    fn recursive_given(&self) -> Option<bool> {
+        self.recursive.or(self.recursive_lower)
     }
     fn fields(&self) -> Option<&str> {
         self.fields.as_deref().or(self.fields_lower.as_deref())
@@ -2422,6 +2551,324 @@ fn parse_ids(value: Option<&str>) -> Vec<Uuid> {
         .collect()
 }
 
+/// Jellyfin's `Ids` and `ExcludeItemIds` on an item list.
+struct IdsFilter {
+    /// The ids asked for, in order; none filters nothing.
+    requested: Vec<Uuid>,
+    wanted: std::collections::HashSet<Uuid>,
+    excluded: Vec<Uuid>,
+    /// More than one id and no SortBy: the answer keeps the order of Ids, as Jellyfin's
+    /// `Folder.SortItemsByRequest` does.
+    in_request_order: bool,
+}
+
+impl IdsFilter {
+    fn new(query: &ItemsQuery) -> Self {
+        let requested = parse_ids(query.ids());
+        Self {
+            wanted: requested.iter().copied().collect(),
+            excluded: parse_ids(query.exclude_item_ids()),
+            in_request_order: requested.len() > 1
+                && query.sort_by().is_none_or(|s| s.trim().is_empty()),
+            requested,
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.requested.is_empty() && self.excluded.is_empty()
+    }
+
+    fn keeps(&self, id: Uuid) -> bool {
+        (self.wanted.is_empty() || self.wanted.contains(&id)) && !self.excluded.contains(&id)
+    }
+
+    /// The items of a whole list that the filter keeps, in the order of Ids when it asks for
+    /// that, then paged.
+    fn page(&self, mut items: Vec<MediaItem>, start: i64, limit: i64) -> QueryResult {
+        items.retain(|item| self.keeps(item.id));
+        if self.in_request_order {
+            let mut position = std::collections::HashMap::new();
+            for (index, id) in self.requested.iter().enumerate() {
+                position.entry(*id).or_insert(index);
+            }
+            items.sort_by_key(|item| position.get(&item.id).copied().unwrap_or(usize::MAX));
+        }
+        let total = items.len() as i64;
+        let items = items
+            .into_iter()
+            .skip(start as usize)
+            .take(limit as usize)
+            .collect();
+        QueryResult {
+            items,
+            total_record_count: total,
+            start_index: start,
+        }
+    }
+}
+
+/// The collections and playlists among the requested ids that aren't media items (`found`), as
+/// `/Items/{id}` answers them: only those the caller may see, and only when the list's types
+/// (`include`, `exclude`) keep `BoxSet` or `Playlist`.
+async fn requested_containers(
+    state: &AppState,
+    claims: &Claims,
+    by_id: &IdsFilter,
+    found: &[MediaItem],
+    include: Option<&[String]>,
+    exclude: Option<&[String]>,
+) -> Result<Vec<MediaItem>, ApiError> {
+    let mut seen: std::collections::HashSet<Uuid> = found.iter().map(|item| item.id).collect();
+    let mut containers = Vec::new();
+    for &id in &by_id.requested {
+        if !by_id.keeps(id) || !seen.insert(id) {
+            continue;
+        }
+        let item = match super::collections::container_details(state, id, claims).await {
+            Ok(Some(item)) => item,
+            Ok(None) | Err(ApiError::NotFound(_)) => continue,
+            Err(e) => return Err(e),
+        };
+        let kind = match item.media_type {
+            rustyfin_model::media::MediaType::BoxSet => "BoxSet",
+            _ => "Playlist",
+        };
+        let names = |types: Option<&[String]>| {
+            types.is_some_and(|types| {
+                types
+                    .iter()
+                    .any(|t| t.trim_matches('"').eq_ignore_ascii_case(kind))
+            })
+        };
+        if include.is_some_and(|types| !types.is_empty()) && !names(include) || names(exclude) {
+            continue;
+        }
+        containers.push(item);
+    }
+    Ok(containers)
+}
+
+/// The values of a Jellyfin pipe-delimited list (`PipeDelimitedCollectionModelBinder`), trimmed,
+/// without empty ones.
+fn pipe_list(value: Option<&str>) -> Vec<String> {
+    value
+        .into_iter()
+        .flat_map(|v| v.split('|'))
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// The values of a comma-delimited list, trimmed, without empty ones.
+fn comma_list(value: Option<&str>) -> Vec<String> {
+    value
+        .into_iter()
+        .flat_map(|v| v.split(','))
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// A date query value (RFC 3339, or a date and time without a zone, read as UTC, or a date) as
+/// the UTC instant SQLite's `julianday` reads; 400 when it is none of those, as in Jellyfin.
+fn query_instant(name: &str, value: Option<&str>) -> Result<Option<String>, ApiError> {
+    let Some(value) = value.map(str::trim).filter(|v| !v.is_empty()) else {
+        return Ok(None);
+    };
+    let instant = chrono::DateTime::parse_from_rfc3339(value)
+        .map(|d| d.with_timezone(&chrono::Utc).naive_utc())
+        .or_else(|_| chrono::NaiveDateTime::parse_from_str(value, "%Y-%m-%dT%H:%M:%S%.f"))
+        .or_else(|_| {
+            chrono::NaiveDate::parse_from_str(value, "%Y-%m-%d")
+                .map(|d| d.and_hms_opt(0, 0, 0).unwrap_or_default())
+        })
+        .map_err(|_| ApiError::BadRequest(format!("invalid {name}: {value}")))?;
+    Ok(Some(instant.format("%Y-%m-%d %H:%M:%S").to_string()))
+}
+
+/// The item types whose Jellyfin `MediaType` (`MediaType::media_kind`) is one of `kinds`, or
+/// `None` to filter nothing. As Jellyfin 12.4's comma-delimited binder drops a value that isn't a
+/// `MediaType` (`Unknown`, `Video`, `Audio`, `Photo`, `Book`), only those count, and with none
+/// left nothing is filtered; a kind no item has (`Book`) keeps a type no item has, so it lists
+/// nothing.
+fn item_types_of_media_kinds(kinds: &[String]) -> Option<Vec<String>> {
+    use rustyfin_model::media::MediaType;
+    const KINDS: [&str; 5] = ["Unknown", "Video", "Audio", "Photo", "Book"];
+    let kinds: Vec<&String> = kinds
+        .iter()
+        .filter(|k| KINDS.iter().any(|known| known.eq_ignore_ascii_case(k)))
+        .collect();
+    if kinds.is_empty() {
+        return None;
+    }
+    const TYPES: [MediaType; 12] = [
+        MediaType::Movie,
+        MediaType::Series,
+        MediaType::Season,
+        MediaType::Episode,
+        MediaType::Audio,
+        MediaType::MusicAlbum,
+        MediaType::MusicArtist,
+        MediaType::Photo,
+        MediaType::Video,
+        MediaType::Genre,
+        MediaType::BoxSet,
+        MediaType::Playlist,
+    ];
+    let mut types: Vec<String> = TYPES
+        .iter()
+        .filter(|t| kinds.iter().any(|k| k.eq_ignore_ascii_case(t.media_kind())))
+        .map(|t| format!("{t:?}"))
+        .collect();
+    if types.is_empty() {
+        types.push("Book".to_string());
+    }
+    Some(types)
+}
+
+/// The `InternalItemsQuery` conditions of a list request that `repo_item_filter` answers.
+fn item_filter(query: &ItemsQuery) -> Result<rustyfin_db::repo_item_filter::ItemFilter, ApiError> {
+    let ids = |value: Option<&str>| -> Vec<String> {
+        parse_ids(value).iter().map(Uuid::to_string).collect()
+    };
+    let rating = |value: Option<&str>| {
+        value
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .and_then(rustyfin_model::parental::rating_score)
+    };
+    // IsKids, IsNews and IsSports are the tags of those names, as in Jellyfin.
+    let mut tags = pipe_list(query.tags());
+    let mut exclude_tags = Vec::new();
+    for (flag, tag) in [
+        (query.is_kids, "Kids"),
+        (query.is_news, "News"),
+        (query.is_sports, "Sports"),
+    ] {
+        match flag {
+            Some(true) => tags.push(tag.to_string()),
+            Some(false) => exclude_tags.push(tag.to_string()),
+            None => {}
+        }
+    }
+    // Jellyfin reads the location types as whether an item is virtual (`ItemsController`).
+    let location = comma_list(query.location_types.as_deref());
+    let excluded_locations = comma_list(query.exclude_location_types.as_deref());
+    let virtual_ = |list: &[String]| list.iter().any(|t| t.eq_ignore_ascii_case("Virtual"));
+    let is_virtual = if virtual_(&excluded_locations) {
+        Some(false)
+    } else if !location.is_empty() && location.len() < 4 {
+        Some(virtual_(&location))
+    } else {
+        query.is_missing
+    };
+    let min_rating = rating(query.min_official_rating.as_deref());
+    let max_rating = rating(query.max_official_rating.as_deref());
+    let now = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
+    Ok(rustyfin_db::repo_item_filter::ItemFilter {
+        person_ids: ids(query.person_ids.as_deref()),
+        person_types: comma_list(query.person_types.as_deref()),
+        official_ratings: query
+            .official_ratings()
+            .into_iter()
+            .flat_map(|s| s.split(['|', ',']))
+            .map(str::trim)
+            .filter(|r| !r.is_empty())
+            .map(str::to_string)
+            .collect(),
+        audio_languages: comma_list(query.audio_languages.as_deref())
+            .iter()
+            .flat_map(|code| rustyfin_model::media_source::language_forms(code))
+            .collect(),
+        // Jellyfin 12.4: languages make HasSubtitles=true redundant, and HasSubtitles=false
+        // drops the languages.
+        subtitle_languages: query
+            .subtitle_languages()
+            .filter(|_| query.has_subtitles() != Some(false))
+            .unwrap_or_default(),
+        person: query
+            .person
+            .as_deref()
+            .map(str::trim)
+            .filter(|p| !p.is_empty())
+            .map(str::to_string),
+        studios: pipe_list(query.studios.as_deref()),
+        artist_ids: ids(query.artist_ids()),
+        artist_names: pipe_list(query.artists.as_deref()),
+        album_artist_ids: ids(query.album_artist_ids.as_deref()),
+        contributing_artist_ids: ids(query.contributing_artist_ids.as_deref()),
+        exclude_artist_ids: ids(query.exclude_artist_ids.as_deref()),
+        album_ids: ids(query.album_ids()),
+        album_names: pipe_list(query.albums.as_deref()),
+        tags,
+        exclude_tags,
+        min_community_rating: query.min_community_rating,
+        min_premiere_date: query_instant("MinPremiereDate", query.min_premiere_date.as_deref())?,
+        max_premiere_date: query_instant("MaxPremiereDate", query.max_premiere_date.as_deref())?,
+        // Both compare the item's last save in Jellyfin 12.4; the later bound wins.
+        min_date_last_saved: query_instant(
+            "MinDateLastSaved",
+            query.min_date_last_saved.as_deref(),
+        )?
+        .into_iter()
+        .chain(query_instant(
+            "MinDateLastSavedForUser",
+            query.min_date_last_saved_for_user.as_deref(),
+        )?)
+        .max(),
+        unaired: query.is_unaired.map(|unaired| (unaired, now)),
+        has_imdb_id: query.has_imdb_id,
+        has_tmdb_id: query.has_tmdb_id,
+        has_tvdb_id: query.has_tvdb_id,
+        is_hd: query.is_hd,
+        is_4k: query.is_4k,
+        is_3d: query.is_3d,
+        min_width: query.min_width,
+        min_height: query.min_height,
+        max_width: query.max_width,
+        max_height: query.max_height,
+        has_subtitles: query
+            .has_subtitles()
+            .filter(|&has| !(has && query.subtitle_languages().is_some())),
+        has_overview: query.has_overview,
+        has_official_rating: query.has_official_rating,
+        no_parental_rating: query.has_parental_rating == Some(false)
+            && min_rating.is_none()
+            && max_rating.is_none(),
+        min_rating,
+        max_rating,
+        is_locked: query.is_locked,
+        is_placeholder: query.is_place_holder,
+        is_virtual,
+        // Set by the caller, which knows the user
+        hide_virtual_seasons: false,
+        video_types: comma_list(query.video_types.as_deref()),
+        name_less_than: query
+            .name_less_than
+            .as_deref()
+            .filter(|n| !n.trim().is_empty())
+            .map(str::to_string),
+        index_number: query.index_number,
+        parent_index_number: query.parent_index_number,
+        image_types: comma_list(query.image_types.as_deref()),
+    })
+}
+
+/// Jellyfin 12.4's `AdjacentTo` (`ApplyAdjacencyFilter`): the item `id` of the ordered list and
+/// the ones before and after it; nothing when the list doesn't hold it.
+fn adjacent_items(items: Vec<MediaItem>, id: Uuid) -> Vec<MediaItem> {
+    let index = items.iter().position(|item| item.id == id);
+    let keep = |i: usize| index.is_some_and(|index| i + 1 == index || i == index || i == index + 1);
+    items
+        .into_iter()
+        .enumerate()
+        .filter(|(i, _)| keep(*i))
+        .map(|(_, item)| item)
+        .collect()
+}
+
 /// The ids of `kept` (all items when `None`) that are also in `ids`.
 /// The hidden items' filter (`HiddenItems::json`: `{"h": [ids], "l": [libraries]}`) that also hides `ids`.
 fn hide_also(hidden: Option<String>, ids: Vec<String>) -> Option<String> {
@@ -2468,9 +2915,8 @@ async fn get_items(
     let years: Option<Vec<i32>> = query
         .years()
         .map(|s| s.split(',').filter_map(|y| y.trim().parse().ok()).collect());
-    let official_ratings: Option<Vec<String>> = query
-        .official_ratings()
-        .map(|s| s.split(['|', ',']).map(|r| r.trim().to_string()).collect());
+    // OfficialRatings, as SubtitleLanguages, goes to `item_filter`: Jellyfin 12.4 matches a
+    // folder by its contents too.
     // `Filters=IsPlayed,IsUnplayed,IsResumable,IsFavorite` sets the same conditions as the flags.
     let flag = |set: Option<bool>, names: &[&str]| {
         set.or(names.iter().any(|n| query.has_filter(n)).then_some(true))
@@ -2479,12 +2925,13 @@ async fn get_items(
     let is_played = flag(query.is_played(), &["IsPlayed"]);
     let is_unplayed = flag(query.is_unplayed(), &["IsUnplayed"]);
     let is_resumable = flag(query.is_resumable(), &["IsResumable"]);
-    let tags: Option<Vec<String>> = query
-        .tags()
-        .map(|s| s.split(',').map(|t| t.trim().to_string()).collect());
+    // Tags (with IsKids, IsNews, IsSports) go to `item_filter`: any of them, or the series'.
+    let tags: Option<Vec<String>> = None;
+    // MediaTypes names Jellyfin's media kinds (Video, Audio, …), kept as the item types of them.
     let media_types_filter: Option<Vec<String>> = query
         .media_types()
-        .map(|s| s.split(',').map(|t| t.trim().to_string()).collect());
+        .and_then(|s| item_types_of_media_kinds(&comma_list(Some(s))));
+    let mut conditions = item_filter(&query)?;
     let runtime_parts: Option<(i32, i32)> = query.runtime().map(|s| {
         let parts: Vec<&str> = s.split('-').collect();
         let min = parts
@@ -2500,11 +2947,26 @@ async fn get_items(
 
     let start_index = query.start_index();
     let limit = query.limit();
+    let by_id = IdsFilter::new(&query);
+    // With Ids or ExcludeItemIds, a whole listing is fetched, narrowed, ordered, then paged.
+    let (list_start, list_limit) = if by_id.is_empty() {
+        (start_index as usize, limit as usize)
+    } else {
+        (0, usize::MAX)
+    };
+    let narrowed = |list: QueryResult| {
+        if by_id.is_empty() {
+            list
+        } else {
+            by_id.page(list.items, start_index, limit)
+        }
+    };
 
     // Collections and playlists live outside media_items: a list of only those kinds, or one of
     // them as ParentId, is answered from their own tables.
     let mut parent_id = query.parent_id();
     let mut collection_ids = None;
+    let mut in_collection = false;
     let only_containers = media_types.as_ref().filter(|kinds| {
         !kinds.is_empty()
             && kinds.iter().all(|kind| {
@@ -2517,20 +2979,20 @@ async fn get_items(
     if let Some(id) = parent_id {
         match super::collections::container_of(&state, id, &claims).await? {
             Some(Container::Playlist) => {
-                let limit = Some(limit as usize);
                 let entries = super::collections::playlist_entries(
                     &state,
                     id,
                     &claims,
-                    start_index as usize,
-                    limit,
+                    list_start,
+                    Some(list_limit),
                     query
                         .sort_by()
                         .is_some_and(rustyfin_db::repo_media::sorts_randomly),
                 );
-                return entries.await.map(|r| Json(r).into_response());
+                return entries.await.map(|r| Json(narrowed(r)).into_response());
             }
             Some(Container::Collection(ids)) => {
+                in_collection = true;
                 parent_id = None;
                 collection_ids = Some(ids);
             }
@@ -2546,10 +3008,10 @@ async fn get_items(
                     wants("BoxSet"),
                     wants("Playlist"),
                     Some(id),
-                    start_index as usize,
-                    limit as usize,
+                    list_start,
+                    list_limit,
                 );
-                return listing.await.map(|r| Json(r).into_response());
+                return listing.await.map(|r| Json(narrowed(r)).into_response());
             }
             None => {}
         }
@@ -2560,12 +3022,19 @@ async fn get_items(
             wants("BoxSet"),
             wants("Playlist"),
             None,
-            start_index as usize,
-            limit as usize,
+            list_start,
+            list_limit,
         );
-        return listing.await.map(|r| Json(r).into_response());
+        return listing.await.map(|r| Json(narrowed(r)).into_response());
     }
 
+    // Whether IncludeItemTypes names any type, or only MusicAlbum (for the defaults below).
+    let typed_list = media_types
+        .as_ref()
+        .is_some_and(|t| t.iter().any(|t| !t.is_empty()));
+    let albums_only = media_types
+        .as_ref()
+        .is_some_and(|t| t.len() == 1 && t[0].eq_ignore_ascii_case("MusicAlbum"));
     // IsMovie and IsSeries are Live TV program flags in Jellyfin, and library items are never
     // programs (as on /Search/Hints): IsMovie=true keeps the list when the include types are
     // empty or name Movie or Trailer and empties it otherwise, IsSeries=true empties it, and
@@ -2603,10 +3072,18 @@ async fn get_items(
         let ids = rustyfin_db::repo_media::series_ids_with_status(&state.db_ro, &statuses).await?;
         item_ids = Some(narrow_ids(item_ids, ids));
     }
-    if let Some(languages) = query.subtitle_languages() {
-        let ids =
-            rustyfin_db::repo_media::item_ids_with_subtitle_language(&state.db_ro, &languages)
-                .await?;
+    // A parent's virtual seasons (a series' seasons with no file behind them) are left out unless
+    // the user's DisplayMissingEpisodes, or an API key, asks for them (12.4 SetSeasonQueryOptions).
+    conditions.hide_virtual_seasons = parent_id.is_some()
+        && !(claims.sub.is_nil()
+            || crate::routes::shows::display_missing_episodes(&state.db_ro, Some(claims.sub))
+                .await);
+    // The other conditions join the list's own SQL, beside the parental limits and the count.
+    let extra = rustyfin_db::repo_item_filter::filter_sql(&state.db_ro, &conditions).await?;
+    // Ids keeps only the listed items (Jellyfin's `InternalItemsQuery.ItemIds`); ids of no item
+    // are skipped, and an empty list filters nothing, as in Jellyfin.
+    if !by_id.requested.is_empty() {
+        let ids = by_id.requested.iter().map(Uuid::to_string).collect();
         item_ids = Some(narrow_ids(item_ids, ids));
     }
     // HasTrailer, HasSpecialFeature, HasThemeSong and HasThemeVideo, as in Jellyfin 12.4: an item matches
@@ -2630,9 +3107,51 @@ async fn get_items(
         }
     }
     let hidden = HiddenItems::for_caller(&state, &claims).await?;
-    let hidden_json = hide_also(hidden.json(), without);
+    // ExcludeItemIds, and the items without the extras asked for, drop items as the caller's
+    // hidden ones are dropped.
+    let hidden_json = hide_also(hidden.json_excluding(&by_id.excluded), without);
 
-    let (items, total) = rustyfin_db::repo_media::get_items_filtered(
+    // With Ids every match is fetched, then merged with the requested collections and
+    // playlists, ordered and paged here.
+    // AdjacentTo: the SQL finds the item and its neighbours, but in the order of Ids it is
+    // picked here from that short list.
+    let adjacent_to = query.adjacent_to;
+    let whole_list = !by_id.requested.is_empty() || adjacent_to.is_some();
+    let sql_adjacent_to = adjacent_to.filter(|_| by_id.requested.is_empty());
+    let (fetch_start, fetch_limit) = if !whole_list {
+        (start_index, limit)
+    } else if by_id.requested.is_empty() {
+        (0, 3)
+    } else {
+        (0, by_id.requested.len() as i64)
+    };
+
+    // Jellyfin 12.4: with item types, a library as ParentId lists its contents recursively unless
+    // the client chose; an artist's albums come newest first unless an order is asked for.
+    let recursive = match query.recursive_given() {
+        Some(recursive) => recursive,
+        None => match parent_id {
+            Some(id) if typed_list => {
+                rustyfin_db::repo_library::get_library_by_id(&state.db_ro, id)
+                    .await?
+                    .is_some()
+            }
+            _ => false,
+        },
+    };
+    let (sort_by, sort_order) = if query.sort_by().is_none_or(|s| s.trim().is_empty())
+        && (!conditions.artist_ids.is_empty() || !conditions.artist_names.is_empty())
+        && albums_only
+    {
+        (
+            Some("ProductionYear,SortName"),
+            Some("Descending,Ascending"),
+        )
+    } else {
+        (query.sort_by(), query.sort_order())
+    };
+
+    let (mut items, mut total) = rustyfin_db::repo_media::get_items_filtered(
         &state.db_ro,
         parent_id,
         query.library_id(),
@@ -2643,15 +3162,15 @@ async fn get_items(
         query.search_term(),
         query.name_starts_with(),
         query.name_starts_with_or_greater(),
-        query.sort_by(),
-        query.sort_order(),
-        start_index,
-        limit,
-        query.recursive(),
+        sort_by,
+        sort_order,
+        fetch_start,
+        fetch_limit,
+        recursive,
         is_favorite,
         is_unplayed,
         is_played,
-        official_ratings.as_deref(),
+        None,
         tags.as_deref(),
         media_types_filter.as_deref(),
         query.start_date(),
@@ -2662,8 +3181,47 @@ async fn get_items(
         Some(claims.sub),
         item_ids.as_deref(),
         hidden_json.as_deref(),
+        extra.as_ref(),
+        sql_adjacent_to,
     )
     .await?;
+    // Collections and playlists named in Ids are listed as `/Items/{id}` answers them; they are
+    // under no library or collection, so a ParentId or LibraryId leaves them out.
+    let mut containers = std::collections::HashSet::new();
+    if whole_list {
+        if !by_id.requested.is_empty()
+            && parent_id.is_none()
+            && !in_collection
+            && query.library_id().is_none()
+        {
+            let found = requested_containers(
+                &state,
+                &claims,
+                &by_id,
+                &items,
+                constrained_media_types.as_deref(),
+                exclude_media_types.as_deref(),
+            )
+            .await?;
+            containers.extend(found.iter().map(|item| item.id));
+            items.extend(found);
+        }
+        let mut page = by_id.page(items, 0, i64::MAX);
+        if let Some(id) = adjacent_to.filter(|_| !by_id.requested.is_empty()) {
+            page.items = adjacent_items(page.items, id);
+        }
+        total = page.items.len() as i64;
+        items = page
+            .items
+            .into_iter()
+            .skip(start_index as usize)
+            .take(limit as usize)
+            .collect();
+    }
+
+    if query.enable_total_record_count == Some(false) {
+        total = items.len() as i64;
+    }
 
     if query.card_index() {
         let result =
@@ -2680,6 +3238,12 @@ async fn get_items(
     let need_media_sources = fields
         .iter()
         .any(|f| f.eq_ignore_ascii_case("MediaSources"));
+
+    // The collections and playlists are sent as they are, and only the media items are
+    // enriched; `is_container` keeps their places.
+    let is_container: Vec<bool> = items.iter().map(|i| containers.contains(&i.id)).collect();
+    let (held, items): (Vec<MediaItem>, Vec<MediaItem>) =
+        items.into_iter().partition(|i| containers.contains(&i.id));
 
     let mut items = if need_media_sources {
         let mut items_copy = items;
@@ -2707,6 +3271,13 @@ async fn get_items(
         &query.image_options(),
     )
     .await;
+    if !held.is_empty() {
+        let (mut media, mut held) = (items.into_iter(), held.into_iter());
+        items = is_container
+            .iter()
+            .filter_map(|&c| if c { held.next() } else { media.next() })
+            .collect();
+    }
 
     if minimal {
         return Ok(
@@ -2949,9 +3520,16 @@ pub(crate) async fn media_item(
         true => crate::parental::user_filter(&state.db_ro, Some(user)).await,
         false => None,
     };
-    if visible.is_some()
-        && let Ok(counts) =
-            rustyfin_db::repo_media::count_items_by_type(&state.db_ro, id, visible.as_deref()).await
+    let include_virtual =
+        crate::routes::shows::display_missing_episodes(&state.db_ro, Some(user)).await;
+    if (visible.is_some() || include_virtual)
+        && let Ok(counts) = rustyfin_db::repo_media::count_items_by_type(
+            &state.db_ro,
+            id,
+            visible.as_deref(),
+            include_virtual,
+        )
+        .await
     {
         set_folder_counts(&mut item, counts);
     }
@@ -3375,113 +3953,15 @@ async fn get_latest(
     latest_page(&state, user, &params).await
 }
 
-/// The "Latest" row (`/Items/Latest`, `/Users/{userId}/Items/Latest`), as Jellyfin's
-/// `UserLibraryController.GetLatestMedia` builds it, for `user` and what that user may see:
-/// `isPlayed` (unset means unplayed only when the user's `HidePlayedInLatest` is on; ignored
-/// when a music library is read), `groupItems`
-/// (default true: two or more new episodes of a series show as the series, new tracks as their
-/// album, each with `ChildCount`), `limit` (default 20) entries, and without `parentId` the
-/// user's `LatestItemsExcludes` libraries left out.
+/// The "Latest" row (`/Items/Latest`, `/Users/{userId}/Items/Latest`) for `user`, as Jellyfin
+/// 12.4 builds it (see `latest::latest_entries`).
 async fn latest_page(
     state: &AppState,
     user: Uuid,
     params: &[(String, String)],
 ) -> Result<Json<Vec<MediaItem>>, ApiError> {
-    use crate::query::{bool_param, count_param, item_kinds, parent_param};
-    let limit = count_param(params, "limit")?.unwrap_or(20);
-    let group_items = bool_param(params, "groupItems")?.unwrap_or(true);
-    let library_id = parent_param(params, "parentId")?;
-    let config = rustyfin_db::repo_user::get_user_by_id(&state.db_ro, user)
-        .await?
-        .map(|u| rustyfin_model::user::jellyfin_configuration(&u.configuration))
-        .unwrap_or_default();
-    let mut is_played = bool_param(params, "isPlayed")?;
-    if is_played.is_none() && config["HidePlayedInLatest"].as_bool() != Some(false) {
-        is_played = Some(false);
-    }
-    let mut exclude_libraries = Vec::new();
-    if let Some(library_id) = library_id {
-        let library =
-            rustyfin_db::repo_library::get_library_by_id(&state.db_ro, library_id).await?;
-        if library
-            .is_some_and(|l| l.content_type == rustyfin_model::library::LibraryContentType::Music)
-        {
-            is_played = None;
-        }
-    } else {
-        exclude_libraries = config["LatestItemsExcludes"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .filter_map(|id| id.as_str().and_then(|id| Uuid::parse_str(id).ok()))
-            .collect();
-        // Jellyfin ignores the played filter when any library the row reads is music.
-        let policy = crate::parental::user_policy(state, user).await?;
-        let libraries = rustyfin_db::repo_library::get_all_libraries(&state.db_ro).await?;
-        if libraries.iter().any(|l| {
-            l.content_type == rustyfin_model::library::LibraryContentType::Music
-                && !exclude_libraries.contains(&l.id)
-                && policy.allows_folder(&l.id.to_string())
-        }) {
-            is_played = None;
-        }
-    }
-    let mut filter = rustyfin_db::repo_media::LatestFilter {
-        user_id: Some(user),
-        item_types: item_kinds(params, "includeItemTypes")
-            .into_iter()
-            .map(str::to_string)
-            .collect(),
-        library_id,
-        exclude_libraries,
-        is_played,
-        limit: (limit as i64).saturating_mul(5).max(1),
-        offset: 0,
-        hidden_ids_json: HiddenItems::for_user(state, user).await?.json(),
-    };
-
-    // Jellyfin's UserViewManager.GetLatestItems: group by container in first-seen order, up to
-    // `limit` groups. Pages of candidates are read until there are `limit` groups, so a series
-    // with many new episodes doesn't leave the row short.
-    let mut groups: Vec<(Option<Uuid>, Vec<MediaItem>)> = Vec::new();
-    'pages: while groups.len() < limit {
-        let candidates = rustyfin_db::repo_media::get_latest_items(&state.db_ro, &filter).await?;
-        let last_page = (candidates.len() as i64) < filter.limit;
-        for (item, container) in candidates {
-            if groups.len() >= limit {
-                break 'pages;
-            }
-            match container.filter(|_| group_items) {
-                Some(id) => match groups.iter_mut().find(|(c, _)| *c == Some(id)) {
-                    Some((_, members)) => members.push(item),
-                    None => groups.push((Some(id), vec![item])),
-                },
-                None => groups.push((None, vec![item])),
-            }
-        }
-        if last_page {
-            break;
-        }
-        filter.offset += filter.limit;
-    }
-    let mut items = Vec::with_capacity(groups.len());
-    let mut child_counts = Vec::with_capacity(groups.len());
-    for (container, mut members) in groups {
-        let container = match container {
-            Some(id) => rustyfin_db::repo_media::get_item_by_id(&state.db_ro, id).await?,
-            None => None,
-        };
-        match container {
-            Some(c) if members.len() > 1 || c.media_type == MediaType::MusicAlbum => {
-                child_counts.push(members.len() as i32);
-                items.push(c);
-            }
-            _ => {
-                child_counts.push(0);
-                items.push(members.swap_remove(0));
-            }
-        }
-    }
+    let (mut items, child_counts) =
+        crate::routes::latest::latest_entries(state, user, params).await?;
     // Enrich latest items using batch queries
     // Skip blurhash for list views to avoid per-item disk I/O
     let tmdb = state.tmdb.api(None);
@@ -3496,9 +3976,12 @@ async fn latest_page(
         true, // skip_blurhash for list views
     )
     .await;
-    // Jellyfin sets ChildCount on every entry: the new items in a group, else 0.
+    // Jellyfin 12.4 sets ChildCount to the number of new items of a group shown as its
+    // container; other entries keep their own.
     for (item, count) in items.iter_mut().zip(child_counts) {
-        item.child_count = Some(count);
+        if count > 0 {
+            item.child_count = Some(count);
+        }
     }
     Ok(Json(items))
 }
@@ -3750,7 +4233,66 @@ async fn get_filters2(
             json!({ "Name": name, "Id": id.simple().to_string() })
         })
         .collect();
-    Ok(Json(json!({ "Genres": genres, "Tags": [] })))
+    let (audio, subtitles) = filter_languages(&state, &claims, library_id, &item_types).await?;
+    Ok(Json(json!({
+        "Genres": genres,
+        "Tags": [],
+        "AudioLanguages": audio,
+        "SubtitleLanguages": subtitles,
+    })))
+}
+
+/// The AudioLanguages and SubtitleLanguages of `/Items/Filters2`, as Jellyfin 12.4's
+/// `FilterController.GetQueryFilters` lists them: only for movies, series, seasons or episodes
+/// (a series' or season's streams are its episodes'), each `{ Name, Value }` with the language's
+/// display name and code (the code alone when it names no language), sorted by name.
+async fn filter_languages(
+    state: &AppState,
+    claims: &Claims,
+    library_id: Option<Uuid>,
+    item_types: &[String],
+) -> Result<(Vec<Value>, Vec<Value>), ApiError> {
+    let video = ["Movie", "Series", "Season", "Episode"];
+    let has = |kind: &str| item_types.iter().any(|t| t.eq_ignore_ascii_case(kind));
+    if !video.iter().any(|kind| has(kind)) {
+        return Ok((Vec::new(), Vec::new()));
+    }
+    let mut types = item_types.to_vec();
+    if (has("Series") || has("Season")) && !has("Episode") {
+        types.push("Episode".to_string());
+    }
+    let hidden = HiddenItems::for_caller(state, claims).await?.json();
+    let mut lists = Vec::new();
+    for kind in ["audio", "subtitle"] {
+        let languages = rustyfin_db::repo_item_filter::stream_languages(
+            &state.db_ro,
+            kind,
+            library_id,
+            &types,
+            hidden.as_deref(),
+        )
+        .await?;
+        let mut pairs: Vec<(String, String)> = languages
+            .into_iter()
+            .map(|language| {
+                let name = match super::localization::language_display_name(&language) {
+                    Some(display) => format!("{display} ({language})"),
+                    None => language.clone(),
+                };
+                (name, language)
+            })
+            .collect();
+        pairs.sort_by_key(|(name, _)| name.to_lowercase());
+        lists.push(
+            pairs
+                .into_iter()
+                .map(|(name, value)| json!({ "Name": name, "Value": value }))
+                .collect::<Vec<_>>(),
+        );
+    }
+    let subtitles = lists.pop().unwrap_or_default();
+    let audio = lists.pop().unwrap_or_default();
+    Ok((audio, subtitles))
 }
 
 /// The claims a list answers for: the user `user_id` names, under `path_user`'s rules, with that
@@ -3887,17 +4429,59 @@ async fn get_ancestors(
     Ok(Json(ancestors))
 }
 
-/// GET /Items/{id}/Collections - Get collections containing this item
+/// GET /Items/{id}/Collections?userId=&startIndex=&limit=, as Jellyfin 12.4's
+/// `LibraryController.GetItemCollections`: the collections holding the item that the caller (or
+/// `userId`) may see, as `/Items/{id}` answers each, sorted by sort name then name without case,
+/// then paged; the count is of every one. 404 for an item that doesn't exist (a hidden one is a
+/// 404 already, by `parental`).
 async fn get_item_collections(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
+    Query(params): Query<Vec<(String, String)>>,
+    Extension(claims): Extension<Claims>,
 ) -> Result<Json<QueryResult>, ApiError> {
-    let collections = rustyfin_db::repo_media::get_item_collections(&state.db_ro, id).await?;
+    use crate::query::{count_param, uuid_param};
+    let user = query_user(&state, &claims, uuid_param(&params, "userId")?)
+        .await?
+        .unwrap_or(claims.sub);
+    match media_item(&state, id, user).await {
+        Ok(_) => {}
+        Err(ApiError::NotFound(_))
+            if super::collections::container_details(&state, id, &claims)
+                .await?
+                .is_some() => {}
+        Err(e) => return Err(e),
+    }
+    let start = count_param(&params, "startIndex")?;
+    let limit = count_param(&params, "limit")?;
+    let mut collections = Vec::new();
+    for collection in rustyfin_db::repo_media::get_item_collections(&state.db_ro, id).await? {
+        match super::collections::container_details(&state, collection.id, &claims).await {
+            Ok(Some(item)) => collections.push(item),
+            Ok(None) | Err(ApiError::NotFound(_)) => {}
+            Err(e) => return Err(e),
+        }
+    }
+    let key = |item: &MediaItem| {
+        (
+            item.sort_name
+                .as_deref()
+                .unwrap_or(&item.name)
+                .to_uppercase(),
+            item.name.to_uppercase(),
+        )
+    };
+    collections.sort_by_key(key);
     let total = collections.len() as i64;
+    let items = collections
+        .into_iter()
+        .skip(start.unwrap_or(0))
+        .take(limit.unwrap_or(usize::MAX))
+        .collect();
     Ok(Json(QueryResult {
-        items: collections,
+        items,
         total_record_count: total,
-        start_index: 0,
+        start_index: start.unwrap_or(0) as i64,
     }))
 }
 

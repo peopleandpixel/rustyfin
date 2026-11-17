@@ -225,3 +225,36 @@ test('the branding CSS goes into a style element, and the login disclaimer is sh
     assert.match(auth, /<p id="login-disclaimer"/);
     assert.match(auth, /loadOidcSignIn\(\);\n\s*showLoginDisclaimer\(\$\('login-disclaimer'\)\);/);
 });
+
+test('the dashboard\'s task list follows a library scan that starts or ends, wherever it started', () => {
+    const libraryAdmin = read('modules/library-admin.js');
+    const from = libraryAdmin.indexOf('let scanSocket = null;');
+    const to = libraryAdmin.indexOf('function stopScanProgressWebSocket(');
+    let socket = null;
+    const refreshes = [];
+    const rings = [];
+    const context = vm.createContext({
+        API: { isLoggedIn: () => true, token: 't' },
+        WebSocket: function WebSocket() { socket = this; },
+        window: { location: { protocol: 'http:', host: 'x' } },
+        updateScanRings: id => rings.push(id),
+        refreshTasks: quiet => refreshes.push(quiet),
+        currentPage: 'admin',
+        toast: () => {}, t: k => k, libraries: [], refreshViewAfterLibraryChange: () => {},
+        setTimeout, clearTimeout, console,
+    });
+    vm.runInContext(`let scanStatuses = {};\n${libraryAdmin.slice(from, to)}\nthis.fns = { initScanProgressWebSocket, statuses: () => scanStatuses };`, context);
+    context.fns.initScanProgressWebSocket();
+    socket.onopen();
+    const frame = (id, progress, state) => socket.onmessage({ data: JSON.stringify({ MessageType: 'RefreshProgress', Data: { ItemId: id, Progress: String(progress), State: state } }) });
+    frame('tv', 0, 'Queued');
+    same(refreshes, [true], 'a scan that starts');
+    frame('tv', 40, 'Active');
+    same(refreshes, [true], 'not on every percent');
+    frame('tv', 100, 'Idle');
+    same(refreshes, [true, true], 'a scan that ends');
+    same(context.fns.statuses(), {}, 'its ring cleared');
+    context.currentPage = 'home';
+    frame('tv', 0, 'Queued');
+    same(refreshes, [true, true], 'only on the dashboard');
+});

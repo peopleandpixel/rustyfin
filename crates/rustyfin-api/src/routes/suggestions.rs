@@ -73,6 +73,8 @@ async fn suggestions(
         target,
         None,
         hidden_json.as_deref(),
+        None,
+        None,
     )
     .await?;
 

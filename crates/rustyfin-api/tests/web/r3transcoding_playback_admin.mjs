@@ -186,3 +186,43 @@ test('out-of-range values are refused before a save', () => {
         'playback_admin.error_resume',
     );
 });
+
+// Hardware detection: "Automatic" leads the type list, the detected device is described, and
+// saving with "Automatic" sends no type, so the server keeps using the detected device.
+const hw = {
+    Automatic: true,
+    Detecting: false,
+    Detection: {
+        Devices: [
+            { Type: 'vaapi', Device: '/dev/dri/renderD128', Usable: true, Error: null, HardwareDecodingCodecs: ['h264', 'hevc', 'vp9', 'av1'], EnableDecodingColorDepth10Hevc: true, EnableDecodingColorDepth10Vp9: false },
+            { Type: 'vaapi', Device: '/dev/dri/renderD129', Usable: false, Error: 'permission denied', HardwareDecodingCodecs: [], EnableDecodingColorDepth10Hevc: false, EnableDecodingColorDepth10Vp9: false },
+        ],
+        DetectedAt: '2026-11-16T00:00:00Z',
+    },
+};
+hw.Detection.Selected = hw.Detection.Devices[0];
+
+test('r3hwaccel: the detected device and the Automatic choice', () => {
+    const { playbackSettingsHtml, readPlaybackSettings } = sandbox();
+    const html = playbackSettingsHtml(encoding, config, hw);
+    assert.ok(html.includes('Detected: VA-API, /dev/dri/renderD128, decodes H.264, HEVC, HEVC 10-bit, VP9, AV1'), html);
+    assert.ok(html.includes('VA-API /dev/dri/renderD129 is not usable: permission denied'), html);
+    assert.ok(html.includes('data-action="playback-detect-hw"'));
+    assert.ok(html.includes('>Automatic (VA-API)</option>'));
+    const form = formFrom(html);
+    assert.equal(form.elements.HardwareAccelerationType.value, 'auto');
+    const { encoding: saved } = readPlaybackSettings(form, encoding, config);
+    assert.equal(saved.HardwareAccelerationType, null);
+
+    // A chosen type is shown and saved as before
+    const chosen = formFrom(playbackSettingsHtml(encoding, config, { ...hw, Automatic: false }));
+    assert.equal(chosen.elements.HardwareAccelerationType.value, 'vaapi');
+    assert.equal(readPlaybackSettings(chosen, encoding, config).encoding.HardwareAccelerationType, 'vaapi');
+
+    // Nothing found
+    const none = playbackSettingsHtml(encoding, config, { Automatic: true, Detecting: false, Detection: { Devices: [], Selected: null } });
+    assert.ok(none.includes('No usable video hardware was found'), none);
+    assert.ok(none.includes('>Automatic (no hardware found)</option>'));
+    // Without the detection (an older server), the list is Jellyfin's
+    assert.ok(!playbackSettingsHtml(encoding, config).includes('Automatic ('));
+});

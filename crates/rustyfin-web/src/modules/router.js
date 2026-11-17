@@ -16,7 +16,7 @@ import {
 import { playContainer } from './queue.js';
 import { stopThemeSong } from './theme-media.js';
 import {
-    openCardMenu, toggleCardPlayed, toggleCardFavorite, setCardLikes, playCardItem, playInstantMix, openAddTo,
+    openCardMenu, toggleCardPlayed, toggleCardFavorite, setCardLikes, playCardItem, playInstantMix, downloadCardItem, openAddTo,
 } from './cardmenu.js';
 import { playAlbumFrom } from './music.js';
 import { playContainerFrom, removeFromContainer, openNewContainer } from './collections.js';
@@ -31,7 +31,7 @@ import {
     folderBrowserSelect, closeFolderBrowser, addLibraryPathRow, removeLibraryPathRow, initScanProgressWebSocket,
 } from './library-admin.js';
 import { openPluginConfig, openPluginPriority } from './plugins.js';
-import { savePlaybackSettings } from './playback-admin.js';
+import { savePlaybackSettings, detectHardware } from './playback-admin.js';
 import { saveDlnaSettings } from './dlna-admin.js';
 import { serverPower, openLibraryEditor, removeLibraryFolder, openTriggerEditor, removeTaskTrigger } from './dashboard.js';
 import {
@@ -177,6 +177,7 @@ const clickActions = {
     'card-like': el => setCardLikes(el, true),
     'card-dislike': el => setCardLikes(el, false),
     'card-play': el => playCardItem(el),
+    'card-download': el => downloadCardItem(el),
     'card-instant-mix': el => playInstantMix(el),
     // A timed lyric line seeks the song to its start (ticks), lyrics.js
     'seek-lyric': el => seekToTicks(Number(el.dataset.start)),
@@ -239,6 +240,7 @@ const clickActions = {
     'oidc-save-settings': () => saveOidcAdminSettings(),
     'playback-save': () => savePlaybackSettings(),
     'dlna-save': () => saveDlnaSettings(),
+    'playback-detect-hw': el => detectHardware(el),
     'plugin-edit-config': el => openPluginConfig(el.dataset.pluginId),
     'plugin-edit-priority': el => openPluginPriority(el.dataset.pluginId),
     'move-home-library': el => moveHomeLibrary(el),

@@ -42,7 +42,6 @@ function sandbox() {
          ${slice('const LIBRARY_PLACEHOLDER = ', ';\n')}
          ${slice('function libraryViewCustom(')}
          ${slice('const LIBRARY_FILTER_PARAMS = ', ';\n')}
-         ${slice('const LIBRARY_CUSTOM_KEYS = ', ';\n')}
          ${slice('const LIBRARY_PREFS_CLIENT = ', ';\n')}
          ${slice('function librarySort(')}
          ${slice('function libraryFilterQuery(')}
@@ -107,10 +106,7 @@ test('view settings save under Jellyfin names, and the defaults save nothing', (
     const { fns } = sandbox();
     const base = fns.libraryPrefsFromDisplay(null);
     assert.deepEqual(plain(base.view), { layout: 'poster', size: 'medium' });
-    // The server merges CustomPrefs key by key, so every key the list writes is sent, unset ones as null
-    const KEYS = ['Filters', 'SeriesStatus', 'Genres', 'OfficialRatings', 'Years', 'ViewMode', 'ImageType', 'CardSize'];
-    const cleared = Object.fromEntries(KEYS.map(k => [k, null]));
-    assert.deepEqual(plain(fns.libraryPrefsToDisplay('films', base).CustomPrefs), cleared);
+    assert.deepEqual(plain(fns.libraryPrefsToDisplay('films', base).CustomPrefs), {});
     const cases = [
         [{ layout: 'thumb', size: 'small' }, { ImageType: 'Thumb', CardSize: 'small' }],
         [{ layout: 'banner', size: 'medium' }, { ImageType: 'Banner' }],
@@ -119,7 +115,7 @@ test('view settings save under Jellyfin names, and the defaults save nothing', (
     for (const [view, custom] of cases) {
         const prefs = { ...base, filters: { ...base.filters, Genres: ['Drama'] }, view };
         const body = plain(fns.libraryPrefsToDisplay('films', prefs));
-        assert.deepEqual(body.CustomPrefs, { ...cleared, Genres: 'Drama', ...custom });
+        assert.deepEqual(body.CustomPrefs, { Genres: 'Drama', ...custom });
         assert.deepEqual(plain(fns.libraryPrefsFromDisplay(body)), plain(prefs));
     }
     const odd = fns.libraryPrefsFromDisplay({ CustomPrefs: { ImageType: 'Logo', CardSize: 'huge' } });

@@ -68,8 +68,7 @@ test('a save on the settings page writes the account and the device; Auto clears
     assert.equal(box.fns.maxStreamingBitrate(), 3000000);
     assert.equal(box.fns.subtitleBurnIn(), 'allcomplexformats');
     await box.fns.saveUserSettings({ maxStreamingBitrate: '' });
-    // Sent as null: the server merges CustomPrefs key by key and removes a null one
-    assert.equal(box.posts.at(-1)[1].CustomPrefs.maxStreamingBitrate, null);
+    assert.equal(box.posts.at(-1)[1].CustomPrefs.maxStreamingBitrate, undefined);
     assert.equal(box.fns.maxStreamingBitrate(), 0);
 });
 

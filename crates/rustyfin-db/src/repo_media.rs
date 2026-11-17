@@ -54,7 +54,8 @@ pub async fn upsert_media_item(pool: &SqlitePool, item: &MediaItem) -> Result<()
           original_language = excluded.original_language, tagline = excluded.tagline, \
           production_countries = excluded.production_countries, budget = excluded.budget, \
           revenue = excluded.revenue, homepage = excluded.homepage, end_date = excluded.end_date, \
-          vote_count = excluded.vote_count, popularity = excluded.popularity",
+          vote_count = excluded.vote_count, popularity = excluded.popularity, \
+          is_virtual_item = CASE WHEN excluded.path <> '' THEN 0 ELSE media_items.is_virtual_item END",
     )
     .bind(&id)
     .bind(&item.name)
@@ -498,7 +499,9 @@ pub async fn batch_upsert_media_items(
               production_countries = excluded.production_countries, budget = excluded.budget, \
               revenue = excluded.revenue, homepage = excluded.homepage, \
               end_date = excluded.end_date, vote_count = excluded.vote_count, \
-              popularity = excluded.popularity",
+              popularity = excluded.popularity, \
+              is_virtual_item = CASE WHEN excluded.path <> '' THEN 0 \
+                                     ELSE media_items.is_virtual_item END",
         )
         .bind(&id)
         .bind(&item.name)
@@ -705,89 +708,208 @@ pub async fn delete_item(pool: &SqlitePool, id: Uuid) -> Result<bool, sqlx::Erro
     Ok(root_deleted)
 }
 
-/// What `get_latest_items` lists: Jellyfin's `UserViewManager.GetItemsForLatestItems` query.
+/// What a "Latest" row reads: Jellyfin 12.4's `UserViewManager.GetItemsForLatestItems` query.
 #[derive(Debug, Clone, Default)]
 pub struct LatestFilter {
     /// The user whose played state `is_played` reads.
     pub user_id: Option<Uuid>,
-    /// Stored kinds to list (`Movie`, `Episode`, ...). Empty means every non-folder kind.
+    /// Stored kinds to list (`Movie`, `Episode`, ...).
     pub item_types: Vec<String>,
-    /// Only this library.
-    pub library_id: Option<Uuid>,
-    /// Leave these libraries out (the user's `LatestItemsExcludes`).
-    pub exclude_libraries: Vec<Uuid>,
+    /// The libraries read (Jellyfin's parents).
+    pub library_ids: Vec<Uuid>,
     /// Only played (true) or unplayed (false) items.
     pub is_played: Option<bool>,
-    pub limit: i64,
-    /// Rows to skip, to read the next page.
-    pub offset: i64,
     pub hidden_ids_json: Option<String>,
 }
 
-/// The newest items for a "Latest" row, newest first (then sort name and year, descending, as
-/// Jellyfin orders them), each with the item Jellyfin groups it under: an episode's series, a
-/// track's album.
-pub async fn get_latest_items(
-    pool: &SqlitePool,
-    filter: &LatestFilter,
-) -> Result<Vec<(MediaItem, Option<Uuid>)>, sqlx::Error> {
-    // Jellyfin's IsFolder=false when no type is asked for.
-    const NON_FOLDER_KINDS: [&str; 5] = ["Movie", "Episode", "Audio", "Photo", "Video"];
-    let kinds: Vec<&str> = if filter.item_types.is_empty() {
-        NON_FOLDER_KINDS.to_vec()
-    } else {
-        filter.item_types.iter().map(String::as_str).collect()
-    };
-    let excluded: Vec<String> = filter
-        .exclude_libraries
-        .iter()
-        .map(Uuid::to_string)
-        .collect();
-    let rows = sqlx::query(sqlx::AssertSqlSafe(format!(
+/// A candidate of a "Latest" row, with the items Jellyfin groups it under.
+#[derive(Debug, Clone)]
+pub struct LatestRow {
+    pub item: MediaItem,
+    /// An episode's series.
+    pub series_id: Option<Uuid>,
+    /// An episode's season.
+    pub season_id: Option<Uuid>,
+    /// A track's album.
+    pub album_id: Option<Uuid>,
+}
+
+/// How `get_latest_items` orders and narrows the candidates.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LatestOrder {
+    /// Date added, then sort name and year, newest first (`GetItemsForLatestItems`).
+    Added,
+    /// Date added, then id, newest first (`GetLatestItemList`).
+    AddedThenId,
+}
+
+/// The candidates' SELECT (no ORDER or LIMIT) as a CTE body; binds ?1 to ?6.
+fn latest_candidates_sql() -> String {
+    format!(
         "SELECT m.id, m.name, m.sort_name, m.overview, m.media_type, m.path, m.parent_id, m.library_id, \
          m.production_year, m.community_rating, m.official_rating, m.genres, m.date_created, \
          m.premiere_date, m.runtime_ticks, m.index_number, m.parent_index_number, m.index_number_end, \
          m.location_type, m.tmdb_id, m.tvdb_id, \
          m.tags, m.status, m.original_language, m.tagline, m.production_countries, m.budget, m.revenue, \
          m.homepage, m.end_date, m.vote_count, m.popularity, \
-         CASE m.media_type \
-           WHEN 'Episode' THEN COALESCE( \
+         CASE WHEN m.media_type = 'Episode' THEN COALESCE( \
              (SELECT se.parent_id FROM media_items se WHERE se.id = m.parent_id AND se.media_type = 'Season'), \
              (SELECT s.id FROM media_items s WHERE s.id = m.parent_id AND s.media_type = 'Series')) \
-           WHEN 'Audio' THEN \
+         END AS series_id, \
+         CASE WHEN m.media_type = 'Episode' THEN \
+             (SELECT se.id FROM media_items se WHERE se.id = m.parent_id AND se.media_type = 'Season') \
+         END AS season_id, \
+         CASE WHEN m.media_type = 'Audio' THEN \
              (SELECT a.id FROM media_items a WHERE a.id = m.parent_id AND a.media_type = 'MusicAlbum') \
-         END AS container_id \
+         END AS album_id \
          FROM media_items m \
          WHERE m.media_type IN (SELECT value FROM json_each(?1)) \
-         AND (?2 IS NULL OR m.library_id = ?2) \
-         AND (m.library_id IS NULL OR m.library_id NOT IN (SELECT value FROM json_each(?3))) \
+         AND m.library_id IN (SELECT value FROM json_each(?2)) \
          AND m.extra_type IS NULL \
          AND m.location_type IS NOT 'Virtual' \
-         AND (?4 IS NULL OR EXISTS (SELECT 1 FROM user_item_data ud \
-              WHERE ud.item_id = m.id AND ud.user_id = ?5 AND ud.played = 1) = ?4) \
-         AND {visible} \
-         ORDER BY m.date_created DESC, m.sort_name DESC, m.production_year DESC, m.id \
-         LIMIT ?7 OFFSET ?8",
-        visible = crate::repo_parental::visible_sql("m.id", "m.library_id", "?6"),
-    )))
-    .bind(serde_json::to_string(&kinds).unwrap_or_default())
-    .bind(filter.library_id.map(|u| u.to_string()))
-    .bind(serde_json::to_string(&excluded).unwrap_or_default())
-    .bind(filter.is_played)
-    .bind(filter.user_id.map(|u| u.to_string()))
-    .bind(filter.hidden_ids_json.as_deref())
-    .bind(filter.limit)
-    .bind(filter.offset)
-    .fetch_all(pool)
-    .await?;
+         AND (?3 IS NULL OR EXISTS (SELECT 1 FROM user_item_data ud \
+              WHERE ud.item_id = m.id AND ud.user_id = ?4 AND ud.played = 1) = ?3) \
+         AND {visible}",
+        visible = crate::repo_parental::visible_sql("m.id", "m.library_id", "?5"),
+    )
+}
 
+fn bind_latest<'q>(
+    query: sqlx::query::Query<'q, Sqlite, sqlx::sqlite::SqliteArguments>,
+    filter: &'q LatestFilter,
+) -> sqlx::query::Query<'q, Sqlite, sqlx::sqlite::SqliteArguments> {
+    let libraries: Vec<String> = filter.library_ids.iter().map(Uuid::to_string).collect();
+    query
+        .bind(serde_json::to_string(&filter.item_types).unwrap_or_default())
+        .bind(serde_json::to_string(&libraries).unwrap_or_default())
+        .bind(filter.is_played)
+        .bind(filter.user_id.map(|u| u.to_string()))
+        .bind(filter.hidden_ids_json.as_deref())
+}
+
+fn uuid_col(row: &sqlx::sqlite::SqliteRow, name: &str) -> Result<Option<Uuid>, sqlx::Error> {
+    let value: Option<String> = row.try_get(name)?;
+    Ok(value.and_then(|v| Uuid::parse_str(&v).ok()))
+}
+
+/// The newest candidates of a "Latest" row, in `order`, at most `limit` (negative: all).
+/// `without_series` leaves episodes out (Jellyfin's `SeriesName == null`); `in_series` keeps only
+/// episodes of those series.
+pub async fn get_latest_items(
+    pool: &SqlitePool,
+    filter: &LatestFilter,
+    order: LatestOrder,
+    without_series: bool,
+    in_series: Option<&[Uuid]>,
+    limit: i64,
+) -> Result<Vec<LatestRow>, sqlx::Error> {
+    let order_sql = match order {
+        LatestOrder::Added => "date_created DESC, sort_name DESC, production_year DESC, id DESC",
+        LatestOrder::AddedThenId => "date_created DESC, id DESC",
+    };
+    let series: Option<String> = in_series.map(|ids| {
+        let ids: Vec<String> = ids.iter().map(Uuid::to_string).collect();
+        serde_json::to_string(&ids).unwrap_or_default()
+    });
+    let sql = format!(
+        "WITH c AS ({candidates}) SELECT * FROM c \
+         WHERE (?6 = 0 OR series_id IS NULL) \
+         AND (?7 IS NULL OR series_id IN (SELECT value FROM json_each(?7))) \
+         ORDER BY {order_sql} LIMIT ?8",
+        candidates = latest_candidates_sql(),
+    );
+    let rows = bind_latest(sqlx::query(sqlx::AssertSqlSafe(sql)), filter)
+        .bind(without_series)
+        .bind(series)
+        .bind(limit)
+        .fetch_all(pool)
+        .await?;
     let mut items = Vec::with_capacity(rows.len());
     for row in rows {
-        let item: MediaItem = <MediaItemRow as sqlx::FromRow<_>>::from_row(&row)?.into();
-        let container: Option<String> = row.try_get("container_id")?;
-        items.push((item, container.and_then(|c| Uuid::parse_str(&c).ok())));
+        items.push(LatestRow {
+            item: <MediaItemRow as sqlx::FromRow<_>>::from_row(&row)?.into(),
+            series_id: uuid_col(&row, "series_id")?,
+            season_id: uuid_col(&row, "season_id")?,
+            album_id: uuid_col(&row, "album_id")?,
+        });
     }
     Ok(items)
+}
+
+/// The series of the candidates with the newest additions, at most `limit`, each with its
+/// newest episode's `date_created` (Jellyfin 12.4's `GetLatestTvShowItems` step 1).
+pub async fn get_latest_series(
+    pool: &SqlitePool,
+    filter: &LatestFilter,
+    limit: i64,
+) -> Result<Vec<(Uuid, String)>, sqlx::Error> {
+    let sql = format!(
+        "WITH c AS ({candidates}) SELECT series_id, MAX(date_created) AS newest FROM c \
+         WHERE series_id IS NOT NULL GROUP BY series_id \
+         ORDER BY newest DESC, series_id DESC LIMIT ?6",
+        candidates = latest_candidates_sql(),
+    );
+    let rows: Vec<(String, String)> = bind_latest(sqlx::query(sqlx::AssertSqlSafe(sql)), filter)
+        .bind(limit)
+        .fetch_all(pool)
+        .await?
+        .iter()
+        .map(|row| Ok((row.try_get(0)?, row.try_get(1)?)))
+        .collect::<Result<_, sqlx::Error>>()?;
+    Ok(rows
+        .into_iter()
+        .filter_map(|(id, newest)| Some((Uuid::parse_str(&id).ok()?, newest)))
+        .collect())
+}
+
+/// How many children of `kind` each of `parents` has (all of them, whoever sees them).
+pub async fn count_children_of_kind(
+    pool: &SqlitePool,
+    parents: &[Uuid],
+    kind: &str,
+) -> Result<HashMap<Uuid, i64>, sqlx::Error> {
+    let ids: Vec<String> = parents.iter().map(Uuid::to_string).collect();
+    let rows: Vec<(String, i64)> = sqlx::query_as(
+        "SELECT parent_id, COUNT(*) FROM media_items \
+         WHERE parent_id IN (SELECT value FROM json_each(?1)) AND media_type = ?2 \
+         GROUP BY parent_id",
+    )
+    .bind(serde_json::to_string(&ids).unwrap_or_default())
+    .bind(kind)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .filter_map(|(id, n)| Some((Uuid::parse_str(&id).ok()?, n)))
+        .collect())
+}
+
+/// The newest albums of `filter`'s libraries, at most `limit`, by date added then id (Jellyfin
+/// 12.4's music "Latest", which reads the albums themselves and not their tracks).
+pub async fn get_latest_albums(
+    pool: &SqlitePool,
+    filter: &LatestFilter,
+    limit: i64,
+) -> Result<Vec<MediaItem>, sqlx::Error> {
+    let libraries: Vec<String> = filter.library_ids.iter().map(Uuid::to_string).collect();
+    let rows = sqlx::query_as::<_, MediaItemRow>(sqlx::AssertSqlSafe(format!(
+        "SELECT id, name, sort_name, overview, media_type, path, parent_id, library_id, \
+         production_year, community_rating, official_rating, genres, date_created, \
+         premiere_date, runtime_ticks, index_number, parent_index_number, index_number_end, location_type, tmdb_id, tvdb_id, \
+         tags, status, original_language, tagline, production_countries, budget, revenue, \
+         homepage, end_date, vote_count, popularity \
+         FROM media_items \
+         WHERE media_type = 'MusicAlbum' AND location_type IS NOT 'Virtual' \
+         AND library_id IN (SELECT value FROM json_each(?1)) AND {visible} \
+         ORDER BY date_created DESC, id DESC LIMIT ?3",
+        visible = crate::repo_parental::visible_sql("id", "library_id", "?2"),
+    )))
+    .bind(serde_json::to_string(&libraries).unwrap_or_default())
+    .bind(filter.hidden_ids_json.as_deref())
+    .bind(limit)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows.into_iter().map(Into::into).collect())
 }
 
 /// Query plan cache for `get_items_filtered`.
@@ -887,10 +1009,28 @@ enum SortKey {
     PlayCount,
     /// When the caller last played the item (bound user id)
     DatePlayed,
-    /// When the caller last played one of a series' episodes (bound user id)
+    /// When the caller last played one of a series' played episodes (bound user id), as in
+    /// Jellyfin 12.4
     SeriesDatePlayed,
+    /// Whether the caller marked the item a favourite (bound user id); false without user data,
+    /// as in Jellyfin 12.4
+    IsFavoriteOrLiked,
+    /// Whether the caller played the item, or not (bound user id); NULL without user data
+    IsPlayed,
+    IsUnplayed,
     /// Folders before the rest, as Jellyfin's IsFolder comparer (a folder is 0, anything else 1)
     IsFolder,
+    /// The item's critic rating (`item_metadata_extras`)
+    CriticRating,
+    /// The first by name of the artists, album artists or studios credited, folded to lowercase
+    /// as Jellyfin 12.4's `CleanValue`; a track takes its album's album artist when it has none
+    Artist,
+    AlbumArtist,
+    Studio,
+    /// A track's album name
+    Album,
+    /// The largest bit rate of the item's sources (Jellyfin's `TotalBitrate`)
+    VideoBitRate,
     /// Dropped after the keys are paired with the orders, so it never reaches a clause.
     Default,
     /// Any other key; it orders by `sort_name`.
@@ -907,7 +1047,17 @@ impl SortKey {
             "datecreated" | "dateadded" => SortKey::DateCreated,
             "premieredate" => SortKey::PremiereDate,
             "productionyear" => SortKey::ProductionYear,
-            "communityrating" | "criticrating" => SortKey::CommunityRating,
+            "communityrating" => SortKey::CommunityRating,
+            "criticrating" => SortKey::CriticRating,
+            "isfavoriteorliked" => SortKey::IsFavoriteOrLiked,
+            "isplayed" => SortKey::IsPlayed,
+            "isunplayed" => SortKey::IsUnplayed,
+            "isfolder" => SortKey::IsFolder,
+            "artist" => SortKey::Artist,
+            "albumartist" => SortKey::AlbumArtist,
+            "studio" => SortKey::Studio,
+            "album" => SortKey::Album,
+            "videobitrate" => SortKey::VideoBitRate,
             "runtime" => SortKey::Runtime,
             "parentindexnumber" => SortKey::ParentIndexNumber,
             "indexnumber" => SortKey::IndexNumber,
@@ -918,7 +1068,6 @@ impl SortKey {
             "playcount" => SortKey::PlayCount,
             "dateplayed" => SortKey::DatePlayed,
             "seriesdateplayed" => SortKey::SeriesDatePlayed,
-            "isfolder" => SortKey::IsFolder,
             _ => SortKey::Other,
         }
     }
@@ -939,14 +1088,54 @@ impl SortKey {
             SortKey::ParentIndexNumber => "parent_index_number",
             SortKey::IndexNumber => "index_number",
             SortKey::Random => "ROWID",
+            // The inherited rating's parental score (Jellyfin's InheritedParentalRatingValue)
+            // from a bound JSON object of each stored rating's score; an unrated item has none
+            SortKey::OfficialRating => concat!(
+                "(SELECT j.value FROM json_each(?) j WHERE j.key = ",
+                crate::repo_item_filter::inherited_rating_sql!(),
+                ")"
+            ),
+            SortKey::IsFavoriteOrLiked => concat!(
+                "COALESCE((SELECT ud.is_favorite FROM user_item_data ud ",
+                "WHERE ud.item_id = media_items.id AND ud.user_id = ?), 0)"
+            ),
+            SortKey::IsPlayed => concat!(
+                "(SELECT ud.played FROM user_item_data ud ",
+                "WHERE ud.item_id = media_items.id AND ud.user_id = ?)"
+            ),
+            SortKey::IsUnplayed => concat!(
+                "(SELECT NOT ud.played FROM user_item_data ud ",
+                "WHERE ud.item_id = media_items.id AND ud.user_id = ?)"
+            ),
             SortKey::IsFolder => concat!(
                 "CASE WHEN media_items.media_type IN ('Series', 'Season', 'MusicAlbum', 'MusicArtist', 'Genre', ",
                 "'BoxSet', 'Playlist', 'Folder') THEN 0 ELSE 1 END"
             ),
-            // The rating's parental score (Jellyfin's ParentalRatingValue) from a bound JSON
-            // object of each stored rating's score; an unrated item has none
-            SortKey::OfficialRating => {
-                "(SELECT j.value FROM json_each(?) j WHERE j.key = media_items.official_rating)"
+            SortKey::CriticRating => concat!(
+                "(SELECT e.critic_rating FROM item_metadata_extras e ",
+                "WHERE e.item_id = media_items.id)"
+            ),
+            SortKey::Artist => concat!(
+                "(SELECT MIN(lower(p.name)) FROM item_people ip JOIN people p ON p.id = ip.person_id ",
+                "WHERE ip.item_id = media_items.id AND ip.type = 'Artist')"
+            ),
+            SortKey::AlbumArtist => concat!(
+                "COALESCE((SELECT MIN(lower(p.name)) FROM item_people ip JOIN people p ON p.id = ip.person_id ",
+                "WHERE ip.item_id = media_items.id AND ip.type = 'AlbumArtist'), ",
+                "(SELECT MIN(lower(p.name)) FROM item_people ip JOIN people p ON p.id = ip.person_id ",
+                "WHERE ip.item_id = media_items.parent_id AND ip.type = 'AlbumArtist' ",
+                "AND media_items.media_type = 'Audio'))"
+            ),
+            SortKey::Studio => concat!(
+                "(SELECT MIN(lower(st.name)) FROM item_studios s JOIN studios st ON st.id = s.studio_id ",
+                "WHERE s.item_id = media_items.id)"
+            ),
+            SortKey::Album => concat!(
+                "(SELECT p.name FROM media_items p WHERE p.id = media_items.parent_id ",
+                "AND p.media_type = 'MusicAlbum' AND media_items.media_type = 'Audio')"
+            ),
+            SortKey::VideoBitRate => {
+                "(SELECT MAX(ms.bitrate) FROM media_sources ms WHERE ms.item_id = media_items.id)"
             }
             SortKey::DateLastContentAdded => concat!(
                 "COALESCE((SELECT MAX(d) FROM (",
@@ -970,7 +1159,7 @@ impl SortKey {
                 "WHERE ud.item_id = media_items.id AND ud.user_id = ?)"
             ),
             SortKey::SeriesDatePlayed => concat!(
-                "(SELECT MAX(ud.last_played_date) FROM user_item_data ud WHERE ud.user_id = ? ",
+                "(SELECT MAX(ud.last_played_date) FROM user_item_data ud WHERE ud.user_id = ? AND ud.played = 1 ",
                 "AND ud.item_id IN (SELECT c.id FROM media_items c WHERE c.parent_id = media_items.id ",
                 "UNION ALL SELECT g.id FROM media_items c JOIN media_items g ON g.parent_id = c.id ",
                 "WHERE c.parent_id = media_items.id))"
@@ -981,9 +1170,12 @@ impl SortKey {
     /// What the key's expression binds (one `?`), if anything.
     fn bind(self) -> Option<OrderBind> {
         match self {
-            SortKey::PlayCount | SortKey::DatePlayed | SortKey::SeriesDatePlayed => {
-                Some(OrderBind::UserId)
-            }
+            SortKey::PlayCount
+            | SortKey::DatePlayed
+            | SortKey::SeriesDatePlayed
+            | SortKey::IsFavoriteOrLiked
+            | SortKey::IsPlayed
+            | SortKey::IsUnplayed => Some(OrderBind::UserId),
             SortKey::OfficialRating => Some(OrderBind::RatingScores),
             _ => None,
         }
@@ -1011,9 +1203,10 @@ fn order_binds(sort_by: &str, sort_order: &str) -> Vec<OrderBind> {
 /// the OfficialRating sort. Ratings without a score (unrated, unknown) are left out, so they sort
 /// as unrated, before the others in ascending order, as Jellyfin's do.
 async fn rating_scores_json(pool: &SqlitePool) -> Result<String, sqlx::Error> {
+    // Trimmed, as the inherited rating the sort looks up is.
     let ratings: Vec<String> = sqlx::query_scalar(
-        "SELECT DISTINCT official_rating FROM media_items \
-         WHERE official_rating IS NOT NULL AND official_rating != ''",
+        "SELECT DISTINCT TRIM(official_rating) FROM media_items \
+         WHERE TRIM(COALESCE(official_rating, '')) != ''",
     )
     .fetch_all(pool)
     .await?;
@@ -1152,6 +1345,9 @@ fn order_by_clause(terms: &[SortTerm]) -> String {
 /// The key is built here, from the filter this call renders, so no caller can pair a key with a
 /// different filter.
 #[allow(clippy::too_many_arguments)]
+/// The start of the filtered count query; its WHERE clause follows.
+const COUNT_SQL_PREFIX: &str = "SELECT COUNT(*) as cnt FROM media_items WHERE ";
+
 fn build_filtered_query(
     recursive: bool,
     media_types: Option<&[String]>,
@@ -1166,6 +1362,7 @@ fn build_filtered_query(
     is_played: Option<bool>,
     sort_by: &str,
     sort_order: &str,
+    extra_sql: Option<&str>,
 ) -> (String, String) {
     let cache_key = filter_cache_key(
         media_types.map(|t| t.len()).unwrap_or(0),
@@ -1186,7 +1383,7 @@ fn build_filtered_query(
     // Check cache first: a hit needs a stored shape equal to this one, not just an equal hash.
     {
         let cache = FILTER_QUERY_CACHE.lock();
-        if let Some((count_sql, data_sql)) = cache.get(&cache_key) {
+        if let Some((count_sql, data_sql)) = cache.get(&cache_key).filter(|_| extra_sql.is_none()) {
             return (count_sql.clone(), data_sql.clone());
         }
     }
@@ -1287,6 +1484,10 @@ fn build_filtered_query(
     } else if is_unplayed == Some(false) {
         where_parts.push(PLAYED_CLAUSE.to_string());
     }
+    // The `repo_item_filter` condition, bound last; such a query isn't cached, as its text varies.
+    if let Some(extra) = extra_sql {
+        where_parts.push(extra.to_string());
+    }
 
     // Build the static base WHERE clause for single-value params.
     // Uses (? IS NULL OR ? = '' OR col = ?) pattern so the query string is always identical.
@@ -1333,10 +1534,7 @@ fn build_filtered_query(
         order_by_clause(&terms)
     };
 
-    let count_sql = format!(
-        "SELECT COUNT(*) as cnt FROM media_items WHERE {}{}",
-        base_where, array_where
-    );
+    let count_sql = format!("{COUNT_SQL_PREFIX}{base_where}{array_where}");
     let data_sql = format!(
         "SELECT id, name, sort_name, overview, media_type, path, parent_id, library_id, \
          production_year, community_rating, official_rating, genres, date_created, \
@@ -1350,7 +1548,8 @@ fn build_filtered_query(
     // Cache the result, unless the SQL is too long to keep or the cache is full.
     {
         let mut cache = FILTER_QUERY_CACHE.lock();
-        if count_sql.len() + data_sql.len() <= FILTER_QUERY_MAX_CACHED_SQL
+        if extra_sql.is_none()
+            && count_sql.len() + data_sql.len() <= FILTER_QUERY_MAX_CACHED_SQL
             && cache.len() < FILTER_QUERY_CACHE_CAP
         {
             cache.insert(cache_key, (count_sql.clone(), data_sql.clone()));
@@ -1428,6 +1627,8 @@ pub async fn get_items_filtered(
     user_id: Option<Uuid>,
     item_ids: Option<&[String]>,
     hidden_ids_json: Option<&str>,
+    extra: Option<&crate::repo_item_filter::FilterSql>,
+    adjacent_to: Option<Uuid>,
 ) -> Result<(Vec<MediaItem>, i64), sqlx::Error> {
     // Convert options to strings for the (? IS NULL OR ? = '' OR col = ?) pattern
     let pid_str = parent_id.map(|u| u.to_string()).unwrap_or_default();
@@ -1496,246 +1697,148 @@ pub async fn get_items_filtered(
         is_played,
         &sort_by_str,
         &sort_order_str,
+        extra.map(|e| e.sql.as_str()),
     );
 
     // Recursive flag: 1 = recursive, 0 = non-recursive
     let recursive_flag = if recursive { 1i64 } else { 0i64 };
 
-    // Build count query — single-value params use the (? IS NULL OR ? = '' OR col = ?) pattern
-    let mut count_q = sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(count_sql));
-    // Base single-value params (same order in both count and data queries)
-    count_q = count_q
-        .bind(&pid_str)
-        .bind(&pid_str)
-        .bind(&recursive_flag)
-        .bind(&pid_str)
-        .bind(&pid_str)
-        .bind(&recursive_flag)
-        .bind(&pid_str)
-        .bind(&pid_str)
-        .bind(&pid_str)
-        .bind(&lid_str)
-        .bind(&lid_str)
-        .bind(&lid_str)
-        .bind(&search_like)
-        .bind(&search_like)
-        .bind(&search_like)
-        .bind(&starts_with_str)
-        .bind(&starts_with_str)
-        .bind(&starts_with_str)
-        .bind(&starts_with_str)
-        .bind(&starts_with_like)
-        .bind(&starts_with_or_greater_str)
-        .bind(&starts_with_or_greater_str)
-        .bind(&starts_with_or_greater_str)
-        .bind(&sd_str)
-        .bind(&sd_str)
-        .bind(&sd_str)
-        .bind(&ed_str)
-        .bind(&ed_str)
-        .bind(&ed_str)
-        .bind(&pd_str)
-        .bind(&pd_str)
-        .bind(&pd_str)
-        .bind(&dc_str)
-        .bind(&dc_str)
-        .bind(&dc_str)
-        .bind(&min_ticks)
-        .bind(&min_ticks)
-        .bind(&max_ticks)
-        .bind(&max_ticks)
-        .bind(&item_ids_json)
-        .bind(&item_ids_json)
-        .bind(hidden_ids_json)
-        .bind(hidden_ids_json)
-        .bind(hidden_ids_json)
-        .bind(hidden_ids_json);
+    // The WHERE clause's binds, in build_filtered_query's order: the same for the count, the page
+    // and the AdjacentTo position.
+    macro_rules! bind_filters {
+        ($query:expr) => {{
+            let mut q = $query;
+            q = q
+                .bind(&pid_str)
+                .bind(&pid_str)
+                .bind(&recursive_flag)
+                .bind(&pid_str)
+                .bind(&pid_str)
+                .bind(&recursive_flag)
+                .bind(&pid_str)
+                .bind(&pid_str)
+                .bind(&pid_str)
+                .bind(&lid_str)
+                .bind(&lid_str)
+                .bind(&lid_str)
+                .bind(&search_like)
+                .bind(&search_like)
+                .bind(&search_like)
+                .bind(&starts_with_str)
+                .bind(&starts_with_str)
+                .bind(&starts_with_str)
+                .bind(&starts_with_str)
+                .bind(&starts_with_like)
+                .bind(&starts_with_or_greater_str)
+                .bind(&starts_with_or_greater_str)
+                .bind(&starts_with_or_greater_str)
+                .bind(&sd_str)
+                .bind(&sd_str)
+                .bind(&sd_str)
+                .bind(&ed_str)
+                .bind(&ed_str)
+                .bind(&ed_str)
+                .bind(&pd_str)
+                .bind(&pd_str)
+                .bind(&pd_str)
+                .bind(&dc_str)
+                .bind(&dc_str)
+                .bind(&dc_str)
+                .bind(&min_ticks)
+                .bind(&min_ticks)
+                .bind(&max_ticks)
+                .bind(&max_ticks)
+                .bind(&item_ids_json)
+                .bind(&item_ids_json)
+                .bind(hidden_ids_json)
+                .bind(hidden_ids_json)
+                .bind(hidden_ids_json)
+                .bind(hidden_ids_json);
 
-    // Array filter params
-    if let Some(types) = media_types {
-        if !types.is_empty() {
-            for t in types {
-                count_q = count_q.bind(t);
+            // Array filter params
+            if let Some(types) = media_types {
+                if !types.is_empty() {
+                    for t in types {
+                        q = q.bind(t);
+                    }
+                }
             }
-        }
-    }
-    if let Some(types) = exclude_media_types {
-        if !types.is_empty() {
-            for t in types {
-                count_q = count_q.bind(t);
+            if let Some(types) = exclude_media_types {
+                if !types.is_empty() {
+                    for t in types {
+                        q = q.bind(t);
+                    }
+                }
             }
-        }
-    }
-    if let Some(genre_list) = genres {
-        for g in genre_list {
-            // 4 binds per genre: exact match, start, middle, end
-            count_q = count_q
-                .bind(g)
-                .bind(format!("{}|%", g))
-                .bind(format!("%|{}", g))
-                .bind(format!("%|{}|%", g));
-        }
-    }
-    if let Some(year_list) = years {
-        if !year_list.is_empty() {
-            for y in year_list {
-                count_q = count_q.bind(*y);
+            if let Some(genre_list) = genres {
+                for g in genre_list {
+                    // 4 binds per genre: exact match, start, middle, end
+                    q = q
+                        .bind(g)
+                        .bind(format!("{}|%", g))
+                        .bind(format!("%|{}", g))
+                        .bind(format!("%|{}|%", g));
+                }
             }
-        }
-    }
-    if let Some(ratings) = official_ratings {
-        if !ratings.is_empty() {
-            for r in ratings {
-                count_q = count_q.bind(r);
+            if let Some(year_list) = years {
+                if !year_list.is_empty() {
+                    for y in year_list {
+                        q = q.bind(*y);
+                    }
+                }
             }
-        }
-    }
-    if let Some(tag_list) = tags {
-        for tag in tag_list {
-            // 4 binds per tag: exact match, start, middle, end
-            count_q = count_q
-                .bind(tag)
-                .bind(format!("{}|%", tag))
-                .bind(format!("%|{}", tag))
-                .bind(format!("%|{}|%", tag));
-        }
-    }
-    if let Some(mt_filter) = media_types_filter {
-        if !mt_filter.is_empty() {
-            for mt in mt_filter {
-                count_q = count_q.bind(mt);
+            if let Some(ratings) = official_ratings {
+                if !ratings.is_empty() {
+                    for r in ratings {
+                        q = q.bind(r);
+                    }
+                }
             }
-        }
-    }
-    // The user_id for an IsFavorite clause, and the played series and seasons and the user_id for
-    // an IsPlayed / IsUnplayed clause, in build_filtered_query's order.
-    if is_favorite.is_some() {
-        count_q = count_q.bind(&uid_str);
-    }
-    if is_played.is_some() {
-        count_q = count_q.bind(&played_folders).bind(&uid_str);
-    }
-    if is_unplayed.is_some() {
-        count_q = count_q.bind(&played_folders).bind(&uid_str);
+            if let Some(tag_list) = tags {
+                for tag in tag_list {
+                    // 4 binds per tag: exact match, start, middle, end
+                    q = q
+                        .bind(tag)
+                        .bind(format!("{}|%", tag))
+                        .bind(format!("%|{}", tag))
+                        .bind(format!("%|{}|%", tag));
+                }
+            }
+            if let Some(mt_filter) = media_types_filter {
+                if !mt_filter.is_empty() {
+                    for mt in mt_filter {
+                        q = q.bind(mt);
+                    }
+                }
+            }
+            // The user_id for an IsFavorite clause, and the played series and seasons and the user_id for
+            // an IsPlayed / IsUnplayed clause, in build_filtered_query's order.
+            if is_favorite.is_some() {
+                q = q.bind(&uid_str);
+            }
+            if is_played.is_some() {
+                q = q.bind(&played_folders).bind(&uid_str);
+            }
+            if is_unplayed.is_some() {
+                q = q.bind(&played_folders).bind(&uid_str);
+            }
+
+            // The `repo_item_filter` condition's values, last as its condition is.
+            for bound in extra.map(|e| e.binds.as_slice()).unwrap_or_default() {
+                q = match bound {
+                    crate::repo_item_filter::Bound::Text(v) => q.bind(v.clone()),
+                    crate::repo_item_filter::Bound::Int(v) => q.bind(*v),
+                    crate::repo_item_filter::Bound::Real(v) => q.bind(*v),
+                };
+            }
+            q
+        }};
     }
 
-    let total: i64 = count_q.fetch_one(pool).await.unwrap_or(0);
-
-    // Build data query — same bind order as count query
-    let mut data_q = sqlx::query_as::<_, MediaItemRow>(sqlx::AssertSqlSafe(data_sql));
-    data_q = data_q
-        .bind(&pid_str)
-        .bind(&pid_str)
-        .bind(&recursive_flag)
-        .bind(&pid_str)
-        .bind(&pid_str)
-        .bind(&recursive_flag)
-        .bind(&pid_str)
-        .bind(&pid_str)
-        .bind(&pid_str)
-        .bind(&lid_str)
-        .bind(&lid_str)
-        .bind(&lid_str)
-        .bind(&search_like)
-        .bind(&search_like)
-        .bind(&search_like)
-        .bind(&starts_with_str)
-        .bind(&starts_with_str)
-        .bind(&starts_with_str)
-        .bind(&starts_with_str)
-        .bind(&starts_with_like)
-        .bind(&starts_with_or_greater_str)
-        .bind(&starts_with_or_greater_str)
-        .bind(&starts_with_or_greater_str)
-        .bind(&sd_str)
-        .bind(&sd_str)
-        .bind(&sd_str)
-        .bind(&ed_str)
-        .bind(&ed_str)
-        .bind(&ed_str)
-        .bind(&pd_str)
-        .bind(&pd_str)
-        .bind(&pd_str)
-        .bind(&dc_str)
-        .bind(&dc_str)
-        .bind(&dc_str)
-        .bind(&min_ticks)
-        .bind(&min_ticks)
-        .bind(&max_ticks)
-        .bind(&max_ticks)
-        .bind(&item_ids_json)
-        .bind(&item_ids_json)
-        .bind(hidden_ids_json)
-        .bind(hidden_ids_json)
-        .bind(hidden_ids_json)
-        .bind(hidden_ids_json);
-
-    // Array filter params (same order as count query)
-    if let Some(types) = media_types {
-        if !types.is_empty() {
-            for t in types {
-                data_q = data_q.bind(t);
-            }
-        }
-    }
-    if let Some(types) = exclude_media_types {
-        if !types.is_empty() {
-            for t in types {
-                data_q = data_q.bind(t);
-            }
-        }
-    }
-    if let Some(genre_list) = genres {
-        for g in genre_list {
-            // 4 binds per genre: exact match, start, middle, end
-            data_q = data_q
-                .bind(g)
-                .bind(format!("{}|%", g))
-                .bind(format!("%|{}", g))
-                .bind(format!("%|{}|%", g));
-        }
-    }
-    if let Some(year_list) = years {
-        if !year_list.is_empty() {
-            for y in year_list {
-                data_q = data_q.bind(*y);
-            }
-        }
-    }
-    if let Some(ratings) = official_ratings {
-        if !ratings.is_empty() {
-            for r in ratings {
-                data_q = data_q.bind(r);
-            }
-        }
-    }
-    if let Some(tag_list) = tags {
-        for tag in tag_list {
-            // 4 binds per tag: exact match, start, middle, end
-            data_q = data_q
-                .bind(tag)
-                .bind(format!("{}|%", tag))
-                .bind(format!("%|{}", tag))
-                .bind(format!("%|{}|%", tag));
-        }
-    }
-    if let Some(mt_filter) = media_types_filter {
-        if !mt_filter.is_empty() {
-            for mt in mt_filter {
-                data_q = data_q.bind(mt);
-            }
-        }
-    }
-    // Same user_id binds as the count query, for the same clauses.
-    if is_favorite.is_some() {
-        data_q = data_q.bind(&uid_str);
-    }
-    if is_played.is_some() {
-        data_q = data_q.bind(&played_folders).bind(&uid_str);
-    }
-    if is_unplayed.is_some() {
-        data_q = data_q.bind(&played_folders).bind(&uid_str);
-    }
+    let count_q = bind_filters!(sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(
+        count_sql.clone()
+    )));
+    let mut total: i64 = count_q.fetch_one(pool).await.unwrap_or(0);
 
     // The sort keys' binds: the user id (play count, date played), the rating scores
     let order_binds = order_binds(sort_by_str, sort_order_str);
@@ -1744,17 +1847,60 @@ pub async fn get_items_filtered(
     } else {
         String::new()
     };
-    for bind in order_binds {
-        data_q = match bind {
-            OrderBind::UserId => data_q.bind(uid_str.clone()),
-            OrderBind::RatingScores => data_q.bind(scores.clone()),
+    macro_rules! bind_order {
+        ($query:expr) => {{
+            let mut q = $query;
+            for bind in &order_binds {
+                q = match bind {
+                    OrderBind::UserId => q.bind(uid_str.clone()),
+                    OrderBind::RatingScores => q.bind(scores.clone()),
+                };
+            }
+            q
+        }};
+    }
+
+    // AdjacentTo (Jellyfin 12.4's `ApplyAdjacencyFilter`): the item's place in the ordered list,
+    // then only it and its neighbours; nothing when the list doesn't hold it.
+    let (mut start_index, mut limit) = (start_index, limit);
+    if let Some(id) = adjacent_to {
+        let terms = parse_sort(sort_by_str, sort_order_str);
+        let order_clause = if is_random_sort(&terms) {
+            "ORDER BY RANDOM()".to_string()
+        } else {
+            order_by_clause(&terms)
+        };
+        let where_sql = count_sql
+            .strip_prefix(COUNT_SQL_PREFIX)
+            .expect("the count query starts with COUNT_SQL_PREFIX");
+        // The CTE keeps the WHERE binds before the order binds, as in the page query.
+        let position_sql = format!(
+            "WITH m AS (SELECT * FROM media_items WHERE {where_sql}) \
+             SELECT n FROM (SELECT id, ROW_NUMBER() OVER ({order_clause}) - 1 AS n \
+             FROM m AS media_items) WHERE id = ?"
+        );
+        let position_q = bind_filters!(sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(
+            position_sql
+        )));
+        let position = bind_order!(position_q)
+            .bind(id.to_string())
+            .fetch_optional(pool)
+            .await?;
+        (start_index, limit) = match position {
+            Some(0) => (0, 2),
+            Some(n) => (n - 1, 3),
+            None => (0, 0),
         };
     }
 
-    // Pagination
-    data_q = data_q.bind(limit).bind(start_index);
-
+    let data_q = bind_filters!(sqlx::query_as::<_, MediaItemRow>(sqlx::AssertSqlSafe(
+        data_sql
+    )));
+    let data_q = bind_order!(data_q).bind(limit).bind(start_index);
     let rows = data_q.fetch_all(pool).await?;
+    if adjacent_to.is_some() {
+        total = rows.len() as i64;
+    }
     Ok((rows.into_iter().map(Into::into).collect(), total))
 }
 
@@ -2977,52 +3123,47 @@ pub async fn get_next_up(
     let uid = user_id.map(|u| u.to_string());
 
     // Candidate series, each with its newest qualifying play.
-    // Each candidate with its newest qualifying play and its newest finished play.
-    let candidates: Vec<(String, Option<String>, Option<String>)> =
-        match (series_id, uid.as_deref()) {
-            (Some(sid), _) => sqlx::query_scalar::<_, String>(
-                "SELECT id FROM media_items WHERE id = ? AND media_type = 'Series'",
-            )
-            .bind(sid.to_string())
-            .fetch_optional(pool)
-            .await?
-            .map(|id| vec![(id, None, None)])
-            .unwrap_or_default(),
-            (None, Some(user)) => {
-                sqlx::query_as::<_, (String, Option<String>, Option<String>)>(
-                    "SELECT se.parent_id, MAX(ud.last_played_date), \
-                 MAX(CASE WHEN ud.played = 1 THEN ud.last_played_date END) \
+    // Each candidate with its newest qualifying play.
+    let candidates: Vec<(String, Option<String>)> = match (series_id, uid.as_deref()) {
+        (Some(sid), _) => sqlx::query_scalar::<_, String>(
+            "SELECT id FROM media_items WHERE id = ? AND media_type = 'Series'",
+        )
+        .bind(sid.to_string())
+        .fetch_optional(pool)
+        .await?
+        .map(|id| vec![(id, None)])
+        .unwrap_or_default(),
+        (None, Some(user)) => {
+            sqlx::query_as::<_, (String, Option<String>)>(
+                "SELECT se.parent_id, MAX(ud.last_played_date) \
                  FROM user_item_data ud \
-                 JOIN media_items e ON e.id = ud.item_id AND e.media_type = 'Episode' \
+                 JOIN media_items e ON e.id = ud.item_id AND e.media_type = 'Episode' AND e.is_virtual_item = 0 \
                  JOIN media_items se ON se.id = e.parent_id AND se.media_type = 'Season' \
                  WHERE ud.user_id = ? AND ud.last_played_date IS NOT NULL \
                  AND (ud.played = 1 OR ud.playback_position_ticks > 0) \
                  AND se.parent_id IS NOT NULL \
                  GROUP BY se.parent_id",
-                )
-                .bind(user)
-                .fetch_all(pool)
-                .await?
-            }
-            (None, None) => Vec::new(),
-        };
-    // Jellyfin's `nextUpDateCutoff`: a series whose newest finished play is older (or that has
-    // none) is left out. It does not apply to `series_id`.
+            )
+            .bind(user)
+            .fetch_all(pool)
+            .await?
+        }
+        (None, None) => Vec::new(),
+    };
+    // Jellyfin 12.4's `nextUpDateCutoff` (`NextUpService.GetNextUpSeriesKeys`): a series whose
+    // newest play, partial plays included, is older is left out. It does not apply to
+    // `series_id`.
     let candidates: Vec<(String, Option<String>)> = match options.date_cutoff {
         Some(cutoff) if series_id.is_none() => candidates
             .into_iter()
-            .filter(|(_, _, finished)| {
-                finished
+            .filter(|(_, newest)| {
+                newest
                     .as_deref()
                     .and_then(|d| DateTime::parse_from_rfc3339(d).ok())
                     .is_some_and(|d| d.with_timezone(&Utc) >= cutoff)
             })
-            .map(|(series, newest, _)| (series, newest))
             .collect(),
-        _ => candidates
-            .into_iter()
-            .map(|(series, newest, _)| (series, newest))
-            .collect(),
+        _ => candidates,
     };
 
     let mut entries = Vec::new();
@@ -3043,7 +3184,7 @@ pub async fn get_next_up(
              FROM media_items e \
              JOIN media_items se ON se.id = e.parent_id AND se.media_type = 'Season' \
              LEFT JOIN user_item_data ud ON ud.item_id = e.id AND ud.user_id = ? \
-             WHERE se.parent_id = ? AND e.media_type = 'Episode' \
+             WHERE se.parent_id = ? AND e.media_type = 'Episode' AND e.is_virtual_item = 0 \
              AND (e.parent_index_number IS NULL OR e.parent_index_number <> 0)",
         )
         .bind(uid.as_deref())
@@ -3638,18 +3779,39 @@ pub async fn count_items_by_type(
     pool: &SqlitePool,
     parent_id: uuid::Uuid,
     visible: Option<&str>,
+    include_virtual: bool,
 ) -> Result<Vec<(String, i64)>, sqlx::Error> {
     let pid = parent_id.to_string();
+    // Virtual items (`is_virtual_item`) count only with DisplayMissingEpisodes
     let sql = format!(
         "SELECT media_type, COUNT(*) FROM media_items WHERE parent_id = ?1 AND {} \
-         GROUP BY media_type",
+         AND (?3 = 1 OR is_virtual_item = 0) GROUP BY media_type",
         crate::repo_parental::visible_sql("id", "library_id", "?2"),
     );
     sqlx::query_as::<_, (String, i64)>(sqlx::AssertSqlSafe(sql))
         .bind(&pid)
         .bind(visible)
+        .bind(include_virtual)
         .fetch_all(pool)
         .await
+}
+
+/// The virtual items (`is_virtual_item`) of a series: its virtual seasons and episodes.
+pub async fn virtual_item_ids(
+    pool: &SqlitePool,
+    series_id: Uuid,
+) -> Result<std::collections::HashSet<Uuid>, sqlx::Error> {
+    let ids: Vec<String> = sqlx::query_scalar(
+        "SELECT id FROM media_items WHERE is_virtual_item = 1 AND (parent_id = ?1 \
+         OR parent_id IN (SELECT id FROM media_items WHERE parent_id = ?1))",
+    )
+    .bind(series_id.to_string())
+    .fetch_all(pool)
+    .await?;
+    Ok(ids
+        .iter()
+        .filter_map(|id| Uuid::parse_str(id).ok())
+        .collect())
 }
 
 /// Get a parent item by ID (for inherited image tags and series info).
@@ -4257,6 +4419,7 @@ pub async fn get_folder_counts_batch(
     pool: &SqlitePool,
     parent_ids: &[uuid::Uuid],
     visible: Option<&str>,
+    include_virtual: bool,
 ) -> Result<std::collections::HashMap<String, std::collections::HashMap<String, i64>>, sqlx::Error>
 {
     if parent_ids.is_empty() {
@@ -4265,7 +4428,7 @@ pub async fn get_folder_counts_batch(
     let mut results: std::collections::HashMap<String, std::collections::HashMap<String, i64>> =
         std::collections::HashMap::new();
     for pid in parent_ids {
-        let counts = count_items_by_type(pool, *pid, visible).await?;
+        let counts = count_items_by_type(pool, *pid, visible, include_virtual).await?;
         let mut map = std::collections::HashMap::new();
         for (media_type, count) in counts {
             map.insert(media_type, count);
@@ -4384,7 +4547,8 @@ mod tests {
             "ORDER BY sort_name DESC, name DESC, community_rating DESC, id DESC"
         );
         assert_eq!(
-            order_by("Album,ProductionYear", "Descending"),
+            // AirTime sorts by name in Jellyfin 12.4's OrderMapper (Album is the album's name).
+            order_by("AirTime,ProductionYear", "Descending"),
             "ORDER BY sort_name DESC, production_year DESC, id DESC"
         );
         // So a list repeated any number of times sorts as the list itself.
@@ -4399,7 +4563,7 @@ mod tests {
             "ParentIndexNumber",
             "IndexNumber",
             "Random",
-            "Album",
+            "AirTime",
         ];
         assert_eq!(
             order_by(&keys.repeat(500).join(","), "Descending"),
@@ -4418,7 +4582,7 @@ mod tests {
         let build = |genres: Option<&[String]>, sort_by: &str, sort_order: &str| {
             super::build_filtered_query(
                 true, None, None, genres, None, None, None, None, None, None, None, sort_by,
-                sort_order,
+                sort_order, None,
             )
         };
         // Lists that parse to the same terms share an entry. Different terms never do, even when
@@ -4501,7 +4665,7 @@ mod tests {
         let build = |include: Option<&[String]>, exclude: Option<&[String]>| {
             super::build_filtered_query(
                 true, include, exclude, None, None, None, None, None, fav, None, None, sort_by,
-                sort_order,
+                sort_order, None,
             )
         };
         let one = || build(Some(included.as_slice()), None);
@@ -4571,6 +4735,7 @@ mod tests {
                 r.is_played,
                 r.sort_by,
                 r.sort_order,
+                None,
             )
         }
         /// The length of a list, or 0 for no list.
@@ -4729,5 +4894,200 @@ mod tests {
             same_key.is_empty() && shared.is_empty(),
             "these pairs got the same key: {same_key:?}; these shared SQL: {shared:?}"
         );
+    }
+
+    /// The names a list sorted by `sort_by` (each key ascending unless `sort_order` says) holds,
+    /// of the item types `types`, as `user` sees it.
+    #[cfg(test)]
+    async fn r3items_sorted(
+        pool: &sqlx::SqlitePool,
+        user: uuid::Uuid,
+        types: &[&str],
+        sort_by: &str,
+        sort_order: &str,
+    ) -> Vec<String> {
+        let types: Vec<String> = types.iter().map(|t| t.to_string()).collect();
+        let (items, _) = super::get_items_filtered(
+            pool,
+            None,
+            None,
+            Some(&types),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(sort_by),
+            Some(sort_order),
+            0,
+            100,
+            true,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(user),
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        items.into_iter().map(|item| item.name).collect()
+    }
+
+    #[tokio::test]
+    async fn r3items_sorts_by_user_data_credits_folders_and_bit_rate() {
+        let pool = crate::test_pool().await;
+        let user = uuid::Uuid::new_v4();
+        crate::insert_test_user(&pool, user).await;
+        let item = |id: &str, name: &str, kind: &str, parent: &str| {
+            let parent = if parent.is_empty() {
+                "NULL".to_string()
+            } else {
+                format!("'{parent}'")
+            };
+            format!(
+                "INSERT INTO media_items (id, name, sort_name, media_type, path, parent_id, library_id) \
+                 VALUES ('{id}', '{name}', lower('{name}'), '{kind}', '/x/{id}', {parent}, 'lib')"
+            )
+        };
+        let mut sql = vec![
+            "INSERT INTO libraries (id, name, content_type) VALUES ('lib', 'L', 'movies')"
+                .to_string(),
+            item("m1", "Alpha", "Movie", ""),
+            item("m2", "Bravo", "Movie", ""),
+            item("m3", "Charlie", "Movie", ""),
+            item("s", "Show", "Series", ""),
+            item("n", "Season", "Season", "s"),
+            item("e1", "Episode", "Episode", "n"),
+            item("r1", "Record", "MusicAlbum", ""),
+            item("r2", "Another", "MusicAlbum", ""),
+            item("t1", "Song One", "Audio", "r1"),
+            item("t2", "Song Two", "Audio", "r1"),
+            item("t3", "Song Three", "Audio", "r2"),
+        ];
+        sql.extend(
+            [
+                format!("INSERT INTO user_item_data (user_id, item_id, is_favorite, played, play_count) VALUES ('{user}', 'm2', 1, 1, 1), ('{user}', 'm3', 0, 0, 0)"),
+                "INSERT INTO item_metadata_extras (item_id, critic_rating) VALUES ('m1', 50), ('m2', 90)".to_string(),
+                "INSERT INTO media_sources (id, item_id, uid, path, bitrate) VALUES ('s1', 'm1', 's1', '/x/m1', 1000000), ('s3', 'm3', 's3', '/x/m3', 5000000)".to_string(),
+                "INSERT INTO studios (id, name) VALUES ('acme', 'Acme'), ('zeta', 'Zeta')".to_string(),
+                "INSERT INTO item_studios (item_id, studio_id) VALUES ('m3', 'acme'), ('m2', 'zeta')".to_string(),
+                "UPDATE media_items SET official_rating = 'R' WHERE id = 's'".to_string(),
+                "UPDATE media_items SET official_rating = 'PG' WHERE id = 'm1'".to_string(),
+                "INSERT INTO people (id, name) VALUES ('pa', 'Aaron'), ('pb', 'Beta'), ('pc', 'Alpha'), ('pz', 'Zed')".to_string(),
+                "INSERT INTO item_people (item_id, person_id, type) VALUES ('r1', 'pz', 'AlbumArtist'), ('t1', 'pb', 'Artist'), ('t1', 'pc', 'Artist'), ('t2', 'pc', 'Artist'), ('t3', 'pa', 'AlbumArtist')".to_string(),
+            ],
+        );
+        for sql in sql {
+            sqlx::query(sqlx::AssertSqlSafe(sql.clone()))
+                .execute(&pool)
+                .await
+                .unwrap_or_else(|e| panic!("{sql}: {e}"));
+        }
+        let movies = ["Movie"];
+        let cases: Vec<(&[&str], &str, &str, &[&str])> = vec![
+            // The caller's user data: none is not a favourite, as in Jellyfin 12.4, and sorts
+            // first as NULL for played.
+            (
+                &movies,
+                "IsFavoriteOrLiked",
+                "Ascending",
+                &["Alpha", "Charlie", "Bravo"],
+            ),
+            (
+                &movies,
+                "IsFavoriteOrLiked,SortName",
+                "Descending,Ascending",
+                &["Bravo", "Alpha", "Charlie"],
+            ),
+            (
+                &movies,
+                "IsPlayed",
+                "Ascending",
+                &["Alpha", "Charlie", "Bravo"],
+            ),
+            (
+                &movies,
+                "IsUnplayed",
+                "Ascending",
+                &["Alpha", "Bravo", "Charlie"],
+            ),
+            (
+                &movies,
+                "CriticRating",
+                "Ascending",
+                &["Charlie", "Alpha", "Bravo"],
+            ),
+            (
+                &movies,
+                "VideoBitRate",
+                "Ascending",
+                &["Bravo", "Alpha", "Charlie"],
+            ),
+            (
+                &movies,
+                "Studio",
+                "Ascending",
+                &["Alpha", "Charlie", "Bravo"],
+            ),
+            (
+                &["Movie", "Series"],
+                "IsFolder,SortName",
+                "Ascending",
+                &["Show", "Alpha", "Bravo", "Charlie"],
+            ),
+            // The episode takes its series' R; unrated movies come first.
+            (
+                &["Movie", "Episode"],
+                "OfficialRating",
+                "Ascending",
+                &["Bravo", "Charlie", "Alpha", "Episode"],
+            ),
+            // Credits: the first artist; a track's album artist, else its album's.
+            (
+                &["Audio"],
+                "Artist",
+                "Ascending",
+                // The first by name: Song One's Alpha, before its Beta.
+                &["Song Three", "Song One", "Song Two"],
+            ),
+            (
+                &["Audio"],
+                "AlbumArtist",
+                "Ascending",
+                &["Song Three", "Song One", "Song Two"],
+            ),
+            (
+                &["Audio"],
+                "Album",
+                "Ascending",
+                &["Song Three", "Song One", "Song Two"],
+            ),
+            // SimilarityScore and SearchScore go by name, as in Jellyfin.
+            (
+                &movies,
+                "SearchScore",
+                "Descending",
+                &["Charlie", "Bravo", "Alpha"],
+            ),
+        ];
+        for (types, sort_by, sort_order, expected) in cases {
+            assert_eq!(
+                r3items_sorted(&pool, user, types, sort_by, sort_order).await,
+                expected,
+                "{sort_by} {sort_order}"
+            );
+        }
     }
 }
