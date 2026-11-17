@@ -33,7 +33,7 @@ function element(props = {}) {
 
 const video = element({ id: 'video-player' });
 const nativeMenu = element({ id: 'native-menu', classes: ['hidden'] });
-const menuEntries = ['clientsettings', 'downloadmanagement', 'multiserver', 'exit', 'unknownfeature']
+const menuEntries = ['clientsettings', 'downloadmanagement', 'multiserver', 'exitmenu', 'unknownfeature']
     .map(feature => element({ dataset: { nativeFeature: feature }, classes: ['hidden'] }));
 let dialogs = [];
 const docListeners = {};
@@ -216,7 +216,8 @@ test('the app: credentials, plugins, menu and Back', async () => {
 
     // The menu shows what the app offers and this client knows
     assert.equal(nativeMenu.classList.contains('hidden'), false);
-    assert.deepEqual(menuEntries.map(e => e.classList.contains('hidden')), [false, false, false, false, true]);
+    // The app supports exit but not exitmenu, so Jellyfin's web client shows it no Exit entry
+    assert.deepEqual(menuEntries.map(e => e.classList.contains('hidden')), [false, false, false, true, true]);
     app.nativeShellCommand('multiserver');
     app.nativeShellCommand('downloadmanagement');
     app.nativeShellCommand('clientsettings');
@@ -236,7 +237,9 @@ test('the app: credentials, plugins, menu and Back', async () => {
     location.hash = '#home';
     window.NavigationHelper.goBack();
     assert.equal(take('exitApp').length, 1);
-    app.nativeShellCommand('exit');
+    native.features.push('exitmenu');
+    app.nativeShellCommand('exitmenu');
+    native.features.pop();
     assert.equal(take('exitApp').length, 2);
 
     // Signing out drops the stored credentials on the next page change
@@ -335,6 +338,24 @@ test("the web player drives the app's notification, and its buttons drive the we
 
     app.setNativeNowPlaying(null);
     assert.equal(take('hideMediaSession').length, 1);
+
+    // A video in the page: no notification (a local video player does its own) but the app goes full screen
+    reset();
+    const film = { itemId: 'movie-a', streamType: 'Videos', position: () => 1, total: () => 100 };
+    app.setNativeNowPlaying(film, () => assert.fail('no metadata for a video'));
+    video.fire('pause');
+    video.fire('timeupdate');
+    assert.equal(take('updateMediaSession').length, 0);
+    assert.equal(take('enableFullscreen').length, 1);
+    // The next episode keeps it; music after it ends it; closing ends the notification
+    app.setNativeNowPlaying({ ...film, itemId: 'movie-b' });
+    assert.equal(take('enableFullscreen').length, 1);
+    app.setNativeNowPlaying(session, () => ({ title: 'Song A' }));
+    assert.equal(take('disableFullscreen').length, 1);
+    assert.equal(take('updateMediaSession')[0][0].action, 'playbackstart');
+    app.setNativeNowPlaying(null);
+    assert.equal(take('hideMediaSession').length, 1);
+    assert.equal(take('disableFullscreen').length, 1);
 });
 
 test('downloads go to the app by item id', async () => {
@@ -361,12 +382,6 @@ test('downloads go to the app by item id', async () => {
     docListeners.click.forEach(fn => fn({ target: { closest: sel => (sel.includes('_blank') ? out : null) }, preventDefault() {} }));
     assert.deepEqual(take('openUrl'), [['https://example.org/page', '_blank']]);
 
-    // Fullscreen follows the page's
-    reset();
-    document.fullscreenElement = video;
-    docListeners.fullscreenchange.forEach(fn => fn());
-    document.fullscreenElement = null;
-    docListeners.fullscreenchange.forEach(fn => fn());
-    assert.equal(take('enableFullscreen').length, 1);
-    assert.equal(take('disableFullscreen').length, 1);
+    // No download for a book, as in Jellyfin's web client
+    assert.equal(app.canDownload({ CanDownload: true, Type: 'Book' }), false);
 });

@@ -15,7 +15,9 @@ const MENU_COMMANDS = {
     clientsettings: s => s.openClientSettings(),
     downloadmanagement: s => s.openDownloadManager(),
     multiserver: s => s.selectServer(),
-    exit: s => s.AppHost.exit(),
+    // Jellyfin's web client offers Exit in the menu only to an app with this feature; the Android app exits
+    // from Back on Home instead
+    exitmenu: s => s.AppHost.exit(),
 };
 const SHELL_WAIT_MS = 10000;
 const MEDIA_SESSION_EVERY_MS = 1000;
@@ -206,22 +208,26 @@ function externalStopped(player) {
         .catch(e => console.warn('Could not report the stop:', e));
 }
 
-// --- The app's notification for the page's player ---
-// player.js gives each item's session (position() and total() in seconds) and a function that makes its media
-// metadata, called only in the app; null when the player closed
+// --- The page's player in the app ---
+// player.js gives each item's session (streamType, and position() and total() in seconds) and a function that
+// makes its media metadata, called only in the app; null when the player closed. As Jellyfin's web client
+// does: music shows in the app's notification, and a video in the page makes the app full screen (a local
+// video player does its own notification).
 function setNativeNowPlaying(session, meta = () => ({})) {
     if (!shell) return;
-    if (!session) {
-        if (nowPlaying) shell.hideMediaSession();
-        nowPlaying = null;
-        return;
+    const was = nowPlaying;
+    nowPlaying = session ? { session, video: session.streamType !== 'Audio', meta: {} } : null;
+    if (was?.video && !nowPlaying?.video) shell.disableFullscreen();
+    if (nowPlaying?.video && !was?.video) shell.enableFullscreen();
+    if (was && !was.video && (!nowPlaying || nowPlaying.video)) shell.hideMediaSession();
+    if (nowPlaying && !nowPlaying.video) {
+        nowPlaying.meta = meta() || {};
+        reportMediaSession('playbackstart');
     }
-    nowPlaying = { session, meta: meta() || {} };
-    reportMediaSession('playbackstart');
 }
 
 function reportMediaSession(action) {
-    if (!shell || !nowPlaying) return;
+    if (!shell || !nowPlaying || nowPlaying.video) return;
     const { session, meta } = nowPlaying;
     const seconds = fn => {
         try {
@@ -263,7 +269,7 @@ const page = {
 };
 
 // --- Downloads: the app downloads by item id (/Items/{id}/Download) into its own library ---
-const canDownload = item => !!shell?.AppHost.supports('filedownload') && !!item?.CanDownload;
+const canDownload = item => !!shell?.AppHost.supports('filedownload') && !!item?.CanDownload && item.Type !== 'Book';
 
 function downloadItems(items) {
     if (!shell?.AppHost.supports('filedownload')) return false;
@@ -324,7 +330,7 @@ async function start() {
     else ready();
     document.addEventListener('click', interceptDownload, true);
     document.addEventListener('click', interceptExternalLink, true);
-    document.addEventListener('fullscreenchange', () => (document.fullscreenElement ? shell.enableFullscreen() : shell.disableFullscreen()));
+
     await loadPlugins();
     API.getPublicInfo().then(info => {
         serverId = info?.Id || '';

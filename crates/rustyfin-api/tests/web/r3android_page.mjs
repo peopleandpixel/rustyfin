@@ -41,7 +41,7 @@ test('the page uses no /native/ path', () => {
 });
 
 test("the user menu has the app's entries, hidden until the app offers them", () => {
-    for (const feature of ['clientsettings', 'downloadmanagement', 'multiserver', 'exit']) {
+    for (const feature of ['clientsettings', 'downloadmanagement', 'multiserver', 'exitmenu']) {
         const tag = html.match(new RegExp(`<a [^>]*data-native-feature="${feature}"[^>]*>`))?.[0];
         assert.ok(tag, feature);
         assert.match(tag, /class="hidden /);
