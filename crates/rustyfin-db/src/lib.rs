@@ -12,6 +12,7 @@ pub mod repo_device;
 pub mod repo_extras;
 pub mod repo_image;
 pub mod repo_instant_mix;
+pub mod repo_item_dto;
 pub mod repo_item_filter;
 pub mod repo_jellyfin_import;
 pub mod repo_library;

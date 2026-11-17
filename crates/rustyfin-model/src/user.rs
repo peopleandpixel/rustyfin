@@ -245,6 +245,7 @@ pub struct UpdatePolicyRequest {
     pub enable_playback_remuxing: Option<bool>,
     pub force_remote_source_transcoding: Option<bool>,
     pub enable_content_deletion: Option<bool>,
+    pub enable_content_deletion_from_folders: Option<Vec<String>>,
     pub enable_content_downloading: Option<bool>,
     pub max_active_sessions: Option<i32>,
     pub remote_client_bitrate_limit: Option<i64>,
