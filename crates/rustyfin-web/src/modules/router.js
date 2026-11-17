@@ -33,7 +33,6 @@ import {
 import { openPluginConfig, openPluginPriority } from './plugins.js';
 import { savePlaybackSettings, detectHardware } from './playback-admin.js';
 import { saveDlnaSettings } from './dlna-admin.js';
-import { savePlaybackSettings, detectHardware } from './playback-admin.js';
 import { serverPower, openLibraryEditor, removeLibraryFolder, openTriggerEditor, removeTaskTrigger } from './dashboard.js';
 import {
     openUserEditor, closeUserEditor, showUserEditorTab, addUserEditorTag, removeUserEditorTag, addUserEditorSchedule,
