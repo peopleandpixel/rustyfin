@@ -3796,6 +3796,7 @@ const B124_WEB_MODULES: &[&str] = &[
     "theme-media.js",
     "user-editor.js",
     "user-settings.js",
+    "userdata.js",
     "util.js",
     "wizard.js",
 ];
@@ -29287,6 +29288,13 @@ fn r3metadata_web() {
 #[test]
 fn r3cards_cards() {
     b124_node_test("r3cards_cards.mjs");
+}
+
+// The web client follows the server's UserDataChanged: cards, their folders' counts, the cached
+// lists, and this tab's own marks on the same path (tests/web/r3sync_userdata.mjs)
+#[test]
+fn r3sync_userdata() {
+    b124_node_test("r3sync_userdata.mjs");
 }
 
 // The sign-in page's user tiles, Manual login, Forgot password and its PIN step, and Switch user
