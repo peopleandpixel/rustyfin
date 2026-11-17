@@ -85,6 +85,9 @@ pub(crate) struct MkvIndex {
     /// Nanoseconds per timestamp unit.
     scale: u64,
     cues: Vec<Cue>,
+    /// How many frames `frame` read, for tests to see the index was used.
+    #[cfg(test)]
+    pub(crate) frames_read: std::sync::atomic::AtomicUsize,
 }
 
 /// An element: its id, where its body starts, and its body's size (`None`: unknown, to the end
@@ -254,7 +257,13 @@ impl MkvIndex {
             .filter(|&s| s > 0)?;
         let track = Self::video_track(&body(&file, tracks)?)?;
         let cues = Self::cue_points(&body(&file, cues)?, track, scale, segment.body)?;
-        Some(Self { track, scale, cues })
+        Some(Self {
+            track,
+            scale,
+            cues,
+            #[cfg(test)]
+            frames_read: Default::default(),
+        })
     }
 
     /// The number of the first video track, which ffmpeg's `V:0` is; `None` if it is
@@ -325,8 +334,15 @@ impl MkvIndex {
     /// `INDEX_FAILED` where the cue leads to no unlaced key frame block of the track at its
     /// time.
     pub(crate) fn frame(&self, file: &File, cue: Cue) -> Result<Vec<u8>, String> {
-        self.read_frame(file, cue)
-            .ok_or_else(|| format!("{INDEX_FAILED} at {:.3} s", cue.seconds))
+        let frame = self
+            .read_frame(file, cue)
+            .ok_or_else(|| format!("{INDEX_FAILED} at {:.3} s", cue.seconds));
+        #[cfg(test)]
+        if frame.is_ok() {
+            self.frames_read
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        frame
     }
 
     /// Two ranged reads: the cluster's header and timestamp, then from the block on, the first
@@ -382,7 +398,12 @@ impl MkvIndex {
         frame.truncate(len);
         if frame.len() < len {
             let from = at.checked_add(chunk.len() as u64)?;
-            frame.extend(read(file, from, (len - frame.len()) as u64, FRAME_MOST)?);
+            let rest = (len - frame.len()) as u64;
+            // A size that runs past the end of the file is refused before anything is allocated
+            if from.checked_add(rest)? > file_len {
+                return None;
+            }
+            frame.extend(read(file, from, rest, FRAME_MOST)?);
         }
         Some(frame)
     }
@@ -490,6 +511,7 @@ impl MkvIndex {
         Self {
             track: self.track,
             scale: self.scale,
+            frames_read: Default::default(),
             cues: self
                 .cues
                 .iter()
@@ -515,6 +537,7 @@ impl MkvIndex {
         Self {
             track: self.track,
             scale: self.scale,
+            frames_read: Default::default(),
             cues: self
                 .cues
                 .iter()
@@ -672,6 +695,7 @@ pub(crate) mod tests {
             track: 1,
             scale: 1_000_000,
             cues: vec![cue(500), cue(2000), cue(4000)],
+            frames_read: Default::default(),
         };
         assert_eq!(
             index.pick(0.0),
@@ -796,6 +820,7 @@ pub(crate) mod tests {
             track: 1,
             scale: 1_000_000,
             cues: vec![],
+            frames_read: Default::default(),
         };
         let cue = Cue {
             seconds: 0.0,
