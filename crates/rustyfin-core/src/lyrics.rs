@@ -286,7 +286,7 @@ pub async fn read_lyrics_tag(path: &str) -> Option<String> {
     struct Format {
         tags: Option<HashMap<String, String>>,
     }
-    let run = tokio::process::Command::new("ffprobe")
+    let run = tokio::process::Command::new(crate::media_tools::ffprobe())
         .args([
             "-v",
             "quiet",

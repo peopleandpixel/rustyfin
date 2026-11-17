@@ -113,7 +113,7 @@ pub async fn detect_theme_song(
 /// Extract a simple audio fingerprint from the first N seconds of a video file.
 /// Uses FFmpeg to extract audio energy levels per frame as a fingerprint.
 async fn extract_audio_fingerprint(path: &str, duration_seconds: f64) -> Option<Vec<u8>> {
-    let output = Command::new("ffmpeg")
+    let output = Command::new(crate::media_tools::ffmpeg())
         .args([
             "-i",
             path,
@@ -259,7 +259,7 @@ async fn detect_segments_with_threads(
     threads: usize,
     cancel: &Cancel,
 ) -> Result<(Option<DetectedSegment>, Option<DetectedSegment>), String> {
-    let mut cmd = Command::new("ffmpeg");
+    let mut cmd = Command::new(crate::media_tools::ffmpeg());
     cmd.args(segment_detect_args(path, config, threads))
         .stdin(Stdio::null())
         .stdout(Stdio::piped())

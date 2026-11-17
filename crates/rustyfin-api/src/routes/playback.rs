@@ -384,6 +384,17 @@ async fn report_stop(
         "Playback stopped"
     );
     record_stop(&state, claims.sub, &req).await?;
+    // The playback's transcodes end with it, as in Jellyfin, rather than at the stall sweep
+    if let Some(psid) = req.play_state.play_session_id.as_deref() {
+        let stopped = state.transcode_manager.stop_reported_playback(psid).await;
+        if stopped > 0 {
+            tracing::debug!(
+                play_session = psid,
+                stopped,
+                "stopped the playback's transcodes"
+            );
+        }
+    }
     if let Some(session) = caller_session(&state, &token).await? {
         crate::sessions::stopped(&state, &session).await;
     }

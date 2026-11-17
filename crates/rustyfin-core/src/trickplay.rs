@@ -248,7 +248,7 @@ async fn run_tool(
     args: &[&str],
     cancel: &Cancel,
 ) -> Result<Vec<u8>, String> {
-    let mut cmd = Command::new(program);
+    let mut cmd = Command::new(crate::media_tools::program(program));
     cmd.args(["-hide_banner", "-loglevel", "error"])
         .args(first)
         .args(args)
@@ -859,7 +859,7 @@ impl TileDecoding {
         if settings.hardware_acceleration != crate::encoding::HardwareAccelerationType::Vaapi {
             return Self::default();
         }
-        let caps = crate::encoding::probe_capabilities(Path::new("ffmpeg")).await;
+        let caps = crate::encoding::probe_capabilities(&crate::media_tools::ffmpeg()).await;
         if !caps.has_hwaccel("vaapi") || !caps.has_filter("scale_vaapi") {
             warn!("ffmpeg has no VA-API hwaccel or scaler: trickplay decodes in software");
             return Self::default();
@@ -1249,12 +1249,13 @@ impl Feed<'_> {
 
 /// A `run_tool`-like command for `program` whose output is piped.
 fn tool(program: &str) -> Command {
+    let path = crate::media_tools::program(program);
     #[cfg(test)]
-    let program = tests::FAKE_FFMPEG
+    let path = tests::FAKE_FFMPEG
         .with_borrow(|fake| fake.clone())
         .filter(|_| program == "ffmpeg")
-        .unwrap_or_else(|| program.into());
-    let mut cmd = Command::new(program);
+        .unwrap_or(path);
+    let mut cmd = Command::new(path);
     cmd.args(["-hide_banner", "-loglevel", "error"])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

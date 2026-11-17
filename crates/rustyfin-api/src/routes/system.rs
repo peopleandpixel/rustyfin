@@ -186,7 +186,7 @@ async fn get_full_info(
         internal_metadata_path: metadata_path,
         transcoding_temp_path,
         web_path: std::env::var("RUSTYFIN_WEBCLIENT_DIR").unwrap_or_default(),
-        encoder_location: if std::env::var_os("RUSTYFIN_FFMPEG_PATH").is_some() {
+        encoder_location: if rustyfin_core::media_tools::is_custom() {
             "Custom"
         } else {
             "System"
@@ -475,7 +475,9 @@ async fn saved_encoding_options(
 async fn encoding_options(
     state: &AppState,
 ) -> Result<serde_json::Map<String, serde_json::Value>, ApiError> {
-    let ffmpeg = std::env::var("RUSTYFIN_FFMPEG_PATH").unwrap_or_else(|_| "ffmpeg".to_string());
+    let ffmpeg = rustyfin_core::media_tools::ffmpeg()
+        .to_string_lossy()
+        .into_owned();
     let defaults =
         rustyfin_core::encoding::default_options(&ffmpeg, state.transcode_manager.cache_root());
     let saved = saved_encoding_options(state).await?;

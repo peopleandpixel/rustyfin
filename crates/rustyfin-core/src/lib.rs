@@ -17,6 +17,7 @@ pub mod lyrics;
 pub mod mdns;
 pub mod media_reads;
 pub mod media_segments;
+pub mod media_tools;
 pub mod metadata;
 pub mod missing_episodes;
 mod mkv_index;

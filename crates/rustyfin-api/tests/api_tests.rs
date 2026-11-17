@@ -41667,6 +41667,86 @@ async fn g4_active_encodings_needs_a_name() {
     assert_eq!(status, StatusCode::UNAUTHORIZED);
 }
 
+// r3hwaccel: a reported playback stop ends that play session's transcodes, as Jellyfin 12.4's
+// `/Sessions/Playing/Stopped` does, instead of leaving them to the stall sweep; another play
+// session's transcode runs on, and the stopped play session may start again.
+#[tokio::test]
+async fn r3hwaccel_playback_stop_kills_the_play_sessions_transcodes() {
+    if !g4_have_ffmpeg("r3hwaccel_playback_stop_kills_the_play_sessions_transcodes") {
+        return;
+    }
+    let state = test_state().await;
+    let _dir = G4Dir(state.data_dir.to_path_buf());
+    let (token, _) = admin_session(&state).await;
+    let folder = media_folder(&state, "r3-stop");
+    let mut ids = Vec::new();
+    for name in ["Movie A", "Movie B"] {
+        let file = std::path::Path::new(&folder).join(format!("{name}.mp4"));
+        g4_make_media(&[
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc=size=320x240:rate=25",
+            "-t",
+            "8",
+            "-c:v",
+            "libx264",
+            "-pix_fmt",
+            "yuv420p",
+            file.to_str().unwrap(),
+        ]);
+        let id = g4_insert_item(&state, "Movie", &file).await;
+        rustyfin_core::probe::probe_and_save(&state.db, &id, file.to_str().unwrap())
+            .await
+            .unwrap();
+        ids.push(id);
+    }
+    let manager = state.transcode_manager.clone();
+    let app = app(state);
+    let hls = |id: uuid::Uuid, psid: &str| {
+        format!("/Videos/{id}/main.m3u8?VideoCodec=h264&VideoBitrate=500000&PlaySessionId={psid}")
+    };
+    for (id, psid) in [(ids[0], "r3-stop-a"), (ids[1], "r3-stop-b")] {
+        let (status, body) = send(&app, request("GET", &hls(id, psid), Some(&token), None)).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(manager.is_active(id).await);
+    }
+
+    let stop = serde_json::json!({
+        "ItemId": ids[0],
+        "PositionTicks": 10_000_000,
+        "PlaySessionId": "R3-STOP-A",
+    });
+    let (status, body) = send(
+        &app,
+        request(
+            "POST",
+            "/Sessions/Playing/Stopped",
+            Some(&token),
+            Some(stop),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+    assert!(
+        !manager.is_active(ids[0]).await,
+        "the stopped playback's transcode is gone"
+    );
+    assert!(
+        manager.is_active(ids[1]).await,
+        "another play session's runs on"
+    );
+
+    // The play session isn't refused afterwards
+    let (status, body) = send(
+        &app,
+        request("GET", &hls(ids[0], "r3-stop-a"), Some(&token), None),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    manager.stop_all().await;
+}
+
 /// Stores a media source for `item` at `file` with one stream per (CodecType, codec) pair.
 async fn g4_insert_source(
     state: &AppState,
