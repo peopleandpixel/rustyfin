@@ -739,6 +739,15 @@ struct ItemRow {
     parent_id: Option<String>,
     /// The series of the item's season, when the item is an episode.
     series_id: Option<String>,
+    /// The item's LockData and LockedFields (`item_metadata_extras`).
+    lock_data: bool,
+    locked_fields: String,
+}
+
+impl ItemRow {
+    fn locks(&self) -> rustyfin_db::repo_media::ItemLocks {
+        rustyfin_db::repo_media::ItemLocks::from_row(self.lock_data, &self.locked_fields)
+    }
 }
 
 /// A source of an item, as [`reconcile_groups`] reads it.
@@ -889,16 +898,18 @@ pub async fn reconcile_episode_groups(
 
 /// Gives each season of `seasons`, (id, number), the number that the scan read from its folder, where the stored
 /// one differs: a `Specials` folder stored with no number before it was read as season 0, say. A sort name that
-/// the scan made from the stored number is made again from the new one; any other is kept. Only the seasons
-/// that differ are written, in one transaction. Returns how many changed.
+/// the scan made from the stored number is made again from the new one; any other is kept. A locked season
+/// (LockData) keeps its number, as Jellyfin's IsLocked does. Only the seasons that differ are written, in one
+/// transaction. Returns how many changed.
 pub async fn settle_season_numbers(
     pool: &SqlitePool,
     library_id: Uuid,
     seasons: &[(Uuid, Option<i32>)],
 ) -> Result<u64, sqlx::Error> {
     let stored: Vec<(String, Option<i32>, Option<String>)> = sqlx::query_as(
-        "SELECT id, index_number, sort_name FROM media_items
-         WHERE library_id = ?1 AND media_type = 'Season'",
+        "SELECT m.id, m.index_number, m.sort_name FROM media_items AS m
+         LEFT JOIN item_metadata_extras AS x ON x.item_id = m.id
+         WHERE m.library_id = ?1 AND m.media_type = 'Season' AND COALESCE(x.lock_data, 0) = 0",
     )
     .bind(library_id.to_string())
     .fetch_all(pool)
@@ -1288,8 +1299,11 @@ async fn reconcile_groups(
     let items: Vec<ItemRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "SELECT id, path, name, sort_name, production_year, runtime_ticks, date_created,
                 index_number, index_number_end, parent_index_number, parent_id,
-                (SELECT s.parent_id FROM media_items AS s WHERE s.id = m.parent_id) AS series_id
+                (SELECT s.parent_id FROM media_items AS s WHERE s.id = m.parent_id) AS series_id,
+                COALESCE(x.lock_data, 0) != 0 AS lock_data,
+                COALESCE(x.locked_fields, '') AS locked_fields
          FROM media_items AS m
+         LEFT JOIN item_metadata_extras AS x ON x.item_id = m.id
          WHERE m.library_id = ?1 AND m.media_type = ?2 AND {loaded}"
     )))
     .bind(library.as_str())
@@ -1586,40 +1600,56 @@ async fn settle_group(
         Wanted::Movie { title, .. } => title.as_str(),
         Wanted::Episode { name, .. } => name.as_str(),
     };
-    let name = if old_stem.as_deref() == Some(survivor.name.as_str()) {
+    // A locked item keeps its metadata, as Jellyfin's IsLocked keeps a scan from refilling it: a
+    // locked name, and with LockData its year and numbers. It still follows its file: its path and,
+    // for an episode, the season it is in.
+    let locks = survivor.locks();
+    let name = if old_stem.as_deref() == Some(survivor.name.as_str()) && !locks.locked("Name") {
         given_name.to_string()
     } else {
         survivor.name.clone()
     };
     // A movie takes its year and keeps its episode fields. An episode keeps its year and takes the
     // group's numbers and season.
-    let (production_year, index_number, index_number_end, parent_index_number, parent_id) =
-        match &group.wanted {
-            Wanted::Movie { year, .. } => (
-                if survivor.production_year.is_none() || survivor.production_year == old_year {
-                    *year
-                } else {
-                    survivor.production_year
-                },
-                survivor.index_number,
-                survivor.index_number_end,
-                survivor.parent_index_number,
-                survivor.parent_id.clone(),
-            ),
-            Wanted::Episode {
-                index_number,
-                index_number_end,
-                parent_index_number,
-                parent_id: season,
-                ..
-            } => (
-                survivor.production_year,
-                *index_number,
-                *index_number_end,
-                *parent_index_number,
-                Some(season.to_string()),
-            ),
-        };
+    let (
+        production_year,
+        mut index_number,
+        mut index_number_end,
+        mut parent_index_number,
+        parent_id,
+    ) = match &group.wanted {
+        Wanted::Movie { year, .. } => (
+            if !locks.lock_data
+                && (survivor.production_year.is_none() || survivor.production_year == old_year)
+            {
+                *year
+            } else {
+                survivor.production_year
+            },
+            survivor.index_number,
+            survivor.index_number_end,
+            survivor.parent_index_number,
+            survivor.parent_id.clone(),
+        ),
+        Wanted::Episode {
+            index_number,
+            index_number_end,
+            parent_index_number,
+            parent_id: season,
+            ..
+        } => (
+            survivor.production_year,
+            *index_number,
+            *index_number_end,
+            *parent_index_number,
+            Some(season.to_string()),
+        ),
+    };
+    if locks.lock_data {
+        index_number = survivor.index_number;
+        index_number_end = survivor.index_number_end;
+        parent_index_number = survivor.parent_index_number;
+    }
     // A sort name that the scan made, from the old file stem or from the name and numbers, is
     // made again; another one is kept, and so is a forced or locked one (the UPDATE below).
     let media_type = match &group.wanted {

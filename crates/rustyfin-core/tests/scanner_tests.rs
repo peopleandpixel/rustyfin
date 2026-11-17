@@ -6592,6 +6592,111 @@ async fn b18_tv_rescan_removes_gone_episodes_seasons_and_series() {
     assert_eq!(paths(pool, &lib, "Series").await, ["Show A"]);
 }
 
+// R3 core reliability: a scan keeps what a locked item holds, as Jellyfin's IsLocked does.
+
+/// Locks the item at `rel` (LockData), and returns its id.
+async fn r3rel_lock(pool: &SqlitePool, lib: &Library, media_type: &str, rel: &str) -> String {
+    let path = root_of(lib).join(rel).to_string_lossy().into_owned();
+    let id: String = sqlx::query_scalar(
+        "SELECT id FROM media_items WHERE library_id = ?1 AND media_type = ?2 AND path = ?3",
+    )
+    .bind(lib.id.to_string())
+    .bind(media_type)
+    .bind(&path)
+    .fetch_one(pool)
+    .await
+    .unwrap_or_else(|e| panic!("{media_type} at {path}: {e}"));
+    sqlx::query(
+        "INSERT INTO item_metadata_extras (item_id, lock_data) VALUES (?1, 1)
+         ON CONFLICT(item_id) DO UPDATE SET lock_data = 1",
+    )
+    .bind(&id)
+    .execute(pool)
+    .await
+    .unwrap();
+    id
+}
+
+/// (index_number, parent_index_number, production_year) of the item `id`.
+async fn r3rel_numbers(pool: &SqlitePool, id: &str) -> (Option<i32>, Option<i32>, Option<i32>) {
+    sqlx::query_as(
+        "SELECT index_number, parent_index_number, production_year FROM media_items WHERE id = ?",
+    )
+    .bind(id)
+    .fetch_one(pool)
+    .await
+    .unwrap()
+}
+
+#[tokio::test]
+async fn r3rel_a_rescan_keeps_the_numbers_of_locked_episodes_and_seasons() {
+    let fx = Fixture::new().await;
+    let lib = fx.library("tv", LibraryContentType::TvShows).await;
+    let pool = &fx.pool;
+    let root = root_of(&lib);
+    let locked_file = "Sample Show/Season 1/Sample Show S01E02.mkv";
+    let open_file = "Sample Show/Season 1/Sample Show S01E03.mkv";
+    touch(&root, locked_file);
+    touch(&root, open_file);
+    scan(pool, &lib).await;
+
+    // An admin corrects the numbers; the locked items keep them, an unlocked episode follows its
+    // file again.
+    let locked = r3rel_lock(pool, &lib, "Episode", locked_file).await;
+    let season = r3rel_lock(pool, &lib, "Season", "Sample Show/Season 1").await;
+    let open_path = root.join(open_file).to_string_lossy().into_owned();
+    for (sql, id) in [
+        (
+            "UPDATE media_items SET index_number = 5, parent_index_number = 3 WHERE id = ?",
+            locked.clone(),
+        ),
+        (
+            "UPDATE media_items SET index_number = 7 WHERE id = ?",
+            season.clone(),
+        ),
+    ] {
+        sqlx::query(sql).bind(id).execute(pool).await.unwrap();
+    }
+    sqlx::query("UPDATE media_items SET index_number = 9 WHERE path = ?")
+        .bind(&open_path)
+        .execute(pool)
+        .await
+        .unwrap();
+    scan(pool, &lib).await;
+
+    assert_eq!(r3rel_numbers(pool, &locked).await, (Some(5), Some(3), None));
+    assert_eq!(r3rel_numbers(pool, &season).await.0, Some(7));
+    let open: Option<i32> =
+        sqlx::query_scalar("SELECT index_number FROM media_items WHERE path = ?")
+            .bind(&open_path)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+    assert_eq!(open, Some(3));
+}
+
+#[tokio::test]
+async fn r3rel_a_rescan_keeps_the_year_of_a_locked_movie() {
+    let fx = Fixture::new().await;
+    let lib = fx.library("films", LibraryContentType::Movies).await;
+    let pool = &fx.pool;
+    let root = root_of(&lib);
+    let file = "Sample Film (2001)/Sample Film (2001).mkv";
+    touch(&root, file);
+    scan(pool, &lib).await;
+    let film = r3rel_lock(pool, &lib, "Movie", file).await;
+    assert_eq!(r3rel_numbers(pool, &film).await.2, Some(2001));
+
+    // An admin clears the year and locks the item; a scan doesn't fill it again.
+    sqlx::query("UPDATE media_items SET production_year = NULL WHERE id = ?")
+        .bind(&film)
+        .execute(pool)
+        .await
+        .unwrap();
+    scan(pool, &lib).await;
+    assert_eq!(r3rel_numbers(pool, &film).await.2, None);
+}
+
 /// B18 criterion 5: a music rescan removes the tracks of a removed album folder, then the album,
 /// and the tracks of a removed artist folder, then its album and the artist. It also removes an
 /// album row that has no tracks.

@@ -4084,6 +4084,19 @@ pub struct ItemLocks {
 }
 
 impl ItemLocks {
+    /// The locks of a stored `item_metadata_extras` row: its `lock_data` and its `locked_fields`,
+    /// joined with `|`.
+    pub fn from_row(lock_data: bool, locked_fields: &str) -> Self {
+        ItemLocks {
+            lock_data,
+            fields: locked_fields
+                .split('|')
+                .filter(|f| !f.is_empty())
+                .map(str::to_string)
+                .collect(),
+        }
+    }
+
     /// Whether a refresh may not change `field`: the whole item is locked, or the field is.
     pub fn locked(&self, field: &str) -> bool {
         self.lock_data || self.fields.iter().any(|f| f.eq_ignore_ascii_case(field))
@@ -4301,14 +4314,7 @@ pub async fn item_locks(pool: &SqlitePool, item_id: uuid::Uuid) -> Result<ItemLo
     .fetch_optional(pool)
     .await?;
     Ok(row
-        .map(|(lock, fields)| ItemLocks {
-            lock_data: lock != 0,
-            fields: fields
-                .split('|')
-                .filter(|f| !f.is_empty())
-                .map(str::to_string)
-                .collect(),
-        })
+        .map(|(lock, fields)| ItemLocks::from_row(lock != 0, &fields))
         .unwrap_or_default())
 }
 
