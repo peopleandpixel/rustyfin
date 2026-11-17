@@ -565,6 +565,36 @@ pub async fn filter_sql(
     Ok(Some(q))
 }
 
+/// The distinct languages of the `kind` streams (`audio`, `subtitle`) of the items of
+/// `item_types` (all when empty) in `library` (every library when `None`) that the hidden-items
+/// filter `hidden_json` (`repo_parental::filter_json`) lets through, `und` for a stream without
+/// one, as Jellyfin 12.4's `GetMediaStreamLanguages` lists them for `/Items/Filters2`.
+pub async fn stream_languages(
+    pool: &SqlitePool,
+    kind: &str,
+    library: Option<uuid::Uuid>,
+    item_types: &[String],
+    hidden_json: Option<&str>,
+) -> Result<Vec<String>, sqlx::Error> {
+    let sql = format!(
+        "SELECT DISTINCT CASE WHEN COALESCE(st.language, '') = '' THEN 'und' ELSE st.language END \
+         FROM media_streams st JOIN media_sources ms ON ms.id = st.source_id \
+         JOIN media_items m ON m.id = ms.item_id \
+         WHERE lower(st.codec_type) = ?1 AND m.extra_type IS NULL \
+         AND (?2 IS NULL OR m.library_id = ?2) \
+         AND (json_array_length(?3) = 0 OR m.media_type IN (SELECT value FROM json_each(?3))) \
+         AND {visible}",
+        visible = crate::repo_parental::visible_sql("m.id", "m.library_id", "?4"),
+    );
+    sqlx::query_scalar(sqlx::AssertSqlSafe(sql))
+        .bind(kind.to_lowercase())
+        .bind(library.map(|id| id.to_string()))
+        .bind(serde_json::Value::from(item_types.to_vec()).to_string())
+        .bind(hidden_json)
+        .fetch_all(pool)
+        .await
+}
+
 /// The ids of the items, not extras, that meet every condition of `f`, or `None` when it has
 /// none: `filter_sql` on its own, for the tests.
 #[cfg(test)]
@@ -1083,6 +1113,22 @@ mod tests {
             found(&pool, saved("2026-01-15 00:00:00")).await,
             list(&["b"])
         );
+        // The stream languages of /Items/Filters2: `und` for a stream without one.
+        let languages = |kind: &'static str, types: &'static [&'static str]| {
+            let pool = pool.clone();
+            async move {
+                let types: Vec<String> = types.iter().map(|t| t.to_string()).collect();
+                let mut found = super::stream_languages(&pool, kind, None, &types, None)
+                    .await
+                    .unwrap();
+                found.sort();
+                found
+            }
+        };
+        assert_eq!(languages("audio", &[]).await, list(&["eng", "und"]));
+        assert_eq!(languages("audio", &["Episode"]).await, list(&["eng"]));
+        assert_eq!(languages("subtitle", &["Episode"]).await, list(&["ger"]));
+        assert!(languages("subtitle", &["Audio"]).await.is_empty());
         // A list of 10,000 ids is one bound value, under SQLite's limit on parameters.
         let mut many: Vec<String> = (0..10_000).map(|i| format!("missing-{i}")).collect();
         many.push("pat".to_string());

@@ -4018,7 +4018,66 @@ async fn get_filters2(
             json!({ "Name": name, "Id": id.simple().to_string() })
         })
         .collect();
-    Ok(Json(json!({ "Genres": genres, "Tags": [] })))
+    let (audio, subtitles) = filter_languages(&state, &claims, library_id, &item_types).await?;
+    Ok(Json(json!({
+        "Genres": genres,
+        "Tags": [],
+        "AudioLanguages": audio,
+        "SubtitleLanguages": subtitles,
+    })))
+}
+
+/// The AudioLanguages and SubtitleLanguages of `/Items/Filters2`, as Jellyfin 12.4's
+/// `FilterController.GetQueryFilters` lists them: only for movies, series, seasons or episodes
+/// (a series' or season's streams are its episodes'), each `{ Name, Value }` with the language's
+/// display name and code (the code alone when it names no language), sorted by name.
+async fn filter_languages(
+    state: &AppState,
+    claims: &Claims,
+    library_id: Option<Uuid>,
+    item_types: &[String],
+) -> Result<(Vec<Value>, Vec<Value>), ApiError> {
+    let video = ["Movie", "Series", "Season", "Episode"];
+    let has = |kind: &str| item_types.iter().any(|t| t.eq_ignore_ascii_case(kind));
+    if !video.iter().any(|kind| has(kind)) {
+        return Ok((Vec::new(), Vec::new()));
+    }
+    let mut types = item_types.to_vec();
+    if (has("Series") || has("Season")) && !has("Episode") {
+        types.push("Episode".to_string());
+    }
+    let hidden = HiddenItems::for_caller(state, claims).await?.json();
+    let mut lists = Vec::new();
+    for kind in ["audio", "subtitle"] {
+        let languages = rustyfin_db::repo_item_filter::stream_languages(
+            &state.db_ro,
+            kind,
+            library_id,
+            &types,
+            hidden.as_deref(),
+        )
+        .await?;
+        let mut pairs: Vec<(String, String)> = languages
+            .into_iter()
+            .map(|language| {
+                let name = match super::localization::language_display_name(&language) {
+                    Some(display) => format!("{display} ({language})"),
+                    None => language.clone(),
+                };
+                (name, language)
+            })
+            .collect();
+        pairs.sort_by_key(|(name, _)| name.to_lowercase());
+        lists.push(
+            pairs
+                .into_iter()
+                .map(|(name, value)| json!({ "Name": name, "Value": value }))
+                .collect::<Vec<_>>(),
+        );
+    }
+    let subtitles = lists.pop().unwrap_or_default();
+    let audio = lists.pop().unwrap_or_default();
+    Ok((audio, subtitles))
 }
 
 // User-specific item endpoints (same as global for now; user-specific status comes in Phase 2)
@@ -4117,17 +4176,59 @@ async fn get_ancestors(
     Ok(Json(ancestors))
 }
 
-/// GET /Items/{id}/Collections - Get collections containing this item
+/// GET /Items/{id}/Collections?userId=&startIndex=&limit=, as Jellyfin 12.4's
+/// `LibraryController.GetItemCollections`: the collections holding the item that the caller (or
+/// `userId`) may see, as `/Items/{id}` answers each, sorted by sort name then name without case,
+/// then paged; the count is of every one. 404 for an item that doesn't exist (a hidden one is a
+/// 404 already, by `parental`).
 async fn get_item_collections(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
+    Query(params): Query<Vec<(String, String)>>,
+    Extension(claims): Extension<Claims>,
 ) -> Result<Json<QueryResult>, ApiError> {
-    let collections = rustyfin_db::repo_media::get_item_collections(&state.db_ro, id).await?;
+    use crate::query::{count_param, uuid_param};
+    let user = query_user(&state, &claims, uuid_param(&params, "userId")?)
+        .await?
+        .unwrap_or(claims.sub);
+    match media_item(&state, id, user).await {
+        Ok(_) => {}
+        Err(ApiError::NotFound(_))
+            if super::collections::container_details(&state, id, &claims)
+                .await?
+                .is_some() => {}
+        Err(e) => return Err(e),
+    }
+    let start = count_param(&params, "startIndex")?;
+    let limit = count_param(&params, "limit")?;
+    let mut collections = Vec::new();
+    for collection in rustyfin_db::repo_media::get_item_collections(&state.db_ro, id).await? {
+        match super::collections::container_details(&state, collection.id, &claims).await {
+            Ok(Some(item)) => collections.push(item),
+            Ok(None) | Err(ApiError::NotFound(_)) => {}
+            Err(e) => return Err(e),
+        }
+    }
+    let key = |item: &MediaItem| {
+        (
+            item.sort_name
+                .as_deref()
+                .unwrap_or(&item.name)
+                .to_uppercase(),
+            item.name.to_uppercase(),
+        )
+    };
+    collections.sort_by_key(key);
     let total = collections.len() as i64;
+    let items = collections
+        .into_iter()
+        .skip(start.unwrap_or(0))
+        .take(limit.unwrap_or(usize::MAX))
+        .collect();
     Ok(Json(QueryResult {
-        items: collections,
+        items,
         total_record_count: total,
-        start_index: 0,
+        start_index: start.unwrap_or(0) as i64,
     }))
 }
 

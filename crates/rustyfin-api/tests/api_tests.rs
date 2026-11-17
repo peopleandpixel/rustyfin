@@ -48896,3 +48896,109 @@ async fn r3items_sort_by_the_callers_favourites() {
     let (names, _) = r3items_names(&app, sorted, &other).await;
     assert_eq!(names, ["Alpha", "Bravo", "Charlie"]);
 }
+
+#[tokio::test]
+async fn r3items_filters2_lists_stream_languages() {
+    let state = test_state().await;
+    let lib = r3items_library(&state).await;
+    // Bravo: German audio and audio without a language; Episode 1: French subtitles.
+    let (bravo, episode) = (lib.id("Bravo"), lib.id("Episode 1"));
+    let source = uuid::Uuid::new_v4();
+    for sql in [
+        format!(
+            "INSERT INTO media_sources (id, item_id, uid, path) VALUES ('{source}', '{bravo}', '{source}', '/nowhere/b2.mkv')"
+        ),
+        format!(
+            "INSERT INTO media_streams (id, source_id, codec_type, stream_index, language) VALUES ('{}', '{source}', 'Audio', 1, 'ger'), ('{}', '{source}', 'Audio', 2, NULL)",
+            uuid::Uuid::new_v4(),
+            uuid::Uuid::new_v4()
+        ),
+        format!(
+            "INSERT INTO media_sources (id, item_id, uid, path) VALUES ('e{source}', '{episode}', 'e{source}', '/nowhere/e1.mkv')"
+        ),
+        format!(
+            "INSERT INTO media_streams (id, source_id, codec_type, stream_index, language) VALUES ('{}', 'e{source}', 'Subtitle', 3, 'fre')",
+            uuid::Uuid::new_v4()
+        ),
+    ] {
+        r3items_sql(&state, &sql).await;
+    }
+    let (token, _) = admin_session(&state).await;
+    let app = app(state);
+    let filters = |types: &str| format!("/Items/Filters2?IncludeItemTypes={types}");
+    let values = |list: &serde_json::Value| -> Vec<String> {
+        list.as_array()
+            .unwrap()
+            .iter()
+            .map(|pair| pair["Value"].as_str().unwrap().to_string())
+            .collect()
+    };
+    let (status, movies) = send_authed(&app, "GET", &filters("Movie"), &token, None).await;
+    assert_eq!(status, StatusCode::OK, "{movies}");
+    assert_eq!(values(&movies["AudioLanguages"]), ["ger", "und"]);
+    assert_eq!(movies["AudioLanguages"][0]["Name"], "German (ger)");
+    assert_eq!(values(&movies["SubtitleLanguages"]), ["eng"]);
+    assert_eq!(movies["SubtitleLanguages"][0]["Name"], "English (eng)");
+    // A series' streams are its episodes'.
+    let (_, series) = send_authed(&app, "GET", &filters("Series"), &token, None).await;
+    assert_eq!(values(&series["SubtitleLanguages"]), ["fre"]);
+    assert_eq!(values(&series["AudioLanguages"]), Vec::<String>::new());
+    // Only video kinds list them, as in Jellyfin 12.4.
+    let (_, music) = send_authed(&app, "GET", &filters("Audio"), &token, None).await;
+    assert_eq!(music["AudioLanguages"], serde_json::json!([]));
+    assert_eq!(music["SubtitleLanguages"], serde_json::json!([]));
+}
+
+#[tokio::test]
+async fn r3items_item_collections_lists_those_holding_it() {
+    let state = test_state().await;
+    let lib = r3items_library(&state).await;
+    let alpha = lib.id("Alpha");
+    let app = app(state.clone());
+    let (admin, _) = admin_session(&state).await;
+    r3items_container(&app, &admin, false, "Zeta%20set", &[alpha]).await;
+    r3items_container(
+        &app,
+        &admin,
+        false,
+        "alpha%20set",
+        &[alpha, lib.id("Bravo")],
+    )
+    .await;
+    r3items_container(&app, &admin, false, "Other", &[lib.id("Charlie")]).await;
+    let uri = format!("/Items/{alpha}/Collections");
+    let (names, total) = r3items_names(&app, &uri, &admin).await;
+    assert_eq!(
+        (names, total),
+        (vec!["alpha set".into(), "Zeta set".into()], 2)
+    );
+    let (status, page) = send_authed(
+        &app,
+        "GET",
+        &format!("{uri}?startIndex=1&limit=1"),
+        &admin,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(page["Items"][0]["Name"], "Zeta set");
+    assert_eq!(page["Items"][0]["Type"], "BoxSet");
+    assert_eq!(
+        (
+            page["TotalRecordCount"].as_i64(),
+            page["StartIndex"].as_i64()
+        ),
+        (Some(2), Some(1))
+    );
+    let (names, total) = r3items_names(
+        &app,
+        &format!("/Items/{}/Collections", lib.id("Bravo")),
+        &admin,
+    )
+    .await;
+    assert_eq!((names, total), (vec!["alpha set".to_string()], 1));
+    // An item that doesn't exist is a 404.
+    let missing = format!("/Items/{}/Collections", uuid::Uuid::new_v4());
+    let (status, _) = send_authed(&app, "GET", &missing, &admin, None).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}

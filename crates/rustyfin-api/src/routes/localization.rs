@@ -138,6 +138,28 @@ pub(crate) fn normalize_language(language: &str) -> Vec<String> {
     }
 }
 
+/// The display name of the culture a language names (by display name, name, or two- or
+/// three-letter code, any case), as Jellyfin 12.4's `LocalizationManager.FindLanguageInfo`
+/// finds it; `None` when it names none.
+pub(crate) fn language_display_name(language: &str) -> Option<&'static str> {
+    if language.is_empty() {
+        return None;
+    }
+    cultures()
+        .into_iter()
+        .find(|culture| {
+            [
+                culture.display_name,
+                culture.name,
+                culture.two_letter_iso_language_name,
+            ]
+            .iter()
+            .chain(culture.three_letter_iso_language_names.iter())
+            .any(|code| !code.is_empty() && code.eq_ignore_ascii_case(language))
+        })
+        .map(|culture| culture.display_name)
+}
+
 fn countries() -> Vec<CountryInfo> {
     COUNTRIES
         .lines()
