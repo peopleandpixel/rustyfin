@@ -205,8 +205,10 @@ pub struct Source<'a> {
 
 /// Runs the task (12.4 `TmdbUpcomingEpisodesTask.ExecuteAsync`). With the feature off (both
 /// imports off, or no library opted in) it removes every virtual episode it made, and the virtual
-/// seasons left empty. Otherwise it refreshes each series with a TMDb id that has not ended, and
-/// each series in a library not opted in (to prune what it made there). `progress` gets the share done.
+/// seasons left empty. Otherwise it refreshes each series with a TMDb id: TMDb is asked only about
+/// the ones that have not ended, in an opted-in library; the others are only pruned (an ended
+/// series' placeholders still age out, give way to files, and leave no empty virtual season, as a
+/// series refresh does in 12.4). `progress` gets the share done.
 pub async fn run(
     pool: &SqlitePool,
     source: Option<Source<'_>>,
@@ -222,10 +224,7 @@ pub async fn run(
     }
     let series: Vec<SeriesRow> = repo_virtual::series_with_tmdb_id(pool)
         .await
-        .map_err(|e| e.to_string())?
-        .into_iter()
-        .filter(|s| !is_ended(s.status.as_deref()) || !settings.library_enabled(s.library_id))
-        .collect();
+        .map_err(|e| e.to_string())?;
     let total = series.len();
     for (done, row) in series.iter().enumerate() {
         match refresh_series(pool, source.as_ref(), row, settings, today).await {
@@ -273,13 +272,36 @@ struct Fetched {
     seasons: Vec<(SeasonSummary, SeasonMetadata)>,
 }
 
+/// Whether a cached season may have changed on TMDb since: another episode count than the new
+/// season list gives, or an episode that is undated or airs on or after `today` minus the grace
+/// period (its air date may still move). A season that aired in full before that is final.
+fn season_is_stale(
+    cached: Option<&SeasonMetadata>,
+    episode_count: Option<i32>,
+    today: NaiveDate,
+    grace_days: i64,
+) -> bool {
+    let Some(season) = cached else {
+        return episode_count.is_some_and(|count| count > 0);
+    };
+    if episode_count.is_some_and(|count| season.episodes.len() != count.max(0) as usize) {
+        return true;
+    }
+    let settled_before = today - chrono::Duration::days(grace_days.max(0));
+    season
+        .episodes
+        .iter()
+        .any(|(_, meta)| air_date(meta).is_none_or(|day| day >= settled_before))
+}
+
 /// Asks TMDb for a series' season list (fresh), then each season's episode list: from the cache,
-/// unless the season list gives the season another episode count. A season of specials is not
-/// asked for when specials are off. `Ok(None)` is no answer (a 404); `Err` a failed lookup.
+/// unless `season_is_stale`, once a run. A season of specials is not asked for when specials are
+/// off. `Ok(None)` is no answer (a 404); `Err` a failed lookup.
 async fn fetch(
     source: &Source<'_>,
     tmdb_id: i64,
     settings: &Settings,
+    today: NaiveDate,
 ) -> Result<Option<Fetched>, String> {
     let list = source
         .lookups
@@ -299,11 +321,12 @@ async fn fetch(
             .season(tmdb_id, summary.number)
             .await
             .map_err(|e| format!("season {}: {e:?}", summary.number))?;
-        let stale = match (&cached, summary.episode_count) {
-            (Some(season), Some(count)) => season.episodes.len() != count.max(0) as usize,
-            (None, Some(count)) => count > 0,
-            (_, None) => false,
-        };
+        let stale = season_is_stale(
+            cached.as_ref(),
+            summary.episode_count,
+            today,
+            settings.grace_period_days,
+        );
         let season = if stale {
             source
                 .lookups
@@ -367,16 +390,18 @@ pub async fn refresh_series(
         outcome.seasons_removed += remove_empty_seasons(pool, series.id).await.map_err(db)?;
         return Ok(outcome);
     }
-    let Some(source) = source else {
-        return Ok(outcome);
+    // TMDb is asked only about a series that has not ended; an ended one is only pruned.
+    let fetched = match source {
+        Some(source) if !is_ended(series.status.as_deref()) => {
+            fetch(source, series.tmdb_id, settings, today).await?
+        }
+        _ => None,
     };
-    let Some(fetched) = fetch(source, series.tmdb_id, settings).await? else {
-        return Ok(outcome);
-    };
+    let provider_name = source.map(|s| s.provider_name).unwrap_or_default();
 
     // The writes run under the scan lock, so that a scan never sees half of them.
     let _scan = crate::scanner::SCAN_LOCK.lock().await;
-    if let Some(status) = fetched.status.as_deref()
+    if let Some(status) = fetched.as_ref().and_then(|f| f.status.as_deref())
         && series.status.as_deref() != Some(status)
         && !rustyfin_db::repo_media::item_locks(pool, series.id)
             .await
@@ -466,7 +491,11 @@ pub async fn refresh_series(
         .filter_map(|s| Some((s.index_number?, s.id)))
         .collect();
 
-    for (summary, season) in &fetched.seasons {
+    let seasons = fetched
+        .as_ref()
+        .map(|f| f.seasons.as_slice())
+        .unwrap_or(&[]);
+    for (summary, season) in seasons {
         let number = summary.number;
         for (episode_number, meta) in &season.episodes {
             let premiere = air_date(meta);
@@ -482,7 +511,7 @@ pub async fn refresh_series(
             }
             let key = (number, *episode_number);
             if let Some(&id) = updatable.get(&key) {
-                if update_virtual_episode(pool, id, season, source.provider_name).await? {
+                if update_virtual_episode(pool, id, season, provider_name).await? {
                     outcome.updated += 1;
                 }
                 continue;
@@ -513,7 +542,7 @@ pub async fn refresh_series(
                 *episode_number,
                 premiere,
                 season,
-                source.provider_name,
+                provider_name,
             )
             .await?;
             outcome.created += 1;

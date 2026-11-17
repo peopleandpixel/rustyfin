@@ -671,9 +671,30 @@ async fn missing_episodes_library_not_opted_in_or_feature_off_removes_placeholde
 }
 
 #[tokio::test]
-async fn missing_episodes_ask_tmdb_for_the_season_list_once_and_seasons_only_when_changed() {
+async fn missing_episodes_ask_tmdb_for_the_season_list_once_and_seasons_only_when_they_may_move() {
+    /// The mock with season 1 aired in full: E3 `e3` days and E4 `e4` days from today.
+    fn settled(e3: i64, e4: i64) -> MockTmdb {
+        let mut tmdb = mock();
+        let s1 = season_of(vec![
+            tmdb_episode(1, 1, Some(-30)),
+            tmdb_episode(1, 2, Some(-20)),
+            tmdb_episode(1, 3, Some(e3)),
+            tmdb_episode(1, 4, Some(e4)),
+        ]);
+        tmdb.current.insert((TMDB_SERIES, 1), s1.clone());
+        tmdb.cached.insert((TMDB_SERIES, 1), s1);
+        tmdb
+    }
+    let fresh_calls = |tmdb: &MockTmdb| -> Vec<String> {
+        tmdb.calls()
+            .into_iter()
+            .filter(|c| c.starts_with("season_fresh"))
+            .collect()
+    };
     let fx = fixture("Returning Series").await;
-    let tmdb = mock();
+
+    // Season 1 aired more than the grace period ago: from the cache. Season 2 airs later: asked.
+    let tmdb = settled(-15, -10);
     run_with(&fx, &tmdb, &settings(&fx, true, false, false)).await;
     let calls = tmdb.calls();
     assert_eq!(
@@ -681,27 +702,107 @@ async fn missing_episodes_ask_tmdb_for_the_season_list_once_and_seasons_only_whe
             .iter()
             .filter(|c| c.starts_with("seasons_fresh"))
             .count(),
-        1
+        1,
+        "one season list a run: {calls:?}"
     );
-    assert!(
-        !calls.iter().any(|c| c.starts_with("season_fresh")),
-        "the cached seasons match the episode counts: {calls:?}"
+    assert_eq!(
+        fresh_calls(&tmdb),
+        vec![format!("season_fresh {TMDB_SERIES}/2")]
     );
 
-    // TMDb now lists a fifth episode in season 1: that season alone is asked again
-    let mut tmdb = mock();
+    // An episode that aired within the grace period, or has no date, may still move: asked
+    for tmdb in [settled(-15, -3), {
+        let mut t = settled(-15, -10);
+        let mut s1 = t.cached[&(TMDB_SERIES, 1)].clone();
+        s1.episodes[3].1.premiere_date = None;
+        t.cached.insert((TMDB_SERIES, 1), s1);
+        t
+    }] {
+        run_with(&fx, &tmdb, &settings(&fx, true, false, false)).await;
+        assert_eq!(
+            fresh_calls(&tmdb),
+            vec![
+                format!("season_fresh {TMDB_SERIES}/1"),
+                format!("season_fresh {TMDB_SERIES}/2")
+            ]
+        );
+    }
+
+    // TMDb lists a fifth episode in the settled season 1: its count changed, so it is asked
+    let mut tmdb = settled(-15, -10);
     let mut s1 = tmdb.current[&(TMDB_SERIES, 1)].clone();
     s1.episodes.push(tmdb_episode(1, 5, Some(12)));
     tmdb.current.insert((TMDB_SERIES, 1), s1);
     tmdb.lists.get_mut(&TMDB_SERIES).unwrap().seasons[1].episode_count = Some(5);
     run_with(&fx, &tmdb, &settings(&fx, true, false, false)).await;
-    let fresh: Vec<String> = tmdb
-        .calls()
-        .into_iter()
-        .filter(|c| c.starts_with("season_fresh"))
-        .collect();
-    assert_eq!(fresh, vec![format!("season_fresh {TMDB_SERIES}/1")]);
+    assert_eq!(
+        fresh_calls(&tmdb),
+        vec![
+            format!("season_fresh {TMDB_SERIES}/1"),
+            format!("season_fresh {TMDB_SERIES}/2")
+        ]
+    );
     assert!(slots(&fx).await.contains(&(1, 5, true)));
+}
+
+#[tokio::test]
+async fn missing_episodes_ended_series_are_pruned_without_asking_tmdb() {
+    let fx = fixture("Returning Series").await;
+    let tmdb = mock();
+    // S1E3 (airs in 5 days) and S2E1 (in 40 days, in a virtual season 2)
+    run_with(&fx, &tmdb, &settings(&fx, true, false, false)).await;
+    assert_eq!(
+        slots(&fx).await,
+        vec![(1, 1, false), (1, 3, true), (2, 1, true)]
+    );
+    let s2 = repo_virtual::series_seasons(&fx.pool, fx.series)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|s| s.index_number == Some(2))
+        .unwrap();
+
+    // The series ends. A file holding TMDb's S2E1 arrives under another number (S1E9).
+    repo_virtual::set_series_status(&fx.pool, fx.series, "Ended")
+        .await
+        .unwrap();
+    let file = MediaItem {
+        id: Uuid::new_v4(),
+        name: "Show A S01E09".to_string(),
+        media_type: MediaType::Episode,
+        path: "/tv/Show A/Season 1/Show A S01E09.mkv".to_string(),
+        parent_id: Some(fx.season1),
+        library_id: fx.library,
+        index_number: Some(9),
+        parent_index_number: Some(1),
+        tmdb_id: Some(50_201),
+        ..MediaItem::default_dto_fields()
+    };
+    rustyfin_db::repo_media::upsert_media_item(&fx.pool, &file)
+        .await
+        .unwrap();
+
+    // 13 days on, S1E3 aired 8 days ago: past the grace period. No TMDb request is made.
+    let calls_before = tmdb.calls().len();
+    let source = Source {
+        lookups: &tmdb,
+        provider_name: "TMDb",
+    };
+    let later = today() + chrono::Duration::days(13);
+    let s = settings(&fx, true, false, false);
+    let outcome = run(&fx.pool, Some(source), &s, later, &|_| {})
+        .await
+        .unwrap();
+    assert_eq!(tmdb.calls().len(), calls_before, "{:?}", tmdb.calls());
+    assert_eq!(outcome.pruned, 2, "aged out and superseded");
+    assert_eq!(outcome.seasons_removed, 1, "the emptied virtual season 2");
+    assert_eq!(slots(&fx).await, vec![(1, 1, false), (1, 9, false)]);
+    assert!(
+        rustyfin_db::repo_media::get_item_by_id(&fx.pool, s2.id)
+            .await
+            .unwrap()
+            .is_none()
+    );
 }
 
 #[tokio::test]
