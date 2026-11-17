@@ -822,7 +822,7 @@ mod tests {
         /// The NAL unit: `header`, then these bits, the stop bit, padding, escaped.
         fn nal(&mut self, header: u8) -> Vec<u8> {
             self.0.push(true);
-            while self.0.len() % 8 != 0 {
+            while !self.0.len().is_multiple_of(8) {
                 self.0.push(false);
             }
             let rbsp: Vec<u8> = self
@@ -967,7 +967,9 @@ mod tests {
             let mut out = Vec::new();
             let plain = (false, 0, false);
             let idr = h264_slice(coding, true, (0, 6), plain);
-            stream.push(&packet(&[idr.clone()]), &mut out).unwrap();
+            stream
+                .push(&packet(std::slice::from_ref(&idr)), &mut out)
+                .unwrap();
             assert_eq!(last_nal(&out), idr, "an IDR slice goes out as it came");
             // Whatever they held, the next key frames get frame_num 1, 2, 3 and an LSB 4 on
             for k in 1..=3 {
