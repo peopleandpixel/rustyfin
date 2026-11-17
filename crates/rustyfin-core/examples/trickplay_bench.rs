@@ -53,6 +53,11 @@ async fn library(pool: &SqlitePool, dir: &Path, videos: &[(Uuid, &str)]) -> Stri
 
 #[tokio::main]
 async fn main() {
+    // RUST_LOG=rustyfin_core::trickplay=debug logs each tile's waits and times to stderr
+    tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .with_writer(std::io::stderr)
+        .init();
     let args: Vec<String> = std::env::args().skip(1).collect();
     let [mode, root, paths @ ..] = args.as_slice() else {
         eprintln!("usage: trickplay_bench <each|all> <data dir> <video>...");

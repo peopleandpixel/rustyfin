@@ -18,7 +18,7 @@ use tokio::fs;
 use tokio::process::Command;
 use tokio::sync::{RwLock, RwLockReadGuard, Semaphore, SemaphorePermit, watch};
 use tokio::task::JoinSet;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 use rustyfin_model::trickplay::TrickplayInfo;
@@ -755,10 +755,17 @@ async fn seek_tile(
     raw: Option<RawVideo>,
     cancel: &Cancel,
 ) -> Result<(), String> {
+    let waiting = std::time::Instant::now();
     let _slot = tokio::select! {
         slot = seek_tile_slots().acquire() => slot.expect("the semaphore is never closed"),
         _ = cancel.cancelled() => return Err("cancelled".to_string()),
     };
+    debug!(
+        path = tile.path,
+        tile = tile.index,
+        waited_ms = waiting.elapsed().as_millis(),
+        "trickplay tile slot"
+    );
     let interval = f64::from(INTERVAL_MS) / 1000.0;
     // Just before the middle: a key frame right on it is the next thumbnail's to the fps
     // filter. A millisecond, as Matroska's times are in milliseconds and a seek rounds to them.
@@ -987,10 +994,17 @@ async fn raw_tile(
     if let Some(vaapi) = raw.vaapi.as_deref().filter(|v| v.usable()) {
         // One tile on the device per image job: it decodes one at a time anyway, and each
         // ffmpeg on it holds more memory than one in software
+        let waiting = std::time::Instant::now();
         let _slot = tokio::select! {
             slot = device_tile_slots().acquire() => slot.expect("the semaphore is never closed"),
             _ = cancel.cancelled() => return Err("cancelled".to_string()),
         };
+        debug!(
+            path = tile.path,
+            tile = tile.index,
+            waited_ms = waiting.elapsed().as_millis(),
+            "trickplay device slot"
+        );
         match raw_tile_on(tile, from, wanted, raw, Some(vaapi), cancel).await {
             Ok(()) => return Ok(()),
             Err(e) if cancel.is_cancelled() => return Err(e),
@@ -1028,7 +1042,22 @@ async fn raw_tile_on(
     };
     input.extend(["-threads", "1", "-f", raw.codec.format(), "-i", "pipe:0"].map(String::from));
     let ffmpeg_args = tile_args(input, &chain, tile, &frames);
-    let fed = pipe_key_frames(from, tile.path, &ffmpeg_args, stream, cancel).await?;
+    let timing = TileTiming::new();
+    let piped = pipe_key_frames(from, tile.path, &ffmpeg_args, stream, &timing, cancel).await;
+    // Where a tile's time goes: ffmpeg starting (and opening the device) before it takes the
+    // first packet, the packets coming in, and its finish after the last
+    let ms = |d: Option<Duration>| d.map(|d| d.as_millis());
+    debug!(
+        path = tile.path,
+        tile = tile.index,
+        device = vaapi.is_some(),
+        first_packet_ms = ms(timing.first_packet.get().copied()),
+        last_packet_ms = ms(*timing.last_packet.lock().unwrap_or_else(|e| e.into_inner())),
+        total_ms = timing.started.elapsed().as_millis(),
+        error = piped.as_ref().err().map(String::as_str),
+        "trickplay tile"
+    );
+    let fed = piped?;
     if fed != wanted {
         return Err(format!("ffprobe found {fed} of {wanted} key frames"));
     }
@@ -1043,15 +1072,33 @@ async fn raw_tile_on(
     Ok(())
 }
 
+/// When a tile's ffmpeg took its first and last packets, from when it was started.
+struct TileTiming {
+    started: std::time::Instant,
+    first_packet: OnceLock<Duration>,
+    last_packet: std::sync::Mutex<Option<Duration>>,
+}
+
+impl TileTiming {
+    fn new() -> Self {
+        Self {
+            started: std::time::Instant::now(),
+            first_packet: OnceLock::new(),
+            last_packet: std::sync::Mutex::new(None),
+        }
+    }
+}
+
 /// Turns key frame packets into ffmpeg's input, through a `KeyFrameStream`.
-struct Feed {
+struct Feed<'a> {
     stream: KeyFrameStream,
     input: tokio::process::ChildStdin,
     out: Vec<u8>,
     fed: usize,
+    timing: &'a TileTiming,
 }
 
-impl Feed {
+impl Feed<'_> {
     async fn send(&mut self, packet: &[u8]) -> Result<(), String> {
         use tokio::io::AsyncWriteExt;
         self.out.clear();
@@ -1060,7 +1107,15 @@ impl Feed {
         self.input
             .write_all(&self.out)
             .await
-            .map_err(|e| format!("ffmpeg stopped reading the key frames: {e}"))
+            .map_err(|e| format!("ffmpeg stopped reading the key frames: {e}"))?;
+        let at = self.timing.started.elapsed();
+        self.timing.first_packet.get_or_init(|| at);
+        *self
+            .timing
+            .last_packet
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(at);
+        Ok(())
     }
 
     /// Sends the key frames ffprobe prints (`-show_data`) with `probe_args`. Dropping it kills
@@ -1186,6 +1241,7 @@ async fn pipe_key_frames(
     path: &str,
     ffmpeg_args: &[String],
     stream: KeyFrameStream,
+    timing: &TileTiming,
     cancel: &Cancel,
 ) -> Result<usize, String> {
     let mut ffmpeg = tool("ffmpeg");
@@ -1202,6 +1258,7 @@ async fn pipe_key_frames(
         input,
         out: Vec::new(),
         fed: 0,
+        timing,
     };
     let feeding = async {
         match from {
