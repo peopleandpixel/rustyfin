@@ -41545,6 +41545,56 @@ async fn r3playback_hls_input_outside_the_library_is_refused() {
 
 // R3 security review fixes
 
+/// The `/DynamicHls` segment route takes a transcode id and a segment number, never a path: a
+/// `..` in any part, a name that isn't a segment, or a playback id that isn't a UUID answers
+/// 400; an unknown transcode answers 404; nothing is read outside the transcode cache.
+#[tokio::test]
+async fn r3security_dynamic_hls_resolves_segments_by_id_and_number_only() {
+    let state = test_state().await;
+    let (token, _) = admin_session(&state).await;
+    // A file a traversal would reach from the old relative `data/transcode` or the cache root
+    let secret = state.data_dir.join("secret.ts");
+    std::fs::write(&secret, b"secret").unwrap();
+    let app = app(state);
+    let session = uuid::Uuid::new_v4();
+    for (uri, expected) in [
+        (
+            "/DynamicHls/%2E%2E/%2E%2E/secret.ts".to_string(),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            format!("/DynamicHls/{session}/0/..%2F..%2Fsecret.ts"),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            format!("/DynamicHls/{session}/%2E%2E/main.m3u8"),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            "/DynamicHls/not-a-uuid/0/0.ts".to_string(),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            format!("/DynamicHls/{session}/0/0.ts"),
+            StatusCode::NOT_FOUND,
+        ),
+        (
+            format!("/DynamicHls/{session}/0/init.mp4"),
+            StatusCode::NOT_FOUND,
+        ),
+    ] {
+        let (status, body) = r3playback_get(&app, &uri, &token).await;
+        assert_eq!(status, expected, "{uri}");
+        assert_ne!(body, b"secret", "{uri}");
+    }
+    // Signed out: 401, as before
+    let req = Request::builder()
+        .uri(format!("/DynamicHls/{session}/0/0.ts"))
+        .body(Body::empty())
+        .unwrap();
+    assert_eq!(g1_send_raw(&app, req).await.0, StatusCode::UNAUTHORIZED);
+}
+
 /// The DLNA stream needs no sign-in, so it checks a stored path as the signed-in stream does:
 /// a file outside every library, the database, a `..` path and a link out of the library (with
 /// `RefuseLinksOutOfLibraries`) answer 404; the library's own file streams.

@@ -1260,6 +1260,32 @@ impl TranscodeManager {
         self.get_segment_path(playback_id, segment_name)
     }
 
+    /// The item of HLS session `playback_id` and the path of its numbered segment `index`, or of
+    /// its fragmented MP4 init segment when `index` is `None`. Touches the session. The file name
+    /// is the one ffmpeg writes (`segment_%04d.{ts|mp4}`, `init.mp4`), made here from the number,
+    /// so nothing a client sends becomes part of the path; it lies in the session's directory
+    /// under the configured cache root (`get_segment_path`). `None` for an unknown or progressive
+    /// session, or a file it hasn't written.
+    pub fn session_segment(
+        &self,
+        playback_id: Uuid,
+        index: Option<u32>,
+    ) -> Option<(Uuid, PathBuf)> {
+        let (item_id, fmp4) = {
+            let mut session = self.sessions.get_mut(&playback_id)?;
+            if session.progressive {
+                return None;
+            }
+            session.last_access = Instant::now();
+            (session.item_id, session.profile.fmp4)
+        };
+        let name = match index {
+            Some(index) => format!("segment_{index:04}.{}", if fmp4 { "mp4" } else { "ts" }),
+            None => "init.mp4".to_string(),
+        };
+        Some((item_id, self.get_segment_path(playback_id, &name)?))
+    }
+
     /// Get the path to a segment for the legacy `/hls/{segment}` route: the item's most recently
     /// used session if it has the file (touched), else the item's old per-item directory.
     /// A session's playback id in place of the item id finds nothing: session directories are
@@ -3606,6 +3632,36 @@ exec sleep 30
         let profile = TranscodeProfile::default();
         mgr.start_transcode(item, "/in.mkv", &profile, play_session_id, device_id)
             .await
+    }
+
+    /// A session's numbered segment is found by playback id and number alone, with the item it
+    /// belongs to; an unknown id, a number not written yet and the init segment of a TS session
+    /// find nothing.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn r3security_session_segment_by_number() {
+        let (_dir, mgr) = fake_manager("good", Duration::from_secs(10));
+        let item = Uuid::new_v4();
+        let (playlist, id) = start(&mgr, item, "psid", "dev").await.unwrap();
+        let (found_item, path) = mgr.session_segment(id, Some(0)).expect("segment 0");
+        assert_eq!(found_item, item);
+        assert_eq!(path.file_name().unwrap(), SEGMENT);
+        assert_eq!(
+            path.parent(),
+            playlist
+                .parent()
+                .map(|p| p.canonicalize().unwrap())
+                .as_deref()
+        );
+        assert!(mgr.session_segment(id, Some(9999)).is_none());
+        assert!(mgr.session_segment(id, None).is_none());
+        assert!(mgr.session_segment(Uuid::new_v4(), Some(0)).is_none());
+        assert!(
+            mgr.session_segment(item, Some(0)).is_none(),
+            "an item id is no session"
+        );
+        mgr.stop_all().await;
+        assert!(mgr.session_segment(id, Some(0)).is_none());
     }
 
     #[cfg(unix)]
