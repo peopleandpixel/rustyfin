@@ -328,8 +328,8 @@
         <a class="flex items-center gap-2.5 cursor-pointer select-none group" onclick="navigate('home')">
             <img src="/web/assets/logo.png" alt="Rustyfin" class="w-8 h-8 rounded-lg shadow-md transition-transform group-hover:scale-105">
             <div class="flex items-center gap-1.5">
-                <span class="hidden sm:inline text-base font-bold tracking-tight text-white group-hover:text-[#00a4dc] transition-colors">Rustyfin</span>
-                <span id="version-badge" class="hidden sm:inline text-[10px] font-semibold px-1.5 py-0.5 rounded bg-white/10 text-white/50 tracking-wider">...</span>
+                <span class="max-sm:hidden text-base font-bold tracking-tight text-white group-hover:text-[#00a4dc] transition-colors">Rustyfin</span>
+                <span id="version-badge" class="max-sm:hidden text-[10px] font-semibold px-1.5 py-0.5 rounded bg-white/10 text-white/50 tracking-wider">...</span>
             </div>
         </a>
     </div>
@@ -356,7 +356,7 @@
             <span data-i18n="nav.connect">Connect</span>
         </button>
 
-        <button id="nav-add-lib" class="hidden jf-btn-primary !py-1.5 !px-3 text-xs flex items-center gap-1.5" title="Add a new library" data-i18n-title="nav.add_new_library" onclick="openAddLibrary()">
+        <button id="nav-add-lib" class="hidden max-sm:!hidden jf-btn-primary !py-1.5 !px-3 text-xs flex items-center gap-1.5" title="Add a new library" data-i18n-title="nav.add_new_library" onclick="openAddLibrary()">
             <span class="text-sm leading-none font-bold">＋</span>
             <span class="hidden md:inline" data-i18n="common.library">Library</span>
         </button>

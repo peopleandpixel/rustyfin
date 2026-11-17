@@ -29265,6 +29265,11 @@ fn r3mobile_drawer() {
 }
 
 #[test]
+fn r3mobile_touch() {
+    b124_node_test("r3mobile_touch.mjs");
+}
+
+#[test]
 fn r3android_page() {
     b124_node_test("r3android_page.mjs");
 }

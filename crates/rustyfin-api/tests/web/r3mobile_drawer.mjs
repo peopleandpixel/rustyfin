@@ -94,6 +94,17 @@ test('router uses the drawer module and closes it on navigation', () => {
     assert.match(nav.slice(0, nav.indexOf('\n}\n')), /closeSidebar\(\)/);
 });
 
+test('the header brand word and version badge hide on phones only', () => {
+    // input.css has an unlayered `.hidden { display: none !important }`, so `hidden sm:inline` would hide
+    // them at every width; a max-sm variant hides them below 640 px only
+    const badge = html.match(/<span id="version-badge" class="([^"]*)"/)[1].split(/\s+/);
+    const brand = html.match(/<span class="([^"]*)">Rustyfin<\/span>/)[1].split(/\s+/);
+    for (const classes of [badge, brand]) {
+        assert.ok(classes.includes('max-sm:hidden'), classes.join(' '));
+        assert.ok(!classes.includes('hidden'), 'no plain hidden class');
+    }
+});
+
 test('viewport covers the notch area', () => {
     assert.match(html, /<meta name="viewport" content="[^"]*viewport-fit=cover/);
 });
