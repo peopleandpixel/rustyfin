@@ -215,6 +215,10 @@ pub struct TranscodeManager {
     warned: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
     /// The transcode reasons PlaybackInfo gave, by PlaySessionId (in ASCII lower case)
     reasons: Arc<std::sync::Mutex<HashMap<String, PlannedReasons>>>,
+    /// The last hardware detection (`hwaccel::detect`), None until the first one ends
+    detection: Arc<std::sync::RwLock<Option<crate::hwaccel::HardwareDetection>>>,
+    /// Held while a detection runs, so two never probe the devices at once
+    detecting: Arc<tokio::sync::Mutex<()>>,
 }
 
 /// The transcode reasons of one PlaybackInfo answer: each media source's that transcodes.
@@ -297,7 +301,54 @@ impl TranscodeManager {
             hardware: Arc::new(std::sync::Mutex::new(HardwareHealth::default())),
             warned: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
             reasons: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            detection: Arc::new(std::sync::RwLock::new(None)),
+            detecting: Arc::new(tokio::sync::Mutex::new(())),
         }
+    }
+
+    /// The ffmpeg the manager runs.
+    pub fn ffmpeg(&self) -> &Path {
+        &self.ffmpeg
+    }
+
+    /// The last hardware detection, None until the first one ends.
+    pub fn hardware_detection(&self) -> Option<crate::hwaccel::HardwareDetection> {
+        self.detection
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// Whether a hardware detection is running.
+    pub fn detecting_hardware(&self) -> bool {
+        self.detecting.try_lock().is_err()
+    }
+
+    /// Detects the machine's devices (`hwaccel::detect`, its clips under `data_dir`), keeps the
+    /// result and takes the encoding options it gives: while the administrator hasn't chosen a
+    /// type, the best device decodes. Detections run one at a time.
+    pub async fn detect_hardware(&self, data_dir: &Path) -> crate::hwaccel::HardwareDetection {
+        let _guard = self.detecting.lock().await;
+        let work = data_dir.join("hwaccel-probe");
+        let detection = crate::hwaccel::detect(&self.ffmpeg, &work).await;
+        self.set_hardware_detection(data_dir, detection.clone());
+        detection
+    }
+
+    /// Keeps `detection` and takes the encoding options it gives with `data_dir`'s saved ones.
+    pub fn set_hardware_detection(
+        &self,
+        data_dir: &Path,
+        detection: crate::hwaccel::HardwareDetection,
+    ) {
+        let settings = crate::hwaccel::effective_settings(
+            data_dir,
+            &self.ffmpeg.to_string_lossy(),
+            &self.cache_root,
+            Some(&detection),
+        );
+        *self.detection.write().unwrap_or_else(|e| e.into_inner()) = Some(detection);
+        self.set_encoding_settings(settings);
     }
 
     /// Keeps the transcode reasons PlaybackInfo gave for `play_session_id`: the reasons of each
@@ -393,6 +444,7 @@ impl TranscodeManager {
     /// Replace the encoding options. The hardware failures noted before are forgotten, so the
     /// hardware is tried again, and the warnings may be logged again.
     pub fn set_encoding_settings(&self, settings: EncodingSettings) {
+        encoding::set_current(&settings);
         *self.settings.write().unwrap_or_else(|e| e.into_inner()) = settings;
         *self.hardware_health() = HardwareHealth::default();
         self.warned
@@ -429,6 +481,20 @@ impl TranscodeManager {
                 );
             }
         }
+    }
+
+    /// Whether the progressive transcode `playback_id` decodes or encodes on a device.
+    pub fn progressive_uses_hardware(&self, playback_id: Uuid) -> bool {
+        self.sessions
+            .get(&playback_id)
+            .is_some_and(|s| uses_hardware(&s.profile))
+    }
+
+    /// A progressive hardware transcode of `input` that wrote nothing: the file is transcoded in
+    /// software from then on (the next `start_progressive` of it runs in software), and this is
+    /// logged once.
+    pub fn note_progressive_hardware_failure(&self, input: &str, message: &str) {
+        self.note_hardware_result(input, Some(message));
     }
 
     /// Log `message` as a warning the first time `key` is seen.
@@ -1495,6 +1561,23 @@ struct HwPlan {
     accel: HwAccel,
     decode: bool,
     encode: bool,
+}
+
+/// The arguments that open the device of `accel` (and decode on it with `decode`), as a
+/// transcode writes them; the hardware detection probes with these.
+pub(crate) fn hw_device_args(
+    accel: HwAccel,
+    decode: bool,
+    settings: &EncodingSettings,
+) -> Vec<String> {
+    hw_input_args(
+        HwPlan {
+            accel,
+            decode,
+            encode: false,
+        },
+        settings,
+    )
 }
 
 /// The input arguments that open the device, and decode on it with `plan.decode`, as Jellyfin

@@ -432,13 +432,10 @@ fn encoding_path(state: &AppState) -> std::path::PathBuf {
     state.data_dir.join(rustyfin_core::encoding::ENCODING_FILE)
 }
 
-/// The stored encoding options: the defaults, under what a client saved.
-async fn encoding_options(
+/// What a client saved, None when nothing (or nothing readable) was.
+async fn saved_encoding_options(
     state: &AppState,
-) -> Result<serde_json::Map<String, serde_json::Value>, ApiError> {
-    let ffmpeg = std::env::var("RUSTYFIN_FFMPEG_PATH").unwrap_or_else(|_| "ffmpeg".to_string());
-    let mut options =
-        rustyfin_core::encoding::default_options(&ffmpeg, state.transcode_manager.cache_root());
+) -> Result<Option<serde_json::Map<String, serde_json::Value>>, ApiError> {
     let saved = match tokio::fs::read_to_string(encoding_path(state)).await {
         Ok(text) => serde_json::from_str::<serde_json::Value>(&text).unwrap_or_else(|e| {
             tracing::warn!("ignoring an unreadable encoding.json: {e}");
@@ -447,10 +444,27 @@ async fn encoding_options(
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => serde_json::Value::Null,
         Err(e) => return Err(ApiError::Internal(e.to_string())),
     };
-    if let serde_json::Value::Object(saved) = saved {
-        options.extend(saved);
-    }
-    Ok(options)
+    Ok(match saved {
+        serde_json::Value::Object(saved) => Some(saved),
+        _ => None,
+    })
+}
+
+/// The encoding options in effect: the defaults, under the detected device while the
+/// administrator hasn't chosen a hardware acceleration type, under what a client saved
+/// (`rustyfin_core::hwaccel::effective_options`).
+async fn encoding_options(
+    state: &AppState,
+) -> Result<serde_json::Map<String, serde_json::Value>, ApiError> {
+    let ffmpeg = std::env::var("RUSTYFIN_FFMPEG_PATH").unwrap_or_else(|_| "ffmpeg".to_string());
+    let defaults =
+        rustyfin_core::encoding::default_options(&ffmpeg, state.transcode_manager.cache_root());
+    let saved = saved_encoding_options(state).await?;
+    Ok(rustyfin_core::hwaccel::effective_options(
+        defaults,
+        saved.as_ref(),
+        state.transcode_manager.hardware_detection().as_ref(),
+    ))
 }
 
 async fn save_encoding_configuration(
@@ -464,6 +478,14 @@ async fn save_encoding_configuration(
     };
     rustyfin_core::encoding::validate_options(options)
         .map_err(|e| ApiError::BadRequest(format!("encoding: {e}")))?;
+    // The detected values sent back unchanged stay automatic
+    let mut options = options.clone();
+    rustyfin_core::hwaccel::keep_automatic(
+        &mut options,
+        saved_encoding_options(state).await?.as_ref(),
+        state.transcode_manager.hardware_detection().as_ref(),
+    );
+    let body = serde_json::Value::Object(options);
     ensure_config_size(ENCODING_KEY, &body)?;
     let path = encoding_path(state);
     let text =
