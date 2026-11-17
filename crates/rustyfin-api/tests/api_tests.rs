@@ -27870,7 +27870,8 @@ async fn g1_item_admin_routes() {
             true,
         ),
         ("POST", format!("/Items/{item}/Refresh"), None, false),
-        ("DELETE", format!("/Items?ids={item}"), None, true),
+        // DELETE /Items is for any user with deletion rights, as in Jellyfin 12.4:
+        // r3items_delete_items_deletes_exactly_the_ids covers it.
         ("DELETE", format!("/Items/{item}"), None, true),
         ("POST", format!("/Items/{item}/Images/Primary"), None, true),
         (
@@ -53707,6 +53708,91 @@ async fn r3items_filters2_lists_stream_languages() {
     let (_, music) = send_authed(&app, "GET", &filters("Audio"), &token, None).await;
     assert_eq!(music["AudioLanguages"], serde_json::json!([]));
     assert_eq!(music["SubtitleLanguages"], serde_json::json!([]));
+}
+
+#[tokio::test]
+async fn r3items_delete_items_deletes_exactly_the_ids() {
+    let state = test_state().await;
+    let (lib, ids) = r3items_movies(&state).await;
+    let other = j6_library(&state, "R3 Items Other").await;
+    let echo = j6_add_item(&state, other, None, "Echo", "Movie").await;
+    let app = app(state.clone());
+    let (admin, _) = admin_session(&state).await;
+    let (a, b, c, d) = (ids[0], ids[1], ids[2], ids[3]);
+    let listed = |token: String| {
+        let app = app.clone();
+        async move {
+            let uri = format!("/Items?ParentId={lib}&Recursive=true&SortBy=SortName");
+            r3items_names(&app, &uri, &token).await.0
+        }
+    };
+    // The listing is cached before the delete, so a stale answer would show.
+    assert_eq!(
+        listed(admin.clone()).await,
+        ["Alpha", "Bravo", "Charlie", "Delta"]
+    );
+    // Only the ids given go, and the answer is 204, as in Jellyfin 12.4.
+    let (status, _) = send_authed(
+        &app,
+        "DELETE",
+        &format!("/Items?ids={a},{}", b.simple()),
+        &admin,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    assert_eq!(listed(admin.clone()).await, ["Charlie", "Delta"]);
+    // A ParentId without ids deletes nothing; an unknown id is a 404.
+    let (status, _) = send_authed(
+        &app,
+        "DELETE",
+        &format!("/Items?ParentId={lib}"),
+        &admin,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    assert_eq!(listed(admin.clone()).await, ["Charlie", "Delta"]);
+    let missing = format!("/Items?ids={}", uuid::Uuid::new_v4());
+    let (status, _) = send_authed(&app, "DELETE", &missing, &admin, None).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    // A user without deletion rights gets a 401 and deletes nothing.
+    let kid = add_user(&state, "r3items-deleter", "r3items-pass", false).await;
+    let (token, _) = login(&app, "r3items-deleter", "r3items-pass")
+        .await
+        .unwrap();
+    let (status, _) = send_authed(&app, "DELETE", &format!("/Items?ids={c}"), &token, None).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert_eq!(listed(admin.clone()).await, ["Charlie", "Delta"]);
+    // With deletion rights in this library only (EnableContentDeletionFromFolders).
+    let (_, user) = send_authed(&app, "GET", &format!("/Users/{kid}"), &admin, None).await;
+    let mut policy = user["Policy"].clone();
+    policy["EnableContentDeletionFromFolders"] = serde_json::json!([lib.simple().to_string()]);
+    let (status, _) = send_authed(
+        &app,
+        "POST",
+        &format!("/Users/{kid}/Policy"),
+        &admin,
+        Some(&policy.to_string()),
+    )
+    .await;
+    assert!(status.is_success(), "{status}");
+    let (_, user) = send_authed(&app, "GET", &format!("/Users/{kid}"), &admin, None).await;
+    assert_eq!(
+        user["Policy"]["EnableContentDeletionFromFolders"],
+        serde_json::json!([lib.simple().to_string()])
+    );
+    let (status, _) =
+        send_authed(&app, "DELETE", &format!("/Items?ids={echo}"), &token, None).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    let (status, _) = send_authed(&app, "DELETE", &format!("/Items?ids={c}"), &token, None).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    // The web client's multi-select deletes one item at a time, through the same rights.
+    let (status, _) = send_authed(&app, "DELETE", &format!("/Items/{d}"), &token, None).await;
+    assert!(status.is_success(), "{status}");
+    assert!(listed(admin.clone()).await.is_empty());
+    let (status, _) = send_authed(&app, "DELETE", &format!("/Items/{echo}"), &token, None).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
 }
 
 #[tokio::test]

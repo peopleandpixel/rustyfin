@@ -1913,7 +1913,7 @@ pub(crate) async fn enrich_items_with(
 
 pub fn routes() -> Router<AppState> {
     Router::new()
-        .route("/Items", get(get_items_for_query_user))
+        .route("/Items", get(get_items_for_query_user).delete(delete_items))
         // DELETE checks the caller itself: a playlist's owner may delete it, as in Jellyfin.
         .route("/Items/{id}", get(get_item).delete(delete_item))
         .route("/Items/{id}/Children", get(get_children))
@@ -1955,7 +1955,6 @@ pub fn routes() -> Router<AppState> {
 /// Administrator-only item removal routes. `routes::build_router` wraps them in `require_admin`.
 pub fn admin_routes() -> Router<AppState> {
     Router::new()
-        .route("/Items", delete(delete_items))
         .route("/Items/{id}/Images/{image_type}", delete(delete_item_image))
         .route(
             "/Items/{id}/Images/{image_type}/{image_index}",
@@ -3756,35 +3755,56 @@ async fn delete_item(
     if let Some(status) = super::collections::delete_container(&state, id, &claims).await? {
         return Ok(status.into_response());
     }
-    // Jellyfin's EnableContentDeletion; left unset, administrators may and others not.
-    let may_delete = claims.sub.is_nil()
-        || crate::parental::caller_access(&state, &claims)
-            .await?
-            .enable_content_deletion
-            .unwrap_or(claims.is_admin);
+    let library = rustyfin_db::repo_media::get_item_by_id(&state.db, id)
+        .await?
+        .map(|item| item.library_id);
+    let may_delete = match library {
+        Some(library) => may_delete_in(&state, &claims, library).await?,
+        None => may_delete_in(&state, &claims, Uuid::nil()).await?,
+    };
     if !may_delete {
         return Err(ApiError::Forbidden(
             "This user may not delete media.".to_string(),
         ));
     }
-    // The uploaded lyric files of the item and the items under it go with them.
-    let library = rustyfin_db::repo_media::get_item_by_id(&state.db, id)
-        .await?
-        .map(|item| item.library_id);
-    let lyrics = match library {
-        Some(library) => rustyfin_core::lyrics::uploads_in_library(&state.db, library).await,
-        None => Vec::new(),
+    let Some(library) = library else {
+        return Err(ApiError::NotFound("item not found".into()));
     };
+    remove_item(&state, id, library).await?;
+    Ok(Json(json!({ "status": "ok" })).into_response())
+}
+
+/// Whether the caller may delete the media of `library`, as Jellyfin 12.4's
+/// `BaseItem.IsAuthorizedToDelete`: the API key always; a user with `EnableContentDeletion`
+/// (left unset, administrators may and others not), or with the library among their
+/// `EnableContentDeletionFromFolders`.
+async fn may_delete_in(state: &AppState, claims: &Claims, library: Uuid) -> Result<bool, ApiError> {
+    if claims.sub.is_nil() {
+        return Ok(true);
+    }
+    let access = crate::parental::caller_access(state, claims).await?;
+    Ok(access.enable_content_deletion.unwrap_or(claims.is_admin)
+        || access
+            .enable_content_deletion_from_folders
+            .iter()
+            .any(|folder| Uuid::parse_str(folder).ok() == Some(library)))
+}
+
+/// Deletes the media item `id` of `library` and the items under it, with their uploaded lyric
+/// files and trickplay pictures, and clears the cached answers that held them
+/// (`ApiCache::items_changed`). NotFound when there is no such item.
+async fn remove_item(state: &AppState, id: Uuid, library: Uuid) -> Result<(), ApiError> {
+    // The uploaded lyric files of the item and the items under it go with them.
+    let lyrics = rustyfin_core::lyrics::uploads_in_library(&state.db, library).await;
     let affected = crate::cache::ApiCache::affected_items(&state.db, id).await;
-    let deleted = rustyfin_db::repo_media::delete_item(&state.db, id).await?;
-    if !deleted {
+    if !rustyfin_db::repo_media::delete_item(&state.db, id).await? {
         return Err(ApiError::NotFound("item not found".into()));
     }
     state.cache.items_changed(&state.image_cache, &affected);
     rustyfin_core::lyrics::remove_orphaned_uploads(&state.db, &lyrics).await;
     // The items under it lose theirs at the image tasks' next run.
     rustyfin_core::trickplay::remove_item_files(&state.data_dir, id).await;
-    Ok(Json(json!({ "status": "ok" })).into_response())
+    Ok(())
 }
 
 async fn get_children(
@@ -4363,31 +4383,40 @@ async fn get_user_resume(
     resume_page(&state, &claims, user_id, &query).await
 }
 
-/// DELETE /Items - Delete multiple items
+/// DELETE /Items?ids=a,b,c, as Jellyfin 12.4's `LibraryController.DeleteItems`: each listed item
+/// in turn (a collection or playlist as `DELETE /Items/{id}` deletes it), stopping at the first
+/// that fails: 404 for one that doesn't exist or is hidden from the caller, 401 for one the
+/// caller may not delete (`may_delete_in`). 204 when all are deleted. Ids that aren't ids are
+/// dropped, as by Jellyfin's comma-delimited binder.
 async fn delete_items(
     State(state): State<AppState>,
-    Query(query): Query<ItemsQuery>,
-) -> Result<(StatusCode, Json<serde_json::Value>), ApiError> {
-    let ids: Vec<Uuid> = if let Some(parent_id) = query.parent_id.or(query.parent_id_lower) {
-        // Delete all items under a parent
-        let items = rustyfin_db::repo_media::get_items_by_parent(&state.db_ro, parent_id).await?;
-        items.into_iter().map(|i| i.id).collect()
-    } else {
-        Vec::new()
-    };
-    let mut affected = Vec::new();
-    for id in &ids {
-        let under = crate::cache::ApiCache::affected_items(&state.db, *id).await;
-        if let Ok(true) = rustyfin_db::repo_media::delete_item(&state.db, *id).await {
-            affected.extend(under);
-            rustyfin_core::trickplay::remove_item_files(&state.data_dir, *id).await;
+    Query(params): Query<Vec<(String, String)>>,
+    Extension(claims): Extension<Claims>,
+) -> Result<StatusCode, ApiError> {
+    let ids: Vec<Uuid> = params
+        .iter()
+        .filter(|(key, _)| key.eq_ignore_ascii_case("ids"))
+        .flat_map(|(_, value)| parse_ids(Some(value)))
+        .collect();
+    let hidden = HiddenItems::for_caller(&state, &claims).await?;
+    for id in ids {
+        if super::collections::delete_container(&state, id, &claims)
+            .await?
+            .is_some()
+        {
+            continue;
         }
+        let library = rustyfin_db::repo_media::get_item_by_id(&state.db, id)
+            .await?
+            .map(|item| item.library_id)
+            .filter(|&library| !hidden.hides(id, library))
+            .ok_or_else(|| ApiError::NotFound("item not found".into()))?;
+        if !may_delete_in(&state, &claims, library).await? {
+            return Err(ApiError::Unauthorized);
+        }
+        remove_item(&state, id, library).await?;
     }
-    if let Some(parent) = query.parent_id.or(query.parent_id_lower) {
-        affected.push(parent);
-    }
-    state.cache.items_changed(&state.image_cache, &affected);
-    Ok((StatusCode::OK, Json(serde_json::json!({"Success": true}))))
+    Ok(StatusCode::NO_CONTENT)
 }
 
 /// GET /Items/{id}/Ancestors - Get parent chain
