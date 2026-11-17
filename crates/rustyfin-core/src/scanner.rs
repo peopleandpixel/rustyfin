@@ -1172,7 +1172,6 @@ async fn scan_flat_library(
         }
     }
     let mut found_extras = owned_extras;
-    found_extras.append(&mut part_extras);
     // A failure here stops the scan: the reconcile would otherwise add a second movie at the same path.
     rustyfin_db::repo_extras::release_extras(pool, library.id, &released, "Movie").await?;
 
@@ -1184,6 +1183,9 @@ async fn scan_flat_library(
             .iter()
             .any(|p| Path::new(p) == folder.as_path());
         let mut groups = naming::group_movie_files(folder, files, is_library_root);
+        for group in &mut groups {
+            prefer_stack(group, folder, &stack_names);
+        }
         // In a library root the title comes from the file: a stacked movie's from its stack's name.
         if is_library_root {
             for group in &mut groups {
@@ -1196,6 +1198,16 @@ async fn scan_flat_library(
         }
         movie_groups.extend(groups);
     }
+    // A part belongs to the movie its part 1 is a version of, whichever version is the movie's file.
+    for part in &mut part_extras {
+        if let Some(group) = movie_groups
+            .iter()
+            .find(|group| group.files.contains(&part.owner_paths[0]))
+        {
+            part.owner_paths = group.files.clone();
+        }
+    }
+    found_extras.append(&mut part_extras);
     // The items whose file is gone are read first: a group with no owner may take one over.
     let gone =
         scan_sync::gone_items(pool, library, &filter, &collected, &unreadable, &loops).await?;
@@ -1316,6 +1328,28 @@ async fn scan_flat_library(
         images: 0,
     };
     Ok((changes, new_item_ids))
+}
+
+/// Makes a stacked movie (part 1 of a movie split into files) the primary of its versions, as Jellyfin's
+/// `VideoListResolver.OrganizeAlternateVersions` prefers the version with more than one part, unless the
+/// primary is the file named exactly like its folder, which Jellyfin keeps first.
+fn prefer_stack(
+    group: &mut naming::VersionGroup,
+    folder: &Path,
+    stack_names: &HashMap<PathBuf, String>,
+) {
+    let named_like_folder = group.files[0].file_stem() == folder.file_name();
+    if named_like_folder || stack_names.contains_key(&group.files[0]) {
+        return;
+    }
+    if let Some(i) = group
+        .files
+        .iter()
+        .position(|file| stack_names.contains_key(file))
+    {
+        let head = group.files.remove(i);
+        group.files.insert(0, head);
+    }
 }
 
 /// A series folder that a TV scan walked.
