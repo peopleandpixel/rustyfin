@@ -41709,6 +41709,66 @@ async fn r3security_dlna_stream_urls_use_a_reachable_address() {
     );
 }
 
+/// A device id stored URL-encoded by sign-in's old parser: signing in again with the same header
+/// keeps the session and device under the decoded id, instead of starting a second session.
+#[tokio::test]
+async fn r3security_sign_in_adopts_a_device_id_stored_encoded() {
+    let state = test_state().await;
+    let (_, _) = admin_session(&state).await;
+    let user = add_user(&state, "r3sec-dana", "dana-pw", false).await;
+    let old_session = uuid::Uuid::new_v4().to_string();
+    let uid = user.to_string();
+    for sql in [
+        "INSERT INTO sessions (id, user_id, device_id, device_name, app_name, app_version)
+         VALUES (?1, ?2, 'dev%2B1', 'Phone', 'App', '1')",
+        "INSERT INTO access_tokens (token_hash, user_id, device_id, device_name, app_name, app_version)
+         VALUES (?1, ?2, 'dev%2B1', 'Phone', 'App', '1')",
+        "INSERT INTO devices (id, name, app_name, app_version, user_id) VALUES ('dev%2B1', 'Phone', 'App', '1', ?2)",
+    ] {
+        sqlx::query(sql)
+            .bind(&old_session)
+            .bind(&uid)
+            .execute(&state.db)
+            .await
+            .unwrap();
+    }
+    let db = state.db.clone();
+    let app = app(state);
+    let req = Request::builder()
+        .method("POST")
+        .uri("/Users/AuthenticateByName")
+        .header("Content-Type", "application/json")
+        .header(
+            "X-Emby-Authorization",
+            r#"MediaBrowser Client="App", Device="Phone", DeviceId="dev%2B1", Version="1""#,
+        )
+        .body(Body::from(r#"{"Username":"r3sec-dana","Pw":"dana-pw"}"#))
+        .unwrap();
+    let (status, body) = send(&app, req).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["SessionInfo"]["Id"], old_session, "{body}");
+    assert_eq!(body["SessionInfo"]["DeviceId"], "dev+1", "{body}");
+
+    let count = |sql: &'static str| {
+        let (db, uid) = (db.clone(), uid.clone());
+        async move {
+            sqlx::query_scalar::<_, i64>(sql)
+                .bind(uid)
+                .fetch_one(&db)
+                .await
+                .unwrap()
+        }
+    };
+    let encoded = "SELECT COUNT(*) FROM sessions WHERE user_id = ?1 AND device_id = 'dev%2B1'";
+    assert_eq!(count(encoded).await, 0);
+    let decoded = "SELECT COUNT(*) FROM sessions WHERE user_id = ?1 AND device_id = 'dev+1'";
+    assert_eq!(count(decoded).await, 1, "one session, not two");
+    let tokens = "SELECT COUNT(*) FROM access_tokens WHERE user_id = ?1 AND device_id = 'dev%2B1'";
+    assert_eq!(count(tokens).await, 0);
+    let devices = "SELECT COUNT(*) FROM devices WHERE user_id = ?1 AND id = 'dev%2B1'";
+    assert_eq!(count(devices).await, 0);
+}
+
 /// Universal's transcode URL percent-encodes every value: a `+` in the device id comes back as
 /// sent (stopping the transcode by device id compares it), and a `&` or `=` in a value adds no
 /// parameter.

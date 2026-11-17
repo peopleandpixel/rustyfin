@@ -76,6 +76,7 @@ async fn login(
     }
     let local = is_local(&state, peer, &headers);
     crate::parental::check_sign_in(&state, &user, &device.device_id, local).await?;
+    adopt_encoded_device_id(&state, &headers, user.id, &device).await;
     let (user, token) = rustyfin_auth::issue_login_token(&state.db, user.id, &device).await?;
     Ok(Json(start_session(&state, &device, user, token).await).into_response())
 }
@@ -98,6 +99,7 @@ async fn quick_connect_sign_in(
         let local = is_local(&state, peer, &headers);
         crate::parental::check_sign_in(&state, &user, &device.device_id, local).await?;
     }
+    adopt_encoded_device_id(&state, &headers, approver, &device).await;
     let (user, token) = rustyfin_auth::authenticate_approved(&state.db, approver, &device).await?;
     Ok(Json(start_session(&state, &device, user, token).await))
 }
@@ -122,6 +124,7 @@ async fn login_with_setup_code(
     }
     let local = is_local(&state, peer, &headers);
     crate::parental::check_sign_in(&state, verified.user(), &device.device_id, local).await?;
+    adopt_encoded_device_id(&state, &headers, verified.user().id, &device).await;
     let (user, token) =
         rustyfin_auth::redeem_setup_code(&state.db, verified, &req.new_pw, &device).await?;
     Ok(Json(start_session(&state, &device, user, token).await))
@@ -142,6 +145,36 @@ pub(crate) fn token_device(headers: &HeaderMap) -> rustyfin_auth::TokenDevice {
         device_name: auth.device.unwrap_or_default(),
         app_name: auth.client.unwrap_or_default(),
         app_version: auth.version.unwrap_or_default(),
+    }
+}
+
+/// Sign-in once stored the `DeviceId` as the client sent it, without URL-decoding it. When this
+/// sign-in's id was sent encoded, the user's sessions, tokens and device stored under the encoded
+/// form move to the decoded id first, so the sign-in finds its session (and replaces its token)
+/// instead of starting a second one. A failure is logged and the sign-in goes on.
+async fn adopt_encoded_device_id(
+    state: &AppState,
+    headers: &HeaderMap,
+    user_id: Uuid,
+    device: &rustyfin_auth::TokenDevice,
+) {
+    let Some(as_sent) =
+        crate::middleware::media_browser_header(headers).and_then(|auth| auth.device_id_as_sent)
+    else {
+        return;
+    };
+    if as_sent.is_empty() || device.device_id.is_empty() || as_sent == device.device_id {
+        return;
+    }
+    if let Err(e) = rustyfin_db::repo_session::rename_user_device(
+        &state.db,
+        user_id,
+        &as_sent,
+        &device.device_id,
+    )
+    .await
+    {
+        tracing::warn!("Could not move the user's encoded device id to its decoded form: {e}");
     }
 }
 

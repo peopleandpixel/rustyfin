@@ -309,6 +309,47 @@ pub async fn cleanup_expired_sessions(
     Ok(result.rows_affected())
 }
 
+/// Moves `user_id`'s sessions, access tokens and device stored under device id `from` to `to`,
+/// in one transaction. Sign-in once stored a device id as the client sent it (URL-encoded); this
+/// lets a later sign-in with the decoded id find them. A device row that `to` already has wins,
+/// and the `from` one is removed. Returns how many sessions moved.
+pub async fn rename_user_device(
+    pool: &SqlitePool,
+    user_id: Uuid,
+    from: &str,
+    to: &str,
+) -> Result<u64, sqlx::Error> {
+    let uid = user_id.to_string();
+    let mut tx = crate::begin_write(pool).await?;
+    let moved =
+        sqlx::query("UPDATE sessions SET device_id = ?1 WHERE user_id = ?2 AND device_id = ?3")
+            .bind(to)
+            .bind(&uid)
+            .bind(from)
+            .execute(&mut *tx)
+            .await?
+            .rows_affected();
+    sqlx::query("UPDATE access_tokens SET device_id = ?1 WHERE user_id = ?2 AND device_id = ?3")
+        .bind(to)
+        .bind(&uid)
+        .bind(from)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("UPDATE OR IGNORE devices SET id = ?1 WHERE user_id = ?2 AND id = ?3")
+        .bind(to)
+        .bind(&uid)
+        .bind(from)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("DELETE FROM devices WHERE user_id = ?1 AND id = ?2")
+        .bind(&uid)
+        .bind(from)
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    Ok(moved)
+}
+
 // ── Devices ──
 
 pub async fn upsert_device(
