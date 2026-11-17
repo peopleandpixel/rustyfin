@@ -113,6 +113,21 @@ body {
   }
 }
 
+/* touch: shared buttons, tabs and selects get 44px targets; checkboxes and radios get 20px */
+@media (pointer: coarse) {
+  .jf-btn-ghost, .jf-btn-primary, .jf-btn-secondary, .jf-tab, select.jf-input {
+    min-height: 2.75rem;
+  }
+  .jf-icon-btn {
+    min-width: 2.75rem;
+    min-height: 2.75rem;
+  }
+  input[type=checkbox]:not(.toggle), input[type=radio] {
+    width: 1.25rem;
+    height: 1.25rem;
+  }
+}
+
 .jf-drawer-item {
   display: flex;
   align-items: center;
@@ -150,16 +165,19 @@ body {
   transition: transform 0.25s cubic-bezier(0.16, 1, 0.3, 1), box-shadow 0.25s ease, border-color 0.25s ease;
 }
 
-.jf-card:hover {
-  transform: translateY(-6px) scale(1.02);
-  box-shadow: 0 16px 36px -10px rgba(0, 0, 0, 0.8), 0 0 20px -3px var(--jf-primary-glow);
-  border-color: var(--jf-border-hover);
+/* touch: the hover lift is for a mouse only, so a tap leaves no card lifted */
+@media (hover: hover) {
+  .jf-card:hover {
+    transform: translateY(-6px) scale(1.02);
+    box-shadow: 0 16px 36px -10px rgba(0, 0, 0, 0.8), 0 0 20px -3px var(--jf-primary-glow);
+    border-color: var(--jf-border-hover);
+  }
 }
 
 /* Library grid. Columns and gap are set here, not with Tailwind classes, because the virtual grid
    reads them to place its cells. Breakpoints are Tailwind's sm, md, lg and xl. */
 .jf-lib-grid {
-  --jf-cols: 2;
+  --jf-cols: 3; /* phones: medium posters 3 across, as Jellyfin */
   display: grid;
   grid-template-columns: repeat(var(--jf-cols), minmax(0, 1fr));
   gap: 1rem;
@@ -172,7 +190,7 @@ body {
 
 /* The library's view settings (library.js libraryGridClass): the card shape and size pick the
    columns per breakpoint. Medium posters are the default above. */
-.jf-lib-grid.jf-shape-poster.jf-size-small { --jf-cols: 3; }
+.jf-lib-grid.jf-shape-poster.jf-size-small { --jf-cols: 4; } /* phones: 4 small posters across */
 .jf-lib-grid.jf-shape-poster.jf-size-large { --jf-cols: 2; }
 .jf-lib-grid.jf-shape-backdrop { --jf-cols: 1; }
 .jf-lib-grid.jf-shape-backdrop.jf-size-small { --jf-cols: 2; }
@@ -377,7 +395,7 @@ body {
 
 .jf-card-action {
   width: 2rem;
-  height: 2rem;
+  height: 2rem; /* touch: 2.5rem under (hover: none) below */
   border-radius: 9999px;
   display: inline-flex;
   align-items: center;
@@ -542,6 +560,14 @@ body {
 }
 
 @media (hover: none) {
+  /* touch: bigger card buttons, and the drawer's scan button is visible without hover */
+  .jf-card-action {
+    width: 2.5rem;
+    height: 2.5rem;
+  }
+  [data-action="scan-library"] {
+    opacity: 0.6;
+  }
   .jf-card-actions {
     opacity: 1;
   }
@@ -1122,8 +1148,12 @@ select.jf-input {
   box-shadow: 0 0 10px rgba(0, 164, 220, 0.5);
 }
 
-/* The library's filter menu: a popover (top layer, light dismiss), centred by the UA style */
+/* The library's filter menu: a popover (top layer, light dismiss), centred explicitly (the Android WebView's UA style didn't) */
 .jf-filter-menu {
+  position: fixed;
+  inset: 0;
+  margin: auto;
+  height: fit-content;
   width: min(92vw, 30rem);
   max-height: min(80dvh, 40rem);
   overflow-y: auto;
@@ -1133,6 +1163,28 @@ select.jf-input {
   background: var(--jf-bg-surface);
   color: var(--jf-text-main);
   box-shadow: 0 20px 50px rgba(0, 0, 0, 0.6);
+}
+
+/* phones: the filter menu is a bottom sheet */
+@media (width < 40rem) {
+  .jf-filter-menu {
+    inset: auto 0 0 0;
+    width: 100%;
+    max-width: 100%;
+    margin: 0;
+    border-radius: 1rem 1rem 0 0;
+    max-height: 85dvh;
+    padding-bottom: max(1rem, env(safe-area-inset-bottom));
+  }
+}
+
+/* touch: each option row is a 44px target */
+@media (pointer: coarse) {
+  .jf-filter-menu label {
+    min-height: 2.75rem;
+    display: flex;
+    align-items: center;
+  }
 }
 
 .jf-filter-menu::backdrop {
@@ -1227,6 +1279,11 @@ select.jf-input {
   margin-bottom: 1.5rem;
   padding-bottom: 0.5rem;
   overflow-x: auto;
+  scrollbar-width: none; /* the strip still scrolls by swipe; its scrollbar is hidden */
+}
+
+.jf-tabs::-webkit-scrollbar {
+  display: none;
 }
 
 .jf-tab {
@@ -1320,6 +1377,36 @@ button.jf-crumb:hover {
   right: 0;
   background: linear-gradient(to top, rgba(0, 0, 0, 0.95) 0%, rgba(0, 0, 0, 0.6) 60%, transparent 100%);
   padding: 1.5rem 1.5rem 1rem;
+  /* phones: keep the controls clear of the gesture bar and the notch */
+  padding-left: max(1.5rem, env(safe-area-inset-left));
+  padding-right: max(1.5rem, env(safe-area-inset-right));
+  padding-bottom: max(1rem, env(safe-area-inset-bottom));
+}
+
+/* The top bar's paddings come from p-4 lg:p-6; these rules win over them and add the notch insets */
+.jf-player-topbar {
+  padding-top: max(1rem, env(safe-area-inset-top));
+  padding-left: max(1rem, env(safe-area-inset-left));
+  padding-right: max(1rem, env(safe-area-inset-right));
+}
+@media (width >= 64rem) {
+  .jf-player-topbar {
+    padding-top: max(1.5rem, env(safe-area-inset-top));
+    padding-left: max(1.5rem, env(safe-area-inset-left));
+    padding-right: max(1.5rem, env(safe-area-inset-right));
+  }
+}
+
+/* touch: 44px player buttons and a taller seek bar */
+@media (pointer: coarse) {
+  .jf-player-controls .jf-icon-btn,
+  .jf-player-topbar .jf-icon-btn {
+    min-width: 2.75rem;
+    min-height: 2.75rem;
+  }
+  #player-seek {
+    height: 1.75rem;
+  }
 }
 
 /* The top bar (title, back and close) and the bottom controls fade out together when the
@@ -1411,6 +1498,33 @@ button.jf-crumb:hover {
   display: flex;
   flex-direction: column;
   gap: 0.75rem;
+}
+
+/* phones: the player's menus are bottom sheets that fit the screen (also on short landscape screens) */
+@media (width < 40rem), (max-height: 30rem) {
+  .jf-player-menu {
+    position: fixed;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    top: auto;
+    width: auto;
+    max-width: none;
+    margin: 0;
+    max-height: 70dvh;
+    border-radius: 1rem 1rem 0 0;
+    padding-bottom: max(0.75rem, env(safe-area-inset-bottom));
+    z-index: 60;
+  }
+}
+
+/* touch: the player menus' rows and buttons are 44px targets */
+@media (pointer: coarse) {
+  .jf-player-menu select,
+  .jf-player-menu-select,
+  .jf-player-menu-btn {
+    min-height: 2.75rem;
+  }
 }
 
 #player-settings > summary::-webkit-details-marker,
@@ -1654,6 +1768,20 @@ dialog.modal::backdrop {
   background: rgba(0, 0, 0, 0.75);
   backdrop-filter: blur(8px);
   -webkit-backdrop-filter: blur(8px);
+}
+
+/* phones: dialogs are bottom sheets, not centred boxes */
+@media (width < 40rem) {
+  .modal {
+    align-items: flex-end;
+  }
+  .modal-box {
+    width: 100%;
+    max-width: 100%;
+    border-radius: 1rem 1rem 0 0;
+    max-height: calc(100dvh - env(safe-area-inset-top) - 1rem);
+    padding-bottom: max(1.5rem, env(safe-area-inset-bottom));
+  }
 }
 
 /* Lazy Loading Image Effects */
