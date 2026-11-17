@@ -13,6 +13,8 @@ pub mod tracks;
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod tests_users;
 
 use std::collections::{HashMap, HashSet, hash_map::Entry};
 use std::path::{Path, PathBuf};
@@ -25,7 +27,7 @@ use rustyfin_auth::{generate_setup_code, hash_setup_code, unusable_password_hash
 use rustyfin_db::repo_jellyfin_import::{
     ImportTarget, SourceStreams, UserDataRow, item_sources, user_data_rows, write_user_data,
 };
-use rustyfin_model::user::User;
+use rustyfin_model::user::{User, name_too_long};
 use serde::{Deserialize, Serialize};
 use source::{JfItem, JfStream, JfUser, JfUserData, StreamKind};
 use sqlx::SqlitePool;
@@ -231,6 +233,8 @@ pub enum SkipReason {
     /// The name matches the caller's account, which this request fills from another Jellyfin user
     /// (`IntoMyAccount`).
     AccountTakenByIntoMyAccount,
+    /// The name can't be a Rustyfin user name: blank, or over `MAX_NAME_UNITS`.
+    InvalidName,
 }
 
 /// The item counts of the report (spec 2.11, 2.20). The three counts add up to `total`.
@@ -904,9 +908,12 @@ fn map_libraries(
     (ids, not_carried)
 }
 
-/// The Users stage of a run (spec 2.7, 2.26): each row to create is matched again against
-/// Rustyfin's users and the users created earlier in this run. An unmatched row gets a new user
-/// with an unusable password and a one-time code, which the report shows once.
+/// The Users stage of a run (spec 2.7, 2.26): each row to create is matched again, as sign-in
+/// matches names, against Rustyfin's users and the users created earlier in this run. A row that
+/// now matches one is skipped as not confirmed (the preview asks to confirm such a pairing), as is
+/// a blank or too long name. An unmatched row gets a new user with an unusable password and a
+/// one-time code, which the report shows once. Each created row goes to `handle` as soon as its
+/// user is written, so a run that fails later still shows that user's code (H19).
 async fn create_users(
     db: &SqlitePool,
     users: &mut [UserRow],
@@ -920,12 +927,25 @@ async fn create_users(
         .map(|(index, _)| index)
         .collect();
     handle.stage(ImportStage::Users, to_create.len());
+    let mut created_here: HashSet<Uuid> = HashSet::new();
     for (done, index) in to_create.into_iter().enumerate() {
         let row = &mut users[index];
+        if row.name.trim().is_empty() || name_too_long(&row.name) {
+            row.action = UserAction::Skip;
+            row.reason = Some(SkipReason::InvalidName);
+            handle.progress(done + 1);
+            continue;
+        }
         match plan::match_user_name(&row.name, &known) {
             plan::UserMatch::Matched(id) => {
-                row.action = UserAction::Match;
-                row.user_id = Some(id);
+                // A user this run created has the name: two Jellyfin users sign-in can't tell
+                // apart. Any other account was made since the preview, unconfirmed.
+                row.action = UserAction::Skip;
+                row.reason = Some(if created_here.contains(&id) {
+                    SkipReason::Ambiguous
+                } else {
+                    SkipReason::NotConfirmed
+                });
             }
             plan::UserMatch::Ambiguous => {
                 row.action = UserAction::Skip;
@@ -947,12 +967,21 @@ async fn create_users(
                 let code_hash = hash_setup_code(&code)
                     .await
                     .map_err(|_| ImportError::Hash)?;
-                rustyfin_db::repo_setup_code::create_user_with_code(db, &user, &code_hash)
-                    .await
-                    .map_err(ImportError::Db)?;
-                known.push((user.id, user.name.clone()));
-                row.user_id = Some(user.id);
-                row.code = Some(code);
+                let created =
+                    rustyfin_db::repo_setup_code::create_user_with_code(db, &user, &code_hash)
+                        .await
+                        .map_err(ImportError::Db)?;
+                if !created {
+                    // An account with this name was made since `known` was read.
+                    row.action = UserAction::Skip;
+                    row.reason = Some(SkipReason::NotConfirmed);
+                } else {
+                    known.push((user.id, user.name.clone()));
+                    created_here.insert(user.id);
+                    row.user_id = Some(user.id);
+                    row.code = Some(code);
+                    handle.created(row);
+                }
             }
         }
         handle.progress(done + 1);
