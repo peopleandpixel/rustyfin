@@ -655,12 +655,14 @@ fn date(value: Option<&str>) -> Option<String> {
 /// A pipe-joined list: entries trimmed, empty and repeated entries dropped, order kept (spec 5.4).
 fn list(value: &str) -> Vec<String> {
     let mut entries: Vec<String> = Vec::new();
+    // Entries already kept: a repeat is found in O(1), as the value can be long and untrusted.
+    let mut seen: HashSet<&str> = HashSet::new();
     for entry in value
         .split('|')
         .map(str::trim)
         .filter(|entry| !entry.is_empty())
     {
-        if !entries.iter().any(|seen| seen == entry) {
+        if seen.insert(entry) {
             entries.push(entry.to_string());
         }
     }
@@ -685,9 +687,10 @@ fn jellyfin_list(value: Option<&str>) -> Option<Vec<String>> {
 /// The studios of a pipe-joined Jellyfin list as (studio id, name), one row per id (spec 5.4).
 fn studio_rows(value: Option<&str>) -> Vec<(String, String)> {
     let mut rows: Vec<(String, String)> = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
     for name in list(value.unwrap_or_default()) {
         let studio_id = format!("studio-{}", name.to_lowercase().replace(' ', "-"));
-        if !rows.iter().any(|(seen, _)| *seen == studio_id) {
+        if seen.insert(studio_id.clone()) {
             rows.push((studio_id, name));
         }
     }
