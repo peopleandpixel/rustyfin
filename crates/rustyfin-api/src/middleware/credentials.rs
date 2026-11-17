@@ -13,6 +13,9 @@ pub struct MediaBrowserAuth {
     pub token: Option<String>,
     /// The `Token` value as sent: quotes trimmed, not URL-decoded. Set with `token`.
     token_as_sent: Option<String>,
+    /// The `DeviceId` value as sent: quotes trimmed, not URL-decoded. Set with `device_id`.
+    /// Sign-in once stored device ids in this form.
+    pub device_id_as_sent: Option<String>,
 }
 
 impl std::fmt::Debug for MediaBrowserAuth {
@@ -29,14 +32,19 @@ impl std::fmt::Debug for MediaBrowserAuth {
 
 impl MediaBrowserAuth {
     /// Stores one decoded value under its key. Only the five exact Jellyfin keys count, and a
-    /// later pair overwrites an earlier one. A `Token` also keeps its value as sent.
-    fn store(&mut self, key: &str, value: &str) {
-        let raw = value.trim_matches('"');
+    /// later pair overwrites an earlier one. A `Token` and a `DeviceId` also keep their value as
+    /// sent.
+    fn store(&mut self, key: &str, sent: &str) {
+        let raw = sent.trim_matches('"');
         let value = Some(url_decode(raw));
         match key {
             "Client" => self.client = value,
             "Device" => self.device = value,
-            "DeviceId" => self.device_id = value,
+            "DeviceId" => {
+                self.device_id = value;
+                // As the old sign-in parser stored it: trimmed, then quotes trimmed
+                self.device_id_as_sent = Some(sent.trim().trim_matches('"').to_string());
+            }
             "Version" => self.version = value,
             "Token" => {
                 self.token = value;
@@ -250,6 +258,7 @@ mod tests {
                 version: Some("10.10.0".to_string()),
                 token: Some("0123456789abcdef0123456789abcdef".to_string()),
                 token_as_sent: Some("0123456789abcdef0123456789abcdef".to_string()),
+                device_id_as_sent: Some("TW96aWxsYS81LjA".to_string()),
             })
         );
     }

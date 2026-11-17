@@ -457,6 +457,26 @@ fn chrome_takes_an_external_ass_file_as_ass() {
     assert_data(&data, &expected);
 }
 
+/// The token and ids are percent-encoded: a `&` or `#` in the token can't add a parameter or cut
+/// the URL short.
+#[test]
+fn r3security_subtitle_urls_encode_the_token_and_ids() {
+    let mut movie = plus(h264_8bit("mp4"), vec![external(2, "ass")], Some(2));
+    movie.id = "src 1/é".to_string();
+    let request = StreamRequest {
+        access_token: "t&k=1#x+é".to_string(),
+        ..request()
+    };
+    let data = device_data(&movie, &profile("chrome-linux"), &request);
+    assert_eq!(
+        data.subtitles[0].url.as_deref(),
+        Some(
+            "/Videos/11111111-2222-3333-4444-555555555555/src%201%2F%C3%A9/Subtitles/2/0/\
+             Stream.ass?ApiKey=t%26k%3D1%23x%2B%C3%A9"
+        )
+    );
+}
+
 #[test]
 fn a_webvtt_subtitle_stays_out_of_the_transcode_url() {
     let movie = plus(h264_hi10("mp4"), vec![embedded(2, "subrip")], None);

@@ -136,56 +136,64 @@ fn is_mdns_query_for_jellyfin(data: &[u8]) -> bool {
     false
 }
 
-/// Parse a DNS name from a packet, handling compression pointers.
+/// The longest DNS name, in wire bytes: its labels with their length bytes and the root label
+/// (RFC 1035 section 3.1).
+const MAX_NAME_WIRE_LEN: usize = 255;
+/// The most compression pointers one name may follow. A real name needs a handful.
+const MAX_POINTER_JUMPS: usize = 64;
+
+/// Parse a DNS name from a packet, handling compression pointers. `offset` moves past the name
+/// as it is written at `offset` (past its first pointer, if it has one).
+///
+/// The packet comes from anyone on the network, so the walk is bounded: every pointer must point
+/// before the place the previous jump landed on (before `offset` for the first), so a chain of
+/// pointers can't loop; a name follows at most `MAX_POINTER_JUMPS` of them; and it is at most
+/// `MAX_NAME_WIRE_LEN` bytes long. Reserved label types (`0x40`, `0x80`) are refused.
 fn parse_dns_name(data: &[u8], offset: &mut usize) -> Result<String, ()> {
     let mut name = String::new();
-    let mut jumped = false;
-    let mut saved_offset = None;
+    let mut wire_len = 1; // the root label
+    let mut jumps = 0;
+    let mut resume_at = None;
+    // Every pointer must point before this: where the current run of labels started
+    let mut run_start = *offset;
     let mut current = *offset;
 
     loop {
-        if current >= data.len() {
-            return Err(());
-        }
-
-        let len = data[current] as usize;
+        let len = usize::from(*data.get(current).ok_or(())?);
         if len == 0 {
             current += 1;
             break;
         }
-
-        // Check for compression pointer (top 2 bits set)
-        if (len & 0xC0) == 0xC0 {
-            if current + 1 >= data.len() {
-                return Err(());
+        match len & 0xC0 {
+            // A compression pointer: the top 2 bits set, then a 14-bit offset
+            0xC0 => {
+                let low = usize::from(*data.get(current + 1).ok_or(())?);
+                let target = ((len & 0x3F) << 8) | low;
+                jumps += 1;
+                if target >= run_start || jumps > MAX_POINTER_JUMPS {
+                    return Err(());
+                }
+                resume_at.get_or_insert(current + 2);
+                run_start = target;
+                current = target;
             }
-            if !jumped {
-                saved_offset = Some(current + 2);
+            0x00 => {
+                wire_len += 1 + len;
+                if wire_len > MAX_NAME_WIRE_LEN {
+                    return Err(());
+                }
+                let label = data.get(current + 1..current + 1 + len).ok_or(())?;
+                if !name.is_empty() {
+                    name.push('.');
+                }
+                name.push_str(std::str::from_utf8(label).map_err(|_| ())?);
+                current += 1 + len;
             }
-            jumped = true;
-            let pointer = ((len as u16 & 0x3F) << 8) | data[current + 1] as u16;
-            current = pointer as usize;
-            continue;
+            _ => return Err(()),
         }
-
-        current += 1;
-        if current + len > data.len() {
-            return Err(());
-        }
-
-        if !name.is_empty() {
-            name.push('.');
-        }
-        name.push_str(std::str::from_utf8(&data[current..current + len]).map_err(|_| ())?);
-        current += len;
     }
 
-    if let Some(saved) = saved_offset {
-        *offset = saved;
-    } else {
-        *offset = current;
-    }
-
+    *offset = resume_at.unwrap_or(current);
     Ok(name)
 }
 
@@ -267,4 +275,127 @@ fn encode_dns_name(packet: &mut Vec<u8>, name: &str) {
         }
     }
     packet.push(0); // Null terminator
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    /// Runs `f` on its own thread and fails the test when it doesn't return within 5 s: an
+    /// unbounded walk would otherwise hang the test run.
+    fn within_deadline<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(f());
+        });
+        rx.recv_timeout(Duration::from_secs(5))
+            .expect("the DNS parser did not return within 5 s")
+    }
+
+    fn parse(packet: &[u8], offset: usize) -> Result<(String, usize), ()> {
+        let packet = packet.to_vec();
+        within_deadline(move || {
+            let mut at = offset;
+            parse_dns_name(&packet, &mut at).map(|name| (name, at))
+        })
+    }
+
+    /// A query header with one question, then `question`.
+    fn query(question: &[u8]) -> Vec<u8> {
+        let mut packet = vec![0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0];
+        packet.extend_from_slice(question);
+        packet
+    }
+
+    #[test]
+    fn r3security_dns_name_reads_labels_and_backward_pointers() {
+        // "a.b" at 12, then "c" and a pointer back to 12 at 17
+        let packet = query(&[1, b'a', 1, b'b', 0, 1, b'c', 0xC0, 12]);
+        assert_eq!(parse(&packet, 12), Ok(("a.b".to_string(), 17)));
+        assert_eq!(parse(&packet, 17), Ok(("c.a.b".to_string(), 21)));
+    }
+
+    #[test]
+    fn r3security_dns_name_refuses_pointer_loops() {
+        // A pointer to itself
+        assert_eq!(parse(&query(&[0xC0, 12]), 12), Err(()));
+        // Two pointers that point at each other
+        assert_eq!(parse(&query(&[0xC0, 14, 0xC0, 12]), 14), Err(()));
+        // A label, then a pointer back to that label: backwards, and still a loop
+        assert_eq!(parse(&query(&[1, b'x', 0xC0, 12]), 12), Err(()));
+        // A forward pointer
+        assert_eq!(
+            parse(&query(&[0xC0, 20, 0, 0, 0, 0, 0, 0, 1, b'a', 0]), 12),
+            Err(())
+        );
+    }
+
+    #[test]
+    fn r3security_dns_name_bounds_jumps_and_length() {
+        // A root label at 12, then 100 pointers from 13 on, each to the one before it
+        let mut packet = query(&[0]);
+        for i in 0..100u16 {
+            let target = if i == 0 { 12 } else { 11 + 2 * i };
+            packet.extend_from_slice(&[0xC0 | (target >> 8) as u8, target as u8]);
+        }
+        let last = packet.len() - 2;
+        assert_eq!(parse(&packet, last), Err(()), "more than 64 jumps");
+        assert_eq!(parse(&packet, 13), Ok((String::new(), 15)), "one jump");
+        assert_eq!(
+            parse(&packet, 13 + 2 * 63),
+            Ok((String::new(), 141)),
+            "64 jumps"
+        );
+
+        // 5 labels of 63 bytes: 321 wire bytes, over 255
+        let mut long = Vec::new();
+        for _ in 0..5 {
+            long.push(63);
+            long.extend_from_slice(&[b'a'; 63]);
+        }
+        long.push(0);
+        assert_eq!(parse(&query(&long), 12), Err(()));
+        // Reserved label types
+        assert_eq!(parse(&query(&[0x40, 0]), 12), Err(()));
+        assert_eq!(parse(&query(&[0x80, 0]), 12), Err(()));
+    }
+
+    /// Crafted packets: random bytes, and random bytes salted with compression pointers. Every
+    /// one must be answered promptly, whatever it holds.
+    #[test]
+    fn r3security_mdns_query_check_survives_crafted_packets() {
+        within_deadline(|| {
+            let mut seed = 0x9E37_79B9_7F4A_7C15_u64;
+            let mut next = move || {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                seed
+            };
+            for round in 0..20_000 {
+                let len = 13 + (next() % 500) as usize;
+                let mut packet: Vec<u8> = (0..len).map(|_| next() as u8).collect();
+                // A query with the most questions
+                packet[2] = 0;
+                packet[4] = 0xFF;
+                packet[5] = 0xFF;
+                if round % 2 == 0 {
+                    for _ in 0..(next() % 40) {
+                        let at = 12 + (next() as usize % (len - 12));
+                        packet[at] = 0xC0 | (next() as u8 & 0x01);
+                    }
+                }
+                let _ = is_mdns_query_for_jellyfin(&packet);
+                for start in [12, len / 2, len - 1] {
+                    let mut at = start;
+                    if let Ok(name) = parse_dns_name(&packet, &mut at) {
+                        assert!(name.len() < MAX_NAME_WIRE_LEN);
+                        assert!(at <= packet.len());
+                    }
+                }
+            }
+        });
+    }
 }

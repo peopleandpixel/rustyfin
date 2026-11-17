@@ -74,6 +74,7 @@ async fn test_state() -> AppState {
         shutdown_tx: Arc::new(shutdown_tx),
         bind_addr: Arc::new("0.0.0.0:8096".to_string()),
         published_url: None,
+        published_subnets: Default::default(),
         api_key: Some(Arc::new("test-api-key".to_string())),
         quick_connect: Arc::new(RwLock::new(HashMap::new())),
         transcode_manager,
@@ -22905,6 +22906,117 @@ async fn test_sync_play_instances() {
     assert!(resp.status().is_success() || resp.status() == StatusCode::NOT_FOUND);
 }
 
+// R3 security review: SyncPlay groups belong to their creator (and administrators); members may
+// list one another; playback commands need a group, as Jellyfin's SyncPlayIsInGroup policy says
+#[tokio::test]
+async fn r3security_sync_play_groups_are_managed_by_their_creator_or_an_admin() {
+    let state = test_state().await;
+    let (admin, _) = admin_session(&state).await;
+    let (alice, _) = b38_user(&state, "r3sec-alice", false).await;
+    let (bob, bob_id) = b38_user(&state, "r3sec-bob", false).await;
+    let (carol, _) = b38_user(&state, "r3sec-carol", false).await;
+    let app = app(state);
+    let call = |method: &'static str, uri: String, token: String, body: serde_json::Value| {
+        let app = app.clone();
+        async move { send(&app, request(method, &uri, Some(&token), Some(body))).await }
+    };
+    let none = serde_json::json!({});
+
+    let (status, group) = call(
+        "POST",
+        "/SyncPlay/CreateGroup".into(),
+        alice.clone(),
+        serde_json::json!({ "Name": "Group A" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{group}");
+    let id = group["Id"].as_str().unwrap().to_string();
+    let path = |rest: &str| format!("/SyncPlay/Groups/{id}{rest}");
+
+    // Another user may neither change the group nor list its members
+    for (method, uri) in [
+        ("DELETE", path("")),
+        ("POST", path("/Lock")),
+        ("POST", path("/Unlock")),
+        ("GET", path("/Members")),
+    ] {
+        let (status, _) = call(method, uri.clone(), bob.clone(), none.clone()).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{method} {uri}");
+    }
+    let (status, _) = call("GET", path(""), alice.clone(), none.clone()).await;
+    assert_eq!(status, StatusCode::OK, "the group is still there");
+
+    // Not in a group: playback commands are refused
+    for command in ["Play", "Pause", "Seek"] {
+        let uri = format!("/SyncPlay/{command}");
+        let (status, _) = call("POST", uri, carol.clone(), none.clone()).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{command}");
+    }
+
+    // Bob joins (twice: one membership) and may then list the members, still not manage
+    for _ in 0..2 {
+        let join = serde_json::json!({ "GroupId": id });
+        let (status, _) = call("POST", "/SyncPlay/JoinGroup".into(), bob.clone(), join).await;
+        assert_eq!(status, StatusCode::OK);
+    }
+    let (status, members) = call("GET", path("/Members"), bob.clone(), none.clone()).await;
+    assert_eq!(status, StatusCode::OK);
+    let members = members.as_array().unwrap();
+    assert_eq!(members.len(), 1, "{members:?}");
+    assert_eq!(members[0]["UserId"], bob_id.to_string());
+    // Two joins at once still make one membership
+    let join = serde_json::json!({ "GroupId": id });
+    let (a, b) = tokio::join!(
+        call(
+            "POST",
+            "/SyncPlay/JoinGroup".into(),
+            carol.clone(),
+            join.clone()
+        ),
+        call(
+            "POST",
+            "/SyncPlay/JoinGroup".into(),
+            carol.clone(),
+            join.clone()
+        ),
+    );
+    assert_eq!((a.0, b.0), (StatusCode::OK, StatusCode::OK));
+    let (_, members) = call("GET", path("/Members"), bob.clone(), none.clone()).await;
+    assert_eq!(members.as_array().unwrap().len(), 2, "{members}");
+    let (status, _) = call("DELETE", path(""), bob.clone(), none.clone()).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    // A member's playback commands aren't carried out yet: 501, not a 200 that did nothing
+    for command in ["Play", "Pause", "Seek"] {
+        let uri = format!("/SyncPlay/{command}");
+        let (status, _) = call("POST", uri, bob.clone(), none.clone()).await;
+        assert_eq!(status, StatusCode::NOT_IMPLEMENTED, "{command}");
+    }
+
+    // The creator and an administrator may
+    let (status, _) = call("POST", path("/Lock"), alice.clone(), none.clone()).await;
+    assert_eq!(status, StatusCode::OK);
+    // Locked: a member may join again, anyone else is turned away
+    let join = serde_json::json!({ "GroupId": id });
+    let (status, _) = call(
+        "POST",
+        "/SyncPlay/JoinGroup".into(),
+        bob.clone(),
+        join.clone(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "a member rejoins a locked group");
+    let (status, _) = call("POST", "/SyncPlay/JoinGroup".into(), admin.clone(), join).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "a new member is kept out");
+    let (status, _) = call("GET", path("/Members"), alice.clone(), none.clone()).await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _) = call("POST", path("/Unlock"), admin.clone(), none.clone()).await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _) = call("DELETE", path(""), admin.clone(), none.clone()).await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _) = call("DELETE", path(""), admin.clone(), none.clone()).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "gone");
+}
+
 // ── Encoding Manager Tests ──
 
 #[tokio::test]
@@ -41494,6 +41606,359 @@ async fn r3playback_hls_input_outside_the_library_is_refused() {
     let (status, _) = r3playback_get(&app, &uri, &token).await;
     assert_eq!(status, StatusCode::OK, "on: own file");
     manager.stop_all().await;
+}
+
+// R3 security review fixes
+
+/// The `/DynamicHls` segment route takes a transcode id and a segment number, never a path: a
+/// `..` in any part, a name that isn't a segment, or a playback id that isn't a UUID answers
+/// 400; an unknown transcode answers 404; nothing is read outside the transcode cache.
+#[tokio::test]
+async fn r3security_dynamic_hls_resolves_segments_by_id_and_number_only() {
+    let state = test_state().await;
+    let (token, _) = admin_session(&state).await;
+    // A file a traversal would reach from the old relative `data/transcode` or the cache root
+    let secret = state.data_dir.join("secret.ts");
+    std::fs::write(&secret, b"secret").unwrap();
+    let app = app(state);
+    let session = uuid::Uuid::new_v4();
+    for (uri, expected) in [
+        (
+            "/DynamicHls/%2E%2E/%2E%2E/secret.ts".to_string(),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            format!("/DynamicHls/{session}/0/..%2F..%2Fsecret.ts"),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            format!("/DynamicHls/{session}/%2E%2E/main.m3u8"),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            "/DynamicHls/not-a-uuid/0/0.ts".to_string(),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            format!("/DynamicHls/{session}/0/0.ts"),
+            StatusCode::NOT_FOUND,
+        ),
+        (
+            format!("/DynamicHls/{session}/0/init.mp4"),
+            StatusCode::NOT_FOUND,
+        ),
+    ] {
+        let (status, body) = r3playback_get(&app, &uri, &token).await;
+        assert_eq!(status, expected, "{uri}");
+        assert_ne!(body, b"secret", "{uri}");
+    }
+    // Signed out: 401, as before
+    let req = Request::builder()
+        .uri(format!("/DynamicHls/{session}/0/0.ts"))
+        .body(Body::empty())
+        .unwrap();
+    assert_eq!(g1_send_raw(&app, req).await.0, StatusCode::UNAUTHORIZED);
+}
+
+/// The DLNA stream needs no sign-in, so it checks a stored path as the signed-in stream does:
+/// a file outside every library, the database, a `..` path and a link out of the library (with
+/// `RefuseLinksOutOfLibraries`) answer 404; the library's own file streams.
+#[tokio::test]
+async fn r3security_dlna_stream_refuses_files_out_of_the_library() {
+    let state = test_state().await;
+    let (_, admin) = admin_session(&state).await;
+    {
+        let mut config = state.config.write().await;
+        config.enable_dlna_server = true;
+        config.dlna_default_user_id = Some(admin.to_string());
+    }
+    let lib = std::path::PathBuf::from(media_folder(&state, "r3security-dlna"));
+    let outside = state.data_dir.join("r3security-outside");
+    std::fs::create_dir_all(&outside).unwrap();
+    let film = outside.join("Film.mkv");
+    std::fs::write(&film, b"outside bytes").unwrap();
+    let db = state.data_dir.join("test.db");
+    std::os::unix::fs::symlink(&db, lib.join("Linked.mkv")).unwrap();
+    std::os::unix::fs::symlink(&film, lib.join("Out.mkv")).unwrap();
+    let inside = lib.join("In.mkv");
+    std::fs::write(&inside, b"inside bytes").unwrap();
+    let s = |p: &std::path::Path| p.to_str().unwrap().to_string();
+    let mut refused = Vec::new();
+    for path in [
+        s(&film),
+        s(&db),
+        s(&lib.join("Linked.mkv")),
+        format!("{}/../../r3security-outside/Film.mkv", lib.display()),
+    ] {
+        refused.push(r3playback_insert_item(&state, &lib, &path).await);
+    }
+    let out_id = r3playback_insert_item(&state, &lib, &s(&lib.join("Out.mkv"))).await;
+    let inside_id = r3playback_insert_item(&state, &lib, &s(&inside)).await;
+    state.config.write().await.refuse_links_out_of_libraries = true;
+    let server_id = state.server_id.to_string();
+    let app = app(state);
+    let stream = |id: uuid::Uuid| {
+        let req = Request::builder()
+            .uri(format!("/Dlna/{server_id}/Items/{id}/Stream"))
+            .body(Body::empty())
+            .unwrap();
+        g1_send_raw(&app, req)
+    };
+
+    for id in refused.into_iter().chain([out_id]) {
+        let (status, body) = stream(id).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{id}: {body}");
+        assert!(!body.contains("outside bytes"), "{id}");
+    }
+    assert_eq!(
+        stream(inside_id).await,
+        (StatusCode::OK, "inside bytes".to_string())
+    );
+}
+
+/// A server bound to `0.0.0.0` gives DLNA renderers stream URLs at the address of the interface
+/// they reach it on (here loopback), or under the published server URL when one is set; never
+/// at `0.0.0.0`.
+#[tokio::test]
+async fn r3security_dlna_stream_urls_use_a_reachable_address() {
+    let mut state = test_state().await;
+    assert_eq!(state.bind_addr.as_str(), "0.0.0.0:8096");
+    let (_, admin) = admin_session(&state).await;
+    {
+        let mut config = state.config.write().await;
+        config.enable_dlna_server = true;
+        config.dlna_default_user_id = Some(admin.to_string());
+    }
+    let lib = std::path::PathBuf::from(media_folder(&state, "r3security-urls"));
+    let film = lib.join("Film.mkv");
+    std::fs::write(&film, b"film").unwrap();
+    let id = r3playback_insert_item(&state, &lib, film.to_str().unwrap()).await;
+    let path = format!("/Dlna/{}/Items/{id}/Stream", state.server_id);
+
+    let browse = |app: axum::Router| async move {
+        let req = R2Parental::dlna_browse_request(&id.to_string(), "BrowseMetadata");
+        g1_send_raw(&app, req).await
+    };
+    let (status, xml) = browse(app(state.clone())).await;
+    assert_eq!(status, StatusCode::OK, "{xml}");
+    assert!(
+        xml.contains(&format!("http://127.0.0.1:8096{path}")),
+        "{xml}"
+    );
+    assert!(!xml.contains("0.0.0.0"), "{xml}");
+
+    state.published_url = Some(Arc::new("https://media.example/jf/".to_string()));
+    let (_, xml) = browse(app(state.clone())).await;
+    assert!(
+        xml.contains(&format!("https://media.example/jf{path}")),
+        "{xml}"
+    );
+
+    // PublishedServerUriBySubnet: a renderer in 10.0.0.0/8 gets the LAN URL, one elsewhere on
+    // the local network the `all=` URL
+    state.published_subnets = Arc::new(rustyfin_core::net_addr::PublishedUrls::parse([
+        "10.0.0.0/8=http://lan",
+    ]));
+    let from = |ip: [u8; 4]| {
+        build_router(state.clone()).layer(MockConnectInfo(SocketAddr::from((ip, 40000))))
+    };
+    let (status, xml) = browse(from([10, 1, 2, 3])).await;
+    assert_eq!(status, StatusCode::OK, "{xml}");
+    assert!(xml.contains(&format!("http://lan{path}")), "{xml}");
+    assert!(!xml.contains("media.example"), "{xml}");
+    let (_, xml) = browse(from([192, 168, 1, 4])).await;
+    assert!(
+        xml.contains(&format!("https://media.example/jf{path}")),
+        "{xml}"
+    );
+}
+
+/// A transcode's segments go to the user who started it (and administrators) only: through
+/// `/DynamicHls` and `/Videos/{id}/hls/...` the owner reads a real segment, another user gets
+/// 404, and so does the owner once their limits hide the item.
+#[cfg(unix)]
+#[tokio::test]
+async fn r3security_transcode_segments_are_for_their_owner() {
+    use std::os::unix::fs::PermissionsExt;
+    let mut state = test_state().await;
+    let (admin, _) = admin_session(&state).await;
+    let (alice, alice_id) = b38_user(&state, "r3sec-owner", false).await;
+    let (bob, _) = b38_user(&state, "r3sec-other", false).await;
+    // An ffmpeg that writes one segment and a playlist, then runs until stopped. Renamed into
+    // place, so it is never run while still open for writing.
+    let script = state.data_dir.join("fake-ffmpeg");
+    let tmp = state.data_dir.join("fake-ffmpeg.tmp");
+    std::fs::write(
+        &tmp,
+        "#!/bin/sh\nfor last; do :; done\ncase \"$last\" in *.m3u8) ;; *) exit 1;; esac\n\
+         dir=$(dirname \"$last\")\nprintf 'r3security segment' > \"$dir/segment_0000.ts\"\n\
+         printf '#EXTM3U\\n#EXTINF:6.0,\\nsegment_0000.ts\\n' > \"$last\"\nexec sleep 30\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::fs::rename(&tmp, &script).unwrap();
+    state.transcode_manager =
+        rustyfin_core::transcode::TranscodeManager::new(&state.data_dir).with_ffmpeg(script);
+    let lib = std::path::PathBuf::from(media_folder(&state, "r3security-owner"));
+    let film = lib.join("Film.mkv");
+    std::fs::write(&film, b"film").unwrap();
+    let id = r3playback_insert_item(&state, &lib, film.to_str().unwrap()).await;
+    let manager = state.transcode_manager.clone();
+    let app = app(state);
+
+    let uri = format!("/Videos/{id}/main.m3u8?PlaySessionId=r3sec-owner");
+    let (status, playlist) = r3playback_get(&app, &uri, &alice).await;
+    let playlist = String::from_utf8_lossy(&playlist).to_string();
+    assert_eq!(status, StatusCode::OK, "{playlist}");
+    let at = playlist.find("hls/").expect(&playlist) + 4;
+    let playback: uuid::Uuid = playlist[at..at + 36].parse().unwrap();
+
+    let dynamic = format!("/DynamicHls/{playback}/0/0.ts");
+    let videos = format!("/Videos/{id}/hls/{playback}/video/segment_0000.ts");
+    let legacy = format!("/Videos/{id}/hls/segment_0000.ts");
+    for uri in [&dynamic, &videos, &legacy] {
+        let (status, body) = r3playback_get(&app, uri, &alice).await;
+        assert_eq!(status, StatusCode::OK, "owner: {uri}");
+        assert_eq!(body, b"r3security segment", "owner: {uri}");
+        let (status, body) = r3playback_get(&app, uri, &bob).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "other user: {uri}");
+        assert_ne!(body, b"r3security segment", "other user: {uri}");
+        let (status, _) = r3playback_get(&app, uri, &admin).await;
+        assert_eq!(status, StatusCode::OK, "admin: {uri}");
+    }
+    // Another user's request in the same play session gets nothing of the owner's transcode
+    let uri = format!("/Videos/{id}/main.m3u8?PlaySessionId=r3sec-owner");
+    let (_, theirs) = r3playback_get(&app, &uri, &bob).await;
+    assert!(
+        !String::from_utf8_lossy(&theirs).contains(&playback.to_string()),
+        "the other user got the owner's transcode"
+    );
+    let (status, _) = r3playback_get(&app, &dynamic, &alice).await;
+    assert_eq!(status, StatusCode::OK, "the owner's transcode still runs");
+
+    // Hidden from the owner by their library access: 404
+    let (status, body) = send(
+        &app,
+        request(
+            "POST",
+            &format!("/Users/{alice_id}/Policy"),
+            Some(&admin),
+            Some(serde_json::json!({ "EnableAllFolders": false, "EnabledFolders": [] })),
+        ),
+    )
+    .await;
+    assert!(status.is_success(), "{status} {body}");
+    let (status, _) = r3playback_get(&app, &dynamic, &alice).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "hidden item");
+    manager.stop_all().await;
+}
+
+/// A device id stored URL-encoded by sign-in's old parser: signing in again with the same header
+/// keeps the session and device under the decoded id, instead of starting a second session.
+#[tokio::test]
+async fn r3security_sign_in_adopts_a_device_id_stored_encoded() {
+    let state = test_state().await;
+    let (_, _) = admin_session(&state).await;
+    let user = add_user(&state, "r3sec-dana", "dana-pw", false).await;
+    let old_session = uuid::Uuid::new_v4().to_string();
+    let uid = user.to_string();
+    for sql in [
+        "INSERT INTO sessions (id, user_id, device_id, device_name, app_name, app_version)
+         VALUES (?1, ?2, 'dev%2B1', 'Phone', 'App', '1')",
+        "INSERT INTO access_tokens (token_hash, user_id, device_id, device_name, app_name, app_version)
+         VALUES (?1, ?2, 'dev%2B1', 'Phone', 'App', '1')",
+        "INSERT INTO devices (id, name, app_name, app_version, user_id) VALUES ('dev%2B1', 'Phone', 'App', '1', ?2)",
+    ] {
+        sqlx::query(sql)
+            .bind(&old_session)
+            .bind(&uid)
+            .execute(&state.db)
+            .await
+            .unwrap();
+    }
+    let db = state.db.clone();
+    let app = app(state);
+    let req = Request::builder()
+        .method("POST")
+        .uri("/Users/AuthenticateByName")
+        .header("Content-Type", "application/json")
+        .header(
+            "X-Emby-Authorization",
+            r#"MediaBrowser Client="App", Device="Phone", DeviceId="dev%2B1", Version="1""#,
+        )
+        .body(Body::from(r#"{"Username":"r3sec-dana","Pw":"dana-pw"}"#))
+        .unwrap();
+    let (status, body) = send(&app, req).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["SessionInfo"]["Id"], old_session, "{body}");
+    assert_eq!(body["SessionInfo"]["DeviceId"], "dev+1", "{body}");
+
+    let count = |sql: &'static str| {
+        let (db, uid) = (db.clone(), uid.clone());
+        async move {
+            sqlx::query_scalar::<_, i64>(sql)
+                .bind(uid)
+                .fetch_one(&db)
+                .await
+                .unwrap()
+        }
+    };
+    let encoded = "SELECT COUNT(*) FROM sessions WHERE user_id = ?1 AND device_id = 'dev%2B1'";
+    assert_eq!(count(encoded).await, 0);
+    let decoded = "SELECT COUNT(*) FROM sessions WHERE user_id = ?1 AND device_id = 'dev+1'";
+    assert_eq!(count(decoded).await, 1, "one session, not two");
+    let tokens = "SELECT COUNT(*) FROM access_tokens WHERE user_id = ?1 AND device_id = 'dev%2B1'";
+    assert_eq!(count(tokens).await, 0);
+    let devices = "SELECT COUNT(*) FROM devices WHERE user_id = ?1 AND id = 'dev%2B1'";
+    assert_eq!(count(devices).await, 0);
+}
+
+/// Universal's transcode URL percent-encodes every value: a `+` in the device id comes back as
+/// sent (stopping the transcode by device id compares it), and a `&` or `=` in a value adds no
+/// parameter.
+#[tokio::test]
+async fn r3security_universal_url_encodes_every_value() {
+    let state = test_state().await;
+    let (token, _) = admin_session(&state).await;
+    let folder = std::path::PathBuf::from(media_folder(&state, "r3security-universal"));
+    let file = folder.join("Film.mkv");
+    std::fs::write(&file, b"film").unwrap();
+    let id = g4_insert_item(&state, "Movie", &file).await;
+    g4_insert_source(
+        &state,
+        id,
+        "mkv",
+        &file,
+        &[("Video", "hevc"), ("Audio", "ac3")],
+    )
+    .await;
+    let app = app(state);
+
+    // DeviceId "dev+1&Static=true", PlaySessionId "ps é&MaxWidth=1"
+    let uri = format!(
+        "/Videos/{id}/Universal?VideoCodecs=h264&AudioCodecs=aac&DeviceId=dev%2B1%26Static%3Dtrue\
+         &PlaySessionId=ps%20%C3%A9%26MaxWidth%3D1"
+    );
+    let (status, body) = send(&app, request("GET", &uri, Some(&token), None)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let url = body["Url"].as_str().unwrap();
+    let (path, query) = url.split_once('?').unwrap();
+    assert_eq!(path, format!("/Videos/{id}/main.m3u8"));
+    let pairs: Vec<(String, String)> = form_urlencoded::parse(query.as_bytes())
+        .into_owned()
+        .collect();
+    let values = |name: &str| -> Vec<&str> {
+        pairs
+            .iter()
+            .filter(|(key, _)| key == name)
+            .map(|(_, value)| value.as_str())
+            .collect()
+    };
+    assert_eq!(values("DeviceId"), ["dev+1&Static=true"], "{url}");
+    assert_eq!(values("PlaySessionId"), ["ps é&MaxWidth=1"], "{url}");
+    assert!(values("Static").is_empty(), "{url}");
+    assert!(values("MaxWidth").is_empty(), "{url}");
+    assert!(!query.contains(' ') && !query.contains('+'), "{url}");
 }
 
 #[tokio::test]

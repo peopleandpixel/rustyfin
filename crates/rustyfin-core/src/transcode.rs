@@ -151,6 +151,9 @@ impl Default for TranscodeProfile {
 struct TranscodeSession {
     item_id: Uuid,
     playback_id: Uuid,
+    /// The user whose request started it: only they (or an administrator) read its segments, and
+    /// only their requests reuse or replace it. `None` for a progressive transcode.
+    owner: Option<Uuid>,
     /// The file ffmpeg reads: each version of an item has its own.
     input_path: String,
     play_session_id: String, // "" when the request had none
@@ -448,6 +451,12 @@ impl TranscodeManager {
         self
     }
 
+    /// A manager that runs `ffmpeg` instead of the one `media_tools` finds (tests run a script).
+    pub fn with_ffmpeg(mut self, ffmpeg: PathBuf) -> Self {
+        self.ffmpeg = ffmpeg;
+        self
+    }
+
     /// The directory the transcodes are written under.
     pub fn cache_root(&self) -> &Path {
         &self.cache_root
@@ -620,10 +629,18 @@ impl TranscodeManager {
         profile: &TranscodeProfile,
         play_session_id: &str,
         device_id: &str,
+        owner: Option<Uuid>,
     ) -> Result<(PathBuf, Uuid), TranscodeError> {
         let profile = self.prepare(profile, input_path).await;
         let started = self
-            .start_prepared(item_id, input_path, &profile, play_session_id, device_id)
+            .start_prepared(
+                item_id,
+                input_path,
+                &profile,
+                play_session_id,
+                device_id,
+                owner,
+            )
             .await;
         if !uses_hardware(&profile) {
             return started;
@@ -632,7 +649,14 @@ impl TranscodeManager {
             Err(TranscodeError::FfmpegFailed(message)) => {
                 let software = software_profile(&profile);
                 let retried = self
-                    .start_prepared(item_id, input_path, &software, play_session_id, device_id)
+                    .start_prepared(
+                        item_id,
+                        input_path,
+                        &software,
+                        play_session_id,
+                        device_id,
+                        owner,
+                    )
                     .await;
                 if retried.is_ok() {
                     self.note_hardware_result(input_path, Some(&message));
@@ -654,7 +678,9 @@ impl TranscodeManager {
         profile: &TranscodeProfile,
         play_session_id: &str,
         device_id: &str,
+        owner: Option<Uuid>,
     ) -> Result<(PathBuf, Uuid), TranscodeError> {
+        let key = (play_session_id, device_id, owner);
         let playback_id = {
             let _lock = self.start_lock.lock().await;
             if self.closed.load(std::sync::atomic::Ordering::SeqCst) {
@@ -663,22 +689,22 @@ impl TranscodeManager {
             if !play_session_id.is_empty() && self.recently_stopped(play_session_id) {
                 return Err(TranscodeError::Stopped);
             }
-            match self.find_session(item_id, input_path, play_session_id, device_id) {
+            match self.find_session(item_id, input_path, key) {
                 Some(id) if !self.same_profile(id, profile) => {
                     // Other tracks, another start or other limits: the transcode is replaced
                     self.stop_session(id).await;
-                    self.spawn_session(item_id, input_path, profile, play_session_id, device_id)
+                    self.spawn_session(item_id, input_path, profile, key)
                         .await?
                 }
                 Some(id) if self.touch_live_session(id) => id,
                 Some(id) => {
                     // ffmpeg exited without a playlist: start again
                     self.stop_session(id).await;
-                    self.spawn_session(item_id, input_path, profile, play_session_id, device_id)
+                    self.spawn_session(item_id, input_path, profile, key)
                         .await?
                 }
                 None => {
-                    self.spawn_session(item_id, input_path, profile, play_session_id, device_id)
+                    self.spawn_session(item_id, input_path, profile, key)
                         .await?
                 }
             }
@@ -742,13 +768,8 @@ impl TranscodeManager {
     }
 
     /// The item's session of `input_path` that a request with these names reuses.
-    fn find_session(
-        &self,
-        item_id: Uuid,
-        input_path: &str,
-        play_session_id: &str,
-        device_id: &str,
-    ) -> Option<Uuid> {
+    fn find_session(&self, item_id: Uuid, input_path: &str, key: SessionKey<'_>) -> Option<Uuid> {
+        let (play_session_id, device_id, owner) = key;
         self.sessions
             .iter()
             .find(|e| {
@@ -756,6 +777,7 @@ impl TranscodeManager {
                 !session.progressive
                     && session.item_id == item_id
                     && session.input_path == input_path
+                    && session.owner == owner
                     && same_key(session, play_session_id, device_id)
             })
             .map(|e| *e.key())
@@ -809,8 +831,7 @@ impl TranscodeManager {
         item_id: Uuid,
         input_path: &str,
         profile: &TranscodeProfile,
-        play_session_id: &str,
-        device_id: &str,
+        (play_session_id, device_id, owner): SessionKey<'_>,
     ) -> Result<Uuid, TranscodeError> {
         let playback_id = Uuid::new_v4();
         let output_dir = self.cache_root.join(playback_id.to_string());
@@ -858,6 +879,7 @@ impl TranscodeManager {
             TranscodeSession {
                 item_id,
                 playback_id,
+                owner,
                 input_path: input_path.to_string(),
                 play_session_id: play_session_id.to_string(),
                 device_id: device_id.to_string(),
@@ -974,6 +996,7 @@ impl TranscodeManager {
             TranscodeSession {
                 item_id,
                 playback_id,
+                owner: None,
                 input_path: input_path.to_string(),
                 play_session_id: play_session_id.to_string(),
                 device_id: device_id.to_string(),
@@ -1243,6 +1266,14 @@ impl TranscodeManager {
         (path.parent() == Some(dir.as_path()) && path.is_file()).then_some(path)
     }
 
+    /// Whether `viewer` may read the segments of transcode `playback_id`: it exists, and they
+    /// started it or are an administrator.
+    pub fn may_read(&self, playback_id: Uuid, viewer: Viewer) -> bool {
+        self.sessions
+            .get(&playback_id)
+            .is_some_and(|session| viewer.may_read(session.owner))
+    }
+
     /// Get the path to a segment of one transcode session of `item_id`. Touches the session.
     pub fn segment_path(
         &self,
@@ -1260,18 +1291,56 @@ impl TranscodeManager {
         self.get_segment_path(playback_id, segment_name)
     }
 
+    /// The item of HLS session `playback_id` and the path of its numbered segment `index`, or of
+    /// its fragmented MP4 init segment when `index` is `None`. Touches the session. The file name
+    /// is the one ffmpeg writes (`segment_%04d.{ts|mp4}`, `init.mp4`), made here from the number,
+    /// so nothing a client sends becomes part of the path; it lies in the session's directory
+    /// under the configured cache root (`get_segment_path`). `None` for an unknown or progressive
+    /// session, a file it hasn't written, or a `viewer` who neither started the transcode nor is
+    /// an administrator.
+    pub fn session_segment(
+        &self,
+        playback_id: Uuid,
+        index: Option<u32>,
+        viewer: Viewer,
+    ) -> Option<(Uuid, PathBuf)> {
+        let (item_id, fmp4) = {
+            let mut session = self.sessions.get_mut(&playback_id)?;
+            if session.progressive || !viewer.may_read(session.owner) {
+                return None;
+            }
+            session.last_access = Instant::now();
+            (session.item_id, session.profile.fmp4)
+        };
+        let name = match index {
+            Some(index) => format!("segment_{index:04}.{}", if fmp4 { "mp4" } else { "ts" }),
+            None => "init.mp4".to_string(),
+        };
+        Some((item_id, self.get_segment_path(playback_id, &name)?))
+    }
+
     /// Get the path to a segment for the legacy `/hls/{segment}` route: the item's most recently
     /// used session if it has the file (touched), else the item's old per-item directory.
     /// A session's playback id in place of the item id finds nothing: session directories are
     /// named by playback id too, and serving one here would bypass the item and its owner.
-    pub fn legacy_segment_path(&self, item_id: Uuid, segment_name: &str) -> Option<PathBuf> {
+    ///
+    /// Only sessions `viewer` may read count (`may_read`).
+    pub fn legacy_segment_path(
+        &self,
+        item_id: Uuid,
+        segment_name: &str,
+        viewer: Viewer,
+    ) -> Option<PathBuf> {
         if self.sessions.contains_key(&item_id) {
             return None;
         }
         let latest = self
             .sessions
             .iter()
-            .filter(|e| !e.value().progressive && e.value().item_id == item_id)
+            .filter(|e| {
+                let session = e.value();
+                !session.progressive && session.item_id == item_id && viewer.may_read(session.owner)
+            })
             .max_by_key(|e| e.value().last_access)
             .map(|e| *e.key());
         if let Some(playback_id) = latest
@@ -1352,6 +1421,24 @@ impl TranscodeManager {
 
 /// Whether a session answers to a request's names: the same PlaySessionId, else the same
 /// DeviceId among sessions without one, else a session with neither. Case-insensitive.
+/// What a request's transcode is found again by, besides its item and input: its play session
+/// id, its device id and the user who asked for it.
+type SessionKey<'a> = (&'a str, &'a str, Option<Uuid>);
+
+/// Who reads a transcode's segments: the user, and whether they are an administrator.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Viewer {
+    pub user: Uuid,
+    pub admin: bool,
+}
+
+impl Viewer {
+    /// Whether this viewer may read a transcode `owner` started: its owner, or an administrator.
+    fn may_read(self, owner: Option<Uuid>) -> bool {
+        self.admin || owner == Some(self.user)
+    }
+}
+
 fn same_key(session: &TranscodeSession, play_session_id: &str, device_id: &str) -> bool {
     if !play_session_id.is_empty() {
         session
@@ -2200,6 +2287,7 @@ mod tests {
             TranscodeSession {
                 item_id: item,
                 playback_id: playback,
+                owner: None,
                 input_path: String::new(),
                 play_session_id: String::new(),
                 device_id: String::new(),
@@ -2213,8 +2301,15 @@ mod tests {
             },
         );
         // By the item's id the session's file is served; by the playback id it isn't.
-        assert!(manager.legacy_segment_path(item, "main.m3u8").is_some());
-        assert_eq!(manager.legacy_segment_path(playback, "main.m3u8"), None);
+        assert!(
+            manager
+                .legacy_segment_path(item, "main.m3u8", ADMIN)
+                .is_some()
+        );
+        assert_eq!(
+            manager.legacy_segment_path(playback, "main.m3u8", ADMIN),
+            None
+        );
         std::fs::remove_dir_all(&data).ok();
     }
 
@@ -3425,6 +3520,11 @@ mod tests {
     // ── Sessions, run against fake ffmpeg scripts ──
 
     const SEGMENT: &str = "segment_0000.ts";
+    /// An administrator, who reads every transcode
+    const ADMIN: Viewer = Viewer {
+        user: Uuid::nil(),
+        admin: true,
+    };
 
     /// Writes one segment and the playlist next to its last argument, then keeps running.
     const FAKE_GOOD: &str = r#"#!/bin/sh
@@ -3604,8 +3704,74 @@ exec sleep 30
         device_id: &str,
     ) -> Result<(PathBuf, Uuid), TranscodeError> {
         let profile = TranscodeProfile::default();
-        mgr.start_transcode(item, "/in.mkv", &profile, play_session_id, device_id)
+        mgr.start_transcode(item, "/in.mkv", &profile, play_session_id, device_id, None)
             .await
+    }
+
+    /// A session's numbered segment is found by playback id and number alone, with the item it
+    /// belongs to, for its owner or an administrator; an unknown id, a number not written yet, the
+    /// init segment of a TS session and another user find nothing. Another user's request with
+    /// the same play session id gets a transcode of its own.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn r3security_session_segment_by_number() {
+        let (_dir, mgr) = fake_manager("good", Duration::from_secs(10));
+        let item = Uuid::new_v4();
+        let (owner, other) = (Uuid::new_v4(), Uuid::new_v4());
+        let profile = TranscodeProfile::default();
+        let (playlist, id) = mgr
+            .start_transcode(item, "/in.mkv", &profile, "psid", "dev", Some(owner))
+            .await
+            .unwrap();
+        let viewer = |user, admin| Viewer { user, admin };
+        assert!(mgr.may_read(id, viewer(owner, false)));
+        assert!(mgr.may_read(id, viewer(other, true)));
+        assert!(!mgr.may_read(id, viewer(other, false)));
+        assert!(
+            mgr.session_segment(id, Some(0), viewer(other, false))
+                .is_none()
+        );
+        assert!(
+            mgr.legacy_segment_path(item, SEGMENT, viewer(other, false))
+                .is_none()
+        );
+        assert!(
+            mgr.legacy_segment_path(item, SEGMENT, viewer(owner, false))
+                .is_some()
+        );
+        let (_, theirs) = mgr
+            .start_transcode(item, "/in.mkv", &profile, "psid", "dev", Some(other))
+            .await
+            .unwrap();
+        assert_ne!(
+            theirs, id,
+            "another user's request never reuses this transcode"
+        );
+        assert!(mgr.may_read(id, viewer(owner, false)), "nor replaces it");
+
+        let mine = viewer(owner, false);
+        let (found_item, path) = mgr.session_segment(id, Some(0), mine).expect("segment 0");
+        assert_eq!(found_item, item);
+        assert_eq!(path.file_name().unwrap(), SEGMENT);
+        assert_eq!(
+            path.parent(),
+            playlist
+                .parent()
+                .map(|p| p.canonicalize().unwrap())
+                .as_deref()
+        );
+        assert!(mgr.session_segment(id, Some(9999), mine).is_none());
+        assert!(mgr.session_segment(id, None, mine).is_none());
+        assert!(
+            mgr.session_segment(Uuid::new_v4(), Some(0), ADMIN)
+                .is_none()
+        );
+        assert!(
+            mgr.session_segment(item, Some(0), ADMIN).is_none(),
+            "an item id is no session"
+        );
+        mgr.stop_all().await;
+        assert!(mgr.session_segment(id, Some(0), ADMIN).is_none());
     }
 
     #[cfg(unix)]
@@ -3654,7 +3820,7 @@ exec sleep 30
     ) -> Uuid {
         let profile = TranscodeProfile::default();
         let (_, playback_id) = mgr
-            .start_transcode(item, input, &profile, play_session_id, "")
+            .start_transcode(item, input, &profile, play_session_id, "", None)
             .await
             .unwrap();
         playback_id
@@ -3702,7 +3868,7 @@ exec sleep 30
         play_session_id: &str,
     ) -> Uuid {
         let (_, playback_id) = mgr
-            .start_transcode(item, "/in.mkv", profile, play_session_id, "d")
+            .start_transcode(item, "/in.mkv", profile, play_session_id, "d", None)
             .await
             .unwrap();
         playback_id
@@ -4083,7 +4249,7 @@ exec sleep 30
         );
 
         tokio::time::sleep(Duration::from_millis(20)).await;
-        assert!(mgr.legacy_segment_path(item, SEGMENT).is_some());
+        assert!(mgr.legacy_segment_path(item, SEGMENT, ADMIN).is_some());
         assert!(
             last_access(&mgr) > after_playlist,
             "a legacy segment request touches the session"
@@ -4114,7 +4280,10 @@ exec sleep 30
         // Idle for longer than the limit: still running, as its response is
         let later = Instant::now() + Duration::from_secs(3600);
         assert_eq!(mgr.cleanup_idle_sessions(later, IDLE_LIMIT).await, 0);
-        assert_eq!(mgr.find_session(item, "/in.flac", "ps-1", "dev-1"), None);
+        assert_eq!(
+            mgr.find_session(item, "/in.flac", ("ps-1", "dev-1", None)),
+            None
+        );
 
         assert_eq!(mgr.stop_play_session(None, "ps-1", "").await, 1);
         let mut rest = Vec::new();
@@ -4613,7 +4782,7 @@ exec sleep 30
         assert!(hw("/other.mkv").await);
         // The device failing to open on three files in a row turns it off for every file
         for input in ["/b.mkv", "/c.mkv"] {
-            mgr.start_transcode(Uuid::new_v4(), input, &profile, "", "")
+            mgr.start_transcode(Uuid::new_v4(), input, &profile, "", "", None)
                 .await
                 .unwrap();
         }

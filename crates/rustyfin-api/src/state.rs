@@ -42,6 +42,10 @@ pub struct AppState {
     /// `RUSTYFIN_PUBLISHED_URL`: the URL clients reach the server at, when the operator set one.
     /// UDP discovery's `EndpointAddress` and `LocalAddress` give it.
     pub published_url: Option<Arc<String>>,
+    /// The per-client entries of `PublishedServerUriBySubnet` (a subnet, `internal`,
+    /// `external`). For a client they match, they come before `published_url` in the addresses
+    /// DLNA, SSDP and UDP discovery give (`PublishedUrls::for_peer`).
+    pub published_subnets: Arc<rustyfin_core::net_addr::PublishedUrls>,
     pub api_key: Option<Arc<String>>,
     /// Quick Connect requests keyed by secret. Code→secret lookup done by scanning.
     pub quick_connect: Arc<RwLock<HashMap<String, QuickConnectResult>>>,

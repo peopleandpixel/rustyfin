@@ -180,6 +180,11 @@ async fn join_group(
         .map_err(|e| ApiError::Internal(e.to_string()))?
         .ok_or(ApiError::NotFound("Group not found".to_string()))?;
 
+    // A user joins a group once: joining again changes nothing, also once the group is locked,
+    // which keeps out only new members
+    if is_member(&state, &group.id, &claims).await? {
+        return Ok(StatusCode::OK);
+    }
     if group.is_locked {
         return Err(ApiError::BadRequest("Group is locked".to_string()));
     }
@@ -187,10 +192,12 @@ async fn join_group(
     let member_id = Uuid::new_v4().to_string();
     let session_id = Uuid::new_v4().to_string();
 
-    rustyfin_db::repo_sync_play::add_member(
+    // Adds the membership only if there is none yet, in one statement: two joins at once still
+    // make one
+    rustyfin_db::repo_sync_play::add_member_once(
         &state.db,
         &member_id,
-        &req.group_id,
+        &group.id,
         &claims.sub.to_string(),
         &session_id,
     )
@@ -239,31 +246,75 @@ async fn ping(
     })))
 }
 
+/// Whether the caller is a member of group `group_id`.
+async fn is_member(state: &AppState, group_id: &str, claims: &Claims) -> Result<bool, ApiError> {
+    let members = rustyfin_db::repo_sync_play::get_members(&state.db_ro, group_id)
+        .await
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
+    let me = claims.sub.to_string();
+    Ok(members.iter().any(|m| m.user_id == me))
+}
+
+/// The group `group_id`, for the caller to manage (delete, lock, unlock): only its creator or an
+/// administrator may. Jellyfin has no such routes; this keeps them from reaching other users'
+/// groups. 404 when there is no such group, 403 for anyone else.
+async fn group_to_manage(
+    state: &AppState,
+    group_id: &str,
+    claims: &Claims,
+) -> Result<rustyfin_db::repo_sync_play::SyncPlayGroupRow, ApiError> {
+    let group = rustyfin_db::repo_sync_play::get_group(&state.db_ro, group_id)
+        .await
+        .map_err(|e| ApiError::Internal(e.to_string()))?
+        .ok_or(ApiError::NotFound("Group not found".to_string()))?;
+    if claims.is_admin || group.owner_user_id == claims.sub.to_string() {
+        Ok(group)
+    } else {
+        Err(ApiError::Forbidden(
+            "Only the group's creator or an administrator may change it.".to_string(),
+        ))
+    }
+}
+
+/// A playback command (play, pause, seek). Jellyfin's `SyncPlayIsInGroup` policy answers 403 to a
+/// user in no group. Rustyfin doesn't carry the commands out to the group's members yet, so for a
+/// member it answers 501 Not Implemented rather than claim success.
+async fn group_command(state: &AppState, claims: &Claims) -> Result<StatusCode, ApiError> {
+    let in_group =
+        rustyfin_db::repo_sync_play::is_in_any_group(&state.db_ro, &claims.sub.to_string())
+            .await
+            .map_err(|e| ApiError::Internal(e.to_string()))?;
+    if !in_group {
+        return Err(ApiError::Forbidden(
+            "The user is not in a SyncPlay group.".to_string(),
+        ));
+    }
+    Ok(StatusCode::NOT_IMPLEMENTED)
+}
+
 async fn play(
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
+    Extension(claims): Extension<Claims>,
     Json(_req): Json<PlayStateRequest>,
 ) -> Result<StatusCode, ApiError> {
-    // Broadcast play command to all group members via WebSocket
-    tracing::info!("SyncPlay play command received");
-    Ok(StatusCode::OK)
+    group_command(&state, &claims).await
 }
 
 async fn pause(
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
+    Extension(claims): Extension<Claims>,
     Json(_req): Json<PlayStateRequest>,
 ) -> Result<StatusCode, ApiError> {
-    // Broadcast pause command to all group members via WebSocket
-    tracing::info!("SyncPlay pause command received");
-    Ok(StatusCode::OK)
+    group_command(&state, &claims).await
 }
 
 async fn seek(
-    State(_state): State<AppState>,
-    Json(_req): Json<PingRequest>,
+    State(state): State<AppState>,
+    Extension(claims): Extension<Claims>,
+    Json(req): Json<PingRequest>,
 ) -> Result<StatusCode, ApiError> {
-    // Broadcast seek command to all group members via WebSocket
-    tracing::info!("SyncPlay seek command received: {} ticks", _req.ticks);
-    Ok(StatusCode::OK)
+    tracing::debug!("SyncPlay seek to {} ticks", req.ticks);
+    group_command(&state, &claims).await
 }
 
 async fn get_group(
@@ -291,8 +342,10 @@ async fn get_group(
 
 async fn delete_group(
     State(state): State<AppState>,
+    Extension(claims): Extension<Claims>,
     Path(group_id): Path<String>,
 ) -> Result<StatusCode, ApiError> {
+    group_to_manage(&state, &group_id, &claims).await?;
     rustyfin_db::repo_sync_play::delete_group(&state.db, &group_id)
         .await
         .map_err(|e| ApiError::Internal(e.to_string()))?;
@@ -300,13 +353,26 @@ async fn delete_group(
     Ok(StatusCode::OK)
 }
 
+/// GET /SyncPlay/Groups/{id}/Members: for the group's members, its creator and administrators
+/// only (403 for anyone else), as the list names users and their session ids.
 async fn get_members(
     State(state): State<AppState>,
+    Extension(claims): Extension<Claims>,
     Path(group_id): Path<String>,
 ) -> Result<Json<Vec<SyncPlayMemberDto>>, ApiError> {
+    let group = rustyfin_db::repo_sync_play::get_group(&state.db_ro, &group_id)
+        .await
+        .map_err(|e| ApiError::Internal(e.to_string()))?
+        .ok_or(ApiError::NotFound("Group not found".to_string()))?;
     let members = rustyfin_db::repo_sync_play::get_members(&state.db_ro, &group_id)
         .await
         .map_err(|e| ApiError::Internal(e.to_string()))?;
+    let me = claims.sub.to_string();
+    if !claims.is_admin && group.owner_user_id != me && !members.iter().any(|m| m.user_id == me) {
+        return Err(ApiError::Forbidden(
+            "Only the group's members may list them.".to_string(),
+        ));
+    }
 
     let items: Vec<SyncPlayMemberDto> = members
         .into_iter()
@@ -322,8 +388,10 @@ async fn get_members(
 
 async fn lock_group(
     State(state): State<AppState>,
+    Extension(claims): Extension<Claims>,
     Path(group_id): Path<String>,
 ) -> Result<StatusCode, ApiError> {
+    group_to_manage(&state, &group_id, &claims).await?;
     rustyfin_db::repo_sync_play::lock_group(&state.db, &group_id, true)
         .await
         .map_err(|e| ApiError::Internal(e.to_string()))?;
@@ -333,8 +401,10 @@ async fn lock_group(
 
 async fn unlock_group(
     State(state): State<AppState>,
+    Extension(claims): Extension<Claims>,
     Path(group_id): Path<String>,
 ) -> Result<StatusCode, ApiError> {
+    group_to_manage(&state, &group_id, &claims).await?;
     rustyfin_db::repo_sync_play::lock_group(&state.db, &group_id, false)
         .await
         .map_err(|e| ApiError::Internal(e.to_string()))?;

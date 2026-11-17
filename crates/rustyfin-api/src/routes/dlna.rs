@@ -75,6 +75,8 @@ async fn description(State(state): State<AppState>) -> Response {
         server_id: state.server_id.to_string(),
         http_port: parse_port(&state.bind_addr),
         bind_ip: std::net::Ipv4Addr::UNSPECIFIED,
+        published_url: state.published_url.as_deref().cloned(),
+        published_subnets: (*state.published_subnets).clone(),
     };
     let xml = dlna::device_description_xml(&config);
     xml_response(xml)
@@ -89,9 +91,12 @@ async fn connection_manager_scpd() -> Response {
 }
 
 async fn content_directory_control(
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     State(state): State<AppState>,
     body: String,
 ) -> Result<Response, ApiError> {
+    // The stream URLs' base: the published URL, else the interface the renderer reaches
+    let base = stream_base_url(&state, peer);
     // Parse SOAP action from body
     if body.contains("Browse") {
         let object_id = extract_xml_value(&body, "ObjectID").unwrap_or("0".to_string());
@@ -131,7 +136,7 @@ async fn content_directory_control(
                 if let Ok(Some(item)) = rustyfin_db::repo_media::get_item_by_id(&state.db, id).await
                     && !hidden.hides(item.id, item.library_id)
                 {
-                    let item_xml = media_item_to_didl(&item, &state.bind_addr, &state.server_id);
+                    let item_xml = media_item_to_didl(&item, &base, &state.server_id);
                     build_browse_response(&item_xml, 1, 1)
                 } else {
                     build_browse_response("", 0, 0)
@@ -156,11 +161,7 @@ async fn content_directory_control(
                     .collect();
                 let mut items_xml = String::new();
                 for item in &page {
-                    items_xml.push_str(&media_item_to_didl(
-                        item,
-                        &state.bind_addr,
-                        &state.server_id,
-                    ));
+                    items_xml.push_str(&media_item_to_didl(item, &base, &state.server_id));
                 }
                 build_browse_response(&items_xml, page.len(), total)
             } else {
@@ -235,7 +236,10 @@ async fn dlna_stream(
     if !access.access.enable_media_playback {
         return Err(not_found());
     }
-    super::streaming::serve_file(item.path, &headers).await
+    // The same check as the signed-in stream: a file the library owns, inside a library folder,
+    // with no symlink out of it when links out of the libraries are refused
+    let path = super::streaming::validate_path_against_library(&state, &item.path).await?;
+    super::streaming::serve_file(path, &headers).await
 }
 
 async fn connection_manager_control(body: String) -> Response {
@@ -249,7 +253,7 @@ async fn connection_manager_control(body: String) -> Response {
 
 fn media_item_to_didl(
     item: &rustyfin_model::media::MediaItem,
-    bind_addr: &str,
+    base_url: &str,
     server_id: &str,
 ) -> String {
     let is_container = matches!(
@@ -270,10 +274,10 @@ fn media_item_to_didl(
         )
     } else {
         // The DLNA stream route, which checks the DLNA user's limits on every request.
-        let url = format!(
-            "http://{}/Dlna/{}/Items/{}/Stream",
-            bind_addr, server_id, item.id
-        );
+        let url = xml_escape(&format!(
+            "{base_url}/Dlna/{server_id}/Items/{}/Stream",
+            item.id
+        ));
         let mime = match item.media_type {
             MediaType::Movie | MediaType::Episode | MediaType::Video => "video/mp4",
             MediaType::Audio => "audio/mpeg",
@@ -369,6 +373,27 @@ fn extract_xml_value(xml: &str, tag: &str) -> Option<String> {
     let start = xml.find(&open)? + open.len();
     let end = xml[start..].find(&close)? + start;
     Some(xml[start..end].to_string())
+}
+
+/// The base of the stream URLs a renderer at `peer` gets, as Jellyfin's `GetSmartApiUrl`: the
+/// `PublishedServerUriBySubnet` entry for `peer`'s subnet (or `internal`/`external`), else the
+/// published server URL (`all=`), else the address the server is bound to, else (bound to every
+/// interface) the address of the interface toward `peer`. Never `0.0.0.0`.
+fn stream_base_url(state: &AppState, peer: SocketAddr) -> String {
+    let bind_ip = state
+        .bind_addr
+        .parse::<SocketAddr>()
+        .map(|addr| addr.ip())
+        .unwrap_or(std::net::Ipv4Addr::UNSPECIFIED.into());
+    rustyfin_core::net_addr::smart_api_url(
+        state.published_subnets.for_peer(
+            peer.ip(),
+            state.published_url.as_deref().map(String::as_str),
+        ),
+        bind_ip,
+        parse_port(&state.bind_addr),
+        peer.ip(),
+    )
 }
 
 fn parse_port(bind_addr: &str) -> u16 {

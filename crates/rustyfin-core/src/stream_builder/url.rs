@@ -3,6 +3,7 @@
 use rustyfin_model::device_profile::{StreamProtocol, SubtitleDeliveryMethod, TranscodeSeekInfo};
 
 use super::video::StreamInfo;
+use crate::query_string::QueryBuilder;
 
 /// The stream options that go into the URL, in insertion order. Setting a name again replaces
 /// its value in place.
@@ -68,24 +69,25 @@ impl StreamInfo {
     /// transcode's path is `/Videos/{item}/master.m3u8`, also for audio; a progressive (HTTP)
     /// one's is `/audio/{item}/stream.{container}` or `/videos/{item}/stream.{container}`, with
     /// no SegmentContainer. The token goes in `ApiKey`, and the bitrates are in bits per second.
-    /// Empty ids and tokens are left out.
+    /// Empty ids and tokens are left out. Every name and value is percent-encoded
+    /// (`QueryBuilder`), so a `+`, `&` or `=` in a device id or token arrives as sent.
     pub(super) fn to_url(&self) -> String {
         let hls = self.sub_protocol == StreamProtocol::Hls;
-        let mut params: Vec<String> = Vec::new();
+        let mut params = QueryBuilder::new();
         if !self.device_id.is_empty() {
-            params.push(format!("DeviceId={}", self.device_id));
+            params.pair("DeviceId", &self.device_id);
         }
         if !self.media_source_id.is_empty() {
-            params.push(format!("MediaSourceId={}", self.media_source_id));
+            params.pair("MediaSourceId", &self.media_source_id);
         }
         if !self.video_codecs.is_empty() {
-            params.push(format!("VideoCodec={}", self.video_codecs.join(",")));
+            params.pair("VideoCodec", self.video_codecs.join(","));
         }
         if !self.audio_codecs.is_empty() {
-            params.push(format!("AudioCodec={}", self.audio_codecs.join(",")));
+            params.pair("AudioCodec", self.audio_codecs.join(","));
         }
         if let Some(index) = self.audio_stream_index {
-            params.push(format!("AudioStreamIndex={index}"));
+            params.pair("AudioStreamIndex", index);
         }
         // The subtitle is named for a burn-in, or when it is not delivered as a file (SI 955-959).
         // Index -1 has no stream, so it is never named.
@@ -93,88 +95,86 @@ impl StreamInfo {
         if let Some((index, _)) = subtitle.filter(|(_, method)| {
             self.always_burn_in_subtitle || *method != SubtitleDeliveryMethod::External
         }) {
-            params.push(format!("SubtitleStreamIndex={index}"));
+            params.pair("SubtitleStreamIndex", index);
         }
         if let Some(bitrate) = self.video_bitrate {
-            params.push(format!("VideoBitrate={bitrate}"));
+            params.pair("VideoBitrate", bitrate);
         }
         if let Some(bitrate) = self.audio_bitrate {
-            params.push(format!("AudioBitrate={bitrate}"));
+            params.pair("AudioBitrate", bitrate);
         }
         if let Some(rate) = self.audio_sample_rate {
-            params.push(format!("AudioSampleRate={rate}"));
+            params.pair("AudioSampleRate", rate);
         }
         if let Some(rate) = self.max_framerate {
-            params.push(format!("MaxFramerate={rate}"));
+            params.pair("MaxFramerate", rate);
         }
         if let Some(width) = self.max_width {
-            params.push(format!("MaxWidth={width}"));
+            params.pair("MaxWidth", width);
         }
         if let Some(height) = self.max_height {
-            params.push(format!("MaxHeight={height}"));
+            params.pair("MaxHeight", height);
         }
         let container = self.container.as_deref().filter(|c| !c.is_empty());
         if let Some(container) = container.filter(|_| hls) {
-            params.push(format!("SegmentContainer={container}"));
+            params.pair("SegmentContainer", container);
         }
         if let Some(length) = self.segment_length.filter(|_| hls) {
-            params.push(format!("SegmentLength={length}"));
+            params.pair("SegmentLength", length);
         }
         if let Some(min) = self.min_segments.filter(|_| hls) {
-            params.push(format!("MinSegments={min}"));
+            params.pair("MinSegments", min);
         }
         if self.start_position_ticks != 0 {
-            params.push(format!("StartTimeTicks={}", self.start_position_ticks));
+            params.pair("StartTimeTicks", self.start_position_ticks);
         }
         if !self.play_session_id.is_empty() {
-            params.push(format!("PlaySessionId={}", self.play_session_id));
+            params.pair("PlaySessionId", &self.play_session_id);
         }
         if !self.access_token.is_empty() {
-            params.push(format!("ApiKey={}", self.access_token));
+            params.pair("ApiKey", &self.access_token);
         }
         if self.require_non_anamorphic {
-            params.push("RequireNonAnamorphic=True".to_string());
+            params.pair("RequireNonAnamorphic", "True");
         }
         if let Some(channels) = self.transcoding_max_audio_channels {
-            params.push(format!("TranscodingMaxAudioChannels={channels}"));
+            params.pair("TranscodingMaxAudioChannels", channels);
         }
         if self.enable_subtitles_in_manifest {
-            params.push("EnableSubtitlesInManifest=True".to_string());
+            params.pair("EnableSubtitlesInManifest", "True");
         }
         if self.enable_mpegts_m2ts_mode {
-            params.push("EnableMpegtsM2TsMode=True".to_string());
+            params.pair("EnableMpegtsM2TsMode", "True");
         }
         if self.estimate_content_length {
-            params.push("EstimateContentLength=True".to_string());
+            params.pair("EstimateContentLength", "True");
         }
         if self.transcode_seek_info == TranscodeSeekInfo::Bytes {
-            params.push("TranscodeSeekInfo=Bytes".to_string());
+            params.pair("TranscodeSeekInfo", "Bytes");
         }
         if self.copy_timestamps {
-            params.push("CopyTimestamps=True".to_string());
+            params.pair("CopyTimestamps", "True");
         }
-        params.push(format!("RequireAvc={}", self.require_avc));
-        params.push(format!(
-            "EnableAudioVbrEncoding={}",
-            self.enable_audio_vbr_encoding
-        ));
+        params.pair("RequireAvc", self.require_avc);
+        params.pair("EnableAudioVbrEncoding", self.enable_audio_vbr_encoding);
         // SubtitleMethod is written for a chosen stream that isn't delivered as a file. Jellyfin
         // writes it for index -1 too (SI 1103-1112), but Rustyfin's transcoder takes
         // SubtitleMethod=Encode without an index as "burn in the first subtitle".
         if let Some((_, method)) = subtitle.filter(|(_, m)| *m != SubtitleDeliveryMethod::External)
         {
-            params.push(format!("SubtitleMethod={}", method.as_str()));
+            params.pair("SubtitleMethod", method.as_str());
         }
         for (name, value) in self.stream_options.iter() {
-            // Spaces are stripped so that profile names such as "constrained baseline" need no escaping.
-            params.push(format!("{name}={}", value.replace(' ', "")));
+            // Spaces are stripped so that profile names such as "constrained baseline" read as
+            // one word
+            params.pair(name, value.replace(' ', ""));
         }
         let reasons = self.transcode_reasons.names();
         if !reasons.is_empty() {
-            params.push(format!("TranscodeReasons={}", reasons.join(",")));
+            params.pair("TranscodeReasons", reasons.join(","));
         }
         if self.audio_only && hls {
-            params.push("AudioOnly=true".to_string());
+            params.pair("AudioOnly", "true");
         }
 
         let path = match (hls, self.audio_only) {
@@ -186,10 +186,6 @@ impl StreamInfo {
                 container.map(|c| format!(".{c}")).unwrap_or_default()
             ),
         };
-        if params.is_empty() {
-            path
-        } else {
-            format!("{path}?{}", params.join("&"))
-        }
+        params.url(&path)
     }
 }

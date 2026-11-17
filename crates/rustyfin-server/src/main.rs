@@ -383,6 +383,7 @@ async fn main() {
             .or(network.published_url)
             .filter(|url| !url.trim().is_empty())
             .map(Arc::new),
+        published_subnets: Arc::new(network.published_subnets),
         api_key: api_key.map(Arc::new),
         quick_connect: Arc::new(RwLock::new(std::collections::HashMap::new())),
         transcode_manager,
@@ -494,6 +495,8 @@ async fn main() {
             server_id: state.server_id.to_string(),
             http_port,
             bind_ip: std::net::Ipv4Addr::UNSPECIFIED,
+            published_url: state.published_url.as_deref().cloned(),
+            published_subnets: (*state.published_subnets).clone(),
         });
         let shutdown_rx = state.shutdown_tx.subscribe();
         let (cfg, settings) = (dlna_config.clone(), state.config.clone());
@@ -515,6 +518,7 @@ async fn main() {
             http_port,
             bind_ip: std::net::Ipv4Addr::UNSPECIFIED,
             endpoint_address: state.published_url.as_deref().cloned(),
+            published_subnets: (*state.published_subnets).clone(),
         });
         let shutdown_rx = state.shutdown_tx.subscribe();
         let settings = state.config.clone();

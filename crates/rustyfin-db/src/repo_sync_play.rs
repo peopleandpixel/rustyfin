@@ -80,6 +80,40 @@ pub async fn get_members(
     Ok(rows)
 }
 
+/// Adds `user_id` to group `group_id` unless they are a member already, in one statement, so
+/// two joins at once still add one membership. Returns whether a membership was added.
+pub async fn add_member_once(
+    pool: &SqlitePool,
+    id: &str,
+    group_id: &str,
+    user_id: &str,
+    session_id: &str,
+) -> Result<bool, sqlx::Error> {
+    let added = sqlx::query(
+        "INSERT INTO sync_play_members (id, group_id, user_id, session_id)
+         SELECT ?1, ?2, ?3, ?4
+         WHERE NOT EXISTS (SELECT 1 FROM sync_play_members WHERE group_id = ?2 AND user_id = ?3)",
+    )
+    .bind(id)
+    .bind(group_id)
+    .bind(user_id)
+    .bind(session_id)
+    .execute(pool)
+    .await?
+    .rows_affected();
+    Ok(added > 0)
+}
+
+/// Whether `user_id` is a member of any group.
+pub async fn is_in_any_group(pool: &SqlitePool, user_id: &str) -> Result<bool, sqlx::Error> {
+    let found: Option<i64> =
+        sqlx::query_scalar("SELECT 1 FROM sync_play_members WHERE user_id = ?1 LIMIT 1")
+            .bind(user_id)
+            .fetch_optional(pool)
+            .await?;
+    Ok(found.is_some())
+}
+
 pub async fn add_member(
     pool: &SqlitePool,
     id: &str,
@@ -186,5 +220,31 @@ mod tests {
         assert_eq!(get_members(&pool, "g1").await.unwrap().len(), 1);
         remove_member(&pool, "m1").await.unwrap();
         assert!(get_members(&pool, "g1").await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn r3security_add_member_once_adds_one_membership_per_user() {
+        let pool = test_pool().await;
+        create_group(&pool, "g1", "Group", "u1", "sync")
+            .await
+            .unwrap();
+        assert!(
+            add_member_once(&pool, "m1", "g1", "u2", "s1")
+                .await
+                .unwrap()
+        );
+        assert!(
+            !add_member_once(&pool, "m2", "g1", "u2", "s2")
+                .await
+                .unwrap()
+        );
+        assert!(
+            add_member_once(&pool, "m3", "g1", "u3", "s3")
+                .await
+                .unwrap()
+        );
+        assert_eq!(get_members(&pool, "g1").await.unwrap().len(), 2);
+        assert!(is_in_any_group(&pool, "u2").await.unwrap());
+        assert!(!is_in_any_group(&pool, "u1").await.unwrap());
     }
 }

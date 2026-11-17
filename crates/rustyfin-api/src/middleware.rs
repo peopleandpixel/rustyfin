@@ -115,13 +115,20 @@ pub async fn require_auth(
     })
 }
 
-/// The device that the request's `MediaBrowser` header (`Authorization`, else
-/// `X-Emby-Authorization`) names, when it has a `DeviceId`.
-fn stated_device(headers: &HeaderMap) -> Option<crate::sessions::StatedDevice> {
-    let auth = ["Authorization", "X-Emby-Authorization"]
+/// The request's `MediaBrowser` header: `Authorization`, else `X-Emby-Authorization`, as
+/// Jellyfin's `AuthorizationContext` reads them, parsed by `parse_media_browser` (quoted values,
+/// URL-decoded). Sign-in and every later request read the client and device from here.
+pub(crate) fn media_browser_header(headers: &HeaderMap) -> Option<MediaBrowserAuth> {
+    ["Authorization", "X-Emby-Authorization"]
         .iter()
         .filter_map(|name| headers.get(*name)?.to_str().ok())
-        .find_map(parse_media_browser)?;
+        .find_map(parse_media_browser)
+}
+
+/// The device that the request's `MediaBrowser` header (`media_browser_header`) names, when it
+/// has a `DeviceId`.
+fn stated_device(headers: &HeaderMap) -> Option<crate::sessions::StatedDevice> {
+    let auth = media_browser_header(headers)?;
     let device_id = auth.device_id.filter(|id| !id.trim().is_empty())?;
     Some(crate::sessions::StatedDevice(rustyfin_auth::TokenDevice {
         device_id,
