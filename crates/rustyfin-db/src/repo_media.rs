@@ -838,6 +838,25 @@ enum SortKey {
     DatePlayed,
     /// When the caller last played one of a series' episodes (bound user id)
     SeriesDatePlayed,
+    /// Whether the caller marked the item a favourite (bound user id); NULL without user data,
+    /// as Jellyfin's
+    IsFavoriteOrLiked,
+    /// Whether the caller played the item, or not (bound user id); NULL without user data
+    IsPlayed,
+    IsUnplayed,
+    /// Whether the item is a folder (`MediaType::is_folder`)
+    IsFolder,
+    /// The item's critic rating (`item_metadata_extras`)
+    CriticRating,
+    /// The first artist, album artist or studio credited, folded to lowercase as Jellyfin's
+    /// `CleanValue`; a track takes its album's album artist when it has none of its own
+    Artist,
+    AlbumArtist,
+    Studio,
+    /// A track's album name
+    Album,
+    /// The largest bit rate of the item's sources (Jellyfin's `TotalBitrate`)
+    VideoBitRate,
     /// Dropped after the keys are paired with the orders, so it never reaches a clause.
     Default,
     /// Any other key; it orders by `sort_name`.
@@ -854,7 +873,17 @@ impl SortKey {
             "datecreated" | "dateadded" => SortKey::DateCreated,
             "premieredate" => SortKey::PremiereDate,
             "productionyear" => SortKey::ProductionYear,
-            "communityrating" | "criticrating" => SortKey::CommunityRating,
+            "communityrating" => SortKey::CommunityRating,
+            "criticrating" => SortKey::CriticRating,
+            "isfavoriteorliked" => SortKey::IsFavoriteOrLiked,
+            "isplayed" => SortKey::IsPlayed,
+            "isunplayed" => SortKey::IsUnplayed,
+            "isfolder" => SortKey::IsFolder,
+            "artist" => SortKey::Artist,
+            "albumartist" => SortKey::AlbumArtist,
+            "studio" => SortKey::Studio,
+            "album" => SortKey::Album,
+            "videobitrate" => SortKey::VideoBitRate,
             "runtime" => SortKey::Runtime,
             "parentindexnumber" => SortKey::ParentIndexNumber,
             "indexnumber" => SortKey::IndexNumber,
@@ -885,10 +914,57 @@ impl SortKey {
             SortKey::ParentIndexNumber => "parent_index_number",
             SortKey::IndexNumber => "index_number",
             SortKey::Random => "ROWID",
-            // The rating's parental score (Jellyfin's ParentalRatingValue) from a bound JSON
-            // object of each stored rating's score; an unrated item has none
-            SortKey::OfficialRating => {
-                "(SELECT j.value FROM json_each(?) j WHERE j.key = media_items.official_rating)"
+            // The inherited rating's parental score (Jellyfin's InheritedParentalRatingValue)
+            // from a bound JSON object of each stored rating's score; an unrated item has none
+            SortKey::OfficialRating => concat!(
+                "(SELECT j.value FROM json_each(?) j WHERE j.key = ",
+                crate::repo_item_filter::inherited_rating_sql!(),
+                ")"
+            ),
+            SortKey::IsFavoriteOrLiked => concat!(
+                "(SELECT ud.is_favorite FROM user_item_data ud ",
+                "WHERE ud.item_id = media_items.id AND ud.user_id = ?)"
+            ),
+            SortKey::IsPlayed => concat!(
+                "(SELECT ud.played FROM user_item_data ud ",
+                "WHERE ud.item_id = media_items.id AND ud.user_id = ?)"
+            ),
+            SortKey::IsUnplayed => concat!(
+                "(SELECT NOT ud.played FROM user_item_data ud ",
+                "WHERE ud.item_id = media_items.id AND ud.user_id = ?)"
+            ),
+            SortKey::IsFolder => concat!(
+                "(media_type IN ('Series', 'Season', 'MusicAlbum', 'MusicArtist', 'Genre', ",
+                "'BoxSet', 'Playlist'))"
+            ),
+            SortKey::CriticRating => concat!(
+                "(SELECT e.critic_rating FROM item_metadata_extras e ",
+                "WHERE e.item_id = media_items.id)"
+            ),
+            SortKey::Artist => concat!(
+                "(SELECT lower(p.name) FROM item_people ip JOIN people p ON p.id = ip.person_id ",
+                "WHERE ip.item_id = media_items.id AND ip.type = 'Artist' ",
+                "ORDER BY ip.sort_order IS NULL, ip.sort_order, ip.rowid LIMIT 1)"
+            ),
+            SortKey::AlbumArtist => concat!(
+                "COALESCE((SELECT lower(p.name) FROM item_people ip JOIN people p ON p.id = ip.person_id ",
+                "WHERE ip.item_id = media_items.id AND ip.type = 'AlbumArtist' ",
+                "ORDER BY ip.sort_order IS NULL, ip.sort_order, ip.rowid LIMIT 1), ",
+                "(SELECT lower(p.name) FROM item_people ip JOIN people p ON p.id = ip.person_id ",
+                "WHERE ip.item_id = media_items.parent_id AND ip.type = 'AlbumArtist' ",
+                "AND media_items.media_type = 'Audio' ",
+                "ORDER BY ip.sort_order IS NULL, ip.sort_order, ip.rowid LIMIT 1))"
+            ),
+            SortKey::Studio => concat!(
+                "(SELECT lower(st.name) FROM item_studios s JOIN studios st ON st.id = s.studio_id ",
+                "WHERE s.item_id = media_items.id ORDER BY s.rowid LIMIT 1)"
+            ),
+            SortKey::Album => concat!(
+                "(SELECT p.name FROM media_items p WHERE p.id = media_items.parent_id ",
+                "AND p.media_type = 'MusicAlbum' AND media_items.media_type = 'Audio')"
+            ),
+            SortKey::VideoBitRate => {
+                "(SELECT MAX(ms.bitrate) FROM media_sources ms WHERE ms.item_id = media_items.id)"
             }
             SortKey::DateLastContentAdded => concat!(
                 "COALESCE((SELECT MAX(d) FROM (",
@@ -923,9 +999,12 @@ impl SortKey {
     /// What the key's expression binds (one `?`), if anything.
     fn bind(self) -> Option<OrderBind> {
         match self {
-            SortKey::PlayCount | SortKey::DatePlayed | SortKey::SeriesDatePlayed => {
-                Some(OrderBind::UserId)
-            }
+            SortKey::PlayCount
+            | SortKey::DatePlayed
+            | SortKey::SeriesDatePlayed
+            | SortKey::IsFavoriteOrLiked
+            | SortKey::IsPlayed
+            | SortKey::IsUnplayed => Some(OrderBind::UserId),
             SortKey::OfficialRating => Some(OrderBind::RatingScores),
             _ => None,
         }
@@ -953,9 +1032,10 @@ fn order_binds(sort_by: &str, sort_order: &str) -> Vec<OrderBind> {
 /// the OfficialRating sort. Ratings without a score (unrated, unknown) are left out, so they sort
 /// as unrated, before the others in ascending order, as Jellyfin's do.
 async fn rating_scores_json(pool: &SqlitePool) -> Result<String, sqlx::Error> {
+    // Trimmed, as the inherited rating the sort looks up is.
     let ratings: Vec<String> = sqlx::query_scalar(
-        "SELECT DISTINCT official_rating FROM media_items \
-         WHERE official_rating IS NOT NULL AND official_rating != ''",
+        "SELECT DISTINCT TRIM(official_rating) FROM media_items \
+         WHERE TRIM(COALESCE(official_rating, '')) != ''",
     )
     .fetch_all(pool)
     .await?;
@@ -4469,5 +4549,198 @@ mod tests {
             same_key.is_empty() && shared.is_empty(),
             "these pairs got the same key: {same_key:?}; these shared SQL: {shared:?}"
         );
+    }
+
+    /// The names a list sorted by `sort_by` (each key ascending unless `sort_order` says) holds,
+    /// of the item types `types`, as `user` sees it.
+    #[cfg(test)]
+    async fn r3items_sorted(
+        pool: &sqlx::SqlitePool,
+        user: uuid::Uuid,
+        types: &[&str],
+        sort_by: &str,
+        sort_order: &str,
+    ) -> Vec<String> {
+        let types: Vec<String> = types.iter().map(|t| t.to_string()).collect();
+        let (items, _) = super::get_items_filtered(
+            pool,
+            None,
+            None,
+            Some(&types),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(sort_by),
+            Some(sort_order),
+            0,
+            100,
+            true,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(user),
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        items.into_iter().map(|item| item.name).collect()
+    }
+
+    #[tokio::test]
+    async fn r3items_sorts_by_user_data_credits_folders_and_bit_rate() {
+        let pool = crate::test_pool().await;
+        let user = uuid::Uuid::new_v4();
+        crate::insert_test_user(&pool, user).await;
+        let item = |id: &str, name: &str, kind: &str, parent: &str| {
+            let parent = if parent.is_empty() {
+                "NULL".to_string()
+            } else {
+                format!("'{parent}'")
+            };
+            format!(
+                "INSERT INTO media_items (id, name, sort_name, media_type, path, parent_id, library_id) \
+                 VALUES ('{id}', '{name}', lower('{name}'), '{kind}', '/x/{id}', {parent}, 'lib')"
+            )
+        };
+        let mut sql = vec![
+            "INSERT INTO libraries (id, name, content_type) VALUES ('lib', 'L', 'movies')"
+                .to_string(),
+            item("m1", "Alpha", "Movie", ""),
+            item("m2", "Bravo", "Movie", ""),
+            item("m3", "Charlie", "Movie", ""),
+            item("s", "Show", "Series", ""),
+            item("n", "Season", "Season", "s"),
+            item("e1", "Episode", "Episode", "n"),
+            item("r1", "Record", "MusicAlbum", ""),
+            item("r2", "Another", "MusicAlbum", ""),
+            item("t1", "Song One", "Audio", "r1"),
+            item("t2", "Song Two", "Audio", "r1"),
+            item("t3", "Song Three", "Audio", "r2"),
+        ];
+        sql.extend(
+            [
+                format!("INSERT INTO user_item_data (user_id, item_id, is_favorite, played, play_count) VALUES ('{user}', 'm2', 1, 1, 1), ('{user}', 'm3', 0, 0, 0)"),
+                "INSERT INTO item_metadata_extras (item_id, critic_rating) VALUES ('m1', 50), ('m2', 90)".to_string(),
+                "INSERT INTO media_sources (id, item_id, uid, path, bitrate) VALUES ('s1', 'm1', 's1', '/x/m1', 1000000), ('s3', 'm3', 's3', '/x/m3', 5000000)".to_string(),
+                "INSERT INTO studios (id, name) VALUES ('acme', 'Acme'), ('zeta', 'Zeta')".to_string(),
+                "INSERT INTO item_studios (item_id, studio_id) VALUES ('m3', 'acme'), ('m2', 'zeta')".to_string(),
+                "UPDATE media_items SET official_rating = 'R' WHERE id = 's'".to_string(),
+                "UPDATE media_items SET official_rating = 'PG' WHERE id = 'm1'".to_string(),
+                "INSERT INTO people (id, name) VALUES ('pa', 'Aaron'), ('pb', 'Beta'), ('pc', 'Alpha'), ('pz', 'Zed')".to_string(),
+                "INSERT INTO item_people (item_id, person_id, type) VALUES ('r1', 'pz', 'AlbumArtist'), ('t1', 'pb', 'Artist'), ('t2', 'pc', 'Artist'), ('t3', 'pa', 'AlbumArtist')".to_string(),
+            ],
+        );
+        for sql in sql {
+            sqlx::query(sqlx::AssertSqlSafe(sql.clone()))
+                .execute(&pool)
+                .await
+                .unwrap_or_else(|e| panic!("{sql}: {e}"));
+        }
+        let movies = ["Movie"];
+        let cases: Vec<(&[&str], &str, &str, &[&str])> = vec![
+            // The caller's user data: none sorts first, as NULL does in Jellyfin's.
+            (
+                &movies,
+                "IsFavoriteOrLiked",
+                "Ascending",
+                &["Alpha", "Charlie", "Bravo"],
+            ),
+            (
+                &movies,
+                "IsFavoriteOrLiked,SortName",
+                "Descending,Ascending",
+                &["Bravo", "Charlie", "Alpha"],
+            ),
+            (
+                &movies,
+                "IsPlayed",
+                "Ascending",
+                &["Alpha", "Charlie", "Bravo"],
+            ),
+            (
+                &movies,
+                "IsUnplayed",
+                "Ascending",
+                &["Alpha", "Bravo", "Charlie"],
+            ),
+            (
+                &movies,
+                "CriticRating",
+                "Ascending",
+                &["Charlie", "Alpha", "Bravo"],
+            ),
+            (
+                &movies,
+                "VideoBitRate",
+                "Ascending",
+                &["Bravo", "Alpha", "Charlie"],
+            ),
+            (
+                &movies,
+                "Studio",
+                "Ascending",
+                &["Alpha", "Charlie", "Bravo"],
+            ),
+            (
+                &["Movie", "Series"],
+                "IsFolder,SortName",
+                "Descending,Ascending",
+                &["Show", "Alpha", "Bravo", "Charlie"],
+            ),
+            // The episode takes its series' R; unrated movies come first.
+            (
+                &["Movie", "Episode"],
+                "OfficialRating",
+                "Ascending",
+                &["Bravo", "Charlie", "Alpha", "Episode"],
+            ),
+            // Credits: the first artist; a track's album artist, else its album's.
+            (
+                &["Audio"],
+                "Artist",
+                "Ascending",
+                &["Song Three", "Song Two", "Song One"],
+            ),
+            (
+                &["Audio"],
+                "AlbumArtist",
+                "Ascending",
+                &["Song Three", "Song One", "Song Two"],
+            ),
+            (
+                &["Audio"],
+                "Album",
+                "Ascending",
+                &["Song Three", "Song One", "Song Two"],
+            ),
+            // SimilarityScore and SearchScore go by name, as in Jellyfin.
+            (
+                &movies,
+                "SearchScore",
+                "Descending",
+                &["Charlie", "Bravo", "Alpha"],
+            ),
+        ];
+        for (types, sort_by, sort_order, expected) in cases {
+            assert_eq!(
+                r3items_sorted(&pool, user, types, sort_by, sort_order).await,
+                expected,
+                "{sort_by} {sort_order}"
+            );
+        }
     }
 }

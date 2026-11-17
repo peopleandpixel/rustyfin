@@ -239,14 +239,20 @@ impl FilterSql {
 
 /// The rating Jellyfin's `InheritedParentalRatingValue` reads: the item's own, else its
 /// parent's (an extra's owner's), else its grandparent's, as `repo_parental` inherits it; NULL
-/// when none is set.
-const INHERITED_RATING_SQL: &str = "COALESCE(\
-     NULLIF(TRIM(COALESCE(media_items.official_rating, '')), ''), \
-     (SELECT NULLIF(TRIM(COALESCE(p.official_rating, '')), '') FROM media_items p \
-      WHERE p.id = COALESCE(media_items.parent_id, media_items.owner_id)), \
-     (SELECT NULLIF(TRIM(COALESCE(g.official_rating, '')), '') FROM media_items p \
-      JOIN media_items g ON g.id = p.parent_id \
-      WHERE p.id = COALESCE(media_items.parent_id, media_items.owner_id)))";
+/// when none is set. A macro, so `repo_media`'s OfficialRating sort can `concat!` it.
+macro_rules! inherited_rating_sql {
+    () => {
+        "COALESCE(\
+         NULLIF(TRIM(COALESCE(media_items.official_rating, '')), ''), \
+         (SELECT NULLIF(TRIM(COALESCE(p.official_rating, '')), '') FROM media_items p \
+          WHERE p.id = COALESCE(media_items.parent_id, media_items.owner_id)), \
+         (SELECT NULLIF(TRIM(COALESCE(g.official_rating, '')), '') FROM media_items p \
+          JOIN media_items g ON g.id = p.parent_id \
+          WHERE p.id = COALESCE(media_items.parent_id, media_items.owner_id)))"
+    };
+}
+pub(crate) use inherited_rating_sql;
+const INHERITED_RATING_SQL: &str = inherited_rating_sql!();
 
 /// The ratings (trimmed, as `INHERITED_RATING_SQL` reads them) the rating conditions leave out:
 /// those with a score outside `min_rating`..`max_rating`, or with any score when only unrated

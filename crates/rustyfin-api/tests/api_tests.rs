@@ -48866,3 +48866,21 @@ async fn r3items_camel_case_names_counts_and_last_saved() {
     )
     .await;
 }
+
+#[tokio::test]
+async fn r3items_sort_by_the_callers_favourites() {
+    let state = test_state().await;
+    let lib = r3items_library(&state).await;
+    let (token, user) = admin_session(&state).await;
+    let (other, _) = admin_session(&state).await;
+    let app = app(state);
+    let uri = format!("/Users/{user}/FavoriteItems/{}", lib.id("Charlie"));
+    let (status, _) = send_authed(&app, "POST", &uri, &token, None).await;
+    assert!(status.is_success(), "{status}");
+    let sorted = "/Items?Recursive=true&IncludeItemTypes=Movie&SortBy=IsFavoriteOrLiked,SortName&SortOrder=Descending,Ascending";
+    let (names, _) = r3items_names(&app, sorted, &token).await;
+    assert_eq!(names, ["Charlie", "Alpha", "Bravo"]);
+    // Another user's favourites don't count.
+    let (names, _) = r3items_names(&app, sorted, &other).await;
+    assert_eq!(names, ["Alpha", "Bravo", "Charlie"]);
+}
