@@ -40,8 +40,9 @@ fn parse_segment(name: &str) -> Option<Option<u32>> {
 /// `playbackId`, found by the transcode's id and the segment's number only; no part of the URL
 /// becomes part of a file path. The file lies in the transcode's directory under the configured
 /// cache, and is streamed. 400 for a name that isn't a segment (`{n}.ts`, `{n}.mp4`, `{n}.m4s`,
-/// `init.mp4`) or a playback id that isn't a UUID; 404 for an unknown transcode, a segment not
-/// written yet, or an item the caller's limits hide. `streamId` is not used.
+/// `init.mp4`) or a playback id that isn't a UUID; 404 for an unknown transcode, another user's
+/// transcode (unless the caller is an administrator), a segment not written yet, or an item the
+/// caller's limits hide. `streamId` is not used.
 async fn get_hls_segment(
     State(state): State<AppState>,
     Extension(claims): Extension<Claims>,
@@ -52,7 +53,7 @@ async fn get_hls_segment(
     let not_found = || ApiError::NotFound("Segment not found".to_string());
     let (item_id, path) = state
         .transcode_manager
-        .session_segment(playback_id, index)
+        .session_segment(playback_id, index, super::transcode::viewer(&claims))
         .ok_or_else(not_found)?;
     // The route has no item id for the item gate: check the transcode's item here
     crate::parental::ensure_visible(&state, &claims, item_id).await?;

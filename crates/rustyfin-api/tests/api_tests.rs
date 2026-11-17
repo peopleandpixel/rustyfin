@@ -41709,6 +41709,86 @@ async fn r3security_dlna_stream_urls_use_a_reachable_address() {
     );
 }
 
+/// A transcode's segments go to the user who started it (and administrators) only: through
+/// `/DynamicHls` and `/Videos/{id}/hls/...` the owner reads a real segment, another user gets
+/// 404, and so does the owner once their limits hide the item.
+#[cfg(unix)]
+#[tokio::test]
+async fn r3security_transcode_segments_are_for_their_owner() {
+    use std::os::unix::fs::PermissionsExt;
+    let mut state = test_state().await;
+    let (admin, _) = admin_session(&state).await;
+    let (alice, alice_id) = b38_user(&state, "r3sec-owner", false).await;
+    let (bob, _) = b38_user(&state, "r3sec-other", false).await;
+    // An ffmpeg that writes one segment and a playlist, then runs until stopped. Renamed into
+    // place, so it is never run while still open for writing.
+    let script = state.data_dir.join("fake-ffmpeg");
+    let tmp = state.data_dir.join("fake-ffmpeg.tmp");
+    std::fs::write(
+        &tmp,
+        "#!/bin/sh\nfor last; do :; done\ncase \"$last\" in *.m3u8) ;; *) exit 1;; esac\n\
+         dir=$(dirname \"$last\")\nprintf 'r3security segment' > \"$dir/segment_0000.ts\"\n\
+         printf '#EXTM3U\\n#EXTINF:6.0,\\nsegment_0000.ts\\n' > \"$last\"\nexec sleep 30\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::fs::rename(&tmp, &script).unwrap();
+    state.transcode_manager =
+        rustyfin_core::transcode::TranscodeManager::new(&state.data_dir).with_ffmpeg(script);
+    let lib = std::path::PathBuf::from(media_folder(&state, "r3security-owner"));
+    let film = lib.join("Film.mkv");
+    std::fs::write(&film, b"film").unwrap();
+    let id = r3playback_insert_item(&state, &lib, film.to_str().unwrap()).await;
+    let manager = state.transcode_manager.clone();
+    let app = app(state);
+
+    let uri = format!("/Videos/{id}/main.m3u8?PlaySessionId=r3sec-owner");
+    let (status, playlist) = r3playback_get(&app, &uri, &alice).await;
+    let playlist = String::from_utf8_lossy(&playlist).to_string();
+    assert_eq!(status, StatusCode::OK, "{playlist}");
+    let at = playlist.find("hls/").expect(&playlist) + 4;
+    let playback: uuid::Uuid = playlist[at..at + 36].parse().unwrap();
+
+    let dynamic = format!("/DynamicHls/{playback}/0/0.ts");
+    let videos = format!("/Videos/{id}/hls/{playback}/video/segment_0000.ts");
+    let legacy = format!("/Videos/{id}/hls/segment_0000.ts");
+    for uri in [&dynamic, &videos, &legacy] {
+        let (status, body) = r3playback_get(&app, uri, &alice).await;
+        assert_eq!(status, StatusCode::OK, "owner: {uri}");
+        assert_eq!(body, b"r3security segment", "owner: {uri}");
+        let (status, body) = r3playback_get(&app, uri, &bob).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "other user: {uri}");
+        assert_ne!(body, b"r3security segment", "other user: {uri}");
+        let (status, _) = r3playback_get(&app, uri, &admin).await;
+        assert_eq!(status, StatusCode::OK, "admin: {uri}");
+    }
+    // Another user's request in the same play session gets nothing of the owner's transcode
+    let uri = format!("/Videos/{id}/main.m3u8?PlaySessionId=r3sec-owner");
+    let (_, theirs) = r3playback_get(&app, &uri, &bob).await;
+    assert!(
+        !String::from_utf8_lossy(&theirs).contains(&playback.to_string()),
+        "the other user got the owner's transcode"
+    );
+    let (status, _) = r3playback_get(&app, &dynamic, &alice).await;
+    assert_eq!(status, StatusCode::OK, "the owner's transcode still runs");
+
+    // Hidden from the owner by their library access: 404
+    let (status, body) = send(
+        &app,
+        request(
+            "POST",
+            &format!("/Users/{alice_id}/Policy"),
+            Some(&admin),
+            Some(serde_json::json!({ "EnableAllFolders": false, "EnabledFolders": [] })),
+        ),
+    )
+    .await;
+    assert!(status.is_success(), "{status} {body}");
+    let (status, _) = r3playback_get(&app, &dynamic, &alice).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "hidden item");
+    manager.stop_all().await;
+}
+
 /// A device id stored URL-encoded by sign-in's old parser: signing in again with the same header
 /// keeps the session and device under the decoded id, instead of starting a second session.
 #[tokio::test]

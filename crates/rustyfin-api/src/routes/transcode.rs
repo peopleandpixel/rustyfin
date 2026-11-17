@@ -971,7 +971,14 @@ async fn hls_master_playlist(
 
     let (playlist_path, playback_id) = match state
         .transcode_manager
-        .start_transcode(id, input_path, &profile, &play_session_id, &device_id)
+        .start_transcode(
+            id,
+            input_path,
+            &profile,
+            &play_session_id,
+            &device_id,
+            claims.as_ref().map(|axum::Extension(claims)| claims.sub),
+        )
         .await
     {
         Ok(started) => started,
@@ -1041,20 +1048,38 @@ fn rewrite_playlist(content: &str, playback_id: &Uuid, query: Option<&str>) -> S
         .join("\n")
 }
 
+/// Who reads a transcode's segments: the caller, and whether they are an administrator. Only a
+/// transcode's owner (the user who started it) or an administrator reads it.
+pub(crate) fn viewer(claims: &rustyfin_model::auth::Claims) -> rustyfin_core::transcode::Viewer {
+    rustyfin_core::transcode::Viewer {
+        user: claims.sub,
+        admin: claims.is_admin,
+    }
+}
+
 /// Handle Jellyfin HLS segment requests: /Videos/{id}/hls/{playbackId}/{type}/{segment}
 async fn hls_segment(
     State(state): State<AppState>,
+    axum::Extension(claims): axum::Extension<rustyfin_model::auth::Claims>,
     Path((id, playback_id, segment_type, segment)): Path<(Uuid, Uuid, String, String)>,
 ) -> Result<Response, ApiError> {
     // segment_type is typically "video", "audio", or "sub" — we just ignore it
     // and serve the segment file by name
     let _ = segment_type;
 
-    // The playback id names the session, which must belong to this item
+    // The playback id names the session, which must belong to this item and to the caller (or
+    // the caller is an administrator); another user's session answers as one that doesn't exist
+    let not_found = || ApiError::NotFound(format!("Segment {segment} not found for item {id}"));
+    if !state
+        .transcode_manager
+        .may_read(playback_id, viewer(&claims))
+    {
+        return Err(not_found());
+    }
     let segment_path = state
         .transcode_manager
         .segment_path(id, playback_id, &segment)
-        .ok_or_else(|| ApiError::NotFound(format!("Segment {segment} not found for item {id}")))?;
+        .ok_or_else(not_found)?;
 
     let data = tokio::fs::read(&segment_path)
         .await
@@ -1084,6 +1109,7 @@ async fn hls_segment(
 /// Legacy segment endpoint for backward compatibility: /Videos/{id}/hls/{segment}
 async fn hls_segment_legacy(
     State(state): State<AppState>,
+    axum::Extension(claims): axum::Extension<rustyfin_model::auth::Claims>,
     Path((id, segment)): Path<(Uuid, String)>,
 ) -> Result<Response, ApiError> {
     // `{id}` must be an item, which the parental gate has already checked for the caller. A
@@ -1095,7 +1121,7 @@ async fn hls_segment_legacy(
         .ok_or_else(not_found)?;
     let segment_path = state
         .transcode_manager
-        .legacy_segment_path(id, &segment)
+        .legacy_segment_path(id, &segment, viewer(&claims))
         .ok_or_else(not_found)?;
 
     let data = tokio::fs::read(&segment_path)
