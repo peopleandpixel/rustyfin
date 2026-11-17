@@ -529,6 +529,9 @@ fn parental_policy(
     if req.enable_content_deletion.is_some() {
         access.enable_content_deletion = req.enable_content_deletion;
     }
+    if let Some(folders) = &req.enable_content_deletion_from_folders {
+        access.enable_content_deletion_from_folders = folders.clone();
+    }
     if let Some(n) = req.max_active_sessions {
         access.max_active_sessions = n;
     }

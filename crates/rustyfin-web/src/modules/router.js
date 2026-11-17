@@ -1,5 +1,6 @@
 // Hash routing, page dispatch, the user menu, click actions and start-up
 import { $, toast } from './util.js';
+import { toggleSidebar, closeSidebar } from './drawer.js';
 import { checkSetupWizard, wizAddManualLibrary } from './wizard.js';
 import { startOidcSignIn, startOidcLink, unlinkOidc, renderLogin, updateAuthUI } from './auth.js';
 import { renderHome, renderFavorites } from './home.js';
@@ -85,6 +86,7 @@ function navigate(page, data, { fromHistory = false } = {}) {
 
     if (pages[page]) pages[page]();
     closeUserMenu();
+    closeSidebar();
     window.scrollTo({ top: 0, behavior: 'smooth' });
 }
 
@@ -252,22 +254,6 @@ document.addEventListener('click', e => {
     if (el) clickActions[el.dataset.action]?.(el, e);
 });
 
-function toggleSidebar() {
-    const m = $('sidebar-mobile'), o = $('sidebar-overlay');
-    if (!m || !o) return;
-    if (m.classList.contains('hidden')) {
-        m.classList.remove('hidden');
-        o.classList.remove('hidden');
-        setTimeout(() => m.style.transform = 'translateX(0)', 10);
-        const content = $('sidebar')?.innerHTML || '';
-        $('sidebar-mobile-content').innerHTML = content;
-    } else {
-        m.style.transform = 'translateX(-100%)';
-        o.classList.add('hidden');
-        setTimeout(() => m.classList.add('hidden'), 200);
-    }
-}
-
 // --- Hash Router ---
 // A hash route (location.hash without its #) as { page, param, query }: a leading slash is
 // allowed (#/library/<id>), and a ?query after the route (#library/<id>?debug=grid) is split off,
@@ -304,7 +290,11 @@ function handleHash() {
 }
 
 // --- Bootstrap & Lifecycle ---
-window.addEventListener('hashchange', handleHash);
+// navigate() has already drawn the page whose hash it set, so the hashchange that follows is skipped;
+// any other hash (Back/Forward, a typed or linked one) is routed. A page used to draw twice per click.
+window.addEventListener('hashchange', () => {
+    if (window.location.hash.slice(1) !== navigatedHash) handleHash();
+});
 
 document.addEventListener('DOMContentLoaded', async () => {
     // Every way of closing the player goes through here, so the session is stopped and its position reported once

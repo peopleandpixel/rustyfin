@@ -3863,6 +3863,7 @@ const B124_WEB_MODULES: &[&str] = &[
     "collections.js",
     "dashboard.js",
     "dlna-admin.js",
+    "drawer.js",
     "genres.js",
     "home.js",
     "item.js",
@@ -3873,6 +3874,7 @@ const B124_WEB_MODULES: &[&str] = &[
     "libtabs.js",
     "lyrics.js",
     "metadata-admin.js",
+    "mobile.js",
     "multiselect.js",
     "music.js",
     "nativeshell.js",
@@ -27982,7 +27984,8 @@ async fn g1_item_admin_routes() {
             true,
         ),
         ("POST", format!("/Items/{item}/Refresh"), None, false),
-        ("DELETE", format!("/Items?ids={item}"), None, true),
+        // DELETE /Items is for any user with deletion rights, as in Jellyfin 12.4:
+        // r3items_delete_items_deletes_exactly_the_ids covers it.
         ("DELETE", format!("/Items/{item}"), None, true),
         ("POST", format!("/Items/{item}/Images/Primary"), None, true),
         (
@@ -29422,6 +29425,18 @@ fn r3prefs_player() {
     b124_node_test("r3prefs_player.mjs");
 }
 
+// The web player reports progress every 10 s, paused too, and on pause and unpause with IsPaused
+#[test]
+fn r3prefs_progress() {
+    b124_node_test("r3prefs_progress.mjs");
+}
+
+// Every stop and hand-off path (remote Stop, Play on, Cast, the OS stop key) stops local music and video
+#[test]
+fn r3prefs_stop() {
+    b124_node_test("r3prefs_stop.mjs");
+}
+
 // The album page's Play queues every track in disc and track order; a track plays the album from it
 #[test]
 fn r3player_album() {
@@ -29494,6 +29509,24 @@ fn r3item_play() {
 #[test]
 fn r3android_shell() {
     b124_node_test("r3android_shell.mjs");
+}
+
+// R3 web client on phones: the desktop sidebar stays hidden below lg, and the drawer opens, closes on
+// an item, Escape and navigation (tests/web/r3mobile_*.mjs)
+#[test]
+fn r3mobile_drawer() {
+    b124_node_test("r3mobile_drawer.mjs");
+}
+
+#[test]
+fn r3mobile_touch() {
+    b124_node_test("r3mobile_touch.mjs");
+}
+
+// In-app navigation draws the page once, not again on the hashchange it causes (tests/web/r3mobile_navigate_once.mjs)
+#[test]
+fn r3mobile_navigate_once() {
+    b124_node_test("r3mobile_navigate_once.mjs");
 }
 
 #[test]
@@ -32684,11 +32717,13 @@ async fn b35_deleting_items_under_a_parent_clears_their_data() {
     b35_favourite_and_play(&app, &bob_t, bob, episodes[0]).await;
     b35_pin(&state, bob, series, season, episodes[1]).await;
 
+    // Jellyfin 12.4's DELETE /Items deletes the listed ids (here the series' one child, the
+    // season, with the episodes under it); a ParentId alone deletes nothing.
     let (status, body) = send(
         &app,
         request(
             "DELETE",
-            &format!("/Items?ParentId={series}"),
+            &format!("/Items?ids={season}"),
             Some(&owner_t),
             None,
         ),
@@ -46948,7 +46983,8 @@ async fn b20_import_run_creates_picked_users_with_codes() {
 
 #[tokio::test]
 async fn b20_import_run_creates_one_user_per_name() {
-    // Jellyfin users whose names differ only in case: the one created first matches the other.
+    // Jellyfin users whose names sign-in can't tell apart: the first is created, the other is
+    // skipped as ambiguous, never merged into it unconfirmed (H18).
     let mut w = b20_world().await;
     w.source.users.push(jf::JfUser::new(3, "Erin", false));
     w.source.users.push(jf::JfUser::new(4, "erin", false));
@@ -46962,10 +46998,11 @@ async fn b20_import_run_creates_one_user_per_name() {
         panic!("{report}");
     };
     let actions = (first.action.as_str(), second.action.as_str());
-    assert_eq!(actions, ("Create", "Match"), "{report}");
+    assert_eq!(actions, ("Create", "Skip"), "{report}");
+    assert_eq!(second.reason.as_deref(), Some("Ambiguous"), "{report}");
     assert!(first.code.is_some() && second.code.is_none(), "{report}");
     assert!(first.user_id.is_some(), "{report}");
-    assert_eq!(second.user_id, first.user_id, "{report}");
+    assert_eq!(second.user_id, None, "{report}");
     let erin_users: i64 =
         sqlx::query_scalar("SELECT COUNT(*) FROM users WHERE lower(name) = 'erin'")
             .fetch_one(&w.state.db)
@@ -54175,6 +54212,152 @@ async fn r3items_filters2_lists_stream_languages() {
 }
 
 #[tokio::test]
+async fn r3items_delete_items_deletes_exactly_the_ids() {
+    let state = test_state().await;
+    let (lib, ids) = r3items_movies(&state).await;
+    let other = j6_library(&state, "R3 Items Other").await;
+    let echo = j6_add_item(&state, other, None, "Echo", "Movie").await;
+    let app = app(state.clone());
+    let (admin, _) = admin_session(&state).await;
+    let (a, b, c, d) = (ids[0], ids[1], ids[2], ids[3]);
+    let listed = |token: String| {
+        let app = app.clone();
+        async move {
+            let uri = format!("/Items?ParentId={lib}&Recursive=true&SortBy=SortName");
+            r3items_names(&app, &uri, &token).await.0
+        }
+    };
+    // The listing is cached before the delete, so a stale answer would show.
+    assert_eq!(
+        listed(admin.clone()).await,
+        ["Alpha", "Bravo", "Charlie", "Delta"]
+    );
+    // Only the ids given go, and the answer is 204, as in Jellyfin 12.4.
+    let (status, _) = send_authed(
+        &app,
+        "DELETE",
+        &format!("/Items?ids={a},{}", b.simple()),
+        &admin,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    assert_eq!(listed(admin.clone()).await, ["Charlie", "Delta"]);
+    // A ParentId without ids deletes nothing; an unknown id is a 404.
+    let (status, _) = send_authed(
+        &app,
+        "DELETE",
+        &format!("/Items?ParentId={lib}"),
+        &admin,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    assert_eq!(listed(admin.clone()).await, ["Charlie", "Delta"]);
+    let missing = format!("/Items?ids={}", uuid::Uuid::new_v4());
+    let (status, _) = send_authed(&app, "DELETE", &missing, &admin, None).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    // A user without deletion rights gets a 401 and deletes nothing.
+    let kid = add_user(&state, "r3items-deleter", "r3items-pass", false).await;
+    let (token, _) = login(&app, "r3items-deleter", "r3items-pass")
+        .await
+        .unwrap();
+    let (status, _) = send_authed(&app, "DELETE", &format!("/Items?ids={c}"), &token, None).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert_eq!(listed(admin.clone()).await, ["Charlie", "Delta"]);
+    // With deletion rights in this library only (EnableContentDeletionFromFolders).
+    let (_, user) = send_authed(&app, "GET", &format!("/Users/{kid}"), &admin, None).await;
+    let mut policy = user["Policy"].clone();
+    policy["EnableContentDeletionFromFolders"] = serde_json::json!([lib.simple().to_string()]);
+    let (status, _) = send_authed(
+        &app,
+        "POST",
+        &format!("/Users/{kid}/Policy"),
+        &admin,
+        Some(&policy.to_string()),
+    )
+    .await;
+    assert!(status.is_success(), "{status}");
+    let (_, user) = send_authed(&app, "GET", &format!("/Users/{kid}"), &admin, None).await;
+    assert_eq!(
+        user["Policy"]["EnableContentDeletionFromFolders"],
+        serde_json::json!([lib.simple().to_string()])
+    );
+    let (status, _) =
+        send_authed(&app, "DELETE", &format!("/Items?ids={echo}"), &token, None).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    let (status, _) = send_authed(&app, "DELETE", &format!("/Items?ids={c}"), &token, None).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    // The web client's multi-select deletes one item at a time, through the same rights.
+    let (status, _) = send_authed(&app, "DELETE", &format!("/Items/{d}"), &token, None).await;
+    assert!(status.is_success(), "{status}");
+    assert!(listed(admin.clone()).await.is_empty());
+    let (status, _) = send_authed(&app, "DELETE", &format!("/Items/{echo}"), &token, None).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn r3items_detail_and_list_send_the_same_stored_fields() {
+    let state = test_state().await;
+    let lib = r3items_library(&state).await;
+    let (alpha, show) = (lib.id("Alpha"), lib.id("Show"));
+    let part = uuid::Uuid::new_v4();
+    for sql in [
+        format!(
+            "UPDATE item_metadata_extras SET original_title = 'Alpha Original', critic_rating = 77, forced_sort_name = 'aaa alpha', locked_fields = 'Name|Overview' WHERE item_id = '{alpha}'"
+        ),
+        format!(
+            "INSERT INTO media_items (id, library_id, name, media_type, path, owner_id, extra_type) VALUES ('{part}', '{}', 'Alpha part 2', 'Movie', '/nowhere/alpha-part2.mkv', '{alpha}', 'Part')",
+            lib.library
+        ),
+    ] {
+        r3items_sql(&state, &sql).await;
+    }
+    let (token, _) = admin_session(&state).await;
+    let app = app(state);
+    let fields = [
+        "OriginalTitle",
+        "CriticRating",
+        "ForcedSortName",
+        "LockData",
+        "LockedFields",
+        "PartCount",
+        "DateLastMediaAdded",
+        "ProviderIds",
+    ];
+    for id in [alpha, show] {
+        let (status, detail) =
+            send_authed(&app, "GET", &format!("/Items/{id}"), &token, None).await;
+        assert_eq!(status, StatusCode::OK, "{detail}");
+        let (status, list) =
+            send_authed(&app, "GET", &format!("/Items?Ids={id}"), &token, None).await;
+        assert_eq!(status, StatusCode::OK, "{list}");
+        let listed = &list["Items"][0];
+        for field in fields {
+            assert_eq!(detail[field], listed[field], "{field} of {id}");
+        }
+    }
+    // And the values are the stored ones.
+    let (_, listed) = send_authed(&app, "GET", &format!("/Items?Ids={alpha}"), &token, None).await;
+    let alpha = &listed["Items"][0];
+    assert_eq!(alpha["OriginalTitle"], "Alpha Original");
+    assert_eq!(alpha["CriticRating"], 77.0);
+    assert_eq!(alpha["ForcedSortName"], "aaa alpha");
+    assert_eq!(alpha["LockData"], true);
+    assert_eq!(
+        alpha["LockedFields"],
+        serde_json::json!(["Name", "Overview"])
+    );
+    assert_eq!(alpha["PartCount"], 2);
+    assert_eq!(alpha["ProviderIds"]["Imdb"], "tt0000001");
+    let (_, listed) = send_authed(&app, "GET", &format!("/Items?Ids={show}"), &token, None).await;
+    assert!(
+        listed["Items"][0]["DateLastMediaAdded"].is_string(),
+        "{listed}"
+    );
+}
+
+#[tokio::test]
 async fn r3items_item_collections_lists_those_holding_it() {
     let state = test_state().await;
     let lib = r3items_library(&state).await;
@@ -54233,6 +54416,11 @@ async fn r3items_item_collections_lists_those_holding_it() {
 #[test]
 fn r3item2_web() {
     b124_node_test("r3item2_web.mjs");
+}
+
+#[test]
+fn r3item2_web_stale() {
+    b124_node_test("r3item2_stale.mjs");
 }
 
 /// A library in the test's data dir with one movie whose file holds 4000 known bytes, and one
@@ -54633,6 +54821,117 @@ async fn r3item2_subtitle_upload_delete_and_search() {
     )
     .await;
     assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+/// The remote subtitle search asks every enabled subtitle provider, and a download asks the
+/// provider that gave the id: the file is saved beside the video and becomes one of its streams.
+/// A disabled provider is not asked.
+#[tokio::test]
+async fn r3meta_remote_subtitles_ask_the_enabled_providers() {
+    use rustyfin_model::plugin::{PluginStatus, SubtitleResult};
+    use std::future::Future;
+    use std::pin::Pin;
+    type Found = Pin<Box<dyn Future<Output = Vec<SubtitleResult>> + Send>>;
+    type Fetched = Pin<Box<dyn Future<Output = Result<(), String>> + Send>>;
+    let state = test_state().await;
+    let asked: Arc<std::sync::Mutex<Vec<String>>> = Arc::default();
+    for (plugin, status) in [
+        ("mocksubs", PluginStatus::Active),
+        ("offsubs", PluginStatus::Disabled),
+    ] {
+        let seen = asked.clone();
+        let fetched = asked.clone();
+        state
+            .plugin_manager
+            .register_subtitle_provider(
+                plugin.to_string(),
+                status,
+                move |_: &reqwest::Client,
+                      item: &rustyfin_model::media::MediaItem,
+                      lang: &str|
+                      -> Found {
+                    seen.lock()
+                        .unwrap()
+                        .push(format!("search {plugin} {} {lang}", item.name));
+                    Box::pin(async move {
+                        vec![SubtitleResult {
+                            id: "991".to_string(),
+                            name: "Quill.Harbor.2031.eng.srt".to_string(),
+                            language: "eng".to_string(),
+                            description: Some("from the mock".to_string()),
+                        }]
+                    })
+                },
+                move |_: &reqwest::Client, id: &str, path: &std::path::Path| -> Fetched {
+                    fetched
+                        .lock()
+                        .unwrap()
+                        .push(format!("download {plugin} {id}"));
+                    let path = path.to_path_buf();
+                    Box::pin(async move {
+                        std::fs::write(path, "1\n00:00:01,000 --> 00:00:02,000\nMock\n")
+                            .map_err(|e| e.to_string())
+                    })
+                },
+            )
+            .await;
+    }
+    let app = app(state.clone());
+    let (owner, _, _, _) = g1_owner_and_viewer(&state, &app).await;
+    let (library, movie, _, _) = r3item2_library(&state).await;
+
+    let search = format!("/Items/{movie}/RemoteSearch/Subtitles/eng");
+    let (status, _, body) = r3item2_send(&app, "GET", &search, &owner, None).await;
+    assert_eq!(status, StatusCode::OK);
+    let found = r3item2_json(&body);
+    assert_eq!(found.as_array().unwrap().len(), 1, "{found}");
+    assert_eq!(found[0]["Id"], "mocksubs_eng_srt_991");
+    assert_eq!(found[0]["ProviderName"], "mocksubs");
+    assert_eq!(found[0]["Format"], "srt");
+    assert_eq!(found[0]["ThreeLetterISOLanguageName"], "eng");
+    assert_eq!(found[0]["Comment"], "from the mock");
+
+    let download = format!("/Items/{movie}/RemoteSearch/Subtitles/mocksubs_eng_srt_991");
+    let (status, _, body) = r3item2_send(&app, "POST", &download, &owner, None).await;
+    assert_eq!(
+        status,
+        StatusCode::NO_CONTENT,
+        "{}",
+        String::from_utf8_lossy(&body)
+    );
+    let saved = library
+        .join("Quill Harbor (2031)")
+        .join("Quill Harbor (2031).eng.srt");
+    assert!(std::fs::read_to_string(&saved).unwrap().contains("Mock"));
+    let sources = rustyfin_db::repo_media_source::get_media_sources(&state.db, &movie)
+        .await
+        .unwrap();
+    assert!(
+        sources[0]
+            .media_streams
+            .iter()
+            .any(|s| s.is_external && s.path.as_deref() == saved.to_str()),
+        "{:?}",
+        sources[0].media_streams
+    );
+    let calls = asked.lock().unwrap().clone();
+    assert_eq!(calls.len(), 2, "{calls:?}");
+    assert!(calls[0].starts_with("search mocksubs "), "{calls:?}");
+    assert_eq!(calls[1], "download mocksubs 991");
+
+    // An id from no enabled provider, or a format a scan doesn't read, is not asked for
+    for id in ["offsubs_eng_srt_991", "mocksubs_eng_exe_991"] {
+        let (status, _, _) = r3item2_send(
+            &app,
+            "POST",
+            &format!("/Items/{movie}/RemoteSearch/Subtitles/{id}"),
+            &owner,
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{id}");
+    }
+    assert_eq!(asked.lock().unwrap().len(), 2);
 }
 
 /// A subtitle file of about 3 MB uploads: the JSON body (the file in base64, about 4 MB) is past

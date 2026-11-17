@@ -373,26 +373,9 @@ async fn enrich_item(
     }
     item.provider_ids = provider_ids;
 
-    // Jellyfin import: metadata columns that live outside media_items
-    if let Ok(Some(extras)) = rustyfin_db::repo_jellyfin_import::item_extras(pool, item.id).await {
-        if let Some(title) = extras.original_title {
-            item.original_title = Some(title);
-        }
-        if let Some(rating) = extras.critic_rating {
-            item.critic_rating = Some(rating);
-        }
-        if let Some(imdb) = extras.imdb_id {
-            item.provider_ids.set("Imdb".to_string(), imdb);
-        }
-        item.forced_sort_name = extras.forced_sort_name.filter(|s| !s.trim().is_empty());
-        item.lock_data = extras.lock_data;
-        item.locked_fields = extras
-            .locked_fields
-            .split('|')
-            .filter(|field| !field.is_empty())
-            .map(str::to_string)
-            .collect();
-    }
+    // The stored fields the lists send too (OriginalTitle, CriticRating, IMDb id, ForcedSortName,
+    // locks, PartCount, DateLastMediaAdded), from the one function both use.
+    apply_stored_fields(pool, std::slice::from_mut(item)).await;
 
     // Photos: what the scan read from the file's header and EXIF block
     if item.media_type == rustyfin_model::media::MediaType::Photo
@@ -439,13 +422,6 @@ async fn enrich_item(
         .unwrap_or_default();
     item.local_trailer_count = Some(trailers);
     item.special_feature_count = Some(specials);
-    // A movie split into files: Jellyfin's PartCount, part 1 included.
-    let parts = rustyfin_db::repo_extras::additional_part_count(pool, item.id)
-        .await
-        .unwrap_or(0);
-    if parts > 0 {
-        item.part_count = Some(parts as i32 + 1);
-    }
 
     // Parallel queries: images, chapters, trickplay, user_data, people, studios
     // These are independent and can run concurrently instead of sequentially.
@@ -905,13 +881,6 @@ async fn enrich_item(
         }
     }
 
-    // --- DateLastMediaAdded for folders ---
-    if item.media_type.is_folder()
-        && let Ok(Some(last_added)) =
-            rustyfin_db::repo_media::get_last_media_added(pool, item.id).await
-    {
-        item.date_last_media_added = Some(last_added);
-    }
     set_top_level_parent(item);
 }
 
@@ -1231,9 +1200,6 @@ pub(crate) async fn enrich_items_with(
     let studios_map = rustyfin_db::repo_media::get_studios_for_items(pool, &item_ids)
         .await
         .unwrap_or_default();
-    let imdb_map = rustyfin_db::repo_media::get_imdb_ids_for_items(pool, &item_ids)
-        .await
-        .unwrap_or_default();
 
     // Batch query 8: People for all items
     let people_map: std::collections::HashMap<String, Vec<rustyfin_db::repo_media::PersonRow>> = {
@@ -1318,9 +1284,6 @@ pub(crate) async fn enrich_items_with(
         }
         if let Some(tvdb) = item.tvdb_id {
             provider_ids.set("Tvdb".to_string(), tvdb.to_string());
-        }
-        if let Some(imdb) = imdb_map.get(&item.id.to_string()) {
-            provider_ids.set("Imdb".to_string(), imdb.clone());
         }
         item.provider_ids = provider_ids;
 
@@ -1904,6 +1867,7 @@ pub(crate) async fn enrich_items_with(
         item.local_trailer_count = Some(trailers);
         item.special_feature_count = Some(specials);
     }
+    apply_stored_fields(pool, items).await;
 
     for item in items.iter_mut() {
         images.apply(item);
@@ -1911,9 +1875,57 @@ pub(crate) async fn enrich_items_with(
     }
 }
 
+/// The stored fields that `/Items/{id}` (`enrich_item`) and the lists (`enrich_items_with`) both
+/// send, from one place so the two can't disagree: OriginalTitle and CriticRating from the
+/// metadata columns, the IMDb id, ForcedSortName, LockData and LockedFields, a split movie's
+/// PartCount (part 1 included) and a folder's DateLastMediaAdded. One batch for all of `items`.
+async fn apply_stored_fields(pool: &SqlitePool, items: &mut [MediaItem]) {
+    let ids: Vec<Uuid> = items.iter().map(|item| item.id).collect();
+    let folders: Vec<Uuid> = items
+        .iter()
+        .filter(|item| item.media_type.is_folder())
+        .map(|item| item.id)
+        .collect();
+    let stored = match rustyfin_db::repo_item_dto::stored_fields(pool, &ids, &folders).await {
+        Ok(stored) => stored,
+        Err(e) => {
+            tracing::warn!(error = %e, "could not read the items' stored fields");
+            return;
+        }
+    };
+    for item in items.iter_mut() {
+        let Some(fields) = stored.get(&item.id) else {
+            continue;
+        };
+        if let Some(title) = &fields.original_title {
+            item.original_title = Some(title.clone());
+        }
+        if let Some(rating) = fields.critic_rating {
+            item.critic_rating = Some(rating);
+        }
+        if let Some(imdb) = &fields.imdb_id {
+            item.provider_ids.set("Imdb".to_string(), imdb.clone());
+        }
+        item.forced_sort_name = fields.forced_sort_name.clone();
+        item.lock_data = fields.lock_data;
+        item.locked_fields = fields
+            .locked_fields
+            .split('|')
+            .filter(|field| !field.is_empty())
+            .map(str::to_string)
+            .collect();
+        if fields.additional_parts > 0 {
+            item.part_count = Some(fields.additional_parts as i32 + 1);
+        }
+        if item.media_type.is_folder() && fields.last_media_added.is_some() {
+            item.date_last_media_added = fields.last_media_added;
+        }
+    }
+}
+
 pub fn routes() -> Router<AppState> {
     Router::new()
-        .route("/Items", get(get_items_for_query_user))
+        .route("/Items", get(get_items_for_query_user).delete(delete_items))
         // DELETE checks the caller itself: a playlist's owner may delete it, as in Jellyfin.
         .route("/Items/{id}", get(get_item).delete(delete_item))
         .route("/Items/{id}/Children", get(get_children))
@@ -1955,7 +1967,6 @@ pub fn routes() -> Router<AppState> {
 /// Administrator-only item removal routes. `routes::build_router` wraps them in `require_admin`.
 pub fn admin_routes() -> Router<AppState> {
     Router::new()
-        .route("/Items", delete(delete_items))
         .route("/Items/{id}/Images/{image_type}", delete(delete_item_image))
         .route(
             "/Items/{id}/Images/{image_type}/{image_index}",
@@ -3756,35 +3767,56 @@ async fn delete_item(
     if let Some(status) = super::collections::delete_container(&state, id, &claims).await? {
         return Ok(status.into_response());
     }
-    // Jellyfin's EnableContentDeletion; left unset, administrators may and others not.
-    let may_delete = claims.sub.is_nil()
-        || crate::parental::caller_access(&state, &claims)
-            .await?
-            .enable_content_deletion
-            .unwrap_or(claims.is_admin);
+    let library = rustyfin_db::repo_media::get_item_by_id(&state.db, id)
+        .await?
+        .map(|item| item.library_id);
+    let may_delete = match library {
+        Some(library) => may_delete_in(&state, &claims, library).await?,
+        None => may_delete_in(&state, &claims, Uuid::nil()).await?,
+    };
     if !may_delete {
         return Err(ApiError::Forbidden(
             "This user may not delete media.".to_string(),
         ));
     }
-    // The uploaded lyric files of the item and the items under it go with them.
-    let library = rustyfin_db::repo_media::get_item_by_id(&state.db, id)
-        .await?
-        .map(|item| item.library_id);
-    let lyrics = match library {
-        Some(library) => rustyfin_core::lyrics::uploads_in_library(&state.db, library).await,
-        None => Vec::new(),
+    let Some(library) = library else {
+        return Err(ApiError::NotFound("item not found".into()));
     };
+    remove_item(&state, id, library).await?;
+    Ok(Json(json!({ "status": "ok" })).into_response())
+}
+
+/// Whether the caller may delete the media of `library`, as Jellyfin 12.4's
+/// `BaseItem.IsAuthorizedToDelete`: the API key always; a user with `EnableContentDeletion`
+/// (left unset, administrators may and others not), or with the library among their
+/// `EnableContentDeletionFromFolders`.
+async fn may_delete_in(state: &AppState, claims: &Claims, library: Uuid) -> Result<bool, ApiError> {
+    if claims.sub.is_nil() {
+        return Ok(true);
+    }
+    let access = crate::parental::caller_access(state, claims).await?;
+    Ok(access.enable_content_deletion.unwrap_or(claims.is_admin)
+        || access
+            .enable_content_deletion_from_folders
+            .iter()
+            .any(|folder| Uuid::parse_str(folder).ok() == Some(library)))
+}
+
+/// Deletes the media item `id` of `library` and the items under it, with their uploaded lyric
+/// files and trickplay pictures, and clears the cached answers that held them
+/// (`ApiCache::items_changed`). NotFound when there is no such item.
+async fn remove_item(state: &AppState, id: Uuid, library: Uuid) -> Result<(), ApiError> {
+    // The uploaded lyric files of the item and the items under it go with them.
+    let lyrics = rustyfin_core::lyrics::uploads_in_library(&state.db, library).await;
     let affected = crate::cache::ApiCache::affected_items(&state.db, id).await;
-    let deleted = rustyfin_db::repo_media::delete_item(&state.db, id).await?;
-    if !deleted {
+    if !rustyfin_db::repo_media::delete_item(&state.db, id).await? {
         return Err(ApiError::NotFound("item not found".into()));
     }
     state.cache.items_changed(&state.image_cache, &affected);
     rustyfin_core::lyrics::remove_orphaned_uploads(&state.db, &lyrics).await;
     // The items under it lose theirs at the image tasks' next run.
     rustyfin_core::trickplay::remove_item_files(&state.data_dir, id).await;
-    Ok(Json(json!({ "status": "ok" })).into_response())
+    Ok(())
 }
 
 async fn get_children(
@@ -4363,31 +4395,40 @@ async fn get_user_resume(
     resume_page(&state, &claims, user_id, &query).await
 }
 
-/// DELETE /Items - Delete multiple items
+/// DELETE /Items?ids=a,b,c, as Jellyfin 12.4's `LibraryController.DeleteItems`: each listed item
+/// in turn (a collection or playlist as `DELETE /Items/{id}` deletes it), stopping at the first
+/// that fails: 404 for one that doesn't exist or is hidden from the caller, 401 for one the
+/// caller may not delete (`may_delete_in`). 204 when all are deleted. Ids that aren't ids are
+/// dropped, as by Jellyfin's comma-delimited binder.
 async fn delete_items(
     State(state): State<AppState>,
-    Query(query): Query<ItemsQuery>,
-) -> Result<(StatusCode, Json<serde_json::Value>), ApiError> {
-    let ids: Vec<Uuid> = if let Some(parent_id) = query.parent_id.or(query.parent_id_lower) {
-        // Delete all items under a parent
-        let items = rustyfin_db::repo_media::get_items_by_parent(&state.db_ro, parent_id).await?;
-        items.into_iter().map(|i| i.id).collect()
-    } else {
-        Vec::new()
-    };
-    let mut affected = Vec::new();
-    for id in &ids {
-        let under = crate::cache::ApiCache::affected_items(&state.db, *id).await;
-        if let Ok(true) = rustyfin_db::repo_media::delete_item(&state.db, *id).await {
-            affected.extend(under);
-            rustyfin_core::trickplay::remove_item_files(&state.data_dir, *id).await;
+    Query(params): Query<Vec<(String, String)>>,
+    Extension(claims): Extension<Claims>,
+) -> Result<StatusCode, ApiError> {
+    let ids: Vec<Uuid> = params
+        .iter()
+        .filter(|(key, _)| key.eq_ignore_ascii_case("ids"))
+        .flat_map(|(_, value)| parse_ids(Some(value)))
+        .collect();
+    let hidden = HiddenItems::for_caller(&state, &claims).await?;
+    for id in ids {
+        if super::collections::delete_container(&state, id, &claims)
+            .await?
+            .is_some()
+        {
+            continue;
         }
+        let library = rustyfin_db::repo_media::get_item_by_id(&state.db, id)
+            .await?
+            .map(|item| item.library_id)
+            .filter(|&library| !hidden.hides(id, library))
+            .ok_or_else(|| ApiError::NotFound("item not found".into()))?;
+        if !may_delete_in(&state, &claims, library).await? {
+            return Err(ApiError::Unauthorized);
+        }
+        remove_item(&state, id, library).await?;
     }
-    if let Some(parent) = query.parent_id.or(query.parent_id_lower) {
-        affected.push(parent);
-    }
-    state.cache.items_changed(&state.image_cache, &affected);
-    Ok((StatusCode::OK, Json(serde_json::json!({"Success": true}))))
+    Ok(StatusCode::NO_CONTENT)
 }
 
 /// GET /Items/{id}/Ancestors - Get parent chain

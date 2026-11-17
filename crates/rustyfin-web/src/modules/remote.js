@@ -4,7 +4,7 @@
 // the socket's messages with onSocketMessage and send on it with sendSocket.
 import { $, toast } from './util.js';
 import {
-    nowPlaying, seekToTicks, playItem, closePlayer, togglePlayPause, setVolume, toggleMute, changeAudioTrack,
+    nowPlaying, seekToTicks, playItem, stopNowPlaying, togglePlayPause, setVolume, toggleMute, changeAudioTrack,
     changeSubtitleTrack, skipTime, playAdjacentEpisode, toggleFullscreen,
 } from './player.js';
 import { playContainer, playQueueAt, queueStreamType } from './queue.js';
@@ -44,7 +44,7 @@ const PLAYSTATE = {
     Pause: () => video()?.pause(),
     Unpause: () => video()?.play(),
     PlayPause: () => togglePlayPause(),
-    Stop: () => closePlayer(),
+    Stop: () => stopNowPlaying(),
     Seek: d => seekToTicks(Number(d.SeekPositionTicks) || 0),
     NextTrack: () => playAdjacentEpisode(1),
     PreviousTrack: () => playAdjacentEpisode(-1),

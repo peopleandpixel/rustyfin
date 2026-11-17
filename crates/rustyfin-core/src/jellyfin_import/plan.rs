@@ -26,16 +26,16 @@ pub enum UserMatch {
     NoMatch,
 }
 
-/// Matches `name` against `users` (id, name): case-insensitively; an exact-case match wins; two
-/// case-insensitive matches and no exact one are ambiguous.
+/// Matches `name` against `users` (id, name) the way sign-in does (`NameMatch`: Unicode caseless,
+/// so "ẞ" matches "ss"); an exactly equal name wins; two matches and no exact one are ambiguous.
 pub fn match_user_name(name: &str, users: &[(Uuid, String)]) -> UserMatch {
     if let Some((id, _)) = users.iter().find(|(_, user)| user == name) {
         return UserMatch::Matched(*id);
     }
-    let folded = name.to_lowercase();
+    let matcher = NameMatch::new(name);
     let mut hits = users
         .iter()
-        .filter(|(_, user)| user.to_lowercase() == folded)
+        .filter(|(_, user)| matcher.matches(user))
         .map(|(id, _)| *id);
     match (hits.next(), hits.next()) {
         (None, _) => UserMatch::NoMatch,
@@ -99,6 +99,20 @@ pub fn plan_users(
         })
         .collect();
     rows.sort_by_cached_key(|row| (row.name.to_lowercase(), row.jellyfin_id));
+    // Two users to create whose names sign-in can't tell apart: the run creates the first and
+    // skips the others as ambiguous (`create_users`), so the preview says so too.
+    let mut creating: Vec<(Uuid, String)> = Vec::new();
+    for row in &mut rows {
+        if row.action != UserAction::Create {
+            continue;
+        }
+        if match_user_name(&row.name, &creating) == UserMatch::NoMatch {
+            creating.push((row.jellyfin_id, row.name.clone()));
+        } else {
+            row.action = UserAction::Skip;
+            row.reason = Some(SkipReason::Ambiguous);
+        }
+    }
     rows
 }
 

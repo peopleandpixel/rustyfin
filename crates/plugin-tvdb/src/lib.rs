@@ -100,8 +100,6 @@ struct TvmazeWebChannel {
 #[derive(Debug, Deserialize, Clone)]
 struct TvmazeExternals {
     tvdb: Option<i64>,
-    #[serde(rename = "thetvdb")]
-    #[allow(dead_code)]
     thetvdb: Option<i64>,
     imdb: Option<String>,
     tmdb: Option<i64>,
@@ -186,10 +184,34 @@ pub struct PersonPhoto {
     pub photo_url: String,
 }
 
-/// Fetch cast for a TV show from TVMaze, returning person info with photos
+/// The TVMaze show id of a TheTVDB id (`/lookup/shows?thetvdb=`, cached). TVMaze's show
+/// endpoints take only their own ids: another show's id would give another show's data.
+async fn maze_id_at(client: &reqwest::Client, base: &str, tvdb_id: i64) -> Option<i64> {
+    let url = format!("{base}/lookup/shows?thetvdb={tvdb_id}");
+    let cache_key = format!("{base}|tvdb_lookup:{tvdb_id}");
+    let show = fetch_tvdb_json(client, &cache_key, &url).await?;
+    // Only a show that names this TheTVDB id counts
+    let externals = show.get("externals")?;
+    (externals.get("thetvdb")?.as_i64()? == tvdb_id).then(|| show.get("id")?.as_i64())?
+}
+
+/// Fetch cast for a TV show from TVMaze, returning person info with photos. `tvdb_id` is
+/// TheTVDB's id; the cast is asked for under the show's TVMaze id.
 pub async fn get_tv_people(client: &reqwest::Client, tvdb_id: i64) -> Vec<PersonPhoto> {
-    let url = format!("{}/shows/{}/cast", TVDB_BASE, tvdb_id);
-    let cache_key = format!("tvdb_cast:{}", tvdb_id);
+    get_tv_people_at(client, TVDB_BASE, tvdb_id).await
+}
+
+/// `get_tv_people` against `base`.
+pub async fn get_tv_people_at(
+    client: &reqwest::Client,
+    base: &str,
+    tvdb_id: i64,
+) -> Vec<PersonPhoto> {
+    let Some(maze_id) = maze_id_at(client, base, tvdb_id).await else {
+        return Vec::new();
+    };
+    let url = format!("{base}/shows/{maze_id}/cast");
+    let cache_key = format!("{base}|tvdb_cast:{maze_id}");
 
     let mut result = Vec::new();
 
@@ -251,17 +273,20 @@ fn urlencoded(s: &str) -> String {
     encoded
 }
 
-/// Fetch images for a TV show from TVMaze
-async fn fetch_images(client: &reqwest::Client, tvdb_id: i64) -> Vec<MetadataImage> {
-    let url = format!("{}/shows/{}/images", TVDB_BASE, tvdb_id);
-    let cache_key = format!("tvdb_images:{}", tvdb_id);
+/// The images of a TV show, by its TVMaze id.
+async fn fetch_images(client: &reqwest::Client, base: &str, maze_id: i64) -> Vec<MetadataImage> {
+    let url = format!("{base}/shows/{maze_id}/images");
+    let cache_key = format!("{base}|tvdb_images:{maze_id}");
     let mut result = Vec::new();
 
     if let Some(json) = fetch_tvdb_json(client, &cache_key, &url).await {
         // TVMaze images endpoint returns an array of image objects
         if let Ok(images) = serde_json::from_value::<Vec<TvmazeImageItem>>(json) {
             for (i, img) in images.into_iter().enumerate() {
-                let image_type = match img.kind.as_str() {
+                let Some(url) = img.resolutions.original.map(|r| r.url) else {
+                    continue;
+                };
+                let image_type = match img.kind.as_deref().unwrap_or_default() {
                     "poster" => {
                         if i == 0 {
                             "Primary".to_string()
@@ -278,10 +303,7 @@ async fn fetch_images(client: &reqwest::Client, tvdb_id: i64) -> Vec<MetadataIma
                     }
                     _ => continue,
                 };
-                result.push(MetadataImage {
-                    image_type,
-                    url: img.original,
-                });
+                result.push(MetadataImage { image_type, url });
             }
         }
     }
@@ -289,23 +311,49 @@ async fn fetch_images(client: &reqwest::Client, tvdb_id: i64) -> Vec<MetadataIma
     result
 }
 
+/// One of TVMaze's show images: `{"type": "poster", "resolutions": {"original": {"url": …}}}`.
 #[derive(Debug, Deserialize)]
 struct TvmazeImageItem {
-    #[allow(dead_code)]
-    country: Option<TvmazeCountry>,
-    #[allow(dead_code)]
-    kind: String,
-    original: String,
-    #[allow(dead_code)]
-    score: Option<f64>,
-    #[allow(dead_code)]
-    language: Option<String>,
+    #[serde(rename = "type")]
+    kind: Option<String>,
+    resolutions: TvmazeResolutions,
+}
+
+#[derive(Debug, Deserialize)]
+struct TvmazeResolutions {
+    original: Option<TvmazeResolution>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TvmazeResolution {
+    url: String,
 }
 
 /// Search TVMaze for a TV show and return full metadata
 pub async fn search_tv(client: &reqwest::Client, name: &str) -> Option<ExternalMetadata> {
-    let url = format!("{}/shows?q={}", TVDB_BASE, urlencoded(name));
-    let cache_key = format!("tvdb_search:{}", name);
+    search_tv_at(client, TVDB_BASE, name).await
+}
+
+/// The images of a TV show by its TheTVDB id, asked for under its TVMaze id.
+pub async fn images_for_tvdb_id(
+    client: &reqwest::Client,
+    base: &str,
+    tvdb_id: i64,
+) -> Vec<MetadataImage> {
+    match maze_id_at(client, base, tvdb_id).await {
+        Some(maze_id) => fetch_images(client, base, maze_id).await,
+        None => Vec::new(),
+    }
+}
+
+/// `search_tv` against `base`: TVMaze's search (`/search/shows`), which scores its matches.
+pub async fn search_tv_at(
+    client: &reqwest::Client,
+    base: &str,
+    name: &str,
+) -> Option<ExternalMetadata> {
+    let url = format!("{base}/search/shows?q={}", urlencoded(name));
+    let cache_key = format!("{base}|tvdb_search:{name}");
 
     let resp: Vec<TvmazeSearchResult> = match fetch_tvdb_json(client, &cache_key, &url).await {
         Some(json) => serde_json::from_value(json).ok()?,
@@ -319,7 +367,8 @@ pub async fn search_tv(client: &reqwest::Client, name: &str) -> Option<ExternalM
             .unwrap_or(std::cmp::Ordering::Equal)
     })?;
     let show = best.show;
-    let tvdb_id = show.externals.tvdb?;
+    // TVMaze names TheTVDB's id `thetvdb`
+    let tvdb_id = show.externals.thetvdb.or(show.externals.tvdb)?;
 
     // Get additional images
     let mut images = Vec::new();
@@ -330,8 +379,8 @@ pub async fn search_tv(client: &reqwest::Client, name: &str) -> Option<ExternalM
         });
     }
 
-    // Fetch more images from the images endpoint
-    let extra_images = fetch_images(client, tvdb_id).await;
+    // Fetch more images from the images endpoint, under the show's TVMaze id
+    let extra_images = fetch_images(client, base, show.id).await;
     images.extend(extra_images);
 
     let production_year = show
@@ -518,7 +567,7 @@ where
                 let client = _client.clone();
                 Box::pin(async move {
                     if let Some(id) = tvdb_id {
-                        fetch_images(&client, id).await
+                        images_for_tvdb_id(&client, TVDB_BASE, id).await
                     } else {
                         Vec::new()
                     }

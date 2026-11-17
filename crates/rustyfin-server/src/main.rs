@@ -298,45 +298,9 @@ async fn main() {
             config.library_monitor_poll_interval.max(1),
         )));
 
-    // Helper: register a built-in plugin, loading config and status from DB if available.
-    // Plugins are DISABLED by default — they must be explicitly enabled via the API or by
-    // storing an Active status in the database. TMDb, OMDb and Fanart.tv are the exceptions: a key
-    // enables them (see install_tmdb_plugin, install_omdb_plugin, install_fanart_plugin). This
-    // ensures fast scans without external API calls.
-    async fn register_builtin_plugin<P: rustyfin_model::plugin::Plugin>(
-        plugin: &P,
-        pm: &rustyfin_core::plugin_manager::PluginManager,
-    ) {
-        // Try to load saved config from DB
-        let mut status = rustyfin_model::plugin::PluginStatus::Disabled;
-        if let Some(saved_config) = pm.load_plugin_config_from_db(plugin.id()).await {
-            if let Err(e) = plugin.set_configuration(saved_config.clone()) {
-                tracing::warn!("failed to apply saved config for {}: {}", plugin.id(), e);
-            }
-            // Check if status was saved
-            if let Some(status_str) = saved_config.get("status").and_then(|v| v.as_str()) {
-                status = match status_str {
-                    "Active" => rustyfin_model::plugin::PluginStatus::Active,
-                    "Disabled" => rustyfin_model::plugin::PluginStatus::Disabled,
-                    "Malfunctioned" => rustyfin_model::plugin::PluginStatus::Malfunctioned,
-                    _ => rustyfin_model::plugin::PluginStatus::Disabled,
-                };
-            }
-        }
-        if status == rustyfin_model::plugin::PluginStatus::Active {
-            tracing::info!("plugin {} enabled (from saved config)", plugin.id());
-        }
-        pm.register_builtin_plugin(rustyfin_core::plugin_manager::BuiltinPluginInfo {
-            name: plugin.name().to_string(),
-            version: plugin.version().to_string(),
-            id: plugin.id().to_string(),
-            description: plugin.description().to_string(),
-            plugin_type: plugin.plugin_type(),
-            status,
-        })
-        .await;
-    }
-
+    // Built-in plugins are disabled unless a saved status enables them. TMDb, OMDb and Fanart.tv
+    // are the exceptions: a key enables them (see install_tmdb_plugin, install_omdb_plugin,
+    // install_fanart_plugin). This keeps scans fast, without outside requests.
     // One TMDb client (cache, rate limiter, retries) shared by the provider and AppState. The
     // providers' answers are kept under the data dir's cache, across restarts.
     let metadata_cache = data_dir_arc.join("cache").join("metadata");
@@ -359,99 +323,9 @@ async fn main() {
     .await;
     rustyfin_core::plugin_manager::install_fanart_plugin(&plugin_manager_with_db).await;
 
-    // Register Trakt plugin (disabled by default)
-    {
-        let trakt_plugin = plugin_trakt::TraktPlugin::default();
-        register_builtin_plugin(&trakt_plugin, &plugin_manager_with_db).await;
-        if let Err(e) =
-            plugin_trakt::register_trakt_provider(&trakt_plugin, &plugin_manager_with_db).await
-        {
-            tracing::debug!(
-                "Trakt plugin not registered as provider (no API key): {}",
-                e
-            );
-        }
-    }
-
-    // Register TheTVDB plugin (disabled by default)
-    {
-        let tvdb_plugin = plugin_tvdb::TvdbPlugin::default();
-        register_builtin_plugin(&tvdb_plugin, &plugin_manager_with_db).await;
-        plugin_tvdb::register_tvdb_provider(&tvdb_plugin, &plugin_manager_with_db).await;
-    }
-
-    // Register Local NFO plugin (disabled by default)
-    {
-        let local_nfo_plugin = plugin_local_nfo::LocalNfoPlugin::default();
-        register_builtin_plugin(&local_nfo_plugin, &plugin_manager_with_db).await;
-        plugin_local_nfo::register_local_nfo_provider(&local_nfo_plugin, &plugin_manager_with_db)
-            .await;
-    }
-
-    // Register OpenSubtitles plugin (disabled by default)
-    {
-        let opensubtitles_plugin = plugin_opensubtitles::OpenSubtitlesPlugin::default();
-        register_builtin_plugin(&opensubtitles_plugin, &plugin_manager_with_db).await;
-        plugin_opensubtitles::register_opensubtitles_provider(
-            &opensubtitles_plugin,
-            &plugin_manager_with_db,
-        )
-        .await;
-    }
-
-    // Register Podnapisi plugin (disabled by default)
-    {
-        let podnapisi_plugin = plugin_podnapisi::PodnapisiPlugin::default();
-        register_builtin_plugin(&podnapisi_plugin, &plugin_manager_with_db).await;
-        plugin_podnapisi::register_podnapisi_provider(&podnapisi_plugin, &plugin_manager_with_db)
-            .await;
-    }
-
-    // Register MQTT plugin (disabled by default)
-    {
-        let mqtt_plugin = plugin_mqtt::MqttPlugin::default();
-        register_builtin_plugin(&mqtt_plugin, &plugin_manager_with_db).await;
-        if let Err(e) =
-            plugin_mqtt::register_mqtt_provider(&mqtt_plugin, &plugin_manager_with_db).await
-        {
-            tracing::debug!("MQTT plugin not registered as provider: {}", e);
-        }
-    }
-
-    // Register Ntfy plugin (disabled by default)
-    {
-        let ntfy_plugin = plugin_ntfy::NtfyPlugin::default();
-        register_builtin_plugin(&ntfy_plugin, &plugin_manager_with_db).await;
-        if let Err(e) =
-            plugin_ntfy::register_ntfy_provider(&ntfy_plugin, &plugin_manager_with_db).await
-        {
-            tracing::debug!("Ntfy plugin not registered as provider: {}", e);
-        }
-    }
-
-    // Register Pushover plugin (disabled by default)
-    {
-        let pushover_plugin = plugin_pushover::PushoverPlugin::default();
-        register_builtin_plugin(&pushover_plugin, &plugin_manager_with_db).await;
-        if let Err(e) =
-            plugin_pushover::register_pushover_provider(&pushover_plugin, &plugin_manager_with_db)
-                .await
-        {
-            tracing::debug!("Pushover plugin not registered as provider: {}", e);
-        }
-    }
-
-    // Register Webhook plugin (disabled by default)
-    {
-        let webhook_plugin = plugin_webhook::WebhookPlugin::default();
-        register_builtin_plugin(&webhook_plugin, &plugin_manager_with_db).await;
-        if let Err(e) =
-            plugin_webhook::register_webhook_provider(&webhook_plugin, &plugin_manager_with_db)
-                .await
-        {
-            tracing::debug!("Webhook plugin not registered as provider: {}", e);
-        }
-    }
+    // Trakt, TheTVDB, Local NFO, OpenSubtitles, Podnapisi, MQTT, ntfy, Pushover and Webhook:
+    // disabled unless enabled; a config saved later applies without a restart
+    rustyfin_core::plugin_manager::install_other_plugins(&plugin_manager_with_db).await;
 
     // Use the DB-backed plugin manager for the app state
     let plugin_manager = plugin_manager_with_db;

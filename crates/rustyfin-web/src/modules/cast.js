@@ -6,7 +6,7 @@
 // Safari, iOS) never loads it. Commands go to the receiver on Jellyfin's connectsdk
 // namespace; what it reports back drives the cast bar. Stopping the cast resumes here where the receiver was.
 import { $, icon, toast, escapeHtml, formatDurationSeconds } from './util.js';
-import { nowPlaying, closePlayer, playItem, setPlayInterceptor } from './player.js';
+import { nowPlaying, stopNowPlaying, playItem, setPlayInterceptor } from './player.js';
 import { maxStreamingBitrate } from './playerprefs.js';
 
 const SDK_URL = 'https://www.gstatic.com/cv/js/sender/v1/cast_sender.js?loadCastFramework=1';
@@ -207,7 +207,7 @@ async function castToDevice() {
         await castPlay(np.itemId, {
             startTicks: np.positionTicks, mediaSourceId: np.mediaSourceId, audioIndex: np.audioIndex, subtitleIndex: np.subtitleIndex,
         });
-        closePlayer();
+        stopNowPlaying();
     } catch (e) {
         toast(t('cast.playback_error'), 'error');
     }

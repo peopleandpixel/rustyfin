@@ -164,6 +164,8 @@ pub async fn scan_with_metadata(
         _ => scan_flat_library(pool, library, scope, ticket).await?,
     };
 
+    // The new playable items, for the "new library content" notification
+    let mut added: Vec<Uuid> = Vec::new();
     // Refresh metadata only for newly added items, not all items in the library.
     // This avoids unnecessary API calls on incremental scans.
     if !new_item_ids.is_empty() {
@@ -184,16 +186,20 @@ pub async fn scan_with_metadata(
         let mut later = Vec::new();
         for new_id in new_item_ids {
             match rustyfin_db::repo_media::get_item_by_id(pool, new_id).await {
-                Ok(Some(item))
+                Ok(Some(item)) => {
+                    use rustyfin_model::media::MediaType;
                     if matches!(
                         item.media_type,
-                        rustyfin_model::media::MediaType::Season
-                            | rustyfin_model::media::MediaType::Episode
-                    ) =>
-                {
-                    later.push(item)
+                        MediaType::Movie | MediaType::Episode | MediaType::Audio | MediaType::Video
+                    ) {
+                        added.push(item.id);
+                    }
+                    if matches!(item.media_type, MediaType::Season | MediaType::Episode) {
+                        later.push(item)
+                    } else {
+                        first.push(item)
+                    }
                 }
-                Ok(Some(item)) => first.push(item),
                 _ if counted => {
                     // An item that can't be loaded has nothing to refresh, but it still counts.
                     ticket.advance(1);
@@ -278,7 +284,30 @@ pub async fn scan_with_metadata(
         tracing::warn!("failed to rebuild filter indexes: {}", e);
     }
 
+    notify_new_content(pool, plugin_manager, &added).await;
     Ok(changes)
+}
+
+/// Tells the notification providers about a scan's new playable items, as Jellyfin's
+/// NewLibraryContent: one item by its name (as its refresh left it), more by their number.
+async fn notify_new_content(pool: &SqlitePool, plugin_manager: &PluginManager, added: &[Uuid]) {
+    let message = match added {
+        [] => return,
+        [one] => {
+            let name = rustyfin_db::repo_media::get_item_by_id(pool, *one)
+                .await
+                .ok()
+                .flatten()
+                .map_or_else(|| "A new item".to_string(), |item| item.name);
+            format!("{name} has been added to your media library")
+        }
+        many => format!("{} items have been added to your media library", many.len()),
+    };
+    plugin_manager.notify(
+        crate::plugin_manager::NotificationEvent::NewLibraryContent,
+        "New content added",
+        &message,
+    );
 }
 
 /// Reads the photos of `scope` that were never read or whose file changed since, and stores what each

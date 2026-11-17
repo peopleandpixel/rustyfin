@@ -2,7 +2,7 @@
 // pause, stop and message controls), kept current by the socket's Sessions messages, and "Play on", which hands
 // the playing item over to another session at the same point. The picker lists the Cast devices too (cast.js).
 import { $, icon, toast, escapeHtml, formatDurationSeconds } from './util.js';
-import { nowPlaying, closePlayer } from './player.js';
+import { nowPlaying, stopNowPlaying } from './player.js';
 import { onSocketMessage, sendSocket } from './remote.js';
 import { castSupported, castPickerEntry, refreshPickerEntry } from './cast.js';
 
@@ -210,7 +210,7 @@ async function playOnSession(id) {
     const q = new URLSearchParams({ playCommand: 'PlayNow', itemIds: np.itemId, startPositionTicks: String(np.positionTicks) });
     try {
         await API.post(`/Sessions/${encodeURIComponent(id)}/Playing?${q}`);
-        closePlayer();
+        stopNowPlaying();
         toast(t('remote.sent'));
     } catch (e) {
         toast(t('remote.command_failed'), 'error');

@@ -1121,6 +1121,7 @@
         "reason_ambiguous": "several Rustyfin users have this name",
         "reason_not_selected": "not selected",
         "reason_not_confirmed": "the existing account wasn't confirmed",
+        "reason_invalid_name": "the name is blank or too long",
         "reason_confirmed_other": "the confirmed account is no longer the suggested match",
         "confirm_match": "Import into the existing account {{name}}",
         "into_mine": "Import into my account",
