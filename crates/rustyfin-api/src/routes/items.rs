@@ -6,7 +6,7 @@ use axum::routing::{delete, get};
 use axum::{Extension, Json, Router};
 use rustyfin_core::tmdb_client::TmdbApi;
 use rustyfin_model::auth::Claims;
-use rustyfin_model::media::{FiltersResult, MediaItem, MediaType, QueryResult};
+use rustyfin_model::media::{FiltersResult, MediaItem, QueryResult};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use sqlx::SqlitePool;
@@ -3375,113 +3375,15 @@ async fn get_latest(
     latest_page(&state, user, &params).await
 }
 
-/// The "Latest" row (`/Items/Latest`, `/Users/{userId}/Items/Latest`), as Jellyfin's
-/// `UserLibraryController.GetLatestMedia` builds it, for `user` and what that user may see:
-/// `isPlayed` (unset means unplayed only when the user's `HidePlayedInLatest` is on; ignored
-/// when a music library is read), `groupItems`
-/// (default true: two or more new episodes of a series show as the series, new tracks as their
-/// album, each with `ChildCount`), `limit` (default 20) entries, and without `parentId` the
-/// user's `LatestItemsExcludes` libraries left out.
+/// The "Latest" row (`/Items/Latest`, `/Users/{userId}/Items/Latest`) for `user`, as Jellyfin
+/// 12.4 builds it (see `latest::latest_entries`).
 async fn latest_page(
     state: &AppState,
     user: Uuid,
     params: &[(String, String)],
 ) -> Result<Json<Vec<MediaItem>>, ApiError> {
-    use crate::query::{bool_param, count_param, item_kinds, parent_param};
-    let limit = count_param(params, "limit")?.unwrap_or(20);
-    let group_items = bool_param(params, "groupItems")?.unwrap_or(true);
-    let library_id = parent_param(params, "parentId")?;
-    let config = rustyfin_db::repo_user::get_user_by_id(&state.db_ro, user)
-        .await?
-        .map(|u| rustyfin_model::user::jellyfin_configuration(&u.configuration))
-        .unwrap_or_default();
-    let mut is_played = bool_param(params, "isPlayed")?;
-    if is_played.is_none() && config["HidePlayedInLatest"].as_bool() != Some(false) {
-        is_played = Some(false);
-    }
-    let mut exclude_libraries = Vec::new();
-    if let Some(library_id) = library_id {
-        let library =
-            rustyfin_db::repo_library::get_library_by_id(&state.db_ro, library_id).await?;
-        if library
-            .is_some_and(|l| l.content_type == rustyfin_model::library::LibraryContentType::Music)
-        {
-            is_played = None;
-        }
-    } else {
-        exclude_libraries = config["LatestItemsExcludes"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .filter_map(|id| id.as_str().and_then(|id| Uuid::parse_str(id).ok()))
-            .collect();
-        // Jellyfin ignores the played filter when any library the row reads is music.
-        let policy = crate::parental::user_policy(state, user).await?;
-        let libraries = rustyfin_db::repo_library::get_all_libraries(&state.db_ro).await?;
-        if libraries.iter().any(|l| {
-            l.content_type == rustyfin_model::library::LibraryContentType::Music
-                && !exclude_libraries.contains(&l.id)
-                && policy.allows_folder(&l.id.to_string())
-        }) {
-            is_played = None;
-        }
-    }
-    let mut filter = rustyfin_db::repo_media::LatestFilter {
-        user_id: Some(user),
-        item_types: item_kinds(params, "includeItemTypes")
-            .into_iter()
-            .map(str::to_string)
-            .collect(),
-        library_id,
-        exclude_libraries,
-        is_played,
-        limit: (limit as i64).saturating_mul(5).max(1),
-        offset: 0,
-        hidden_ids_json: HiddenItems::for_user(state, user).await?.json(),
-    };
-
-    // Jellyfin's UserViewManager.GetLatestItems: group by container in first-seen order, up to
-    // `limit` groups. Pages of candidates are read until there are `limit` groups, so a series
-    // with many new episodes doesn't leave the row short.
-    let mut groups: Vec<(Option<Uuid>, Vec<MediaItem>)> = Vec::new();
-    'pages: while groups.len() < limit {
-        let candidates = rustyfin_db::repo_media::get_latest_items(&state.db_ro, &filter).await?;
-        let last_page = (candidates.len() as i64) < filter.limit;
-        for (item, container) in candidates {
-            if groups.len() >= limit {
-                break 'pages;
-            }
-            match container.filter(|_| group_items) {
-                Some(id) => match groups.iter_mut().find(|(c, _)| *c == Some(id)) {
-                    Some((_, members)) => members.push(item),
-                    None => groups.push((Some(id), vec![item])),
-                },
-                None => groups.push((None, vec![item])),
-            }
-        }
-        if last_page {
-            break;
-        }
-        filter.offset += filter.limit;
-    }
-    let mut items = Vec::with_capacity(groups.len());
-    let mut child_counts = Vec::with_capacity(groups.len());
-    for (container, mut members) in groups {
-        let container = match container {
-            Some(id) => rustyfin_db::repo_media::get_item_by_id(&state.db_ro, id).await?,
-            None => None,
-        };
-        match container {
-            Some(c) if members.len() > 1 || c.media_type == MediaType::MusicAlbum => {
-                child_counts.push(members.len() as i32);
-                items.push(c);
-            }
-            _ => {
-                child_counts.push(0);
-                items.push(members.swap_remove(0));
-            }
-        }
-    }
+    let (mut items, child_counts) =
+        crate::routes::latest::latest_entries(state, user, params).await?;
     // Enrich latest items using batch queries
     // Skip blurhash for list views to avoid per-item disk I/O
     let tmdb = state.tmdb.api(None);
@@ -3496,9 +3398,12 @@ async fn latest_page(
         true, // skip_blurhash for list views
     )
     .await;
-    // Jellyfin sets ChildCount on every entry: the new items in a group, else 0.
+    // Jellyfin 12.4 sets ChildCount to the number of new items of a group shown as its
+    // container; other entries keep their own.
     for (item, count) in items.iter_mut().zip(child_counts) {
-        item.child_count = Some(count);
+        if count > 0 {
+            item.child_count = Some(count);
+        }
     }
     Ok(Json(items))
 }
