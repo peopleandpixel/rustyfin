@@ -560,12 +560,6 @@ async fn main() {
         tokio::spawn(async move { rustyfin_api::sort_names::apply(&state).await });
     }
 
-    // Background task: finds the users whose password is the empty one, for the sign-in tiles
-    {
-        let db = state.db_ro.clone();
-        tokio::spawn(async move { rustyfin_auth::find_empty_passwords(&db).await });
-    }
-
     // Extract HTTP port for discovery services
     let http_port: u16 = bind_addr
         .rsplit(':')

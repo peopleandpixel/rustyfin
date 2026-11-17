@@ -1672,9 +1672,8 @@ async fn test_password_reset_endpoints_share_the_login_rate_limit() {
     // G2: ForgotPassword no longer reveals whether the user exists; unknown users get 200.
     let resp = app.clone().oneshot(forgot()).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
-    // A reset from outside the local network tries no PIN (R3 users 2)
     let resp = app.clone().oneshot(reset()).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 
     // The three endpoints draw on one budget per client
     for (name, req) in [("login", login()), ("forgot", forgot()), ("reset", reset())] {
@@ -30967,16 +30966,15 @@ async fn r3users2_public(
 }
 
 #[tokio::test]
-async fn r3users2_public_users_say_whether_they_have_a_password() {
+async fn r3users2_public_users_always_report_a_password() {
     let state = test_state().await;
     let app = app(state.clone());
     assert_eq!(
         post_startup_user(&app, None, "owner", "pw-owner").await,
         StatusCode::NO_CONTENT
     );
-    // A password set to the empty one: the tile signs in at a click
+    // A password set to the empty one, and no password hash at all (password sign-in off)
     add_user(&state, "kid", "", false).await;
-    // No password hash at all: password sign-in is off for the user, so the tile asks
     let sso = add_user(&state, "sso", "pw-sso", false).await;
     sqlx::query("UPDATE users SET password_hash = '' WHERE id = ?")
         .bind(sso.to_string())
@@ -30984,24 +30982,20 @@ async fn r3users2_public_users_say_whether_they_have_a_password() {
         .await
         .unwrap();
 
-    let users = r3users2_public(&app).await;
-    assert_eq!(users["owner"]["HasPassword"], true, "{users:?}");
-    assert_eq!(users["owner"]["HasConfiguredPassword"], true);
-    assert_eq!(users["kid"]["HasPassword"], false, "{users:?}");
-    assert_eq!(users["kid"]["HasConfiguredPassword"], false);
-    assert_eq!(users["sso"]["HasPassword"], true, "{users:?}");
-    // Only what a tile needs: no policy, configuration or hash
-    assert!(users["owner"].get("Policy").is_none());
-    assert!(users["owner"].get("PasswordHash").is_none());
+    // As in Jellyfin 12.4, HasPassword and HasConfiguredPassword are always true, on any network
+    for app in [app.clone(), remote_app(state.clone())] {
+        let users = r3users2_public(&app).await;
+        for name in ["owner", "kid", "sso"] {
+            assert_eq!(users[name]["HasPassword"], true, "{name}: {users:?}");
+            assert_eq!(users[name]["HasConfiguredPassword"], true, "{name}");
+        }
+        // Only what a tile needs: no policy, configuration or hash
+        assert!(users["owner"].get("Policy").is_none());
+        assert!(users["owner"].get("PasswordHash").is_none());
+    }
 
-    // A user without a password signs in from the tile with an empty one, as in Jellyfin
+    // An empty password still signs in, through the form the tile opens
     assert!(login(&app, "kid", "").await.is_some());
-
-    // Outside the local network no user is shown as opening without a password
-    let remote = remote_app(state.clone());
-    let users = r3users2_public(&remote).await;
-    assert_eq!(users["kid"]["HasPassword"], true, "{users:?}");
-    assert_eq!(users["kid"]["HasConfiguredPassword"], true);
 }
 
 #[tokio::test]
@@ -31040,7 +31034,7 @@ async fn r3users2_public_users_outside_the_network_need_remote_access() {
 }
 
 #[tokio::test]
-async fn r3users2_forgot_password_outside_the_network_is_in_network_required() {
+async fn r3users2_forgot_password_answers_alike_and_writes_only_locally() {
     let state = test_state().await;
     let local_app = app(state.clone());
     assert_eq!(
@@ -31061,10 +31055,15 @@ async fn r3users2_forgot_password_outside_the_network_is_in_network_required() {
             ),
         )
         .await;
+        // As in Jellyfin 12.4: PinCode and the file's path for every name and every client
         assert_eq!(status, StatusCode::OK, "{body}");
-        assert_eq!(body["Action"], "InNetworkRequired", "{name}: {body}");
-        assert_eq!(body["PinFile"], "", "no server path for a remote client");
-        assert!(body["PinExpirationDate"].is_null());
+        assert_eq!(body["Action"], "PinCode", "{name}: {body}");
+        assert!(
+            body["PinFile"]
+                .as_str()
+                .is_some_and(|f| f.contains("passwordreset-"))
+        );
+        assert!(body["PinExpirationDate"].is_string());
     }
     let pin_files = std::fs::read_dir(&*state.data_dir)
         .unwrap()
@@ -31108,6 +31107,28 @@ async fn r3users2_forgot_password_outside_the_network_is_in_network_required() {
     let (status, _) = send(&local_app, redeem(pin.clone())).await;
     assert_eq!(status, StatusCode::NOT_FOUND, "a PIN is single use");
     assert!(login(&local_app, "owner", &pin).await.is_some());
+
+    // As in Jellyfin 12.4, a PIN typed without its dashes matches too
+    let (_, body) = send(
+        &local_app,
+        request(
+            "POST",
+            "/Users/ForgotPassword",
+            None,
+            Some(serde_json::json!({ "EnteredUsername": "owner" })),
+        ),
+    )
+    .await;
+    let path = std::path::PathBuf::from(body["PinFile"].as_str().unwrap());
+    let pin = await_reset_pin(&path).await.expect("a second PIN file");
+    let typed = pin.replace('-', "").to_lowercase();
+    let (status, body) = send(&local_app, redeem(typed.clone())).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(
+        login(&local_app, "owner", &typed.to_uppercase())
+            .await
+            .is_some()
+    );
 }
 
 /// A labelled remote client: its router and the headers it sends.
@@ -31193,9 +31214,8 @@ async fn r3users2_reset_routes_try_no_pin_outside_the_network() {
                 ),
             )
             .await;
-            assert_eq!(status, StatusCode::OK, "{label}: {body}");
-            assert_eq!(body["Success"], false, "{label}: {body}");
-            assert_eq!(body["UsersReset"], serde_json::json!([]), "{label}");
+            // The answer of a PIN that matches nothing
+            assert_eq!(status, StatusCode::NOT_FOUND, "{label}: {body}");
 
             let (status, body) = send(
                 &remote,
@@ -31206,7 +31226,7 @@ async fn r3users2_reset_routes_try_no_pin_outside_the_network() {
                 ),
             )
             .await;
-            assert_eq!(status, StatusCode::FORBIDDEN, "{label}: {body}");
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{label}: {body}");
         }
     }
     assert!(

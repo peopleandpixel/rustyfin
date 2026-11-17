@@ -29,49 +29,6 @@ async fn test_pool() -> sqlx::SqlitePool {
         .unwrap()
 }
 
-// ── R3 users 2: the hashes of the empty password, for the sign-in tiles ──
-
-/// An Argon2 hash made here, past `hash_password`, as one stored before this process started.
-fn r3users2_stored_hash(password: &str) -> String {
-    use argon2::PasswordHasher;
-    let salt = argon2::password_hash::SaltString::generate(&mut rand_core::OsRng);
-    argon2::Argon2::default()
-        .hash_password(password.as_bytes(), &salt)
-        .unwrap()
-        .to_string()
-}
-
-#[tokio::test]
-async fn r3users2_empty_passwords_are_known_without_hashing_on_lookup() {
-    // A hash made through hash_password is known at once
-    let fresh = rustyfin_auth::hash_password("").await.unwrap();
-    assert!(rustyfin_auth::is_empty_password_hash(&fresh));
-    let other = rustyfin_auth::hash_password("pw").await.unwrap();
-    assert!(!rustyfin_auth::is_empty_password_hash(&other));
-    assert!(
-        !rustyfin_auth::is_empty_password_hash(""),
-        "no hash means password sign-in is off, not an empty password"
-    );
-
-    // A stored hash is unknown until the startup pass checks it: the lookup does no Argon2 work
-    let pool = test_pool().await;
-    let stored_empty = r3users2_stored_hash("");
-    let stored_pw = r3users2_stored_hash("secret");
-    for (name, hash) in [("kid", &stored_empty), ("adult", &stored_pw)] {
-        sqlx::query("INSERT INTO users (id, name, password_hash) VALUES (?1, ?2, ?3)")
-            .bind(uuid::Uuid::new_v4().to_string())
-            .bind(name)
-            .bind(hash)
-            .execute(&pool)
-            .await
-            .unwrap();
-    }
-    assert!(!rustyfin_auth::is_empty_password_hash(&stored_empty));
-    rustyfin_auth::find_empty_passwords(&pool).await;
-    assert!(rustyfin_auth::is_empty_password_hash(&stored_empty));
-    assert!(!rustyfin_auth::is_empty_password_hash(&stored_pw));
-}
-
 // ── Password Hashing Tests (now async: argon2 runs on spawn_blocking, M-15) ──
 
 #[tokio::test]
