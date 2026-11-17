@@ -15,7 +15,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use rustyfin_core::scan_progress::{ScanRegistry, ScanState, ScanStatus, ScanTicket, ScanUpdate};
 use rustyfin_core::scanner::{ScanChanges, ScanScope};
-use rustyfin_core::scheduler::{TASK_LIBRARY_SCAN, TaskScheduler};
+use rustyfin_core::scheduler::{TASK_LIBRARY_SCAN, TASK_METADATA_REFRESH, TaskScheduler};
 use rustyfin_core::tmdb_client::{TmdbApi, TmdbClient, TmdbKey, TmdbSettings};
 use rustyfin_core::{probe, scanner};
 use rustyfin_model::library::{Library, LibraryContentType};
@@ -4748,7 +4748,7 @@ async fn b30_f8_a_scheduled_scan_calls_back_once_it_ends() {
     let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let (done, mut ended) = tokio::sync::mpsc::unbounded_channel();
     let counted = calls.clone();
-    sched.set_on_scan(move || {
+    sched.set_on_items_changed(move || {
         counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let _ = done.send(());
     });
@@ -4764,6 +4764,31 @@ async fn b30_f8_a_scheduled_scan_calls_back_once_it_ends() {
         .await
         .unwrap();
     assert!(stored > 0, "called back before the scan stored anything");
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+}
+
+// R3 core reliability: the scheduled metadata refresh writes items, so it calls back too, and
+// the server drops what it cached of them.
+#[tokio::test]
+async fn r3rel_a_scheduled_metadata_refresh_calls_back_once_it_ends() {
+    let fx = Fixture::new().await;
+    let lib = fx.library("R3 Films", LibraryContentType::Movies).await;
+    let root = root_of(&lib);
+    touch(&root, "Sample Film (2001)/Sample Film (2001).mkv");
+    let sched = TaskScheduler::new(fx.pool.clone(), Arc::new(fx.dir.clone()));
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let (done, mut ended) = tokio::sync::mpsc::unbounded_channel();
+    let counted = calls.clone();
+    sched.set_on_items_changed(move || {
+        counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let _ = done.send(());
+    });
+
+    assert!(sched.start_task(TASK_METADATA_REFRESH).await);
+    tokio::time::timeout(Duration::from_secs(60), ended.recv())
+        .await
+        .expect("no call back within 60 s of the scheduled metadata refresh");
     tokio::time::sleep(Duration::from_millis(200)).await;
     assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
 }

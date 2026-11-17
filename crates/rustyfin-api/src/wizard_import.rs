@@ -64,10 +64,7 @@ pub(crate) async fn remove_queue(data_dir: &Path) {
 pub(crate) fn written_cache_clear(state: &AppState) -> impl FnOnce() + Send + 'static {
     let cache_state = state.clone();
     move || {
-        cache_state.cache.invalidate_on_scan();
-        cache_state.cache.item_details.invalidate_all();
-        cache_state.cache.search_results.invalidate_all();
-        cache_state.image_cache.invalidate_all();
+        cache_state.cache.library_changed(&cache_state.image_cache);
     }
 }
 

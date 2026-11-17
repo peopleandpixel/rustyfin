@@ -4,7 +4,8 @@
 // `data-multiselect`. Keys: x picks the focused card, Space or Enter too while selecting, Ctrl+A picks every card
 // shown, Escape ends it.
 import { icon, toast, escapeHtml } from './util.js';
-import { userDataChanged, openAddToIds } from './cardmenu.js';
+import { openAddToIds } from './cardmenu.js';
+import { userDataChanged } from './userdata.js';
 import { openRefreshDialog } from './metadata-admin.js';
 
 // The picked items by id: { id, name, type }

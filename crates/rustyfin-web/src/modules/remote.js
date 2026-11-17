@@ -108,10 +108,11 @@ function handleMessage(msg) {
     case 'Playstate': remotePlaystate(msg.Data); break;
     case 'GeneralCommand': remoteCommand(msg.Data); break;
     }
-    for (const fn of listeners.get(msg.MessageType) || []) fn(msg.Data);
+    for (const fn of listeners.get(msg.MessageType) || []) fn(msg.Data, msg);
 }
 
-// Calls fn with the Data of each message of type; 'SocketOpen' runs on each (re)connect. Returns the unsubscriber.
+// Calls fn with the Data of each message of type, and the whole message (some events carry their
+// fields at the top, without Data); 'SocketOpen' runs on each (re)connect. Returns the unsubscriber.
 function onSocketMessage(type, fn) {
     if (!listeners.has(type)) listeners.set(type, new Set());
     listeners.get(type).add(fn);

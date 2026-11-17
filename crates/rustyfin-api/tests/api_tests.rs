@@ -3334,6 +3334,102 @@ async fn r3rel_deleting_an_item_with_play_state_works_and_unknown_ids_are_404() 
     }
 }
 
+/// A series with one season of two episodes in a new library `library`: (series, season,
+/// episodes).
+async fn r3rel_series(
+    app: &axum::Router,
+    state: &AppState,
+    token: &str,
+    library: &str,
+) -> (uuid::Uuid, uuid::Uuid, [uuid::Uuid; 2]) {
+    let shows = create_library_via_api(app, state, token, library, "TvShows").await;
+    let series = r3rel_insert_item(state, shows, "Sample Show", "Series", None, None).await;
+    let season = r3rel_insert_item(state, shows, "Season 1", "Season", Some(series), None).await;
+    let e1 = r3rel_insert_item(state, shows, "Episode 1", "Episode", Some(season), None).await;
+    let e2 = r3rel_insert_item(state, shows, "Episode 2", "Episode", Some(season), None).await;
+    (series, season, [e1, e2])
+}
+
+/// A cached image of `item`, as the image route keys them.
+fn r3rel_cache_image(state: &AppState, item: uuid::Uuid) -> String {
+    let key = format!("{item}:Primary:0:1:orig");
+    state.image_cache.insert(key.clone(), vec![1, 2, 3]);
+    key
+}
+
+#[tokio::test]
+async fn r3rel_deleting_items_drops_their_cached_details_images_and_their_parents() {
+    let state = test_state().await;
+    let (token, _) = admin_session(&state).await;
+    let app = app(state.clone());
+    let (series, season, [e1, e2]) = r3rel_series(&app, &state, &token, "Shows").await;
+    let other = r3rel_series(&app, &state, &token, "More Shows").await.0;
+    for id in [series, season, other] {
+        let (status, body) = send_authed(&app, "GET", &format!("/Items/{id}"), &token, None).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(state.cache.item_details.get(&id.to_string()).is_some());
+    }
+    let e2_image = r3rel_cache_image(&state, e2);
+    let other_image = r3rel_cache_image(&state, other);
+
+    // An episode: its season's and series' cached details (their counts) go
+    let (status, body) = send_authed(&app, "DELETE", &format!("/Items/{e1}"), &token, None).await;
+    assert!(status.is_success(), "{status} {body}");
+    for id in [series, season] {
+        assert!(state.cache.item_details.get(&id.to_string()).is_none());
+    }
+
+    // The series: none of it is served from a cache again, its episodes' images neither
+    for id in [series, season] {
+        send_authed(&app, "GET", &format!("/Items/{id}"), &token, None).await;
+    }
+    let (status, body) =
+        send_authed(&app, "DELETE", &format!("/Items/{series}"), &token, None).await;
+    assert!(status.is_success(), "{status} {body}");
+    for id in [series, season] {
+        let (status, body) = send_authed(&app, "GET", &format!("/Items/{id}"), &token, None).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{id}: {body}");
+    }
+    assert!(state.image_cache.get(&e2_image).is_none());
+    assert!(
+        state.image_cache.get(&other_image).is_some(),
+        "another item's image stays"
+    );
+}
+
+#[tokio::test]
+async fn r3rel_refreshing_a_series_drops_its_seasons_and_episodes_from_the_caches() {
+    let state = test_state().await;
+    let (token, _) = admin_session(&state).await;
+    let app = app(state.clone());
+    let (series, season, [e1, _]) = r3rel_series(&app, &state, &token, "Shows").await;
+    let (_, body) = send_authed(&app, "GET", &format!("/Items/{season}"), &token, None).await;
+    assert_eq!(body["Name"], "Season 1", "{body}");
+    let e1_image = r3rel_cache_image(&state, e1);
+
+    // A refresh writes the season (a provider's name for it); the cached copy is still the old one
+    sqlx::query("UPDATE media_items SET name = 'Season One' WHERE id = ?")
+        .bind(season.to_string())
+        .execute(&state.db)
+        .await
+        .unwrap();
+    let (_, body) = send_authed(&app, "GET", &format!("/Items/{season}"), &token, None).await;
+    assert_eq!(body["Name"], "Season 1", "the season is cached: {body}");
+
+    let (status, body) = send_authed(
+        &app,
+        "POST",
+        &format!("/Items/{series}/Refresh"),
+        &token,
+        None,
+    )
+    .await;
+    assert!(status.is_success(), "{status} {body}");
+    let (_, body) = send_authed(&app, "GET", &format!("/Items/{season}"), &token, None).await;
+    assert_eq!(body["Name"], "Season One", "{body}");
+    assert!(state.image_cache.get(&e1_image).is_none());
+}
+
 #[tokio::test]
 async fn r3rel_a_partial_configuration_post_keeps_every_other_setting() {
     let state = test_state().await;
@@ -3796,6 +3892,7 @@ const B124_WEB_MODULES: &[&str] = &[
     "theme-media.js",
     "user-editor.js",
     "user-settings.js",
+    "userdata.js",
     "util.js",
     "wizard.js",
 ];
@@ -26986,6 +27083,22 @@ async fn r3parental_dlna_browses_as_the_dlna_user_with_its_limits() {
         g1_send_raw(&world.app, req.body(Body::empty()).unwrap())
     };
 
+    // The device description names the server as configured, as it is now.
+    for name in ["Living Room", "Den & Co"] {
+        w.configure(serde_json::json!({ "ServerName": name })).await;
+        let req = Request::builder()
+            .uri("/dlna/description.xml")
+            .body(Body::empty())
+            .unwrap();
+        let (status, xml) = g1_send_raw(&w.app, req).await;
+        assert_eq!(status, StatusCode::OK);
+        let escaped = name.replace('&', "&amp;");
+        assert!(
+            xml.contains(&format!("<friendlyName>{escaped}</friendlyName>")),
+            "{xml}"
+        );
+    }
+
     // No DLNA user: DLNA devices don't sign in, so nothing is listed or streamed.
     let root = w.dlna_browse("0", "BrowseDirectChildren").await;
     assert!(root.contains("<TotalMatches>0</TotalMatches>"), "{root}");
@@ -29287,6 +29400,13 @@ fn r3metadata_web() {
 #[test]
 fn r3cards_cards() {
     b124_node_test("r3cards_cards.mjs");
+}
+
+// The web client follows the server's UserDataChanged: cards, their folders' counts, the cached
+// lists, and this tab's own marks on the same path (tests/web/r3sync_userdata.mjs)
+#[test]
+fn r3sync_userdata() {
+    b124_node_test("r3sync_userdata.mjs");
 }
 
 // The sign-in page's user tiles, Manual login, Forgot password and its PIN step, and Switch user
@@ -56039,4 +56159,166 @@ async fn r3dash3_a_library_scan_shows_as_the_scan_task_and_clears() {
     let (task, folder) = r3dash3_scan_views(&app, &owner, lib).await;
     assert_eq!(task["State"], "Idle", "{task}");
     assert_eq!(folder["RefreshStatus"], "Idle", "{folder}");
+}
+
+// The older `/Configuration/MediaEncoding` and `/Configuration/Networking` routes read and save the
+// named configurations `encoding` and `network`: one stored source for each, not a second answer.
+#[tokio::test]
+async fn r3dash3_shadow_configuration_routes_share_the_named_configurations() {
+    let state = test_state().await;
+    let app = app(state.clone());
+    let (owner, _, viewer, _) = g1_owner_and_viewer(&state, &app).await;
+    let mut net = send_authed(&app, "GET", "/System/Configuration/network", &owner, None)
+        .await
+        .1;
+    net["KnownProxies"] = serde_json::json!(["10.0.0.0/8"]);
+    let (status, body) = send_authed(
+        &app,
+        "PUT",
+        "/Configuration/Networking",
+        &owner,
+        Some(&net.to_string()),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+    let (_, named) = send_authed(&app, "GET", "/System/Configuration/network", &owner, None).await;
+    assert_eq!(named, net);
+    let (_, old) = send_authed(&app, "GET", "/Configuration/Networking", &owner, None).await;
+    assert_eq!(old, net);
+    let bad = serde_json::json!({ "KnownProxies": ["0.0.0.0/0"] }).to_string();
+    let (status, _) =
+        send_authed(&app, "PUT", "/Configuration/Networking", &owner, Some(&bad)).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    for token in [&owner, &viewer] {
+        let (_, named) =
+            send_authed(&app, "GET", "/System/Configuration/encoding", token, None).await;
+        let (_, old) = send_authed(&app, "GET", "/Configuration/MediaEncoding", token, None).await;
+        assert_eq!(old, named);
+    }
+    let mut enc = send_authed(&app, "GET", "/System/Configuration/encoding", &owner, None)
+        .await
+        .1;
+    enc["EncodingThreadCount"] = serde_json::json!(3);
+    let (status, body) = send_authed(
+        &app,
+        "PUT",
+        "/Configuration/MediaEncoding",
+        &owner,
+        Some(&enc.to_string()),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+    let (_, named) = send_authed(&app, "GET", "/System/Configuration/encoding", &owner, None).await;
+    assert_eq!(named["EncodingThreadCount"], 3, "{named}");
+}
+
+// A scan the scheduler starts over two libraries shows one percentage everywhere: the library
+// scan task (GET /ScheduledTasks, GET /ScheduledTasks/LibraryScan and the ScheduledTasksInfo
+// frames) is the mean of what /Library/VirtualFolders and the RefreshProgress frames show for each
+// library, because all of them read the scan registry. The task's result is still the scheduler's.
+#[tokio::test]
+async fn r3dash3_a_scheduled_scan_shows_one_percentage_everywhere() {
+    let state = test_state().await;
+    let app = app(state.clone());
+    let (owner, _, _, _) = g1_owner_and_viewer(&state, &app).await;
+    let first = create_library_via_api(&app, &state, &owner, "Movies A", "Movies").await;
+    let second = create_library_via_api(&app, &state, &owner, "Shows B", "TvShows").await;
+    let addr = b17_serve(&app).await;
+    let scans = state.task_scheduler.scans().clone();
+    while scans.state(first).is_some() || scans.state(second).is_some() {
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+
+    // The scheduler's scan waits for the scan lock in its first library, both libraries queued
+    let lock = rustyfin_core::scanner::SCAN_LOCK.lock().await;
+    let (status, body) = send_authed(
+        &app,
+        "POST",
+        "/ScheduledTasks/Running/LibraryScan",
+        &owner,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+    for _ in 0..500 {
+        if scans.state(first).is_some() && scans.state(second).is_some() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    let mut socket = G1cSocket::open(addr, &owner).await;
+    r3tasks_send(
+        &mut socket,
+        r#"{"MessageType":"ScheduledTasksInfoStart","Data":"0,500"}"#,
+    )
+    .await;
+
+    // Work reported on each library's run: 1 of 2 in the first, 1 of 4 in the second
+    let a = scans.queue(first);
+    a.add_total(2);
+    a.advance(1);
+    let b = scans.queue(second);
+    b.add_total(4);
+    b.advance(1);
+
+    // The RefreshProgress frames reach 50 and 25, and a ScheduledTasksInfo frame the mean
+    let (mut ring_a, mut ring_b, mut frame_task) = (None, None, None);
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while ring_a != Some(50.0) || ring_b != Some(25.0) || frame_task != Some(37.5) {
+            let frame = socket.next().await;
+            match frame["MessageType"].as_str() {
+                Some("RefreshProgress") => {
+                    let percent = frame["Data"]["Progress"]
+                        .as_str()
+                        .and_then(|p| p.parse::<f64>().ok());
+                    if frame["Data"]["ItemId"] == first.to_string() {
+                        ring_a = percent;
+                    } else if frame["Data"]["ItemId"] == second.to_string() {
+                        ring_b = percent;
+                    }
+                }
+                Some("ScheduledTasksInfo") => {
+                    frame_task = frame["Data"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .find(|t| t["Id"] == "LibraryScan")
+                        .and_then(|t| t["CurrentProgressPercentage"].as_f64());
+                }
+                _ => {}
+            }
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("frames: {ring_a:?} {ring_b:?} {frame_task:?}"));
+
+    let (task, folder_a) = r3dash3_scan_views(&app, &owner, first).await;
+    let (_, folder_b) = r3dash3_scan_views(&app, &owner, second).await;
+    let (_, one) = send_authed(&app, "GET", "/ScheduledTasks/LibraryScan", &owner, None).await;
+    assert_eq!(task["State"], "Running", "{task}");
+    assert_eq!(task["CurrentProgressPercentage"], 37.5, "{task}");
+    assert_eq!(one["CurrentProgressPercentage"], 37.5, "{one}");
+    assert_eq!(folder_a["RefreshProgress"], 50.0, "{folder_a}");
+    assert_eq!(folder_b["RefreshProgress"], 25.0, "{folder_b}");
+    let mean = (folder_a["RefreshProgress"].as_f64().unwrap()
+        + folder_b["RefreshProgress"].as_f64().unwrap())
+        / 2.0;
+    assert_eq!(task["CurrentProgressPercentage"].as_f64(), Some(mean));
+
+    // The scans run and end: the task is Idle, with the scheduler's result
+    drop(a);
+    drop(b);
+    drop(lock);
+    let mut task = serde_json::Value::Null;
+    for _ in 0..1000 {
+        task = r3dash3_scan_views(&app, &owner, first).await.0;
+        if task["State"] == "Idle" && task["LastExecutionResult"].is_object() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert_eq!(task["State"], "Idle", "{task}");
+    assert!(task["CurrentProgressPercentage"].is_null(), "{task}");
+    assert_eq!(task["LastExecutionResult"]["Status"], "Completed", "{task}");
 }

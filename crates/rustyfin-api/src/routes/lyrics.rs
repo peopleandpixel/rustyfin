@@ -164,7 +164,7 @@ async fn upload_lyrics(
         .map_err(|e| ApiError::Internal(e.to_string()))?;
     rustyfin_db::repo_lyrics::set_uploaded(&state.db, item.id, Some(&path.to_string_lossy()))
         .await?;
-    forget_cached(&state, item.id);
+    forget_cached(&state, item.id).await;
     Ok(Json(dto))
 }
 
@@ -216,12 +216,14 @@ async fn delete_lyrics(
         .next()
         .map(|p| p.to_string_lossy().into_owned());
     rustyfin_db::repo_lyrics::set_sidecar(&state.db, item.id, left.as_deref()).await?;
-    forget_cached(&state, item.id);
+    forget_cached(&state, item.id).await;
     Ok(StatusCode::NO_CONTENT)
 }
 
 /// Drops the cached answers that carry the item's HasLyrics: its details and the item lists.
-fn forget_cached(state: &AppState, item: Uuid) {
-    state.cache.invalidate_item(&item.to_string());
-    state.cache.invalidate_library_lists();
+async fn forget_cached(state: &AppState, item: Uuid) {
+    state
+        .cache
+        .item_changed(&state.db, &state.image_cache, item)
+        .await;
 }

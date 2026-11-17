@@ -70,8 +70,8 @@ fn skipped(id: &str) {
     );
 }
 
-/// The callback that runs when a scheduled library scan ends.
-type OnScan = Arc<dyn Fn() + Send + Sync>;
+/// The callback that runs when a scheduled task that writes items ends.
+type OnItemsChanged = Arc<dyn Fn() + Send + Sync>;
 
 #[derive(Clone)]
 struct TaskEntry {
@@ -86,7 +86,7 @@ pub struct TaskScheduler {
     scans: ScanRegistry,
     changes: ChangeQueue,
     watcher: LibraryWatcher,
-    on_scan: Arc<std::sync::RwLock<Option<OnScan>>>,
+    on_items_changed: Arc<std::sync::RwLock<Option<OnItemsChanged>>>,
     plugin_manager: crate::plugin_manager::PluginManager,
     http_client: reqwest::Client,
     /// Every task run going on, each with the handle that stops it. A run stays listed until it
@@ -526,7 +526,7 @@ impl TaskScheduler {
             scans: ScanRegistry::new(),
             changes,
             watcher,
-            on_scan: Arc::new(std::sync::RwLock::new(None)),
+            on_items_changed: Arc::new(std::sync::RwLock::new(None)),
             plugin_manager,
             http_client,
             image_runs: Arc::new(std::sync::Mutex::new(HashMap::new())),
@@ -601,14 +601,28 @@ impl TaskScheduler {
         }
     }
 
-    /// Sets the callback that runs once each time the scheduled library scan ends, whether or
-    /// not a library failed. The server uses it to clear the caches a scan can change.
-    pub fn set_on_scan(&self, f: impl Fn() + Send + Sync + 'static) {
+    /// Sets the callback that runs once each time a scheduled task that writes items ends,
+    /// whether or not it failed: the library scan, the metadata refresh and the missing episodes.
+    /// The server uses it to clear the caches those items are in.
+    pub fn set_on_items_changed(&self, f: impl Fn() + Send + Sync + 'static) {
         let mut slot = self
-            .on_scan
+            .on_items_changed
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         *slot = Some(Arc::new(f));
+    }
+
+    /// Runs the `set_on_items_changed` callback, if any.
+    fn items_changed(&self) {
+        // Cloned out of the lock so the callback never runs while the lock is held.
+        let callback = self
+            .on_items_changed
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        if let Some(f) = callback {
+            f();
+        }
     }
 
     /// The library scans in progress.
@@ -638,10 +652,13 @@ impl TaskScheduler {
 
     /// A task's info, with the percent it has reported while it is not idle.
     ///
-    /// As in Jellyfin, every library scan shows as the library scan task: while any library has a
-    /// scan listed (queued, scanning or probing), wherever it was started (a library's Scan, Scan
-    /// all, the setup wizard), an idle library scan task reads Running, at the listed scans'
-    /// average percent. The scans listed are what the web client's scan rings show.
+    /// As in Jellyfin, every library scan shows as the library scan task. Its `State` and percent
+    /// come only from the scan registry, the source of the web client's scan rings, the
+    /// `RefreshProgress` frames and `RefreshStatus`: Running while any library has a scan listed
+    /// (queued, scanning or probing), wherever it was started (the scheduler, whose run holds
+    /// tickets like any other scan, a library's Scan, Scan all, the setup wizard), at the batch's
+    /// percent (`library_scan_state`); Idle when none is. A stopped scheduler run reads Cancelling while
+    /// its scans are listed. `LastExecutionResult` stays the scheduler's.
     fn info_of(&self, entry: &TaskEntry) -> ScheduledTaskInfo {
         let mut info = entry.info.clone();
         info.current_progress_percentage = match info.state {
@@ -650,16 +667,10 @@ impl TaskScheduler {
                 self.progress.get(&info.id).and_then(TaskProgress::get)
             }
         };
-        if info.id == TASK_LIBRARY_SCAN && info.state == TaskState::Idle {
-            let scans = self.scans.snapshot();
-            if !scans.is_empty() {
-                let sum: f64 = scans
-                    .iter()
-                    .map(|(_, s)| f64::from(s.progress.unwrap_or(0)))
-                    .sum();
-                info.state = TaskState::Running;
-                info.current_progress_percentage = Some(sum / scans.len() as f64);
-            }
+        if info.id == TASK_LIBRARY_SCAN {
+            let (state, percent) = library_scan_state(&self.scans, &info.state);
+            info.state = state;
+            info.current_progress_percentage = percent;
         }
         info
     }
@@ -1014,6 +1025,7 @@ impl TaskScheduler {
             start_time_utc: start.to_rfc3339(),
             end_time_utc: Utc::now().to_rfc3339(),
         };
+        self.items_changed();
         self.set_task_result(TASK_MISSING_EPISODES, result).await;
         self.end_run(claim).await;
     }
@@ -1170,11 +1182,6 @@ impl TaskScheduler {
 
         let result = match rustyfin_db::repo_library::get_all_libraries(&self.db).await {
             Ok(libraries) => {
-                let follower = follow_scans(
-                    self.scans.subscribe(),
-                    libraries.iter().map(|lib| lib.id).collect(),
-                    self.progress_of(TASK_LIBRARY_SCAN),
-                );
                 // Every library is listed as queued before the first one starts.
                 let tickets: Vec<_> = libraries
                     .iter()
@@ -1182,17 +1189,16 @@ impl TaskScheduler {
                     .collect();
                 let client = &self.http_client;
                 let mut errors = Vec::new();
-                // The runs another caller scans, which this task waits for before it ends
-                let mut runs = Vec::new();
                 for (lib, ticket) in libraries.iter().zip(tickets) {
                     // A stop ends the task between libraries; the libraries not scanned yet
                     // drop their queued runs
                     if claim.is_cancelled() {
                         break;
                     }
-                    // Only the caller that claimed the library's run scans it.
+                    // Only the caller that claimed the library's run scans it. A library another
+                    // caller claimed is left to it: the task neither scans nor waits for it (its
+                    // listing alone keeps the task reading Running).
                     if !ticket.claim() {
-                        runs.push(ticket);
                         continue;
                     }
                     if let Err(e) = crate::scanner::scan_library_with_metadata(
@@ -1214,16 +1220,6 @@ impl TaskScheduler {
                         _ = claim.cancel.cancelled() => {}
                     }
                 }
-                // Scans started elsewhere aren't this task's to wait for once it is stopped
-                for ticket in runs {
-                    tokio::select! {
-                        _ = ticket.wait_end() => {}
-                        _ = claim.cancel.cancelled() => break,
-                    }
-                }
-                // Waited for, so no late percent lands after the task ends
-                follower.abort();
-                let _ = follower.await;
                 let end = Utc::now();
                 if errors.is_empty() {
                     TaskResult {
@@ -1252,15 +1248,7 @@ impl TaskScheduler {
             }
         };
 
-        // Cloned out of the lock so the callback never runs while the lock is held.
-        let on_scan = self
-            .on_scan
-            .read()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clone();
-        if let Some(f) = on_scan {
-            f();
-        }
+        self.items_changed();
 
         self.set_task_result(TASK_LIBRARY_SCAN, result).await;
         self.end_run(claim).await;
@@ -1639,6 +1627,7 @@ impl TaskScheduler {
             }
         };
 
+        self.items_changed();
         self.set_task_result(TASK_METADATA_REFRESH, result).await;
         self.end_run(claim).await;
     }
@@ -1815,6 +1804,16 @@ impl TaskScheduler {
         );
     }
 
+    /// Whether the scheduler's own run of task `id` is going, whatever its reported state (the
+    /// library scan task reports the scan registry's).
+    async fn run_active(&self, id: &str) -> bool {
+        self.tasks
+            .read()
+            .await
+            .get(id)
+            .is_some_and(|entry| entry.info.state != TaskState::Idle)
+    }
+
     /// The running work a VACUUM would hold up: it holds the write lock throughout, so their
     /// writes would wait and then fail. `scan_lock_held`: whether `SCAN_LOCK` is held, as by the
     /// scans started outside the scheduler.
@@ -1828,7 +1827,7 @@ impl TaskScheduler {
             TASK_TRICKPLAY,
         ] {
             if let Some(task) = self.get_task(id).await
-                && task.state != TaskState::Idle
+                && (task.state != TaskState::Idle || self.run_active(id).await)
             {
                 blockers.push(task.name);
             }
@@ -1836,7 +1835,8 @@ impl TaskScheduler {
         let scan_listed = self
             .get_task(TASK_LIBRARY_SCAN)
             .await
-            .is_some_and(|task| task.state != TaskState::Idle);
+            .is_some_and(|task| task.state != TaskState::Idle)
+            || self.run_active(TASK_LIBRARY_SCAN).await;
         if !scan_listed && scan_lock_held {
             blockers.push("a library scan".to_string());
         }
@@ -1978,37 +1978,19 @@ fn no_library_on(id: &str, message: &str) -> String {
     message.to_string()
 }
 
-/// Reports the library scan task's percent from the scans' updates: the mean of each library's
-/// percent, where a library whose scan ended counts as 100. Each library's percent only rises, so
-/// the late updates of a library still probing never move the total back.
-fn follow_scans(
-    mut updates: tokio::sync::broadcast::Receiver<crate::scan_progress::ScanUpdate>,
-    libraries: Vec<uuid::Uuid>,
-    progress: TaskProgress,
-) -> tokio::task::JoinHandle<()> {
-    use crate::scan_progress::ScanStatus;
-    use tokio::sync::broadcast::error::RecvError;
-    let mut percents = vec![0u8; libraries.len()];
-    progress.report_count(0, libraries.len());
-    tokio::spawn(async move {
-        loop {
-            let update = match updates.recv().await {
-                Ok(update) => update,
-                Err(RecvError::Lagged(_)) => continue,
-                Err(RecvError::Closed) => return,
-            };
-            let Some(i) = libraries.iter().position(|id| *id == update.library_id) else {
-                continue;
-            };
-            let percent = match update.status {
-                ScanStatus::Idle => 100,
-                ScanStatus::Active | ScanStatus::Queued => update.progress,
-            };
-            percents[i] = percents[i].max(percent);
-            let sum: usize = percents.iter().map(|&p| usize::from(p)).sum();
-            progress.report(sum as f64 / percents.len() as f64);
-        }
-    })
+/// The library scan task's state and percent from the scan registry: Idle with no percent when no
+/// scan is listed, else Running (Cancelling while the scheduler's run is stopping) at the batch's
+/// percent, the mean of each library's `RefreshProgress` percent, a finished one at 100 until the
+/// batch ends, so the percent never drops as libraries finish.
+fn library_scan_state(scans: &ScanRegistry, run: &TaskState) -> (TaskState, Option<f64>) {
+    let Some(percent) = scans.batch_progress() else {
+        return (TaskState::Idle, None);
+    };
+    let state = match run {
+        TaskState::Cancelling => TaskState::Cancelling,
+        _ => TaskState::Running,
+    };
+    (state, Some(percent))
 }
 
 /// Remove transcode cache files older than 24 hours
@@ -2618,6 +2600,34 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// The scheduler's own run of the library scan reads only what the registry lists: not its own
+    /// reported percent, Idle while nothing is listed, Running while scans are, a stopped run's
+    /// included (stopping it does not end the scans already going).
+    #[tokio::test]
+    async fn r3dash3_the_scheduler_run_reads_the_registry_only() {
+        let (sched, dir) = r3tasks_scheduler().await;
+        sched
+            .set_task_state(TASK_LIBRARY_SCAN, TaskState::Running)
+            .await;
+        sched.progress_of(TASK_LIBRARY_SCAN).report(80.0);
+        assert_eq!(r3dash3_scan_task(&sched).await, (TaskState::Idle, None));
+        let ticket = sched.scans().queue(Uuid::new_v4());
+        ticket.add_total(10);
+        ticket.advance(3);
+        assert_eq!(
+            r3dash3_scan_task(&sched).await,
+            (TaskState::Running, Some(30.0))
+        );
+        assert!(sched.stop_task(TASK_LIBRARY_SCAN).await);
+        assert_eq!(
+            r3dash3_scan_task(&sched).await,
+            (TaskState::Running, Some(30.0))
+        );
+        drop(ticket);
+        assert_eq!(r3dash3_scan_task(&sched).await, (TaskState::Idle, None));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// A scan that is cancelled (its task aborted) or fails (panics) clears the library's listing,
     /// so neither the scan ring nor the task stays on.
     #[tokio::test]
@@ -2661,10 +2671,11 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// The scheduled library scan stays Running until the scans it covers have ended, the ones
-    /// another caller is running included, and only then records its result.
+    /// The scheduled library scan leaves a library another caller claimed to it: it neither scans
+    /// nor waits for it, and records its result. The other scan, still listed, keeps the task
+    /// reading Running until it ends.
     #[tokio::test]
-    async fn r3dash3_the_scheduled_scan_waits_for_running_scans() {
+    async fn r3dash3_the_scheduled_scan_skips_a_claimed_library() {
         let (sched, dir) = r3tasks_scheduler().await;
         let media = dir.join("media");
         std::fs::create_dir_all(&media).unwrap();
@@ -2678,23 +2689,21 @@ mod tests {
             .await
             .unwrap();
         // Another caller (a library's Scan) has claimed the library's run, which still waits for
-        // the scan lock, so the task joins that run instead of scanning
+        // the scan lock, so the task joins that run and leaves it to its claimer
         let api_scan = sched.scans().queue(lib.id);
         assert!(api_scan.claim());
-        let task = {
-            let sched = sched.clone();
-            tokio::spawn(async move { sched.run_library_scan().await })
-        };
-        for _ in 0..50 {
-            tokio::task::yield_now().await;
-        }
-        assert!(!task.is_finished(), "the task waits for the other scan");
-        assert_eq!(r3dash3_scan_task(&sched).await.0, TaskState::Running);
-        drop(api_scan);
-        task.await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(10), sched.run_library_scan())
+            .await
+            .expect("the task doesn't wait for the claimed library");
         let info = sched.get_task(TASK_LIBRARY_SCAN).await.unwrap();
-        assert_eq!(info.state, TaskState::Idle);
         assert!(info.last_execution_result.is_some());
+        assert_eq!(
+            info.state,
+            TaskState::Running,
+            "the other scan is still listed"
+        );
+        drop(api_scan);
+        assert_eq!(r3dash3_scan_task(&sched).await, (TaskState::Idle, None));
         assert!(sched.scans().snapshot().is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -3135,47 +3144,5 @@ mod tests {
         .await;
         assert!(again.last_execution_result.is_some());
         let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[tokio::test]
-    async fn r3tasks_scan_progress_follows_the_libraries_scans() {
-        let scans = ScanRegistry::new();
-        let (first, second) = (uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
-        let progress = TaskProgress::new();
-        let follower = follow_scans(scans.subscribe(), vec![first, second], progress.clone());
-        assert_eq!(progress.get(), Some(0.0), "a scan of libraries starts at 0");
-
-        let wait_for = |want: f64| {
-            let progress = progress.clone();
-            async move {
-                for _ in 0..200 {
-                    if progress.get() == Some(want) {
-                        return;
-                    }
-                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-                }
-                panic!("progress {:?}, want {want}", progress.get());
-            }
-        };
-        let one = scans.queue(first);
-        let two = scans.queue(second);
-        one.start();
-        one.add_total(4);
-        one.advance(2);
-        wait_for(25.0).await;
-        drop(one);
-        wait_for(50.0).await;
-        two.start();
-        two.add_total(2);
-        two.advance(1);
-        wait_for(75.0).await;
-        // A late update of a library that has ended never moves the total back.
-        let late = scans.queue(first);
-        late.start();
-        two.advance(1);
-        drop(two);
-        wait_for(100.0).await;
-        drop(late);
-        follower.abort();
     }
 }

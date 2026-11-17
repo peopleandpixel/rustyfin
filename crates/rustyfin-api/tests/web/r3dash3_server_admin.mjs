@@ -228,25 +228,28 @@ test('the branding CSS goes into a style element, and the login disclaimer is sh
 
 test('the dashboard\'s task list follows a library scan that starts or ends, wherever it started', () => {
     const libraryAdmin = read('modules/library-admin.js');
-    const from = libraryAdmin.indexOf('let scanSocket = null;');
-    const to = libraryAdmin.indexOf('function stopScanProgressWebSocket(');
-    let socket = null;
+    const from = libraryAdmin.indexOf('// One server message');
+    const to = libraryAdmin.indexOf('// After a sign-in');
+    // remote.js's session socket: its subscribers by message type
+    const listeners = new Map();
     const refreshes = [];
     const rings = [];
     const context = vm.createContext({
-        API: { isLoggedIn: () => true, token: 't' },
-        WebSocket: function WebSocket() { socket = this; },
-        window: { location: { protocol: 'http:', host: 'x' } },
+        onSocketMessage: (type, fn) => listeners.set(type, [...(listeners.get(type) || []), fn]),
+        queueMicrotask: fn => fn(),
         updateScanRings: id => rings.push(id),
         refreshTasks: quiet => refreshes.push(quiet),
         currentPage: 'admin',
         toast: () => {}, t: k => k, libraries: [], refreshViewAfterLibraryChange: () => {},
-        setTimeout, clearTimeout, console,
+        console,
     });
-    vm.runInContext(`let scanStatuses = {};\n${libraryAdmin.slice(from, to)}\nthis.fns = { initScanProgressWebSocket, statuses: () => scanStatuses };`, context);
-    context.fns.initScanProgressWebSocket();
-    socket.onopen();
-    const frame = (id, progress, state) => socket.onmessage({ data: JSON.stringify({ MessageType: 'RefreshProgress', Data: { ItemId: id, Progress: String(progress), State: state } }) });
+    vm.runInContext(`let scanStatuses = { stale: { percent: 5 } };\n${libraryAdmin.slice(from, to)}\nthis.fns = { statuses: () => scanStatuses };`, context);
+    // No socket of its own: it listens on the session socket
+    assert.doesNotMatch(libraryAdmin, /new WebSocket\(/);
+    const emit = message => (listeners.get(message.MessageType) || []).forEach(fn => fn(message.Data, message));
+    listeners.get('SocketOpen').forEach(fn => fn());
+    same(context.fns.statuses(), {}, 'a (re)connect starts the rings over');
+    const frame = (id, progress, state) => emit({ MessageType: 'RefreshProgress', Data: { ItemId: id, Progress: String(progress), State: state } });
     frame('tv', 0, 'Queued');
     same(refreshes, [true], 'a scan that starts');
     frame('tv', 40, 'Active');
@@ -257,4 +260,34 @@ test('the dashboard\'s task list follows a library scan that starts or ends, whe
     context.currentPage = 'home';
     frame('tv', 0, 'Queued');
     same(refreshes, [true, true], 'only on the dashboard');
+    // Task events carry their fields at the top, without Data
+    context.currentPage = 'admin';
+    emit({ MessageType: 'ScheduledTaskCompleted', Name: 'Library scan: TV', State: 'Completed', ItemId: 'tv' });
+    assert.equal(refreshes.length, 3, 'a task that ends refreshes the list');
+});
+
+test('the drawer lists the user\'s views for everyone, administrators too', async () => {
+    const libraryAdmin = read('modules/library-admin.js');
+    const from = libraryAdmin.indexOf('async function loadSidebar(');
+    const to = libraryAdmin.indexOf('\n}\n', from) + 3;
+    const calls = [];
+    const list = { innerHTML: '' };
+    const all = [{ id: 'a', name: 'Movies A', content_type: 'Movies' }, { id: 'h', name: 'Hidden H', content_type: 'Mixed' }];
+    const context = vm.createContext({
+        API: {
+            isAdmin: true,
+            isLoggedIn: () => true,
+            getUserViews: async ({ includeHidden = false } = {}) => { calls.push(includeHidden); return includeHidden ? all : all.slice(0, 1); },
+            getLibraries: async () => { throw new Error('the drawer must not read VirtualFolders'); },
+        },
+        $: id => (id === 'sidebar-lib-list' ? list : null),
+        show: () => {}, hide: () => {}, toast: () => {}, t: k => k, escapeHtml, icon: () => '',
+        scanRing: () => '', currentLibraryId: null, currentPage: 'home',
+    });
+    vm.runInContext(`let libraries = [];\n${libraryAdmin.slice(from, to)}\nthis.fns = { loadSidebar, libs: () => libraries };`, context);
+    await context.fns.loadSidebar();
+    same(calls.sort(), [false, true]);
+    assert.match(list.innerHTML, /Movies A/);
+    assert.doesNotMatch(list.innerHTML, /Hidden H/, 'hidden from My Media, hidden here');
+    same(context.fns.libs().map(l => l.id), ['a', 'h'], 'the pages still find a hidden library');
 });

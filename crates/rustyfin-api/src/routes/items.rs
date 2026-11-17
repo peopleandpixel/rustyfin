@@ -3775,10 +3775,12 @@ async fn delete_item(
         Some(library) => rustyfin_core::lyrics::uploads_in_library(&state.db, library).await,
         None => Vec::new(),
     };
+    let affected = crate::cache::ApiCache::affected_items(&state.db, id).await;
     let deleted = rustyfin_db::repo_media::delete_item(&state.db, id).await?;
     if !deleted {
         return Err(ApiError::NotFound("item not found".into()));
     }
+    state.cache.items_changed(&state.image_cache, &affected);
     rustyfin_core::lyrics::remove_orphaned_uploads(&state.db, &lyrics).await;
     // The items under it lose theirs at the image tasks' next run.
     rustyfin_core::trickplay::remove_item_files(&state.data_dir, id).await;
@@ -4373,11 +4375,18 @@ async fn delete_items(
     } else {
         Vec::new()
     };
+    let mut affected = Vec::new();
     for id in &ids {
+        let under = crate::cache::ApiCache::affected_items(&state.db, *id).await;
         if let Ok(true) = rustyfin_db::repo_media::delete_item(&state.db, *id).await {
+            affected.extend(under);
             rustyfin_core::trickplay::remove_item_files(&state.data_dir, *id).await;
         }
     }
+    if let Some(parent) = query.parent_id.or(query.parent_id_lower) {
+        affected.push(parent);
+    }
+    state.cache.items_changed(&state.image_cache, &affected);
     Ok((StatusCode::OK, Json(serde_json::json!({"Success": true}))))
 }
 
@@ -4536,8 +4545,10 @@ async fn remove_item_image(
             rustyfin_db::repo_media::delete_item_image(&state.db, id, image_type.as_str()).await?
         }
     }
-    state.cache.invalidate_item(&id.to_string());
-    state.image_cache.invalidate_item(&id.to_string());
+    state
+        .cache
+        .item_changed(&state.db, &state.image_cache, id)
+        .await;
     Ok(StatusCode::NO_CONTENT)
 }
 

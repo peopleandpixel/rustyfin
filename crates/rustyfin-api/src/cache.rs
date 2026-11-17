@@ -72,6 +72,44 @@ impl ApiCache {
     pub fn invalidate_on_scan(&self) {
         self.invalidate_library_lists();
         self.item_details.invalidate_all();
+        self.search_results.invalidate_all();
+    }
+
+    // The one rule for writes to items. User data is in none of these caches (item details are
+    // kept without it and search and lists don't carry it), so its writes clear nothing.
+
+    /// After a write that changed, added or removed the items `ids`, outside a scan: a delete, a
+    /// refresh, an edit, an image or subtitle change. A cached folder's details hold its
+    /// children's counts and names, so every item's details go; the library views, filter lists
+    /// and search answers go; and the images of `ids`. Pass every item the write touched, a
+    /// series' seasons and episodes too (`repo_media::subtree_ids`).
+    pub fn items_changed(&self, images: &ImageCache, ids: &[uuid::Uuid]) {
+        self.invalidate_on_scan();
+        images.invalidate_items(ids);
+    }
+
+    /// The items a write to the item `id` touches, for `items_changed`: it and everything under it
+    /// (a series' seasons and episodes, an album's tracks). Read before a delete. The item alone
+    /// when the database can't say.
+    pub async fn affected_items(db: &SqlitePool, id: uuid::Uuid) -> Vec<uuid::Uuid> {
+        match rustyfin_db::repo_media::subtree_ids(db, id).await {
+            Ok(ids) if !ids.is_empty() => ids,
+            _ => vec![id],
+        }
+    }
+
+    /// `items_changed` for a write to the existing item `id`, which shows in everything under it
+    /// (a series' images and name in its seasons' and episodes').
+    pub async fn item_changed(&self, db: &SqlitePool, images: &ImageCache, id: uuid::Uuid) {
+        let ids = Self::affected_items(db, id).await;
+        self.items_changed(images, &ids);
+    }
+
+    /// After a scan, an import or a scheduled task that may have changed any item: as
+    /// `items_changed`, with every image.
+    pub fn library_changed(&self, images: &ImageCache) {
+        self.invalidate_on_scan();
+        images.invalidate_all();
     }
 
     /// Invalidate a specific item's cache when metadata is refreshed.
@@ -330,6 +368,20 @@ impl ImageCache {
     /// Invalidate all cached images — called when a library scan completes.
     pub fn invalidate_all(&self) {
         self.inner.invalidate_all();
+    }
+
+    /// Invalidate the cached images of each of `ids`, in one pass over the keys.
+    pub fn invalidate_items(&self, ids: &[uuid::Uuid]) {
+        let ids: std::collections::HashSet<String> = ids.iter().map(|id| id.to_string()).collect();
+        let keys: Vec<String> = self
+            .inner
+            .iter()
+            .map(|(k, _)| k.to_string())
+            .filter(|k| k.split_once(':').is_some_and(|(id, _)| ids.contains(id)))
+            .collect();
+        for key in keys {
+            self.inner.invalidate(&key);
+        }
     }
 
     /// Invalidate cached images for a specific item — called when metadata is refreshed.
