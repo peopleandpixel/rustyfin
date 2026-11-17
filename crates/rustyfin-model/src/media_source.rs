@@ -1,8 +1,10 @@
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 /// Represents a media source (file) for a media item, matching Jellyfin's `MediaSourceResponse`.
+/// Serialized with the flags Jellyfin always sends (`source_flags`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "PascalCase")]
+#[serde(rename_all = "PascalCase", remote = "Self")]
 pub struct MediaSourceResponse {
     /// Unique ID for this media source
     pub id: String,
@@ -65,8 +67,9 @@ fn default_source_type() -> String {
 }
 
 /// Represents a single media stream (video, audio, or subtitle track), matching Jellyfin's `MediaStream`.
+/// Serialized with the flags Jellyfin always sends (`MediaStream::stream_flags`).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(rename_all = "PascalCase")]
+#[serde(rename_all = "PascalCase", remote = "Self")]
 pub struct MediaStream {
     /// Index of the stream within the media source
     pub index: i32,
@@ -107,9 +110,21 @@ pub struct MediaStream {
     pub width: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub height: Option<u32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// Frame rates as ffprobe gives them ("24000/1001"); sent as Jellyfin's floats, which its SDK
+    /// clients require (see `serialize_frame_rate`), and read in either form
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "serialize_frame_rate",
+        deserialize_with = "deserialize_frame_rate"
+    )]
     pub average_frame_rate: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "serialize_frame_rate",
+        deserialize_with = "deserialize_frame_rate"
+    )]
     pub real_frame_rate: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bit_rate: Option<u32>,
@@ -396,6 +411,148 @@ pub fn language_forms(language: &str) -> Vec<String> {
     forms
 }
 
+// --- The fields Jellyfin's MediaSourceInfo and MediaStream always carry. Its SDK clients (the
+// Android app's player and downloads) refuse a PlaybackInfo or item without them. The derived
+// impls are inherent (`remote = "Self"`); these add the missing keys, never replacing one. ---
+
+/// Jellyfin's values for the source flags Rustyfin doesn't track: a plain file it opens itself,
+/// streamed over HTTP unless PlaybackInfo says HLS
+fn source_flags() -> [(&'static str, Value); 11] {
+    [
+        ("ReadAtNativeFramerate", Value::Bool(false)),
+        ("IgnoreDts", Value::Bool(false)),
+        ("IgnoreIndex", Value::Bool(false)),
+        ("GenPtsInput", Value::Bool(false)),
+        ("IsInfiniteStream", Value::Bool(false)),
+        ("RequiresOpening", Value::Bool(false)),
+        ("RequiresClosing", Value::Bool(false)),
+        ("RequiresLooping", Value::Bool(false)),
+        ("SupportsProbing", Value::Bool(true)),
+        ("HasSegments", Value::Bool(false)),
+        ("TranscodingSubProtocol", Value::String("http".into())),
+    ]
+}
+
+/// Picture subtitles, which Jellyfin can't send as text (ffprobe's names and Jellyfin's)
+const IMAGE_SUBTITLE_CODECS: [&str; 9] = [
+    "hdmv_pgs_subtitle",
+    "pgssub",
+    "pgs",
+    "dvd_subtitle",
+    "dvdsub",
+    "dvb_subtitle",
+    "dvbsub",
+    "vobsub",
+    "xsub",
+];
+
+impl MediaStream {
+    /// Jellyfin's `IsTextSubtitleStream`: a subtitle that isn't a picture
+    pub fn is_text_subtitle(&self) -> bool {
+        self.codec_type.eq_ignore_ascii_case("subtitle")
+            && !self.codec.as_deref().is_some_and(|c| {
+                IMAGE_SUBTITLE_CODECS
+                    .iter()
+                    .any(|i| i.eq_ignore_ascii_case(c))
+            })
+    }
+
+    fn stream_flags(&self) -> [(&'static str, Value); 5] {
+        let text = self.is_text_subtitle();
+        [
+            ("IsHearingImpaired", Value::Bool(false)),
+            ("IsOriginal", Value::Bool(false)),
+            ("IsTextSubtitleStream", Value::Bool(text)),
+            // A text subtitle can be sent as its own file, as Jellyfin offers it
+            ("SupportsExternalStream", Value::Bool(text)),
+            ("Type", Value::String("Data".into())),
+        ]
+    }
+}
+
+/// What the derived `serialize` gives, with each of `flags` added where it is missing or null
+fn with_flags<S: serde::Serializer>(
+    value: Result<Value, serde_json::Error>,
+    flags: impl IntoIterator<Item = (&'static str, Value)>,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    let mut value = value.map_err(serde::ser::Error::custom)?;
+    if let Value::Object(map) = &mut value {
+        for (key, flag) in flags {
+            let slot = map.entry(key).or_insert(Value::Null);
+            if slot.is_null() {
+                *slot = flag;
+            }
+        }
+    }
+    value.serialize(serializer)
+}
+
+impl Serialize for MediaSourceResponse {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        with_flags(
+            MediaSourceResponse::serialize(self, serde_json::value::Serializer),
+            source_flags(),
+            serializer,
+        )
+    }
+}
+
+impl<'de> Deserialize<'de> for MediaSourceResponse {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        MediaSourceResponse::deserialize(deserializer)
+    }
+}
+
+impl Serialize for MediaStream {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        with_flags(
+            MediaStream::serialize(self, serde_json::value::Serializer),
+            self.stream_flags(),
+            serializer,
+        )
+    }
+}
+
+impl<'de> Deserialize<'de> for MediaStream {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        MediaStream::deserialize(deserializer)
+    }
+}
+
+/// A frame rate ("24000/1001", "25/1" or "23.976") as Jellyfin's float, rounded to 3 decimals as
+/// Jellyfin does; null when it is no rate (ffprobe's "0/0")
+fn frame_rate_value(text: &str) -> Option<f32> {
+    let rate = match text.split_once('/') {
+        Some((numerator, denominator)) => {
+            numerator.trim().parse::<f64>().ok()? / denominator.trim().parse::<f64>().ok()?
+        }
+        None => text.trim().parse::<f64>().ok()?,
+    };
+    (rate.is_finite() && rate > 0.0).then(|| ((rate * 1000.0).round() / 1000.0) as f32)
+}
+
+fn serialize_frame_rate<S: serde::Serializer>(
+    rate: &Option<String>,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    rate.as_deref()
+        .and_then(frame_rate_value)
+        .serialize(serializer)
+}
+
+fn deserialize_frame_rate<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<String>, D::Error> {
+    Ok(
+        match Option::<serde_json::Value>::deserialize(deserializer)? {
+            Some(serde_json::Value::String(text)) => Some(text),
+            Some(serde_json::Value::Number(number)) => Some(number.to_string()),
+            _ => None,
+        },
+    )
+}
+
 fn serialize_jellyfin_codec<S: serde::Serializer>(
     codec: &Option<String>,
     serializer: S,
@@ -416,6 +573,104 @@ fn serialize_jellyfin_language<S: serde::Serializer>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Jellyfin's SDK clients (the Android app) refuse PlaybackInfo when a frame rate is a string
+    #[test]
+    fn r3android_frame_rates_are_floats() {
+        let stream = MediaStream {
+            codec_type: "video".into(),
+            average_frame_rate: Some("24000/1001".into()),
+            real_frame_rate: Some("25/1".into()),
+            ..MediaStream::default()
+        };
+        let json = serde_json::to_value(&stream).unwrap();
+        assert_eq!(json["AverageFrameRate"], serde_json::json!(23.976_f32));
+        assert!(json["AverageFrameRate"].is_f64());
+        assert_eq!(json["RealFrameRate"], serde_json::json!(25.0));
+
+        let none = serde_json::to_value(MediaStream {
+            average_frame_rate: Some("0/0".into()),
+            ..MediaStream::default()
+        })
+        .unwrap();
+        assert!(none["AverageFrameRate"].is_null());
+        assert!(none.get("RealFrameRate").is_none());
+
+        // Read back in either form, as ffprobe's fraction or Jellyfin's float
+        let read: MediaStream = serde_json::from_value(serde_json::json!({
+            "Index": 0, "CodecType": "video", "AverageFrameRate": "24/1", "RealFrameRate": 23.976,
+        }))
+        .unwrap();
+        assert_eq!(read.average_frame_rate.as_deref(), Some("24/1"));
+        assert_eq!(read.real_frame_rate.as_deref(), Some("23.976"));
+        assert_eq!(frame_rate_value("24/1"), Some(24.0));
+    }
+
+    // The fields Jellyfin's SDK requires of MediaSourceInfo and MediaStream (jellyfin-sdk-kotlin's
+    // non-null properties); the Android app's player refuses a PlaybackInfo without one
+    #[test]
+    fn r3android_sources_carry_the_fields_jellyfin_clients_require() {
+        let source: MediaSourceResponse = serde_json::from_value(serde_json::json!({
+            "Id": "s", "Uid": "s", "Protocol": "File", "Path": "/x.mkv", "Container": "mkv",
+            "MediaStreams": [
+                {"Index": 0, "CodecType": "video", "Codec": "h264", "Type": "Video"},
+                {"Index": 1, "CodecType": "subtitle", "Codec": "subrip", "Type": "Subtitle"},
+                {"Index": 2, "CodecType": "subtitle", "Codec": "hdmv_pgs_subtitle", "Type": "Subtitle"},
+                {"Index": 3, "CodecType": "data"},
+            ],
+        }))
+        .unwrap();
+        let json = serde_json::to_value(&source).unwrap();
+        for key in [
+            "Protocol",
+            "Type",
+            "IsRemote",
+            "ReadAtNativeFramerate",
+            "IgnoreDts",
+            "IgnoreIndex",
+            "GenPtsInput",
+            "SupportsTranscoding",
+            "SupportsDirectStream",
+            "SupportsDirectPlay",
+            "IsInfiniteStream",
+            "RequiresOpening",
+            "RequiresClosing",
+            "RequiresLooping",
+            "SupportsProbing",
+            "TranscodingSubProtocol",
+            "HasSegments",
+        ] {
+            assert!(!json[key].is_null(), "source {key}");
+        }
+        assert_eq!(json["TranscodingSubProtocol"], "http");
+        let streams = json["MediaStreams"].as_array().unwrap();
+        for stream in streams {
+            for key in [
+                "IsInterlaced",
+                "IsDefault",
+                "IsForced",
+                "IsHearingImpaired",
+                "IsOriginal",
+                "Type",
+                "Index",
+                "IsExternal",
+                "IsTextSubtitleStream",
+                "SupportsExternalStream",
+            ] {
+                assert!(!stream[key].is_null(), "stream {} {key}", stream["Index"]);
+            }
+        }
+        let text: Vec<_> = streams
+            .iter()
+            .map(|s| s["IsTextSubtitleStream"].clone())
+            .collect();
+        assert_eq!(text, [false, true, false, false]);
+        assert_eq!(streams[1]["SupportsExternalStream"], true);
+        assert_eq!(streams[3]["Type"], "Data");
+        // A value the source has is kept, and it reads back as before
+        let back: MediaSourceResponse = serde_json::from_value(json).unwrap();
+        assert_eq!(back.media_streams.len(), 4);
+    }
 
     fn dv(profile: i32, compat: i32) -> MediaStream {
         MediaStream {
