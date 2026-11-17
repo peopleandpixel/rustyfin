@@ -991,8 +991,9 @@ fn audio_stream_at(source: &SourceFacts, index: i32) -> Option<&StreamFacts> {
 }
 
 /// The audio streams that the transcode may pick from (Jellyfin's `candidateAudioStreams`, SB
-/// 672-708). An explicit request index (a remembered track comes as one), or no audio stream,
-/// leaves only the chosen stream. Then, by the settings that chose the default audio:
+/// 669-708). An explicit request index, a default the user remembered (Jellyfin's
+/// `AudioIndexSource.User`), or no audio stream, leaves only the chosen stream. Then, by the
+/// settings that chose the default audio:
 /// - none applied (`None`), or applied with neither PlayDefaultAudioTrack nor a preferred
 ///   language (Jellyfin's `AudioIndexSource.None`): every audio stream, or only the default ones
 ///   when the chosen stream is a default;
@@ -1007,7 +1008,7 @@ fn audio_candidates<'a>(
 ) -> Vec<&'a StreamFacts> {
     let explicit = requested.is_some_and(|index| index >= 0);
     let mut candidates: Vec<&StreamFacts> = audio.into_iter().collect();
-    if explicit {
+    if explicit || source.audio_index_source.is_some_and(|flags| flags.user) {
         return candidates;
     }
     let audio_streams = || {
@@ -1613,21 +1614,28 @@ mod tests {
         }
         let default = Some(AudioIndexSource {
             default: true,
-            language: false,
+            ..AudioIndexSource::default()
         });
         assert_eq!(candidates(default, 2, &mixed), [1, 3]);
         assert!(candidates(default, 1, &unflagged).is_empty());
         let language = Some(AudioIndexSource {
-            default: false,
             language: true,
+            ..AudioIndexSource::default()
         });
         assert_eq!(candidates(language, 2, &mixed), [2, 3]);
         let both = Some(AudioIndexSource {
             default: true,
             language: true,
+            ..AudioIndexSource::default()
         });
         assert_eq!(candidates(both, 2, &mixed), [3]);
         assert_eq!(candidates(both, 2, &unflagged), Vec::<i32>::new());
+        // A default the user remembered keeps only that stream, as in Jellyfin (SB 669)
+        let user = Some(AudioIndexSource {
+            user: true,
+            ..AudioIndexSource::default()
+        });
+        assert_eq!(candidates(user, 2, &mixed), [2]);
         // An explicit index keeps only the chosen stream
         let source = SourceFacts {
             streams: mixed.to_vec(),

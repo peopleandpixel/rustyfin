@@ -215,6 +215,10 @@ pub struct TranscodeManager {
     warned: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
     /// The transcode reasons PlaybackInfo gave, by PlaySessionId (in ASCII lower case)
     reasons: Arc<std::sync::Mutex<HashMap<String, PlannedReasons>>>,
+    /// The last hardware detection (`hwaccel::detect`), None until the first one ends
+    detection: Arc<std::sync::RwLock<Option<crate::hwaccel::HardwareDetection>>>,
+    /// Held while a detection runs, so two never probe the devices at once
+    detecting: Arc<tokio::sync::Mutex<()>>,
 }
 
 /// The transcode reasons of one PlaybackInfo answer: each media source's that transcodes.
@@ -297,7 +301,71 @@ impl TranscodeManager {
             hardware: Arc::new(std::sync::Mutex::new(HardwareHealth::default())),
             warned: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
             reasons: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            detection: Arc::new(std::sync::RwLock::new(None)),
+            detecting: Arc::new(tokio::sync::Mutex::new(())),
         }
+    }
+
+    /// The ffmpeg the manager runs.
+    pub fn ffmpeg(&self) -> &Path {
+        &self.ffmpeg
+    }
+
+    /// The last hardware detection, None until the first one ends.
+    pub fn hardware_detection(&self) -> Option<crate::hwaccel::HardwareDetection> {
+        self.detection
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// Whether a hardware detection is running.
+    pub fn detecting_hardware(&self) -> bool {
+        self.detecting.try_lock().is_err()
+    }
+
+    /// Detects the machine's devices (`hwaccel::detect`, its clips under `data_dir`), keeps the
+    /// result and takes the encoding options it gives: while the administrator hasn't chosen a
+    /// type, the best device decodes. Detections run one at a time.
+    pub async fn detect_hardware(&self, data_dir: &Path) -> crate::hwaccel::HardwareDetection {
+        let guard = self.detecting.lock().await;
+        self.detect_hardware_locked(data_dir, guard).await
+    }
+
+    /// `detect_hardware`, unless a detection is already running: then None at once.
+    pub async fn try_detect_hardware(
+        &self,
+        data_dir: &Path,
+    ) -> Option<crate::hwaccel::HardwareDetection> {
+        let guard = self.detecting.try_lock().ok()?;
+        Some(self.detect_hardware_locked(data_dir, guard).await)
+    }
+
+    async fn detect_hardware_locked(
+        &self,
+        data_dir: &Path,
+        _guard: tokio::sync::MutexGuard<'_, ()>,
+    ) -> crate::hwaccel::HardwareDetection {
+        let work = data_dir.join("hwaccel-probe");
+        let detection = crate::hwaccel::detect(&self.ffmpeg, &work).await;
+        self.set_hardware_detection(data_dir, detection.clone());
+        detection
+    }
+
+    /// Keeps `detection` and takes the encoding options it gives with `data_dir`'s saved ones.
+    pub fn set_hardware_detection(
+        &self,
+        data_dir: &Path,
+        detection: crate::hwaccel::HardwareDetection,
+    ) {
+        let settings = crate::hwaccel::effective_settings(
+            data_dir,
+            &self.ffmpeg.to_string_lossy(),
+            &self.cache_root,
+            Some(&detection),
+        );
+        *self.detection.write().unwrap_or_else(|e| e.into_inner()) = Some(detection);
+        self.set_encoding_settings(settings);
     }
 
     /// Keeps the transcode reasons PlaybackInfo gave for `play_session_id`: the reasons of each
@@ -393,6 +461,7 @@ impl TranscodeManager {
     /// Replace the encoding options. The hardware failures noted before are forgotten, so the
     /// hardware is tried again, and the warnings may be logged again.
     pub fn set_encoding_settings(&self, settings: EncodingSettings) {
+        encoding::set_current(&settings);
         *self.settings.write().unwrap_or_else(|e| e.into_inner()) = settings;
         *self.hardware_health() = HardwareHealth::default();
         self.warned
@@ -429,6 +498,13 @@ impl TranscodeManager {
                 );
             }
         }
+    }
+
+    /// Whether the progressive transcode `playback_id` decodes or encodes on a device.
+    pub fn progressive_uses_hardware(&self, playback_id: Uuid) -> bool {
+        self.sessions
+            .get(&playback_id)
+            .is_some_and(|s| uses_hardware(&s.profile))
     }
 
     /// Log `message` as a warning the first time `key` is seen.
@@ -908,6 +984,66 @@ impl TranscodeManager {
             },
         );
         Ok((playback_id, stdout))
+    }
+
+    /// `start_progressive`, then its first bytes, read within `first_wait`. A hardware transcode
+    /// that exits without writing, or writes nothing in time, is ended and run again in software
+    /// (the file stays in software from then on, logged once): at most two tries. Answers the
+    /// playback id, the rest of the output and the first bytes. Writing nothing in time in
+    /// software is `PlaylistTimeout`.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn start_progressive_first(
+        &self,
+        item_id: Uuid,
+        input_path: &str,
+        profile: &TranscodeProfile,
+        format: &str,
+        play_session_id: &str,
+        device_id: &str,
+        first_wait: Duration,
+    ) -> Result<(Uuid, tokio::process::ChildStdout, Vec<u8>), TranscodeError> {
+        use tokio::io::AsyncReadExt;
+        let mut tries = 0;
+        loop {
+            tries += 1;
+            let (playback_id, mut stdout) = self
+                .start_progressive(
+                    item_id,
+                    input_path,
+                    profile,
+                    format,
+                    play_session_id,
+                    device_id,
+                )
+                .await?;
+            let retry = tries < 2 && self.progressive_uses_hardware(playback_id);
+            let mut first = vec![0; 64 * 1024];
+            let failure = match tokio::time::timeout(first_wait, stdout.read(&mut first)).await {
+                Ok(Ok(n)) if n > 0 => {
+                    first.truncate(n);
+                    return Ok((playback_id, stdout, first));
+                }
+                Ok(Ok(_)) => self.progressive_failure(playback_id).await,
+                Ok(Err(e)) => {
+                    self.end_progressive(playback_id).await;
+                    return Err(TranscodeError::Io(e.to_string()));
+                }
+                Err(_) => {
+                    self.end_progressive(playback_id).await;
+                    if !retry {
+                        return Err(TranscodeError::PlaylistTimeout);
+                    }
+                    TranscodeError::FfmpegFailed(format!(
+                        "the hardware transcode wrote nothing in {} s",
+                        first_wait.as_secs()
+                    ))
+                }
+            };
+            if !retry {
+                return Err(failure);
+            }
+            self.note_hardware_result(input_path, Some(&failure.to_string()));
+        }
     }
 
     /// End the progressive transcode `playback_id`: kill its ffmpeg if it still runs. False
@@ -1395,7 +1531,7 @@ fn image_overlay_graph(
     let main = if plan.decode {
         format!(
             "{},hwdownload,format=nv12",
-            hw_scale(plan.accel, &w.to_string(), &h.to_string(), false)
+            hw_scale(plan.accel, &w.to_string(), &h.to_string())
         )
     } else {
         format!("scale={w}:{h},format=yuv420p")
@@ -1497,6 +1633,34 @@ struct HwPlan {
     encode: bool,
 }
 
+/// The arguments that open the device of `accel` (and decode on it with `decode`), as a
+/// transcode writes them; the hardware detection probes with these.
+pub(crate) fn hw_device_args(
+    accel: HwAccel,
+    decode: bool,
+    settings: &EncodingSettings,
+) -> Vec<String> {
+    hw_input_args(
+        HwPlan {
+            accel,
+            decode,
+            encode: false,
+        },
+        settings,
+    )
+}
+
+/// The filter that takes software frames to `accel`'s encoder, as a transcode writes it; the
+/// hardware detection's encode probe uses it.
+pub(crate) fn hw_encoder_upload(accel: HwAccel) -> &'static str {
+    to_hw_encoder(HwPlan {
+        accel,
+        decode: false,
+        encode: true,
+    })
+    .trim_start_matches(',')
+}
+
 /// The input arguments that open the device, and decode on it with `plan.decode`, as Jellyfin
 /// writes them on Linux.
 fn hw_input_args(plan: HwPlan, settings: &EncodingSettings) -> Vec<String> {
@@ -1563,16 +1727,23 @@ fn to_hw_encoder(plan: HwPlan) -> &'static str {
     }
 }
 
-/// The device's scale within `max_width`×`max_height`, to 8-bit NV12 (`w`/`h` are expressions).
-fn hw_scale(accel: HwAccel, w: &str, h: &str, keep_aspect: bool) -> String {
-    let aspect = if keep_aspect {
-        ":force_original_aspect_ratio=decrease"
-    } else {
-        ""
-    };
+/// The scale's width and height expressions for a video of unknown size within
+/// `max_width`×`max_height`: at most its own size, its aspect kept, each truncated to an even
+/// number as 4:2:0 frames and the encoders need, as Jellyfin's `EncodingHelper` writes them
+/// (`trunc(…/2)*2`). Only `iw` and `ih` are used, which every scale filter (software, VAAPI,
+/// CUDA, QSV) evaluates.
+fn even_fit(max_width: u32, max_height: u32) -> (String, String) {
+    (
+        format!("'trunc(min(min(iw,{max_width}),{max_height}*iw/ih)/2)*2'"),
+        format!("'trunc(min(min(ih,{max_height}),{max_width}*ih/iw)/2)*2'"),
+    )
+}
+
+/// The device's scale to `w`×`h` (numbers or `even_fit` expressions), to 8-bit NV12.
+fn hw_scale(accel: HwAccel, w: &str, h: &str) -> String {
     match accel {
-        HwAccel::Vaapi => format!("scale_vaapi=w={w}:h={h}{aspect}:format=nv12"),
-        HwAccel::Nvenc => format!("scale_cuda=w={w}:h={h}{aspect}:format=nv12"),
+        HwAccel::Vaapi => format!("scale_vaapi=w={w}:h={h}:format=nv12"),
+        HwAccel::Nvenc => format!("scale_cuda=w={w}:h={h}:format=nv12"),
         HwAccel::Qsv => format!("scale_qsv=w={w}:h={h}:format=nv12"),
         HwAccel::None => format!("scale={w}:{h}"),
     }
@@ -1682,22 +1853,20 @@ fn ffmpeg_args(input: &str, output: Output<'_>, profile: &TranscodeProfile) -> V
         // Scale filter. Its last step makes the frames 8-bit 4:2:0 (NV12 on the hardware
         // encoders): libx264 would keep a 10-bit or 4:2:2 source's format, which browsers
         // can't decode. HDR video is tonemapped to SDR after the scale, in software.
-        let (w, h) = (
-            format!("'min({},iw)'", profile.max_width),
-            format!("'min({},ih)'", profile.max_height),
-        );
+        // Even dimensions, the aspect kept: an odd width (1280×720 at 480 lines is 853.3
+        // wide) makes libx264 and the hardware encoders refuse to start
+        let (w, h) = even_fit(profile.max_width, profile.max_height);
         // The device scales to the exact output size when the source's is known; else by
-        // expression, QSV (which can't keep the aspect within both limits) by height
+        // expression
         let device_scale = match profile.source_size {
             Some(size) => {
                 let (w, h) = output_size(size, profile.max_width, profile.max_height);
-                hw_scale(plan.accel, &w.to_string(), &h.to_string(), false)
+                hw_scale(plan.accel, &w.to_string(), &h.to_string())
             }
-            None if plan.accel == HwAccel::Qsv => hw_scale(plan.accel, "-1", &h, false),
-            None => hw_scale(plan.accel, &w, &h, true),
+            None => hw_scale(plan.accel, &w, &h),
         };
         let software_scale = format!(
-            "{}{}scale={w}:{h}:force_original_aspect_ratio=decrease,{}",
+            "{}{}scale={w}:{h},{}",
             if profile.deinterlace { "bwdif=0," } else { "" },
             if profile.square_pixels {
                 "scale=trunc(iw*sar/2)*2:ih,setsar=1,"
@@ -2529,7 +2698,7 @@ mod tests {
             has_pair(
                 &args,
                 "-filter_complex",
-                "[0:V:0][1:3]overlay=eof_action=pass:repeatlast=0,scale='min(1920,iw)':'min(1080,ih)':force_original_aspect_ratio=decrease,format=yuv420p[v]"
+                "[0:V:0][1:3]overlay=eof_action=pass:repeatlast=0,scale='trunc(min(min(iw,1920),1080*iw/ih)/2)*2':'trunc(min(min(ih,1080),1920*ih/iw)/2)*2',format=yuv420p[v]"
             ),
             "{args:?}"
         );
@@ -2688,7 +2857,7 @@ mod tests {
 
     /// The software scale for the default 1920x1080 limit.
     const SW_SCALE: &str =
-        "scale='min(1920,iw)':'min(1080,ih)':force_original_aspect_ratio=decrease";
+        "scale='trunc(min(min(iw,1920),1080*iw/ih)/2)*2':'trunc(min(min(ih,1080),1920*ih/iw)/2)*2'";
 
     /// Each hardware encoder with its scale for the default limit, ending in the 8-bit 4:2:0
     /// format the encoder takes.
@@ -2696,17 +2865,17 @@ mod tests {
         (
             HwAccel::Vaapi,
             "h264_vaapi",
-            "scale_vaapi=w='min(1920,iw)':h='min(1080,ih)':force_original_aspect_ratio=decrease:format=nv12",
+            "scale_vaapi=w='trunc(min(min(iw,1920),1080*iw/ih)/2)*2':h='trunc(min(min(ih,1080),1920*ih/iw)/2)*2':format=nv12",
         ),
         (
             HwAccel::Nvenc,
             "h264_nvenc",
-            "scale_cuda=w='min(1920,iw)':h='min(1080,ih)':force_original_aspect_ratio=decrease:format=nv12",
+            "scale_cuda=w='trunc(min(min(iw,1920),1080*iw/ih)/2)*2':h='trunc(min(min(ih,1080),1920*ih/iw)/2)*2':format=nv12",
         ),
         (
             HwAccel::Qsv,
             "h264_qsv",
-            "scale_qsv=w=-1:h='min(1080,ih)':format=nv12",
+            "scale_qsv=w='trunc(min(min(iw,1920),1080*iw/ih)/2)*2':h='trunc(min(min(ih,1080),1920*ih/iw)/2)*2':format=nv12",
         ),
     ];
 
@@ -2731,10 +2900,111 @@ mod tests {
             has_pair(
                 &args,
                 "-vf",
-                "scale='min(1280,iw)':'min(720,ih)':force_original_aspect_ratio=decrease,format=yuv420p"
+                "scale='trunc(min(min(iw,1280),720*iw/ih)/2)*2':'trunc(min(min(ih,720),1280*ih/iw)/2)*2',format=yuv420p"
             ),
             "{args:?}"
         );
+    }
+
+    /// Evaluates an `even_fit` expression (without its quotes) for an `iw`×`ih` source: the
+    /// four operations it uses, enough to check the sizes ffmpeg computes from it.
+    fn eval_even(expr: &str, iw: f64, ih: f64) -> f64 {
+        fn parse(s: &mut &str, iw: f64, ih: f64) -> f64 {
+            let mut value = term(s, iw, ih);
+            while let Some(rest) = s.strip_prefix('*').or_else(|| s.strip_prefix('/')) {
+                let op = s.as_bytes()[0];
+                *s = rest;
+                let rhs = term(s, iw, ih);
+                value = if op == b'*' { value * rhs } else { value / rhs };
+            }
+            value
+        }
+        fn term(s: &mut &str, iw: f64, ih: f64) -> f64 {
+            for (name, f) in [("trunc(", 1), ("min(", 2)] {
+                if let Some(rest) = s.strip_prefix(name) {
+                    *s = rest;
+                    let a = parse(s, iw, ih);
+                    let v = if f == 2 {
+                        *s = s.strip_prefix(',').unwrap();
+                        a.min(parse(s, iw, ih))
+                    } else {
+                        a.trunc()
+                    };
+                    *s = s.strip_prefix(')').unwrap();
+                    return v;
+                }
+            }
+            for (name, v) in [("iw", iw), ("ih", ih)] {
+                if let Some(rest) = s.strip_prefix(name) {
+                    *s = rest;
+                    return v;
+                }
+            }
+            let end = s.find(|c: char| !c.is_ascii_digit()).unwrap_or(s.len());
+            let (n, rest) = s.split_at(end);
+            *s = rest;
+            n.parse().unwrap()
+        }
+        let mut s = expr;
+        let v = parse(&mut s, iw, ih);
+        assert!(s.is_empty(), "left over: {s}");
+        v
+    }
+
+    /// A 1280×720 source at a 480- and a 360-line limit gets even widths and heights, its
+    /// aspect kept, in software and on VAAPI, as Jellyfin 12.4's `trunc(…/2)*2` computes them:
+    /// 852×480 and 640×360. A known source size gives the same.
+    #[test]
+    fn r3hwaccel_scales_give_even_dimensions() {
+        for (max_height, want) in [(480, (852.0, 480.0)), (360, (640.0, 360.0))] {
+            let (w, h) = even_fit(1920, max_height);
+            let got = (
+                eval_even(w.trim_matches('\''), 1280.0, 720.0),
+                eval_even(h.trim_matches('\''), 1280.0, 720.0),
+            );
+            assert_eq!(got, want, "{max_height}");
+            assert_eq!(
+                output_size((1280, 720), 1920, max_height),
+                (want.0 as u32, want.1 as u32)
+            );
+            for accel in [HwAccel::None, HwAccel::Vaapi] {
+                let profile = TranscodeProfile {
+                    hw_accel: accel,
+                    max_height,
+                    ..Default::default()
+                };
+                let args = args_for(&profile);
+                let vf = &args[position(&args, "-vf") + 1];
+                assert!(
+                    vf.contains(&format!("w={w}:h={h}")) || vf.contains(&format!("scale={w}:{h},")),
+                    "{accel:?}: {vf}"
+                );
+                assert!(!vf.contains("force_original_aspect_ratio"), "{vf}");
+                // With the source size known, the exact even size
+                let sized = TranscodeProfile {
+                    source_size: Some((1280, 720)),
+                    ..profile
+                };
+                let args = args_for(&sized);
+                let vf = &args[position(&args, "-vf") + 1];
+                let exact = format!("{}:{}", want.0, want.1);
+                if accel == HwAccel::Vaapi {
+                    assert!(
+                        vf.contains(&format!("scale_vaapi=w={}:h={}", want.0, want.1)),
+                        "{vf}"
+                    );
+                } else {
+                    assert!(
+                        vf.contains(&format!("scale={w}:{h}")) || vf.contains(&exact),
+                        "{vf}"
+                    );
+                }
+            }
+        }
+        // A wide source limited by width keeps its aspect: 1920×800 in 1280×720 is 1280×532
+        let (w, h) = even_fit(1280, 720);
+        assert_eq!(eval_even(w.trim_matches('\''), 1920.0, 800.0), 1280.0);
+        assert_eq!(eval_even(h.trim_matches('\''), 1920.0, 800.0), 532.0);
     }
 
     #[test]
@@ -3149,6 +3419,24 @@ printf '#EXTM3U\n#EXTINF:6.0,\nsegment_0000.ts\n' > "$last"
 exec sleep 30
 "#;
 
+    /// A progressive transcode that fails when asked to open a hardware device, else pipes.
+    const FAKE_HWFAIL_PIPED: &str = r#"#!/bin/sh
+for a; do
+    case "$a" in -init_hw_device) echo "Failed to initialise VAAPI connection" >&2; exit 1;; esac
+done
+printf 'r3gaps2'
+exec sleep 30
+"#;
+
+    /// A progressive transcode that hangs on a hardware device without writing, else pipes.
+    const FAKE_HWHANG_PIPED: &str = r#"#!/bin/sh
+for a; do
+    case "$a" in -init_hw_device) exec sleep 30;; esac
+done
+printf 'r3gaps2'
+exec sleep 30
+"#;
+
     /// Never writes a playlist.
     const FAKE_SLOW: &str = "#!/bin/sh\nexec sleep 30\n";
 
@@ -3224,6 +3512,8 @@ exec sleep 30
                 ("family", FAKE_FAMILY),
                 ("piped", FAKE_PIPED),
                 ("hwfail", FAKE_HWFAIL),
+                ("hwfail-piped", FAKE_HWFAIL_PIPED),
+                ("hwhang-piped", FAKE_HWHANG_PIPED),
             ] {
                 // Rename into place: another test process may be running the old file.
                 let tmp = dir.join(format!("{name}.{}", std::process::id()));
@@ -4282,6 +4572,54 @@ exec sleep 30
         // Saving the options tries the hardware again
         mgr.set_encoding_settings(mgr.encoding_settings());
         assert!(hw("/in.mkv").await && hw("/other.mkv").await);
+        mgr.stop_all().await;
+    }
+
+    /// A progressive hardware transcode that fails, or writes nothing in time, runs again in
+    /// software, and that file stays in software; a software one that writes nothing isn't
+    /// retried.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn r3hwaccel_progressive_hardware_failure_retries_in_software() {
+        for script in ["hwfail-piped", "hwhang-piped"] {
+            let (_dir, mgr) = fake_manager(script, Duration::from_secs(10));
+            mgr.capabilities.set(FfmpegCapabilities::default()).unwrap();
+            mgr.set_encoding_settings(EncodingSettings {
+                hardware_acceleration: encoding::HardwareAccelerationType::Vaapi,
+                ..Default::default()
+            });
+            let profile = TranscodeProfile::default();
+            let (id, _stdout, first) = mgr
+                .start_progressive_first(
+                    Uuid::new_v4(),
+                    "/in.mkv",
+                    &profile,
+                    "matroska",
+                    "ps-hw",
+                    "dev",
+                    Duration::from_secs(2),
+                )
+                .await
+                .unwrap_or_else(|e| panic!("{script}: {e}"));
+            assert_eq!(first, b"r3gaps2", "{script}");
+            assert!(!mgr.progressive_uses_hardware(id), "{script}");
+            assert!(mgr.hardware_health().failed_inputs.contains("/in.mkv"));
+            mgr.stop_all().await;
+        }
+        // Software that writes nothing in time fails without a retry
+        let (_dir, mgr) = fake_manager("slow", Duration::from_secs(10));
+        let started = mgr
+            .start_progressive_first(
+                Uuid::new_v4(),
+                "/in.mkv",
+                &TranscodeProfile::default(),
+                "matroska",
+                "ps-sw",
+                "dev",
+                Duration::from_millis(500),
+            )
+            .await;
+        assert!(matches!(started, Err(TranscodeError::PlaylistTimeout)));
         mgr.stop_all().await;
     }
 

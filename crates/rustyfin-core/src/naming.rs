@@ -105,6 +105,10 @@ pub enum ExtraKind {
     Featurette,
     Clip,
     Unknown,
+    /// Not one of Jellyfin's extra types: part 2 and on of a movie split into files (`movie-cd2.mkv`),
+    /// which Jellyfin keeps in the movie's `AdditionalParts`. It is stored as an extra of part 1 so
+    /// that it plays like any item and never shows in the listings.
+    Part,
 }
 
 impl ExtraKind {
@@ -123,6 +127,7 @@ impl ExtraKind {
             ExtraKind::Featurette => "Featurette",
             ExtraKind::Clip => "Clip",
             ExtraKind::Unknown => "Unknown",
+            ExtraKind::Part => "Part",
         }
     }
 
@@ -135,7 +140,7 @@ impl ExtraKind {
     pub fn is_special_feature(self) -> bool {
         !matches!(
             self,
-            ExtraKind::Trailer | ExtraKind::ThemeSong | ExtraKind::ThemeVideo
+            ExtraKind::Trailer | ExtraKind::ThemeSong | ExtraKind::ThemeVideo | ExtraKind::Part
         )
     }
 }
@@ -1079,6 +1084,127 @@ pub fn group_movie_files(
     result
 }
 
+/// A video file that is one part of a movie split into files: the stack it belongs to, its part type and its part.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct StackPart {
+    name: String,
+    part_type: String,
+    part: String,
+    numeric: bool,
+}
+
+/// Reads a file name (with its extension) by Jellyfin's `VideoFileStackingRules` (`NamingOptions.cs:141`):
+/// a name, then `[ _.-]+` (or nothing after `]`, `)` or `}`), an optional `(` or `[`, a part type (`cd`,
+/// `dvd`, `part`, `pt`, `disc`, `disk`), `[ _.-]*`, a part number (digits, or one of `a` to `d`), and an
+/// optional `)` or `]`. Case is ignored.
+fn stack_part(file_name: &str) -> Option<StackPart> {
+    let base = match file_name.rfind('.') {
+        Some(dot) if dot + 1 < file_name.len() => &file_name[..dot],
+        _ => file_name,
+    };
+    let b = base.as_bytes();
+    let is_sep = |c: u8| matches!(c, b' ' | b'_' | b'.' | b'-');
+    let mut end = b.len();
+    if end > 0 && matches!(b[end - 1], b')' | b']') {
+        end -= 1;
+    }
+    let mut pos = end;
+    while pos > 0 && b[pos - 1].is_ascii_digit() {
+        pos -= 1;
+    }
+    let numeric = pos < end;
+    if !numeric {
+        if end == 0 || !matches!(b[end - 1].to_ascii_lowercase(), b'a'..=b'd') {
+            return None;
+        }
+        pos = end - 1;
+    }
+    let part = base[pos..end].to_string();
+    while pos > 0 && is_sep(b[pos - 1]) {
+        pos -= 1;
+    }
+    let head = base[..pos].to_ascii_lowercase();
+    let part_type = ["cd", "dvd", "part", "pt", "disc", "disk"]
+        .into_iter()
+        .find(|t| head.ends_with(t))?;
+    pos -= part_type.len();
+    let part_type = base[pos..pos + part_type.len()].to_string();
+    if pos > 0 && matches!(b[pos - 1], b'(' | b'[') {
+        pos -= 1;
+    }
+    let name_end = if pos > 0 && matches!(b[pos - 1], b']' | b')' | b'}') {
+        pos
+    } else {
+        let mut p = pos;
+        while p > 0 && is_sep(b[p - 1]) {
+            p -= 1;
+        }
+        if p == pos {
+            return None;
+        }
+        p
+    };
+    Some(StackPart {
+        name: base[..name_end].to_string(),
+        part_type,
+        part,
+        numeric,
+    })
+}
+
+/// A movie split into files (Jellyfin's `StackResolver`): its stack name and its parts in order. `files[0]`
+/// is part 1, the movie's own file; the rest are its `AdditionalParts`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VideoStack {
+    pub name: String,
+    pub files: Vec<PathBuf>,
+}
+
+/// The stacks among the video files of one folder, as Jellyfin's `StackResolver.Resolve` finds them: the files in
+/// path order, each joining the stack its name gives when its part type matches the stack's, its part is new
+/// and its part is a number exactly when the stack's are. A stack of one file is none.
+pub fn video_stacks(files: &[PathBuf]) -> Vec<VideoStack> {
+    let mut sorted: Vec<&PathBuf> = files.iter().collect();
+    sorted.sort();
+    // Each stack: its name, part type, whether its parts are numbers, and its parts with their files.
+    let mut stacks: Vec<(StackPart, Vec<(String, PathBuf)>)> = Vec::new();
+    for path in sorted {
+        let Some(found) = path
+            .file_name()
+            .and_then(|name| stack_part(&name.to_string_lossy()))
+        else {
+            continue;
+        };
+        match stacks
+            .iter_mut()
+            .find(|(stack, _)| stack.name == found.name)
+        {
+            Some((stack, parts)) => {
+                if stack.part_type.eq_ignore_ascii_case(&found.part_type)
+                    && stack.numeric == found.numeric
+                    && !parts
+                        .iter()
+                        .any(|(part, _)| part.eq_ignore_ascii_case(&found.part))
+                {
+                    parts.push((found.part, path.clone()));
+                }
+            }
+            None => {
+                let part = found.part.clone();
+                stacks.push((found, vec![(part, path.clone())]));
+            }
+        }
+    }
+    stacks
+        .into_iter()
+        .filter(|(_, parts)| parts.len() > 1)
+        .map(|(stack, parts)| VideoStack {
+            name: stack.name,
+            files: parts.into_iter().map(|(_, path)| path).collect(),
+        })
+        .collect()
+}
+
 /// Groups one season's files into versions of one episode, keyed by the season (the file's own, else the folder's)
 /// and the episode number. A file with no episode number in its name forms a group of its own.
 pub fn group_episode_files(files: &[PathBuf], folder_season: Option<i32>) -> Vec<Vec<PathBuf>> {
@@ -1105,4 +1231,71 @@ pub fn group_episode_files(files: &[PathBuf], folder_season: Option<i32>) -> Vec
         .collect();
     out.sort_by_key(|group| group[0].clone());
     out
+}
+
+#[cfg(test)]
+mod stack_tests {
+    use super::*;
+
+    fn stacks(names: &[&str]) -> Vec<(String, Vec<String>)> {
+        let files: Vec<PathBuf> = names
+            .iter()
+            .map(|n| PathBuf::from("/m/A").join(n))
+            .collect();
+        video_stacks(&files)
+            .into_iter()
+            .map(|s| {
+                let files = s
+                    .files
+                    .iter()
+                    .map(|f| f.file_name().unwrap().to_string_lossy().into_owned())
+                    .collect();
+                (s.name, files)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn r3endpoints_parts_stack_by_jellyfins_rules() {
+        // Jellyfin's StackTests: cd, dvd, part, pt, disc, disk with numbers or letters, any case.
+        for (a, b, name) in [
+            ("Movie-cd1.mkv", "Movie-cd2.mkv", "Movie"),
+            (
+                "Movie (2010) part1.mp4",
+                "Movie (2010) part2.mp4",
+                "Movie (2010)",
+            ),
+            ("Movie.PT.1.avi", "Movie.PT.2.avi", "Movie"),
+            (
+                "Movie (2010)[disc 1].mkv",
+                "Movie (2010)[disc 2].mkv",
+                "Movie (2010)",
+            ),
+            ("Movie_Disk_A.mkv", "Movie_Disk_B.mkv", "Movie"),
+            ("Movie - DVD1.mkv", "Movie - DVD2.mkv", "Movie"),
+        ] {
+            assert_eq!(
+                stacks(&[b, a]),
+                vec![(name.to_string(), vec![a.to_string(), b.to_string()])],
+                "{a}"
+            );
+        }
+    }
+
+    #[test]
+    fn r3endpoints_files_that_are_not_parts_do_not_stack() {
+        // One part alone, no separator before the part type, different part types, numbers mixed with
+        // letters, and plain titles that end in a number or a letter.
+        for names in [
+            &["Movie-cd1.mkv", "Other.mkv"][..],
+            &["Moviecd1.mkv", "Moviecd2.mkv"],
+            &["Movie-cd1.mkv", "Movie-part2.mkv"],
+            &["Movie-cd1.mkv", "Movie-cd b.mkv"],
+            &["Harbor Lights 2.mkv", "Harbor Lights 3.mkv"],
+            &["Movie DVD.mkv", "Movie BD.mkv"],
+            &["Zebrapart1.mkv", "Zebrapart2.mkv"],
+        ] {
+            assert_eq!(stacks(names), Vec::new(), "{names:?}");
+        }
+    }
 }

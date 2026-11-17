@@ -24,16 +24,20 @@ struct DisplayPrefsQuery {
     client: Option<String>,
 }
 
+/// A field the client leaves out keeps its default, as Jellyfin's model binding does, so a partial
+/// body is still read back with its `CustomPrefs`.
 #[derive(Debug, Serialize, Deserialize)]
-#[serde(rename_all = "PascalCase")]
+#[serde(rename_all = "PascalCase", default)]
 struct DisplayPreferencesDto {
     id: String,
     view_type: Option<String>,
     sort_by: Option<String>,
     sort_order: Option<String>,
     client: String,
-    /// Custom prefs map (string -> string). Jellyfin web uses this for home sections.
-    custom_prefs: HashMap<String, String>,
+    /// Custom prefs map (string -> string or null). Jellyfin web uses this for home sections. A
+    /// null value is kept and given back as null, as Jellyfin 12.4 stores it.
+    #[serde(deserialize_with = "custom_prefs_as_strings")]
+    custom_prefs: HashMap<String, Option<String>>,
     remember_indexing: bool,
     remember_sorting: bool,
     primary_image_height: i32,
@@ -41,6 +45,35 @@ struct DisplayPreferencesDto {
     show_backdrop: bool,
     show_sidebar: bool,
     scroll_direction: String,
+}
+
+/// Reads `CustomPrefs` leniently: null stays null, a number or boolean becomes its text, and a
+/// missing or null map is empty.
+fn custom_prefs_as_strings<'de, D>(
+    deserializer: D,
+) -> Result<HashMap<String, Option<String>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let prefs = Option::<serde_json::Map<String, serde_json::Value>>::deserialize(deserializer)?;
+    Ok(prefs
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(key, value)| {
+            let value = match value {
+                serde_json::Value::Null => None,
+                serde_json::Value::String(s) => Some(s),
+                other => Some(other.to_string()),
+            };
+            (key, value)
+        })
+        .collect())
+}
+
+impl Default for DisplayPreferencesDto {
+    fn default() -> Self {
+        Self::default_for(String::new(), "emby".to_string())
+    }
 }
 
 impl DisplayPreferencesDto {
@@ -99,9 +132,14 @@ async fn update_display_preferences(
     Extension(claims): Extension<Claims>,
     Json(body): Json<serde_json::Value>,
 ) -> Result<axum::http::StatusCode, ApiError> {
-    // Persist to database, per client as the GET reads it
+    // Persist to database, per client as the GET reads it. As in Jellyfin 12.4
+    // (DisplayPreferencesManager), the body replaces what was stored: its CustomPrefs are the
+    // whole set (a key left out is gone, a null value is kept), and a field left out takes its
+    // default. Clients post back the full set they read.
     let client = q.client.unwrap_or_else(|| "emby".to_string());
-    let json_str = serde_json::to_string(&body).map_err(|e| ApiError::Internal(e.to_string()))?;
+    let prefs: DisplayPreferencesDto =
+        serde_json::from_value(body).map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    let json_str = serde_json::to_string(&prefs).map_err(|e| ApiError::Internal(e.to_string()))?;
 
     rustyfin_db::repo_user::update_display_preference(
         &state.db, claims.sub, &key, &client, &json_str,
@@ -110,4 +148,31 @@ async fn update_display_preferences(
     .map_err(|e| ApiError::Internal(e.to_string()))?;
 
     Ok(axum::http::StatusCode::NO_CONTENT)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::DisplayPreferencesDto;
+    use serde_json::json;
+
+    /// What the POST stores and the GET then reads, as one round trip through the DTO
+    fn stored(body: serde_json::Value) -> serde_json::Value {
+        let prefs: DisplayPreferencesDto = serde_json::from_value(body).unwrap();
+        serde_json::to_value(prefs).unwrap()
+    }
+
+    #[test]
+    fn a_post_replaces_custom_prefs_as_jellyfin_12_4_does() {
+        // The posted set is the whole set; a null value is kept, other values become text
+        let got = stored(json!({"CustomPrefs": {"a": "9", "b": null, "d": true}}));
+        assert_eq!(
+            got["CustomPrefs"],
+            json!({"a": "9", "b": null, "d": "true"})
+        );
+        // No CustomPrefs: an empty set; a field left out takes its default
+        let got = stored(json!({"SortBy": "DateCreated"}));
+        assert_eq!(got["CustomPrefs"], json!({}));
+        assert_eq!(got["SortBy"], "DateCreated");
+        assert_eq!(got["ScrollDirection"], "Horizontal");
+    }
 }

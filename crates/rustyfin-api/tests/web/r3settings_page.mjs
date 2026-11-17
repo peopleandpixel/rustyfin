@@ -31,6 +31,7 @@ function sandbox({ config = {}, prefs = {}, post } = {}) {
         },
         uiLocale: () => 'en-GB',
         escapeHtml: s => String(s),
+        icon: name => `<svg data-icon="${name}"></svg>`,
         $: () => null,
         toast: (msg, kind) => log.push(['toast', msg, kind || 'info']),
         showOidcLinkResult() {},

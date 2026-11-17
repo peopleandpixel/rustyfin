@@ -63,7 +63,7 @@ pub fn setup_or_user_routes() -> Router<AppState> {
 /// Jellyfin's `CultureDto`.
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "PascalCase")]
-struct CultureDto {
+pub(crate) struct CultureDto {
     name: &'static str,
     display_name: &'static str,
     #[serde(rename = "TwoLetterISOLanguageName")]
@@ -77,7 +77,7 @@ struct CultureDto {
 /// Jellyfin's `CountryInfo`; its `Name` is the two-letter code.
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "PascalCase")]
-struct CountryInfo {
+pub(crate) struct CountryInfo {
     name: &'static str,
     display_name: &'static str,
     #[serde(rename = "TwoLetterISORegionName")]
@@ -93,7 +93,7 @@ const COUNTRIES: &str = include_str!("../../data/iso3166-1.txt");
 
 /// The cultures as Jellyfin lists them: the ISO 639-2/T code first where it differs from the
 /// bibliographic one (`deu`, then `ger`).
-fn cultures() -> Vec<CultureDto> {
+pub(crate) fn cultures() -> Vec<CultureDto> {
     LANGUAGES
         .lines()
         .filter_map(|line| {
@@ -160,7 +160,7 @@ pub(crate) fn language_display_name(language: &str) -> Option<&'static str> {
         .map(|culture| culture.display_name)
 }
 
-fn countries() -> Vec<CountryInfo> {
+pub(crate) fn countries() -> Vec<CountryInfo> {
     COUNTRIES
         .lines()
         .filter_map(|line| {

@@ -1326,9 +1326,9 @@ async fn upgrade_from_old_state_matches_fresh_scan() {
     let argo_uhd = "Argo (2012)/Argo (2012) Bluray-2160p.mkv";
     let santa = "Bad Santa (2003)/Bad Santa (2003).mkv";
     let santa_cut = "Bad Santa (2003)/Bad Santa.mkv";
-    let kane_uhd = "Citizen Kane (1941)/Citizen Kane (1941) Bluray-2160p.mkv";
-    let kane_cd1 = "Citizen Kane (1941)/Citizen Kane cd1.mkv";
-    let kane_cd2 = "Citizen Kane (1941)/Citizen Kane cd2.mkv";
+    let kane_uhd = "Ember Ridge (1941)/Ember Ridge (1941) Bluray-2160p.mkv";
+    let kane_cd1 = "Ember Ridge (1941)/Ember Ridge cd1.mkv";
+    let kane_cd2 = "Ember Ridge (1941)/Ember Ridge cd2.mkv";
     let seven = "Se7en (1995)/Se7en (1995).mkv";
     let thumb = "Se7en (1995)/.@__thumb/Se7en (1995).mkv";
     let machine = "The Machine (2013)/The Machine (2013) Bluray-1080p.mkv";
@@ -1359,7 +1359,9 @@ async fn upgrade_from_old_state_matches_fresh_scan() {
         &[
             (argo_uhd, &[argo_uhd, argo]),
             (santa, &[santa, santa_cut]),
-            (kane_uhd, &[kane_uhd, kane_cd1, kane_cd2]),
+            // cd1 and cd2 stack into one movie (Jellyfin's StackResolver), which is the primary of
+            // its versions (OrganizeAlternateVersions prefers the one with parts); cd2 is its part.
+            (kane_cd1, &[kane_cd1, kane_uhd]),
             (seven, &[seven]),
             (machine, &[machine, scene]),
         ],
@@ -1395,8 +1397,8 @@ async fn upgrade_from_old_state_matches_fresh_scan() {
     let b = insert_movie(&old, &lib, &root.join(santa), year(2003)).await;
     old_probe(&old, &lib, b, &[santa, santa_cut]).await;
 
-    // Citizen Kane: two items. The second, made first, survives; the first holds the 2160p
-    // file as a version and is in a collection.
+    // The stacked movie: two items. The first holds the 2160p file as a version and is in a
+    // collection; it stays the movie, and the second, its part 2, becomes its part.
     let made = |date| Movie {
         date_created: Some(date),
         ..Movie::default()
@@ -1420,7 +1422,7 @@ async fn upgrade_from_old_state_matches_fresh_scan() {
     let set = Uuid::new_v4().to_string();
     exec(
         &old,
-        "INSERT INTO collections (id, name, user_id) VALUES (?1, 'Kane', ?2)",
+        "INSERT INTO collections (id, name, user_id) VALUES (?1, 'Ridge', ?2)",
         &[&set, &user1],
     )
     .await;
@@ -1453,7 +1455,8 @@ async fn upgrade_from_old_state_matches_fresh_scan() {
     for (file, id) in [
         (argo_uhd, a2),
         (santa, b),
-        (kane_uhd, c2),
+        (kane_cd1, c1),
+        (kane_cd2, c2),
         (seven, s),
         (machine, m),
     ] {
@@ -1474,7 +1477,7 @@ async fn upgrade_from_old_state_matches_fresh_scan() {
         .fetch_all(&old)
         .await
         .unwrap();
-    assert_eq!(in_set, [c2.to_string()]);
+    assert_eq!(in_set, [c1.to_string()]);
     assert_eq!(
         sources_of_s(source_ids(&old, &lib).await),
         s_before,
@@ -4435,15 +4438,22 @@ async fn r1scan_metadata_refresh_upgrades_identified_items_by_id() {
             .map(|r| r.end_time_utc);
         assert!(sched.start_task(TASK_METADATA_REFRESH).await);
         let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+        let mut started = tokio::time::Instant::now();
         loop {
-            let ended = sched
-                .get_task(TASK_METADATA_REFRESH)
-                .await
-                .unwrap()
-                .last_execution_result
-                .map(|r| r.end_time_utc);
+            let task = sched.get_task(TASK_METADATA_REFRESH).await.unwrap();
+            let ended = task.last_execution_result.map(|r| r.end_time_utc);
             if ended.is_some() && ended != before {
                 break;
+            }
+            // The previous run records its result before it lets go of the task, so a start
+            // right after it can be skipped as "running already": still idle a second later with
+            // no new result means it was, and it is started again
+
+            if task.state == rustyfin_model::scheduled_task::TaskState::Idle
+                && started.elapsed() > Duration::from_secs(1)
+            {
+                assert!(sched.start_task(TASK_METADATA_REFRESH).await);
+                started = tokio::time::Instant::now();
             }
             assert!(
                 tokio::time::Instant::now() < deadline,
