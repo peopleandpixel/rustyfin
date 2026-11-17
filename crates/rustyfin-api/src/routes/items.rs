@@ -784,7 +784,8 @@ async fn enrich_item(
     // --- Folder counts (for Series, Season, MusicAlbum, Folder), of every child: `media_item`
     // caches this item for every user and counts again for a user with limits ---
     if item.media_type.is_folder() {
-        if let Ok(counts) = rustyfin_db::repo_media::count_items_by_type(pool, item.id, None).await
+        if let Ok(counts) =
+            rustyfin_db::repo_media::count_items_by_type(pool, item.id, None, false).await
         {
             set_folder_counts(item, counts);
         }
@@ -1161,7 +1162,8 @@ pub(crate) async fn enrich_items_with(
         );
     }
 
-    // Batch query 5: Folder counts for folder items
+    // Batch query 5: Folder counts for folder items (virtual items only with DisplayMissingEpisodes)
+    let include_virtual = crate::routes::shows::display_missing_episodes(pool, user_id).await;
     let folder_ids: Vec<Uuid> = items
         .iter()
         .filter(|item| item.media_type.is_folder())
@@ -1170,9 +1172,14 @@ pub(crate) async fn enrich_items_with(
     let folder_counts_map = if folder_ids.is_empty() {
         std::collections::HashMap::new()
     } else {
-        rustyfin_db::repo_media::get_folder_counts_batch(pool, &folder_ids, visible.as_deref())
-            .await
-            .unwrap_or_default()
+        rustyfin_db::repo_media::get_folder_counts_batch(
+            pool,
+            &folder_ids,
+            visible.as_deref(),
+            include_virtual,
+        )
+        .await
+        .unwrap_or_default()
     };
 
     // Batch query 6: All images for all items - populates image_tags. Only the image types and
@@ -2835,6 +2842,8 @@ fn item_filter(query: &ItemsQuery) -> Result<rustyfin_db::repo_item_filter::Item
         is_locked: query.is_locked,
         is_placeholder: query.is_place_holder,
         is_virtual,
+        // Set by the caller, which knows the user
+        hide_virtual_seasons: false,
         video_types: comma_list(query.video_types.as_deref()),
         name_less_than: query
             .name_less_than
@@ -2922,7 +2931,7 @@ async fn get_items(
     let media_types_filter: Option<Vec<String>> = query
         .media_types()
         .and_then(|s| item_types_of_media_kinds(&comma_list(Some(s))));
-    let conditions = item_filter(&query)?;
+    let mut conditions = item_filter(&query)?;
     let runtime_parts: Option<(i32, i32)> = query.runtime().map(|s| {
         let parts: Vec<&str> = s.split('-').collect();
         let min = parts
@@ -3063,6 +3072,12 @@ async fn get_items(
         let ids = rustyfin_db::repo_media::series_ids_with_status(&state.db_ro, &statuses).await?;
         item_ids = Some(narrow_ids(item_ids, ids));
     }
+    // A parent's virtual seasons (a series' seasons with no file behind them) are left out unless
+    // the user's DisplayMissingEpisodes, or an API key, asks for them (12.4 SetSeasonQueryOptions).
+    conditions.hide_virtual_seasons = parent_id.is_some()
+        && !(claims.sub.is_nil()
+            || crate::routes::shows::display_missing_episodes(&state.db_ro, Some(claims.sub))
+                .await);
     // The other conditions join the list's own SQL, beside the parental limits and the count.
     let extra = rustyfin_db::repo_item_filter::filter_sql(&state.db_ro, &conditions).await?;
     // Ids keeps only the listed items (Jellyfin's `InternalItemsQuery.ItemIds`); ids of no item
@@ -3505,9 +3520,16 @@ pub(crate) async fn media_item(
         true => crate::parental::user_filter(&state.db_ro, Some(user)).await,
         false => None,
     };
-    if visible.is_some()
-        && let Ok(counts) =
-            rustyfin_db::repo_media::count_items_by_type(&state.db_ro, id, visible.as_deref()).await
+    let include_virtual =
+        crate::routes::shows::display_missing_episodes(&state.db_ro, Some(user)).await;
+    if (visible.is_some() || include_virtual)
+        && let Ok(counts) = rustyfin_db::repo_media::count_items_by_type(
+            &state.db_ro,
+            id,
+            visible.as_deref(),
+            include_virtual,
+        )
+        .await
     {
         set_folder_counts(&mut item, counts);
     }

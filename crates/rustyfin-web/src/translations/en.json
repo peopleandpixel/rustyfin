@@ -794,7 +794,20 @@
         "plugin_no_plugins": "No plugins installed",
         "plugin_builtin": "Built-in",
         "plugin_config_json": "Configuration (JSON)",
-        "plugin_enabled": "Enabled"
+        "plugin_enabled": "Enabled",
+        "tmdb_import_unaired": "Create unaired (upcoming) episodes from metadata fetched for series.",
+        "tmdb_import_unaired_desc": "Adds virtual entries for episodes listed on TMDb that have not aired yet. This populates the \"Upcoming\" view.",
+        "tmdb_import_missing": "Create missing episodes from metadata fetched for series.",
+        "tmdb_import_missing_desc": "Adds virtual entries for episodes listed on TMDb that have already aired but are not present in your library.",
+        "tmdb_import_specials": "Include specials when creating unaired and missing episodes.",
+        "tmdb_import_specials_desc": "When disabled, specials (season 0) are never added as virtual entries and any existing virtual specials are removed.",
+        "tmdb_refresh_days": "Episode refresh interval (days)",
+        "tmdb_refresh_days_desc": "How often the scheduled task re-checks TMDb for newly announced unaired or missing episodes.",
+        "tmdb_grace_days": "Recently aired grace period (days)",
+        "tmdb_grace_days_desc": "When missing episodes are disabled, how many days a recently aired episode is kept in place before its placeholder is removed.",
+        "tmdb_libraries": "TV libraries",
+        "tmdb_libraries_desc": "Choose which TV libraries the unaired/missing episode options above apply to.",
+        "tmdb_no_libraries": "No TV libraries found."
     },
     "quick_connect": {
         "title": "Quick Connect",

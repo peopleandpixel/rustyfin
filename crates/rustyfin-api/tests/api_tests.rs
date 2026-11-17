@@ -31291,6 +31291,385 @@ async fn r3tabs_next_up_and_upcoming_keep_to_parent_library() {
     assert_eq!(json["Items"][0]["Id"], s.ids["India S02E01"].to_string());
 }
 
+// r3missing: missing and upcoming episodes (virtual items)
+//
+// Jellyfin 12.4's TMDb missing-episode provider makes virtual episodes, and virtual seasons holding
+// only those, with no file (IsVirtualItem, LocationType Virtual). They stay out of a series'
+// episode and season lists unless the user's DisplayMissingEpisodes is on, out of Next Up, Latest
+// and the counts, show in Upcoming, and /Items filters them with IsMissing, IsUnaired,
+// LocationTypes and ExcludeLocationTypes (Series.cs, TvShowsController.cs, NextUpService.cs,
+// UserViewManager.cs, ItemCountService.cs, BaseItemRepository.TranslateQuery.cs).
+
+/// Show A: season 1 (a folder) with real S1E1 and S1E3 and a virtual S1E2 that aired 10 days ago;
+/// a virtual season 2 with a virtual S2E1 airing in 30 days. Real episodes aired a year ago.
+struct R3Missing {
+    app: axum::Router,
+    owner: String,
+    owner_id: String,
+    library: uuid::Uuid,
+    ids: HashMap<&'static str, uuid::Uuid>,
+}
+
+async fn r3missing_world() -> R3Missing {
+    let state = test_state().await;
+    let app = app(state.clone());
+    let (owner, owner_id, _viewer, _viewer_id) = g1_owner_and_viewer(&state, &app).await;
+    let folder = media_folder(&state, "r3missing");
+    let lib = rustyfin_model::library::Library {
+        id: uuid::Uuid::new_v4(),
+        name: "R3 Missing".to_string(),
+        content_type: rustyfin_model::library::LibraryContentType::TvShows,
+        paths: vec![folder.clone()],
+    };
+    rustyfin_db::repo_library::create_library(&state.db, &lib)
+        .await
+        .unwrap();
+    let now = chrono::Utc::now();
+    let day = |offset: i64| (now + chrono::Duration::days(offset)).to_rfc3339();
+    let mut ids = HashMap::new();
+    for key in [
+        "series", "season1", "season2", "s1e1", "s1e2", "s1e3", "s2e1",
+    ] {
+        ids.insert(key, uuid::Uuid::new_v4());
+    }
+    // (key, name, type, parent, index, season number, premiere, virtual)
+    let rows: [(
+        &str,
+        &str,
+        &str,
+        Option<&str>,
+        Option<i32>,
+        Option<i32>,
+        Option<String>,
+        bool,
+    ); 7] = [
+        ("series", "Show A", "Series", None, None, None, None, false),
+        (
+            "season1",
+            "Season 1",
+            "Season",
+            Some("series"),
+            Some(1),
+            None,
+            None,
+            false,
+        ),
+        (
+            "season2",
+            "Season 2",
+            "Season",
+            Some("series"),
+            Some(2),
+            None,
+            None,
+            true,
+        ),
+        (
+            "s1e1",
+            "Episode One",
+            "Episode",
+            Some("season1"),
+            Some(1),
+            Some(1),
+            Some(day(-365)),
+            false,
+        ),
+        (
+            "s1e2",
+            "Episode Two",
+            "Episode",
+            Some("season1"),
+            Some(2),
+            Some(1),
+            Some(day(-10)),
+            true,
+        ),
+        (
+            "s1e3",
+            "Episode Three",
+            "Episode",
+            Some("season1"),
+            Some(3),
+            Some(1),
+            Some(day(-360)),
+            false,
+        ),
+        (
+            "s2e1",
+            "Episode Four",
+            "Episode",
+            Some("season2"),
+            Some(1),
+            Some(2),
+            Some(day(30)),
+            true,
+        ),
+    ];
+    for (key, name, media_type, parent, index, season, premiere, is_virtual) in rows {
+        let path = match (is_virtual, media_type) {
+            (true, _) => String::new(),
+            (false, "Episode") => format!("{folder}/Show A/Season 1/{name}.mkv"),
+            (false, "Season") => format!("{folder}/Show A/Season 1"),
+            _ => format!("{folder}/Show A"),
+        };
+        sqlx::query(
+            "INSERT INTO media_items (id, library_id, name, media_type, path, parent_id, \
+             index_number, parent_index_number, premiere_date, location_type, is_virtual_item, \
+             date_created) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(ids[key].to_string())
+        .bind(lib.id.to_string())
+        .bind(name)
+        .bind(media_type)
+        .bind(path)
+        .bind(parent.map(|p| ids[p].to_string()))
+        .bind(index)
+        .bind(season)
+        .bind(premiere)
+        .bind(if is_virtual { "Virtual" } else { "FileSystem" })
+        .bind(is_virtual)
+        .bind(now.to_rfc3339())
+        .execute(&state.db)
+        .await
+        .unwrap();
+    }
+    R3Missing {
+        app,
+        owner,
+        owner_id,
+        library: lib.id,
+        ids,
+    }
+}
+
+impl R3Missing {
+    async fn get(&self, uri: &str) -> serde_json::Value {
+        let (status, json) = send_authed(&self.app, "GET", uri, &self.owner, None).await;
+        assert_eq!(status, StatusCode::OK, "{uri}: {json}");
+        json
+    }
+
+    /// The keys of the items in `json["Items"]` (or a bare array), in order.
+    fn keys(&self, json: &serde_json::Value) -> Vec<&'static str> {
+        let items = json
+            .get("Items")
+            .unwrap_or(json)
+            .as_array()
+            .unwrap()
+            .clone();
+        items
+            .iter()
+            .map(|i| {
+                let id: uuid::Uuid = i["Id"].as_str().unwrap().parse().unwrap();
+                *self.ids.iter().find(|(_, v)| **v == id).unwrap().0
+            })
+            .collect()
+    }
+
+    async fn display_missing(&self) {
+        let uri = format!("/Users/{}/Configuration", self.owner_id);
+        let body = serde_json::json!({ "DisplayMissingEpisodes": true }).to_string();
+        let (status, json) = send_authed(&self.app, "POST", &uri, &self.owner, Some(&body)).await;
+        assert!(status.is_success(), "{json}");
+    }
+}
+
+#[tokio::test]
+async fn r3missing_virtual_episode_dto_is_virtual_without_a_path() {
+    let w = r3missing_world().await;
+    let uri = format!("/Users/{}/Items/{}", w.owner_id, w.ids["s1e2"]);
+    let json = w.get(&uri).await;
+    assert_eq!(json["LocationType"], "Virtual", "{json}");
+    assert!(json.get("Path").is_none(), "{json}");
+    let real = w
+        .get(&format!("/Users/{}/Items/{}", w.owner_id, w.ids["s1e1"]))
+        .await;
+    assert_eq!(real["LocationType"], "FileSystem");
+}
+
+#[tokio::test]
+async fn r3missing_series_episodes_hide_virtual_unless_display_missing() {
+    let w = r3missing_world().await;
+    let uri = format!("/Shows/{}/Episodes?userId={}", w.ids["series"], w.owner_id);
+    assert_eq!(w.keys(&w.get(&uri).await), vec!["s1e1", "s1e3"]);
+    // isMissing filters what is listed, so it finds nothing hidden
+    let missing = format!("{uri}&isMissing=true");
+    assert!(w.keys(&w.get(&missing).await).is_empty());
+
+    w.display_missing().await;
+    assert_eq!(
+        w.keys(&w.get(&uri).await),
+        vec!["s1e1", "s1e2", "s1e3", "s2e1"]
+    );
+    assert_eq!(w.keys(&w.get(&missing).await), vec!["s1e2", "s2e1"]);
+    let present = format!("{uri}&isMissing=false");
+    assert_eq!(w.keys(&w.get(&present).await), vec!["s1e1", "s1e3"]);
+}
+
+#[tokio::test]
+async fn r3missing_series_seasons_hide_virtual_seasons_unless_display_missing() {
+    let w = r3missing_world().await;
+    let seasons = format!("/Shows/{}/Seasons?userId={}", w.ids["series"], w.owner_id);
+    let children = format!("/Items?ParentId={}", w.ids["series"]);
+    assert_eq!(w.keys(&w.get(&seasons).await), vec!["season1"]);
+    assert_eq!(w.keys(&w.get(&children).await), vec!["season1"]);
+
+    w.display_missing().await;
+    assert_eq!(w.keys(&w.get(&seasons).await), vec!["season1", "season2"]);
+    assert_eq!(w.keys(&w.get(&children).await), vec!["season1", "season2"]);
+}
+
+#[tokio::test]
+async fn r3missing_next_up_skips_virtual_episodes() {
+    let w = r3missing_world().await;
+    let uri = format!("/Users/{}/PlayedItems/{}", w.owner_id, w.ids["s1e1"]);
+    let (status, _) = send_authed(&w.app, "POST", &uri, &w.owner, None).await;
+    assert!(status.is_success());
+    let next = format!("/Shows/NextUp?userId={}", w.owner_id);
+    assert_eq!(w.keys(&w.get(&next).await), vec!["s1e3"]);
+}
+
+#[tokio::test]
+async fn r3missing_marking_a_series_played_skips_virtual_episodes() {
+    let w = r3missing_world().await;
+    let uri = format!("/Users/{}/PlayedItems/{}", w.owner_id, w.ids["series"]);
+    let (status, _) = send_authed(&w.app, "POST", &uri, &w.owner, None).await;
+    assert!(status.is_success());
+    for (key, played) in [
+        ("s1e1", true),
+        ("s1e3", true),
+        ("s1e2", false),
+        ("s2e1", false),
+    ] {
+        let item = w
+            .get(&format!("/Users/{}/Items/{}", w.owner_id, w.ids[key]))
+            .await;
+        assert_eq!(item["UserData"]["Played"], played, "{key}: {item}");
+    }
+    let series = w
+        .get(&format!("/Users/{}/Items/{}", w.owner_id, w.ids["series"]))
+        .await;
+    assert_eq!(series["UserData"]["Played"], true, "{series}");
+
+    // Unmarking leaves them alone too
+    let (status, _) = send_authed(&w.app, "DELETE", &uri, &w.owner, None).await;
+    assert!(status.is_success());
+    let s1e1 = w
+        .get(&format!("/Users/{}/Items/{}", w.owner_id, w.ids["s1e1"]))
+        .await;
+    assert_eq!(s1e1["UserData"]["Played"], false);
+}
+
+#[tokio::test]
+async fn r3missing_search_and_playback_skip_virtual_episodes() {
+    let w = r3missing_world().await;
+    // 12.4's SqlSearchProvider leaves virtual items out
+    let hints = w
+        .get(&format!(
+            "/Search/Hints?SearchTerm=Episode&userId={}",
+            w.owner_id
+        ))
+        .await;
+    let mut names: Vec<&str> = hints["SearchHints"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|h| h["Name"].as_str())
+        .collect();
+    names.sort();
+    assert_eq!(names, vec!["Episode One", "Episode Three"], "{hints}");
+
+    // No file, no stream: MediaSources empty and NoCompatibleStream (12.4 MediaInfoHelper)
+    let uri = format!(
+        "/Items/{}/PlaybackInfo?userId={}",
+        w.ids["s1e2"], w.owner_id
+    );
+    let (status, info) = send_authed(&w.app, "POST", &uri, &w.owner, Some("{}")).await;
+    assert_eq!(status, StatusCode::OK, "{info}");
+    assert_eq!(info["MediaSources"], serde_json::json!([]), "{info}");
+    assert_eq!(info["ErrorCode"], "NoCompatibleStream", "{info}");
+}
+
+#[tokio::test]
+async fn r3missing_counts_leave_virtual_items_out() {
+    let w = r3missing_world().await;
+    let series = w
+        .get(&format!("/Users/{}/Items/{}", w.owner_id, w.ids["series"]))
+        .await;
+    assert_eq!(series["ChildCount"], 1, "{series}");
+    assert_eq!(series["UserData"]["UnplayedItemCount"], 2, "{series}");
+    let season = w
+        .get(&format!("/Users/{}/Items/{}", w.owner_id, w.ids["season1"]))
+        .await;
+    assert_eq!(season["ChildCount"], 2, "{season}");
+}
+
+#[tokio::test]
+async fn r3missing_items_filters_for_virtual_items() {
+    let w = r3missing_world().await;
+    let base = format!(
+        "/Items?Recursive=true&IncludeItemTypes=Episode&ParentId={}&SortBy=PremiereDate&SortOrder=Ascending",
+        w.library
+    );
+    // A plain request leaves them in
+    assert_eq!(
+        w.keys(&w.get(&base).await),
+        vec!["s1e1", "s1e3", "s1e2", "s2e1"]
+    );
+    assert_eq!(
+        w.keys(&w.get(&format!("{base}&IsMissing=true")).await),
+        vec!["s1e2", "s2e1"]
+    );
+    assert_eq!(
+        w.keys(&w.get(&format!("{base}&IsMissing=false")).await),
+        vec!["s1e1", "s1e3"]
+    );
+    assert_eq!(
+        w.keys(&w.get(&format!("{base}&IsUnaired=true")).await),
+        vec!["s2e1"]
+    );
+    assert_eq!(
+        w.keys(&w.get(&format!("{base}&IsUnaired=false")).await),
+        vec!["s1e1", "s1e3", "s1e2"]
+    );
+    assert_eq!(
+        w.keys(&w.get(&format!("{base}&LocationTypes=Virtual")).await),
+        vec!["s1e2", "s2e1"]
+    );
+    assert_eq!(
+        w.keys(&w.get(&format!("{base}&LocationTypes=FileSystem")).await),
+        vec!["s1e1", "s1e3"]
+    );
+    assert_eq!(
+        w.keys(&w.get(&format!("{base}&ExcludeLocationTypes=Virtual")).await),
+        vec!["s1e1", "s1e3"]
+    );
+    // The total counts the same items
+    let total = w
+        .get(&format!("{base}&IsMissing=true&IsUnaired=true"))
+        .await;
+    assert_eq!(total["TotalRecordCount"], 1, "{total}");
+}
+
+#[tokio::test]
+async fn r3missing_latest_leaves_virtual_episodes_out() {
+    let w = r3missing_world().await;
+    let uri = format!(
+        "/Users/{}/Items/Latest?ParentId={}&GroupItems=false&IncludeItemTypes=Episode",
+        w.owner_id, w.library
+    );
+    let mut keys = w.keys(&w.get(&uri).await);
+    keys.sort();
+    assert_eq!(keys, vec!["s1e1", "s1e3"]);
+}
+
+#[tokio::test]
+async fn r3missing_upcoming_lists_virtual_unaired_episodes() {
+    let w = r3missing_world().await;
+    let uri = format!("/Shows/Upcoming?userId={}", w.owner_id);
+    assert_eq!(w.keys(&w.get(&uri).await), vec!["s2e1"]);
+}
+
 // GET /Shows/NextUp lists one episode per series the user has started: the first unplayed episode
 // after their highest played one, outside season 0. Series sort newest first by when that episode
 // was played, and StartIndex, Limit and TotalRecordCount count series (Jellyfin's
@@ -52495,7 +52874,9 @@ async fn r3items_library(state: &AppState) -> R3ItemsLibrary {
             "UPDATE media_items SET overview = '', premiere_date = '1990-01-01T00:00:00Z' WHERE id = '{c}'"
         ),
         format!("UPDATE media_items SET tags = 'News', tvdb_id = 22 WHERE id = '{show}'"),
-        format!("UPDATE media_items SET location_type = 'Virtual' WHERE id = '{e3}'"),
+        format!(
+            "UPDATE media_items SET location_type = 'Virtual', is_virtual_item = 1 WHERE id = '{e3}'"
+        ),
         format!(
             "INSERT INTO item_metadata_extras (item_id, imdb_id, lock_data) VALUES ('{a}', 'tt0000001', 1)"
         ),

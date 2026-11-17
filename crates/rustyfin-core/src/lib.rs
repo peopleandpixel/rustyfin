@@ -17,6 +17,7 @@ pub mod mdns;
 pub mod media_reads;
 pub mod media_segments;
 pub mod metadata;
+pub mod missing_episodes;
 mod mkv_index;
 pub mod naming;
 pub mod nfo_parser;
