@@ -478,11 +478,10 @@ async fn save_encoding_configuration(
     };
     rustyfin_core::encoding::validate_options(options)
         .map_err(|e| ApiError::BadRequest(format!("encoding: {e}")))?;
-    // The detected values sent back unchanged stay automatic
+    // A save without a type stays automatic: its detected values aren't stored
     let mut options = options.clone();
     rustyfin_core::hwaccel::keep_automatic(
         &mut options,
-        saved_encoding_options(state).await?.as_ref(),
         state.transcode_manager.hardware_detection().as_ref(),
     );
     let body = serde_json::Value::Object(options);

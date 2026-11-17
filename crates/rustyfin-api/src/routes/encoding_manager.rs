@@ -56,13 +56,16 @@ async fn get_hardware_acceleration(State(state): State<AppState>) -> Json<Hardwa
 }
 
 /// POST /System/MediaEncoder/HardwareAcceleration/Detect: detect the devices again (a few
-/// seconds of ffmpeg probes) and answer with the result.
-async fn detect_hardware_acceleration(State(state): State<AppState>) -> Json<HardwareAcceleration> {
+/// seconds of ffmpeg probes) and answer with the result; 409 while a detection is running.
+async fn detect_hardware_acceleration(
+    State(state): State<AppState>,
+) -> Result<Json<HardwareAcceleration>, ApiError> {
     state
         .transcode_manager
-        .detect_hardware(&state.data_dir)
-        .await;
-    Json(hardware_acceleration(&state).await)
+        .try_detect_hardware(&state.data_dir)
+        .await
+        .ok_or_else(|| ApiError::Conflict("a hardware detection is already running".into()))?;
+    Ok(Json(hardware_acceleration(&state).await))
 }
 
 async fn get_encoder_path() -> Json<MediaEncoderPath> {

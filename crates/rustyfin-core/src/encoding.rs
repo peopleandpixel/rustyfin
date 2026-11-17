@@ -79,7 +79,10 @@ impl serde::Serialize for HardwareAccelerationType {
 }
 
 /// The encoding options in effect, for code that runs outside the transcoder (trickplay and
-/// chapter images): the transcode manager's settings, updated whenever it takes new ones.
+/// chapter images): the transcode manager's settings, updated whenever it takes new ones (a
+/// save, or a hardware detection while the type is automatic). Nothing reads it yet: it is the
+/// shared setting the trickplay work's hardware decoding path reads (its type, device and
+/// decoding codecs), so keep it even while it has no caller here.
 pub fn current() -> EncodingSettings {
     current_cell()
         .read()
