@@ -22903,6 +22903,86 @@ async fn test_sync_play_instances() {
     assert!(resp.status().is_success() || resp.status() == StatusCode::NOT_FOUND);
 }
 
+// R3 security review: SyncPlay groups belong to their creator (and administrators); members may
+// list one another; playback commands need a group, as Jellyfin's SyncPlayIsInGroup policy says
+#[tokio::test]
+async fn r3security_sync_play_groups_are_managed_by_their_creator_or_an_admin() {
+    let state = test_state().await;
+    let (admin, _) = admin_session(&state).await;
+    let (alice, _) = b38_user(&state, "r3sec-alice", false).await;
+    let (bob, bob_id) = b38_user(&state, "r3sec-bob", false).await;
+    let (carol, _) = b38_user(&state, "r3sec-carol", false).await;
+    let app = app(state);
+    let call = |method: &'static str, uri: String, token: String, body: serde_json::Value| {
+        let app = app.clone();
+        async move { send(&app, request(method, &uri, Some(&token), Some(body))).await }
+    };
+    let none = serde_json::json!({});
+
+    let (status, group) = call(
+        "POST",
+        "/SyncPlay/CreateGroup".into(),
+        alice.clone(),
+        serde_json::json!({ "Name": "Group A" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{group}");
+    let id = group["Id"].as_str().unwrap().to_string();
+    let path = |rest: &str| format!("/SyncPlay/Groups/{id}{rest}");
+
+    // Another user may neither change the group nor list its members
+    for (method, uri) in [
+        ("DELETE", path("")),
+        ("POST", path("/Lock")),
+        ("POST", path("/Unlock")),
+        ("GET", path("/Members")),
+    ] {
+        let (status, _) = call(method, uri.clone(), bob.clone(), none.clone()).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{method} {uri}");
+    }
+    let (status, _) = call("GET", path(""), alice.clone(), none.clone()).await;
+    assert_eq!(status, StatusCode::OK, "the group is still there");
+
+    // Not in a group: playback commands are refused
+    for command in ["Play", "Pause", "Seek"] {
+        let uri = format!("/SyncPlay/{command}");
+        let (status, _) = call("POST", uri, carol.clone(), none.clone()).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{command}");
+    }
+
+    // Bob joins (twice: one membership) and may then list the members, still not manage
+    for _ in 0..2 {
+        let join = serde_json::json!({ "GroupId": id });
+        let (status, _) = call("POST", "/SyncPlay/JoinGroup".into(), bob.clone(), join).await;
+        assert_eq!(status, StatusCode::OK);
+    }
+    let (status, members) = call("GET", path("/Members"), bob.clone(), none.clone()).await;
+    assert_eq!(status, StatusCode::OK);
+    let members = members.as_array().unwrap();
+    assert_eq!(members.len(), 1, "{members:?}");
+    assert_eq!(members[0]["UserId"], bob_id.to_string());
+    let (status, _) = call("DELETE", path(""), bob.clone(), none.clone()).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    // A member's playback commands aren't carried out yet: 501, not a 200 that did nothing
+    for command in ["Play", "Pause", "Seek"] {
+        let uri = format!("/SyncPlay/{command}");
+        let (status, _) = call("POST", uri, bob.clone(), none.clone()).await;
+        assert_eq!(status, StatusCode::NOT_IMPLEMENTED, "{command}");
+    }
+
+    // The creator and an administrator may
+    let (status, _) = call("POST", path("/Lock"), alice.clone(), none.clone()).await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _) = call("GET", path("/Members"), alice.clone(), none.clone()).await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _) = call("POST", path("/Unlock"), admin.clone(), none.clone()).await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _) = call("DELETE", path(""), admin.clone(), none.clone()).await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _) = call("DELETE", path(""), admin.clone(), none.clone()).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "gone");
+}
+
 // ── Encoding Manager Tests ──
 
 #[tokio::test]

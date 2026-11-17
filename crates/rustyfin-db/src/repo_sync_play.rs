@@ -80,6 +80,16 @@ pub async fn get_members(
     Ok(rows)
 }
 
+/// Whether `user_id` is a member of any group.
+pub async fn is_in_any_group(pool: &SqlitePool, user_id: &str) -> Result<bool, sqlx::Error> {
+    let found: Option<i64> =
+        sqlx::query_scalar("SELECT 1 FROM sync_play_members WHERE user_id = ?1 LIMIT 1")
+            .bind(user_id)
+            .fetch_optional(pool)
+            .await?;
+    Ok(found.is_some())
+}
+
 pub async fn add_member(
     pool: &SqlitePool,
     id: &str,
