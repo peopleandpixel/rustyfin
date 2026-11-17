@@ -1037,6 +1037,62 @@ struct Shown {
     official_rating: Option<String>,
     genres: String,
     runtime_ticks: Option<i64>,
+    /// The item's LockData and LockedFields (`item_metadata_extras`).
+    lock_data: bool,
+    locked_fields: String,
+    /// Whether the item was stored before the older rule went, and isn't cleared yet
+    /// (`show_nfo_cleanup`), and whether a metadata provider has answered for it since.
+    cleanup: bool,
+    refreshed: bool,
+}
+
+/// The columns of `Shown`, from `media_items AS m`; the query joins `SHOWN_JOINS`.
+const SHOWN_COLUMNS: &str = "m.id, m.name, m.sort_name, m.overview, m.production_year,
+    m.community_rating, m.official_rating, m.genres, m.runtime_ticks,
+    COALESCE(x.lock_data, 0) != 0 AS lock_data, COALESCE(x.locked_fields, '') AS locked_fields,
+    c.item_id IS NOT NULL AS cleanup, x.provider_refreshed_at IS NOT NULL AS refreshed";
+const SHOWN_JOINS: &str = "LEFT JOIN item_metadata_extras AS x ON x.item_id = m.id
+    LEFT JOIN show_nfo_cleanup AS c ON c.item_id = m.id";
+
+impl Shown {
+    fn locks(&self) -> rustyfin_db::repo_media::ItemLocks {
+        rustyfin_db::repo_media::ItemLocks::from_row(self.lock_data, &self.locked_fields)
+    }
+
+    /// Whether the older rule's values may be cleared from this season or episode: it was stored
+    /// under that rule, no provider has answered for it since (a provider's value that equals the
+    /// file's is the item's own), and it isn't locked.
+    fn clears_show_nfo(&self) -> bool {
+        self.cleanup && !self.refreshed && !self.lock_data
+    }
+
+    /// Puts back each field of `old` that its locks keep, as `metadata::apply_metadata_to_item`
+    /// does: a locked item keeps every field, a locked Name its name and sort name, and so on.
+    fn keep_locked(&mut self, old: &Shown) {
+        let locks = old.locks();
+        if locks.locked("Name") {
+            self.name = old.name.clone();
+            self.sort_name = old.sort_name.clone();
+        }
+        if locks.locked("Overview") {
+            self.overview = old.overview.clone();
+        }
+        if locks.locked("ProductionYear") {
+            self.production_year = old.production_year;
+        }
+        if locks.locked("CommunityRating") {
+            self.community_rating = old.community_rating;
+        }
+        if locks.locked("OfficialRating") {
+            self.official_rating = old.official_rating.clone();
+        }
+        if locks.locked("Genres") {
+            self.genres = old.genres.clone();
+        }
+        if locks.locked("Runtime") {
+            self.runtime_ticks = old.runtime_ticks;
+        }
+    }
 }
 
 /// Gives each series of `series`, and its seasons, what a new one gets now, where the stored values came from
@@ -1052,6 +1108,10 @@ struct Shown {
 /// - The seasons and loose episodes lose the images that the file gave them, with the provider `nfo`. The
 ///   series keeps its own.
 ///
+/// Jellyfin gives a season or an episode nothing of its series' NFO, so the last three run once, and only on
+/// the items stored under the older rule (`show_nfo_cleanup`) that no provider has answered for since and
+/// that aren't locked; each such item is then taken off the list. A locked field is never written.
+///
 /// Only the items that differ are written, in one transaction, with the image rows that go. Returns how many
 /// changed, images included.
 pub async fn settle_series(
@@ -1059,11 +1119,10 @@ pub async fn settle_series(
     library_id: Uuid,
     series: &[SeriesFolder],
 ) -> Result<u64, sqlx::Error> {
-    let stored: Vec<Shown> = sqlx::query_as(
-        "SELECT id, name, sort_name, overview, production_year, community_rating, official_rating,
-                genres, runtime_ticks
-         FROM media_items WHERE library_id = ?1 AND media_type IN ('Series', 'Season')",
-    )
+    let stored: Vec<Shown> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+        "SELECT {SHOWN_COLUMNS} FROM media_items AS m {SHOWN_JOINS}
+         WHERE m.library_id = ?1 AND m.media_type IN ('Series', 'Season')"
+    )))
     .bind(library_id.to_string())
     .fetch_all(pool)
     .await?;
@@ -1073,6 +1132,8 @@ pub async fn settle_series(
     // its images too.
     let mut changes: Vec<(Shown, Shown)> = Vec::new();
     let mut image_items: Vec<(String, &ExternalMetadata)> = Vec::new();
+    // The seasons and episodes of the older rule that this run settles, cleared or not
+    let mut cleared: Vec<String> = Vec::new();
     for folder in series {
         if let Some(old) = stored.get(&folder.id.to_string()) {
             let mut new = old.clone();
@@ -1092,6 +1153,7 @@ pub async fn settle_series(
             if let Some(nfo) = &folder.nfo {
                 fill_from_nfo(&mut new, nfo);
             }
+            new.keep_locked(old);
             if new != *old {
                 changes.push((new, old.clone()));
             }
@@ -1103,8 +1165,16 @@ pub async fn settle_series(
             let Some(old) = stored.get(&id.to_string()) else {
                 continue;
             };
+            if !old.cleanup {
+                continue;
+            }
+            cleared.push(old.id.clone());
+            if !old.clears_show_nfo() {
+                continue;
+            }
             let mut new = old.clone();
             clear_show_nfo(&mut new, nfo, season_folder, &season_sort_name(*number));
+            new.keep_locked(old);
             if new != *old {
                 changes.push((new, old.clone()));
             }
@@ -1118,8 +1188,16 @@ pub async fn settle_series(
             let Some(old) = stored_episode(pool, library_id, path).await? else {
                 continue;
             };
+            if !old.cleanup {
+                continue;
+            }
+            cleared.push(old.id.clone());
+            if !old.clears_show_nfo() {
+                continue;
+            }
             let mut new = old.clone();
             clear_show_nfo(&mut new, nfo, &stem, &stem.to_lowercase());
+            new.keep_locked(&old);
             if new != old {
                 changes.push((new, old.clone()));
             }
@@ -1148,12 +1226,19 @@ pub async fn settle_series(
                 .is_some_and(|nfo| nfo.image_urls.iter().any(|image| image.url == *path))
         })
         .collect();
-    if changes.is_empty() && images.is_empty() {
+    if changes.is_empty() && images.is_empty() && cleared.is_empty() {
         return Ok(0);
     }
 
     let mut changed = 0;
     let mut tx = rustyfin_db::begin_write(pool).await?;
+    // Each is settled once: a later value that equals the series' file is the item's own
+    for id in &cleared {
+        sqlx::query("DELETE FROM show_nfo_cleanup WHERE item_id = ?1")
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+    }
     for (new, old) in changes {
         // An item that another writer changed since it was read is left to the next scan. Its images are
         // deleted below either way.
@@ -1231,11 +1316,10 @@ async fn stored_episode(
     library_id: Uuid,
     path: &str,
 ) -> Result<Option<Shown>, sqlx::Error> {
-    sqlx::query_as(
-        "SELECT id, name, sort_name, overview, production_year, community_rating, official_rating,
-                genres, runtime_ticks
-         FROM media_items WHERE library_id = ?1 AND media_type = 'Episode' AND path = ?2",
-    )
+    sqlx::query_as(sqlx::AssertSqlSafe(format!(
+        "SELECT {SHOWN_COLUMNS} FROM media_items AS m {SHOWN_JOINS}
+         WHERE m.library_id = ?1 AND m.media_type = 'Episode' AND m.path = ?2"
+    )))
     .bind(library_id.to_string())
     .bind(path)
     .fetch_optional(pool)
