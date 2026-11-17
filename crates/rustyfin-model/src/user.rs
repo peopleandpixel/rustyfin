@@ -81,11 +81,10 @@ impl UserDto {
 }
 
 /// Jellyfin's `UserPolicy` for an account. Rustyfin has no per-user device or channel
-/// restrictions, so those flags are on, and downloading is off, which Rustyfin has no route for;
-/// the flags for what only administrators may do here (managing collections and subtitles,
+/// restrictions, so those flags are on; the flags for what only administrators may do here (managing collections and subtitles,
 /// controlling others' sessions) follow `is_admin`. The parental fields and the access fields
-/// (libraries, schedules, hidden, remote access, playback, transcoding, deletion, session and
-/// bitrate limits) come from `parental`, and `POST /Users/{id}/Policy` reads them back with
+/// (libraries, schedules, hidden, remote access, playback, transcoding, deletion, downloading,
+/// session and bitrate limits) come from `parental`, and `POST /Users/{id}/Policy` reads them back with
 /// `IsAdministrator` and `IsDisabled`.
 pub fn jellyfin_policy(
     is_admin: bool,
@@ -116,8 +115,7 @@ pub fn jellyfin_policy(
         "ForceRemoteSourceTranscoding": false,
         "EnableContentDeletion": is_admin,
         "EnableContentDeletionFromFolders": [],
-        // No /Items/{id}/Download route yet; Jellyfin Web would offer a Download that 404s.
-        "EnableContentDownloading": false,
+
         "EnableSyncTranscoding": true,
         "EnableMediaConversion": true,
         "EnabledDevices": [],
@@ -180,6 +178,16 @@ pub struct PublicUserDto {
     /// The profile picture's tag, left out when the user has none, as in Jellyfin.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub primary_image_tag: Option<String>,
+    /// Always true, as in Jellyfin 12.4, which no longer tells whether a user has a password; its
+    /// web client opens the password form for every tile.
+    #[serde(default = "always_true")]
+    pub has_password: bool,
+    #[serde(default = "always_true")]
+    pub has_configured_password: bool,
+}
+
+fn always_true() -> bool {
+    true
 }
 
 impl From<User> for PublicUserDto {
@@ -188,6 +196,8 @@ impl From<User> for PublicUserDto {
             id: u.id,
             name: u.name,
             primary_image_tag: None,
+            has_password: true,
+            has_configured_password: true,
         }
     }
 }
@@ -235,6 +245,8 @@ pub struct UpdatePolicyRequest {
     pub enable_playback_remuxing: Option<bool>,
     pub force_remote_source_transcoding: Option<bool>,
     pub enable_content_deletion: Option<bool>,
+    pub enable_content_deletion_from_folders: Option<Vec<String>>,
+    pub enable_content_downloading: Option<bool>,
     pub max_active_sessions: Option<i32>,
     pub remote_client_bitrate_limit: Option<i64>,
 }

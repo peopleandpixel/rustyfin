@@ -478,6 +478,8 @@ pub(super) const JELLYFIN_TABLES: &[&str] = &[
     "BaseItemImageInfos",
     "PeopleBaseItemMap",
     "Peoples",
+    "Preferences",
+    "AccessSchedules",
 ];
 /// The tables `read_old_layout` reads from `library.db`, each checked by `check_tables` (B20 round
 /// 2, finding 3).

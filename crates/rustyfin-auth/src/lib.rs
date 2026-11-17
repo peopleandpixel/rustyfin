@@ -90,9 +90,10 @@ pub fn normalize_reset_pin(pin: &str) -> String {
     pin.trim().to_uppercase()
 }
 
-/// SHA-256 hex of the normalized PIN. Only this is stored, so a database leak exposes no live PIN.
+/// SHA-256 hex of the normalized PIN without its dashes, which Jellyfin 12.4 ignores when it
+/// compares PINs. Only this is stored, so a database leak exposes no live PIN.
 fn reset_pin_hash(pin: &str) -> String {
-    Sha256::digest(normalize_reset_pin(pin).as_bytes())
+    Sha256::digest(normalize_reset_pin(pin).replace('-', "").as_bytes())
         .iter()
         .map(|b| format!("{b:02x}"))
         .collect()
@@ -231,7 +232,7 @@ fn generate_token() -> String {
 }
 
 /// Hex SHA-256 of a token. Only this hash is stored, so a database leak exposes no live token.
-fn token_hash(token: &str) -> String {
+pub fn token_hash(token: &str) -> String {
     Sha256::digest(token.as_bytes())
         .iter()
         .map(|b| format!("{b:02x}"))
@@ -324,6 +325,29 @@ pub async fn token_device(
             (uid, device)
         },
     ))
+}
+
+/// A new API key: stored by its hash, with its last four characters as the hint. Returns its id
+/// and the key, which only this caller ever sees.
+pub async fn create_api_key(
+    pool: &SqlitePool,
+    app_name: &str,
+) -> Result<(String, String), AuthError> {
+    let key = generate_token();
+    let id = Uuid::new_v4().simple().to_string();
+    let hint = &key[key.len() - 4..];
+    rustyfin_db::repo_api_key::insert(pool, &id, &token_hash(&key), hint, app_name).await?;
+    Ok((id, key))
+}
+
+/// Whether `key` is a live API key; one that is gets its last activity recorded.
+pub async fn validate_api_key(pool: &SqlitePool, key: &str) -> Result<bool, AuthError> {
+    Ok(rustyfin_db::repo_api_key::use_key(pool, &token_hash(key)).await?)
+}
+
+/// Revokes the API key with this id, or this key. Returns whether one was revoked.
+pub async fn revoke_api_key(pool: &SqlitePool, id_or_key: &str) -> Result<bool, AuthError> {
+    Ok(rustyfin_db::repo_api_key::delete(pool, id_or_key, &token_hash(id_or_key)).await?)
 }
 
 /// Revokes a single token.

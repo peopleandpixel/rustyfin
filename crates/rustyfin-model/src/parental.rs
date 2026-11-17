@@ -419,6 +419,11 @@ pub struct AccessPolicy {
     pub force_remote_source_transcoding: bool,
     /// May delete media items. `None` until set: administrators may, others not.
     pub enable_content_deletion: Option<bool>,
+    /// Without `enable_content_deletion`, the libraries whose items the user may delete
+    /// (Jellyfin's `EnableContentDeletionFromFolders`).
+    pub enable_content_deletion_from_folders: Vec<String>,
+    /// May download media files (`/Items/{id}/Download`); on for a new user, as in Jellyfin.
+    pub enable_content_downloading: bool,
     /// The most sessions the user may have at once; 0 for no limit.
     pub max_active_sessions: i32,
     /// The highest bitrate a client outside the local network may stream at; 0 for no limit.
@@ -441,6 +446,8 @@ impl Default for AccessPolicy {
             enable_playback_remuxing: true,
             force_remote_source_transcoding: false,
             enable_content_deletion: None,
+            enable_content_deletion_from_folders: Vec::new(),
+            enable_content_downloading: true,
             max_active_sessions: 0,
             remote_client_bitrate_limit: 0,
             enable_all_folders: true,

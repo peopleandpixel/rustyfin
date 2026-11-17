@@ -1,7 +1,7 @@
 // R3 cards: a card's badges (played check, unplayed count, progress, favourite), its played,
 // favourite and menu buttons, the banner and list shapes, the context menu's commands per item and
 // user, likes and dislikes, and a mark redrawn on every card of the item, as Jellyfin Web's cards.
-// Runs modules/cards.js and modules/cardmenu.js in a vm sandbox, and api.js's setRating.
+// Runs modules/cards.js, modules/userdata.js and modules/cardmenu.js in a vm sandbox, and api.js's setRating.
 // Usage: node r3cards_cards.mjs (run by api_tests.rs r3cards_cards).
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
@@ -23,6 +23,7 @@ function sandbox({ isAdmin = false, item = null } = {}) {
         icon: name => `<svg data-icon="${name}"></svg>`,
         escapeHtml,
         blurhashTint: () => null,
+        canDownload: () => false,
         toast: (msg, type) => toasts.push([msg, type]),
         playQueueAt: (items, index) => calls.push(['queue', items.map(i => i.Id), index]),
         CSS: { escape: s => s },
@@ -43,7 +44,7 @@ function sandbox({ isAdmin = false, item = null } = {}) {
             invalidateCache: prefix => calls.push(['invalidate', prefix]),
         },
     });
-    vm.runInContext(`${strip(read('modules/cards.js'))}\n${strip(read('modules/cardmenu.js'))}
+    vm.runInContext(`${strip(read('modules/cards.js'))}\n${strip(read('modules/userdata.js'))}\n${strip(read('modules/cardmenu.js'))}
         this.fns = { itemCard, cardState, cardMarksHtml, applyCardUserData, cardMenuCommands, cardMenuHtml,
             toggleCardPlayed, toggleCardFavorite, setCardLikes, playCardItem, openCardMenu, openAddTo, cardPointerDown,
         cardPointerMove, cardContextMenu, cardClickAfterLongPress, LONG_PRESS_MS };`, context);

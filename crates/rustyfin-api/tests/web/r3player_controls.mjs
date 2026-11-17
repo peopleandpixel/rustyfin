@@ -41,6 +41,7 @@ function sandbox(heads, globals = {}, prelude = '') {
         t: (key, opts) => (opts ? `${key}|${JSON.stringify(opts)}` : key),
         $: id => (elements[id] ||= element()),
         formatDurationSeconds: s => `${Math.floor(s / 60)}:${String(Math.floor(s % 60)).padStart(2, '0')}`,
+        setNativeNowPlaying: () => {},
         setTimeout: fn => { timers.push(fn); return timers.length; },
         clearTimeout: () => {},
         API: { base: 'http://srv', token: 'tok', imageUrl: (id, type, o) => `/Items/${id}/Images/${type}?maxHeight=${o.maxHeight}&tag=${o.tag}` },
@@ -242,11 +243,13 @@ test('the handler leaves Ctrl, Alt and Meta keys, and a control focused by keybo
         for (const key of ['ArrowDown', '5', 'm']) assert.equal(press({ key, target: new Element(match) }).prevented, undefined);
     }
     assert.deepEqual(calls, []);
-    // After a click (no focus ring) and on the sliders the player takes them
+    // A text field keeps its keys even after a click; a menu or button after a click, and the sliders, don't
     assert.equal(press({ key: 'ArrowDown', target: new Element('select', false) }).prevented, true);
+    assert.equal(press({ key: 'k', target: new Element('input', false) }).prevented, undefined);
+    assert.equal(press({ key: 'ArrowDown', target: new Element('button', false) }).prevented, true);
     assert.equal(press({ key: 'f' }).prevented, true);
     press({ key: 'Escape', target: new Element('select') });
-    assert.deepEqual(calls, ['action', 'action', 'close']);
+    assert.deepEqual(calls, ['action', 'action', 'action', 'close']);
 });
 
 test('volume steps on Jellyfin\'s cube-root scale; speed steps through its rates and keeps the menu true', () => {
@@ -314,7 +317,7 @@ test('the Media Session shows the item and binds Jellyfin Web\'s actions; previo
         'function episodeNumberLabel(', 'function itemPicture(', 'function itemArtist('], {
         navigator: { mediaSession },
         MediaMetadata: class { constructor(m) { Object.assign(this, m); } },
-        closePlayer: () => calls.push('close'),
+        stopNowPlaying: () => calls.push('close'),
         skipTime: d => calls.push(['skip', d]),
         seekTo: (s, to) => calls.push(['seek', to]),
     }, `${decl('hasMediaSession')} ${decl('ARTWORK_SIZES')} ${decl('MEDIA_SESSION_ACTIONS')}`);

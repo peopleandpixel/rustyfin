@@ -20,12 +20,19 @@ use uuid::Uuid;
 /// 3: a video stream's Dolby Vision configuration record, which its VideoRangeType is read from,
 /// and a video's external subtitle files, stored as its streams. Neither touches audio files, so
 /// audio sources are read again only below [`AUDIO_PROBE_VERSION`].
-pub const PROBE_VERSION: i64 = 3;
+///
+/// 4: whether an audio file's tags hold lyrics, which its HasLyrics shows. It doesn't touch
+/// video files, so video sources are read again only below [`VIDEO_PROBE_VERSION`].
+pub const PROBE_VERSION: i64 = 4;
 
 /// The last [`PROBE_VERSION`] that changed what a probe stores for an audio file. A scan reads an
 /// audio source again only when an older probe wrote it, so a video-only change doesn't re-read
 /// a music library from its share.
-pub const AUDIO_PROBE_VERSION: i64 = 2;
+pub const AUDIO_PROBE_VERSION: i64 = 4;
+
+/// The last [`PROBE_VERSION`] that changed what a probe stores for a video file, so that an
+/// audio-only change doesn't re-read every video.
+pub const VIDEO_PROBE_VERSION: i64 = 3;
 
 // ---------------------------------------------------------------------------
 // MediaSource DB row
@@ -344,6 +351,32 @@ pub async fn get_media_source_ids(
         .await
 }
 
+/// Each item's Container, from its first media source in `get_media_sources`' order, by item id
+/// as stored; items without a known container have no entry.
+pub async fn first_containers(
+    pool: &SqlitePool,
+    item_ids: &[Uuid],
+) -> Result<std::collections::HashMap<String, String>, sqlx::Error> {
+    let mut containers = std::collections::HashMap::new();
+    if item_ids.is_empty() {
+        return Ok(containers);
+    }
+    let ids = serde_json::Value::from(item_ids.iter().map(Uuid::to_string).collect::<Vec<_>>());
+    let rows: Vec<(String, String)> = sqlx::query_as(
+        "SELECT s.item_id, s.container FROM media_sources s \
+         JOIN media_items m ON m.id = s.item_id \
+         WHERE s.item_id IN (SELECT value FROM json_each(?1)) AND COALESCE(s.container, '') != '' \
+         ORDER BY s.item_id, s.path = m.path DESC, COALESCE(s.width, 0) DESC, s.path, s.id",
+    )
+    .bind(ids.to_string())
+    .fetch_all(pool)
+    .await?;
+    for (item, container) in rows {
+        containers.entry(item).or_insert(container);
+    }
+    Ok(containers)
+}
+
 /// Verify that a media item exists and fetch its media sources with streams in a single round-trip.
 /// Returns None if the item does not exist.
 /// Eliminates the N+1 pattern in streaming endpoints where get_item_by_id and get_media_sources
@@ -518,6 +551,23 @@ pub async fn delete_media_source(pool: &SqlitePool, source_id: &Uuid) -> Result<
         .execute(pool)
         .await?;
 
+    Ok(())
+}
+
+/// Deletes the external subtitle stream that reads `path` from an item's sources.
+pub async fn delete_external_stream(
+    pool: &SqlitePool,
+    item_id: &Uuid,
+    path: &str,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "DELETE FROM media_streams WHERE is_external = 1 AND path = ? \
+         AND source_id IN (SELECT id FROM media_sources WHERE item_id = ?)",
+    )
+    .bind(path)
+    .bind(item_id.to_string())
+    .execute(pool)
+    .await?;
     Ok(())
 }
 

@@ -6,12 +6,15 @@ import { renderHome } from './home.js';
 import { currentDetailId, renderDetail, versionLabels } from './item.js';
 import { clearQueue, queueNeighbours, playQueueStep } from './queue.js';
 import { stopThemeSong } from './theme-media.js';
+import { setLyricsTrack, highlightLyrics } from './lyrics.js';
+import { nativeVideoPlayer, playNatively, setNativeNowPlaying } from './nativeshell.js';
 import {
     trackPrefs, defaultTracks, defaultSubtitleIndex as preferredSubtitleIndex, subtitleAppearance, saveSubtitleAppearance,
     subtitleCss, stepSubtitleOffset, qualityOptions, bitrateLabel, maxStreamingBitrate, setMaxStreamingBitrate,
     aspectRatio, setAspectRatio, SEGMENT_TYPES, segmentAction, setSegmentAction, stillWatchingSetting,
     setStillWatchingSetting, stillWatchingDue, burnsInSubtitle,
 } from './playerprefs.js';
+import { lockLandscape, unlockOrientation } from './mobile.js';
 let playerReportInterval = null;
 let playerBars = null;
 
@@ -350,6 +353,26 @@ function changeSubtitleTrack(value) {
     }
 }
 
+// C and S: subtitles off, or back on with the track shown last, else the one the user's preferred
+// language picks, else the first
+function toggleSubtitles() {
+    const session = activePlayback;
+    if (!session || session.streamType !== 'Videos') return;
+    const subs = session.streams.filter(s => isStreamType(s, 'subtitle'));
+    if (!subs.length) return;
+    let index = -1;
+    if (session.subtitleIndex == null || session.subtitleIndex === -1) {
+        const audio = findStream(session, 'audio', session.audioIndex);
+        const preferred = preferredSubtitleIndex(subs, audio, { ...session.prefs, subtitleMode: 'Always' });
+        index = [session.lastSubtitleIndex, preferred].find(i => subs.some(s => s.Index === i)) ?? subs[0].Index;
+    } else {
+        session.lastSubtitleIndex = session.subtitleIndex;
+    }
+    const menu = $('player-subs');
+    if (menu) menu.value = String(index);
+    changeSubtitleTrack(String(index));
+}
+
 // CodecType comes lower case from the server: 'audio', 'subtitle' or 'video'
 function isStreamType(s, type) {
     return (s.CodecType || '').toLowerCase() === type;
@@ -593,7 +616,14 @@ function renderTrackMenus(session) {
 // queued: the play queue (queue.js) started this item; any other play ends the queue.
 // selection: the detail page's choice, { mediaSourceId, audioIndex, subtitleIndex (-1 is off), startTicks };
 // a field left out keeps the default.
+// Casting (cast.js) takes over playback: while it returns true, the receiver plays the item instead
+let playInterceptor = null;
+function setPlayInterceptor(fn) {
+    playInterceptor = fn;
+}
+
 async function playItem(itemId, streamType = 'Videos', title = '', { fromStart = false, carry = null, queued = false, selection = null } = {}) {
+    if (playInterceptor?.(itemId, streamType, title, { fromStart, selection })) return;
     const video = $('video-player');
     const modal = $('player-modal');
     if (!video || !modal) return;
@@ -610,6 +640,12 @@ async function playItem(itemId, streamType = 'Videos', title = '', { fromStart =
     if (hlsInstance) {
         hlsInstance.destroy();
         hlsInstance = null;
+    }
+
+    // In the Jellyfin Android app, a video plays in the app's player when the user chose that there
+    if (streamType === 'Videos' && nativeVideoPlayer() && await playNatively(itemId, { fromStart, selection, resumeTicks: resumePositionTicks })) {
+        if (request === playRequest) playLoading = 0;
+        return;
     }
 
     $('player-title').textContent = title || t('player.playback');
@@ -784,14 +820,11 @@ async function playItem(itemId, streamType = 'Videos', title = '', { fromStart =
     updatePipButton(session);
     updateMediaSession(session, item, $('player-title').textContent);
 
-    // Periodic progress reporting
+    // Progress reports as Jellyfin Web sends them: every 10 s while the item is open, paused too
+    // (they keep the server from stopping a paused session and its transcode), and on pause and
+    // unpause, each with IsPaused
     if (playerReportInterval) clearInterval(playerReportInterval);
-    playerReportInterval = setInterval(() => {
-        if (!video.paused && !video.ended) {
-            const ticks = Math.round(session.position() * 1e7);
-            API.reportProgress(itemId, ticks, false, session.reportFields()).catch(() => {});
-        }
-    }, 8000);
+    playerReportInterval = setInterval(() => reportSessionProgress(session), PROGRESS_REPORT_MS);
 
     // Video events for custom UI
     // A text track added during the playback (captions that hls.js finds in the stream) stays off
@@ -805,9 +838,18 @@ async function playItem(itemId, streamType = 'Videos', title = '', { fromStart =
         updateMediaPosition(session);
     };
 
-    video.onplay = () => { updatePlayIcon(true); setMediaPlaybackState('playing'); };
+    video.onplay = () => {
+        updatePlayIcon(true);
+        setMediaPlaybackState('playing');
+        if (session.reportedPaused) reportSessionProgress(session);
+    };
     video.onplaying = () => { session.failed = false; };
-    video.onpause = () => { updatePlayIcon(false); setMediaPlaybackState('paused'); };
+    video.onpause = () => {
+        updatePlayIcon(false);
+        setMediaPlaybackState('paused');
+        // The pause at the end of the item is the Stopped report's
+        if (!video.ended) reportSessionProgress(session);
+    };
     video.onvolumechange = () => {
         updateVolumeIcon();
         const slider = $('player-vol');
@@ -942,6 +984,7 @@ function playerAreaClick(e) {
 }
 
 function closePlayer() {
+    unlockOrientation();
     const m = $('player-modal');
     if (m) {
         if (typeof m.close === 'function') m.close();
@@ -975,32 +1018,43 @@ function adjacentEpisodes(episodes, currentId) {
     return { prev: list.findLast(before) || null, next: list.find(after) || null };
 }
 
-// What the next episode keeps of this one's tracks: the audio and subtitle languages, or subtitles off
+// What the next episode keeps of this one's tracks: the audio and subtitle languages and titles, or subtitles off
 function episodeTrackCarry(session) {
     const audio = findStream(session, 'audio', session.audioIndex);
     const sub = findStream(session, 'subtitle', session.subtitleIndex);
     return {
         audioLanguage: (audio?.Language || '').toLowerCase(),
+        audioTitle: audio?.Title || '',
         subtitleLanguage: (sub?.Language || '').toLowerCase(),
+        subtitleTitle: sub?.Title || '',
         subtitleForced: !!sub?.IsForced,
         subtitlesOff: session.subtitleIndex === -1 && session.streams.some(s => isStreamType(s, 'subtitle')),
     };
 }
 
-// As in Jellyfin: a track in the last episode's language, else the default this episode picked. When
-// the audio changes and no subtitle carries over, the default subtitle is picked again for that audio,
-// unless the subtitle is the server's choice for this episode (subtitleFromServer), off included.
+// As Jellyfin Web's autoSetNextTracks: a track in the last episode's language (one with the same title,
+// such as a commentary, first; by title alone when the language is unknown), else the default this episode
+// picked. Audio carries only while the user keeps RememberAudioSelections on, subtitles only with
+// RememberSubtitleSelections. When the audio changes and no subtitle carries over, the default subtitle is
+// picked again for that audio, unless the subtitle is the server's choice for this episode
+// (subtitleFromServer), off included.
 function carriedTracks(streams, carry, audioIndex, subtitleIndex, subtitleFromServer = false, prefs = null) {
     if (!carry) return { audioIndex, subtitleIndex };
-    const inLanguage = (type, language) => (language
-        ? streams.filter(s => isStreamType(s, type) && (s.Language || '').toLowerCase() === language)
-        : []);
-    const audio = inLanguage('audio', carry.audioLanguage);
+    const matching = (type, language, title, keep) => {
+        if (!keep) return [];
+        const known = !!language && language !== 'und';
+        const tracks = streams.filter(s => isStreamType(s, type)
+            && (!known || (s.Language || '').toLowerCase() === language));
+        const titled = title ? tracks.filter(s => (s.Title || '') === title) : [];
+        return titled.length ? titled : known ? tracks : [];
+    };
+    const audio = matching('audio', carry.audioLanguage, carry.audioTitle, prefs?.rememberAudio !== false);
     const pickedAudio = audio.find(s => s.Index === audioIndex) || audio.find(s => s.IsDefault) || audio[0];
     const audioChanged = !!pickedAudio && pickedAudio.Index !== audioIndex;
     if (pickedAudio) audioIndex = pickedAudio.Index;
-    if (carry.subtitlesOff) return { audioIndex, subtitleIndex: -1 };
-    const subs = inLanguage('subtitle', carry.subtitleLanguage);
+    const keepSubtitles = prefs?.rememberSubtitles !== false;
+    if (keepSubtitles && carry.subtitlesOff) return { audioIndex, subtitleIndex: -1 };
+    const subs = matching('subtitle', carry.subtitleLanguage, carry.subtitleTitle, keepSubtitles);
     const sameKind = subs.filter(s => !!s.IsForced === carry.subtitleForced);
     const pickedSub = sameKind.find(s => s.Index === subtitleIndex) || sameKind.find(s => s.IsDefault) || sameKind[0] || subs[0];
     if (pickedSub) subtitleIndex = pickedSub.Index;
@@ -1207,6 +1261,18 @@ function hideUpNext() {
     if (status) status.textContent = '';
 }
 
+const PROGRESS_REPORT_MS = 10000;
+
+// One progress report of `session` while it is the active playback, with IsPaused from the
+// player; nothing after the item ended (the Stopped report follows)
+function reportSessionProgress(session) {
+    const video = $('video-player');
+    if (activePlayback !== session || !video || video.ended) return;
+    session.reportedPaused = video.paused;
+    const ticks = Math.round(session.position() * 1e7);
+    API.reportProgress(session.itemId, ticks, video.paused, session.reportFields()).catch(() => {});
+}
+
 function togglePlayPause() {
     const v = $('video-player');
     if (!v) return;
@@ -1361,6 +1427,7 @@ function playerKeyAction(e) {
     case 'End': return () => seekPercent(100);
     case 'PageUp': return nextChapter;
     case 'PageDown': return previousChapter;
+    case 'c': case 's': return toggleSubtitles;
     case 'g': return () => changeSubtitleOffset(-1);
     case 'h': return () => changeSubtitleOffset(1);
     default: return null;
@@ -1373,6 +1440,7 @@ function playerKeyAction(e) {
 function updateNowPlaying(session, item = null) {
     const bar = $('now-playing');
     const audio = session?.streamType === 'Audio';
+    setLyricsTrack(audio ? session.itemId : null, item?.HasLyrics);
     const video = $('video-player');
     const picture = audio ? itemPicture(item) : null;
     const art = picture ? API.imageUrl(picture.id, 'Primary', { maxHeight: 512, tag: picture.tag }) : '';
@@ -1396,6 +1464,7 @@ function updateNowPlayingProgress(session) {
     if (session.streamType !== 'Audio' || $('now-playing')?.hidden) return;
     const total = session.total();
     const pos = session.position();
+    highlightLyrics(pos * 1e7);
     if (!seekDragging) $('now-playing-seek').value = total > 0 ? Math.min(100, pos / total * 100) : 0;
     $('now-playing-time').textContent = `${formatDurationSeconds(pos)} / ${formatDurationSeconds(total)}`;
 }
@@ -1405,7 +1474,9 @@ function openFullPlayer() {
     if (modal && !modal.open) modal.showModal();
 }
 
-// The bar's ×: the music stops, the queue ends and the bar goes
+// The one way to stop local playback, music or video: the bar's ×, the OS stop key, a remote Stop and
+// every hand-off to another player (Play on, Cast). The playback stops, the queue ends, the bar goes
+// and the player closes. (Closing the player alone leaves music playing under the bar.)
 function stopNowPlaying() {
     stopPlayback();
     endNowPlaying();
@@ -1613,6 +1684,7 @@ function mediaSessionMetadata(item, title) {
 }
 
 function updateMediaSession(session, item, title) {
+    setNativeNowPlaying(session, () => mediaSessionMetadata(item, title));
     if (!hasMediaSession()) return;
     bindMediaSession();
     navigator.mediaSession.metadata = new MediaMetadata(mediaSessionMetadata(item, title));
@@ -1641,6 +1713,7 @@ function updateMediaPosition(session) {
 
 // The player closed: no item, and no actions left for the OS to offer
 function clearMediaSession() {
+    setNativeNowPlaying(null);
     if (!hasMediaSession()) return;
     navigator.mediaSession.metadata = null;
     navigator.mediaSession.playbackState = 'none';
@@ -1664,7 +1737,7 @@ function bindMediaSession() {
     const video = () => $('video-player');
     setMediaSessionHandler('play', () => video()?.play());
     setMediaSessionHandler('pause', () => video()?.pause());
-    setMediaSessionHandler('stop', () => (activePlayback?.streamType === 'Audio' ? stopNowPlaying() : closePlayer()));
+    setMediaSessionHandler('stop', () => stopNowPlaying());
     setMediaSessionHandler('seekbackward', d => skipTime(-(d?.seekOffset || 10)));
     setMediaSessionHandler('seekforward', d => skipTime(d?.seekOffset || 30));
     setMediaSessionHandler('seekto', d => { if (activePlayback && Number.isFinite(d?.seekTime)) seekTo(activePlayback, d.seekTime); });
@@ -2016,9 +2089,10 @@ function toggleFullscreen() {
             else video.webkitEnterFullscreen?.();
         };
         const container = $('player-modal')?.querySelector('.jf-player-container');
-        if (container && container.requestFullscreen) container.requestFullscreen().catch(videoOnly);
+        if (container && container.requestFullscreen) container.requestFullscreen().then(lockLandscape).catch(videoOnly);
         else videoOnly();
     } else {
+        unlockOrientation();
         document.exitFullscreen().catch(() => {});
     }
 }
@@ -2029,11 +2103,14 @@ document.addEventListener('keydown', e => {
     if ($('player-modal')?.open) {
         if (e.key === 'Escape') { closePlayer(); return; }
         if (e.ctrlKey || e.altKey || e.metaKey) return;
-        // A button, menu or text field focused by keyboard keeps its keys (Space, arrows, letters, digits).
-        // After a click or tap, and on the seek and volume sliders, the player's keys work.
-        const onControl = e.target instanceof Element && e.target.matches(':focus-visible')
-            && e.target.closest('button, select, textarea, a[href], input:not([type="range"])');
-        if (onControl) return;
+        // A text field keeps its keys (Space, arrows, letters, digits) whenever it has focus; a menu,
+        // button or link only when focused by keyboard, so a menu opened with the mouse and closed again
+        // gives the keys back. After a click or tap, and on the seek and volume sliders, the player's
+        // keys work.
+        const target = e.target instanceof Element ? e.target : null;
+        const typing = target?.closest('textarea, input:not([type="range"]), [contenteditable="true"]');
+        const onControl = target && e.target.matches(':focus-visible') && target.closest('button, select, a[href]');
+        if (typing || onControl) return;
         if (e.code === 'Space') {
             e.preventDefault();
             togglePlayPause();
@@ -2044,10 +2121,13 @@ document.addEventListener('keydown', e => {
     }
 });
 
-// Remote control (remote.js): the playing item and where it is, and a seek to an item time in ticks
+// Remote control (remote.js, cast.js): the playing item, where it is and its tracks, and a seek to an item time in ticks
 function nowPlaying() {
     const s = activePlayback;
-    return s ? { itemId: s.itemId, streamType: s.streamType, positionTicks: Math.round(s.position() * 1e7) } : null;
+    return s ? {
+        itemId: s.itemId, streamType: s.streamType, positionTicks: Math.round(s.position() * 1e7),
+        mediaSourceId: s.mediaSourceId, audioIndex: s.audioIndex, subtitleIndex: s.subtitleIndex,
+    } : null;
 }
 
 function seekToTicks(ticks) {
@@ -2055,7 +2135,7 @@ function seekToTicks(ticks) {
 }
 
 export {
-    nowPlaying, seekToTicks,
+    nowPlaying, seekToTicks, setPlayInterceptor,
     resumePositionTicks, playWithResumeChoice, stopPlayback, seekVideo, skipTime, previewSeek, changeAudioTrack,
     changeSubtitleTrack, playItem, playerAutoHide, onPlayerClosed, playerAreaClick, closePlayer, playAdjacentEpisode,
     playUpNextNow, cancelUpNext, togglePlayPause, setVolume, toggleMute, setPlaybackRate, toggleFullscreen,

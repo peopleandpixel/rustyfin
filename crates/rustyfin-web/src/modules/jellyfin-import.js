@@ -32,7 +32,8 @@ const jiReasonKeys = {
     NotSelected: 'jellyfin_import.reason_not_selected',
     NotConfirmed: 'jellyfin_import.reason_not_confirmed',
     ConfirmedOtherAccount: 'jellyfin_import.reason_confirmed_other',
-    AccountTakenByIntoMyAccount: 'jellyfin_import.reason_taken_by_mine'
+    AccountTakenByIntoMyAccount: 'jellyfin_import.reason_taken_by_mine',
+    InvalidName: 'jellyfin_import.reason_invalid_name'
 };
 
 function jiPanelHtml() {
@@ -410,14 +411,24 @@ function jiShowProgress(st) {
     }
 }
 
-// Completed: the report and the new users' codes (the first read after completion carries them). Failed: the error.
+// The one-time codes box for the users in `users` that carry a code.
+function jiShowCodes(users) {
+    const coded = users.filter(u => u.Code);
+    $('ji-codes').innerHTML = coded.map(u => `
+        <tr><td class="py-1 pr-4 text-white">${escapeHtml(u.Name)}</td><td class="ji-code py-1 font-mono select-all text-amber-200">${escapeHtml(u.Code)}</td></tr>`).join('');
+    if (coded.length) show('ji-codes-box');
+    else hide('ji-codes-box');
+}
+
+// Completed: the report and the new users' codes (the first read after completion carries them). Failed: the error,
+// and the codes of the users the run created before it failed.
 function jiShowResult(st) {
     hide('ji-progress');
     if (st.State === 'Failed') {
         show('ji-result');
         $('ji-result-text').innerHTML = t('jellyfin_import.failed', { error: escapeHtml(st.Error) });
         $('ji-result-report').innerHTML = '';
-        hide('ji-codes-box');
+        jiShowCodes(st.CreatedUsers || []);
         hide('ji-former-admins');
         hide('ji-parental-kept');
         hide('ji-parental-unknown');
@@ -432,11 +443,7 @@ function jiShowResult(st) {
     show('ji-result');
     $('ji-result-text').innerHTML = t('jellyfin_import.done');
     $('ji-result-report').innerHTML = jiCountsHtml(r) + jiUnpairedHtml(r) + jiSamplesHtml(r) + jiUserActionsHtml(users);
-    const coded = users.filter(u => u.Code);
-    $('ji-codes').innerHTML = coded.map(u => `
-        <tr><td class="py-1 pr-4 text-white">${escapeHtml(u.Name)}</td><td class="ji-code py-1 font-mono select-all text-amber-200">${escapeHtml(u.Code)}</td></tr>`).join('');
-    if (coded.length) show('ji-codes-box');
-    else hide('ji-codes-box');
+    jiShowCodes(users);
     const admins = users.filter(u => u.Action === 'Create' && u.WasAdministrator);
     $('ji-former-admins').innerHTML = t('jellyfin_import.former_admins', { names: admins.map(u => escapeHtml(u.Name)).join(', ') });
     if (admins.length) show('ji-former-admins');

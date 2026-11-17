@@ -8,7 +8,7 @@ use serde::Deserialize;
 use std::future::Future;
 use std::path::Path;
 use std::pin::Pin;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 // ── OpenSubtitles API types ──
 
@@ -30,13 +30,17 @@ struct OsSubtitleEntry {
 
 /// OpenSubtitles subtitle provider plugin.
 pub struct OpenSubtitlesPlugin {
-    user_agent: Mutex<String>,
+    /// Shared with the registered provider, which reads the current value on each call
+    user_agent: Arc<Mutex<String>>,
 }
 
 impl Default for OpenSubtitlesPlugin {
     fn default() -> Self {
         Self {
-            user_agent: Mutex::new(format!("rustyfin/{}", env!("CARGO_PKG_VERSION"))),
+            user_agent: Arc::new(Mutex::new(format!(
+                "rustyfin/{}",
+                env!("CARGO_PKG_VERSION")
+            ))),
         }
     }
 }
@@ -286,9 +290,8 @@ pub async fn register_opensubtitles_provider<P>(plugin: &OpenSubtitlesPlugin, re
 where
     P: SubtitleProviderRegistrar,
 {
-    let user_agent = plugin.user_agent();
-    let user_agent1 = user_agent.clone();
-    let user_agent2 = user_agent.clone();
+    let user_agent1 = plugin.user_agent.clone();
+    let user_agent2 = plugin.user_agent.clone();
 
     let plugin_id = plugin.id().to_string();
     registrar
@@ -298,7 +301,7 @@ where
                   item: &MediaItem,
                   lang: &str|
                   -> Pin<Box<dyn Future<Output = Vec<SubtitleResult>> + Send>> {
-                let user_agent = user_agent1.clone();
+                let user_agent = user_agent1.lock().unwrap().clone();
                 let name = item.name.clone();
                 let year = item.production_year;
                 let lang = lang.to_string();
@@ -311,7 +314,7 @@ where
                   id: &str,
                   path: &Path|
                   -> Pin<Box<dyn Future<Output = Result<(), String>> + Send>> {
-                let user_agent = user_agent2.clone();
+                let user_agent = user_agent2.lock().unwrap().clone();
                 let id = id.to_string();
                 let path = path.to_path_buf();
                 let client = client.clone();

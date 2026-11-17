@@ -96,6 +96,12 @@ pub struct ServerConfiguration {
     /// where DLNA is an optional plugin.
     #[serde(default)]
     pub enable_dlna_server: bool,
+    /// The user the DLNA server browses as, with that user's library access and parental limits,
+    /// as the Jellyfin DLNA plugin's `DefaultUserId`. DLNA devices don't sign in, so without one
+    /// (or with a user that is gone or disabled) the DLNA server lists nothing, where the plugin
+    /// would fall back to an administrator.
+    #[serde(default)]
+    pub dlna_default_user_id: Option<String>,
     #[serde(default = "default_http_port")]
     pub public_https_port: u16,
     #[serde(default = "default_http_port")]
@@ -405,6 +411,7 @@ impl Default for ServerConfiguration {
             is_port_authorized: true,
             quick_connect_available: true,
             enable_dlna_server: false,
+            dlna_default_user_id: None,
             public_https_port: 8096,
             public_port: 8096,
             smtp_host: None,

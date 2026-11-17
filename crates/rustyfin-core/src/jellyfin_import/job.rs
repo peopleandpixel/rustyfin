@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use serde::Serialize;
 
-use super::ImportReport;
+use super::{ImportReport, UserRow};
 
 /// The state of the import job.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
@@ -38,6 +38,11 @@ pub struct ImportStatus {
     pub total: usize,
     pub result: Option<ImportReport>,
     pub error: Option<String>,
+    /// The users a failed run created before it failed, each with its one-time code (H19). Empty
+    /// while running and after a completed run, whose `result` lists them; left out of the JSON
+    /// when empty.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub created_users: Vec<UserRow>,
 }
 
 /// The server's one import job. Clones share it. `preview` gates the setup wizard's preview, which
@@ -87,19 +92,25 @@ impl ImportJob {
         })
     }
 
-    /// The job's status. The first answer that shows a completed run carries its codes; the job
-    /// forgets them then.
+    /// The job's status. The first answer that shows a finished run carries its codes: a completed
+    /// run's in `result`, a failed run's in `created_users`. The job forgets them then.
     pub fn status(&self) -> ImportStatus {
         let mut status = lock(&self.shared);
-        let answer = status.clone();
-        if status.state == JobState::Completed {
-            for user in status
-                .result
-                .iter_mut()
-                .flat_map(|report| &mut report.users)
-            {
-                user.code = None;
+        let mut answer = status.clone();
+        match status.state {
+            JobState::Running => answer.created_users.clear(),
+            JobState::Completed | JobState::Failed => {
+                let status = &mut *status;
+                for user in status
+                    .result
+                    .iter_mut()
+                    .flat_map(|report| &mut report.users)
+                    .chain(status.created_users.iter_mut())
+                {
+                    user.code = None;
+                }
             }
+            JobState::Idle => {}
         }
         answer
     }
@@ -126,20 +137,30 @@ impl JobHandle {
         lock(&self.shared).done = done;
     }
 
+    /// Records a user the run just created, with its code, so a failed run still shows it (H19).
+    pub fn created(&self, row: &UserRow) {
+        lock(&self.shared).created_users.push(row.clone());
+    }
+
     /// Ends the run with its report.
     pub fn complete(mut self, report: ImportReport) {
         self.end(JobState::Completed, Some(report), None);
     }
 
-    /// Ends the run with an error (no secrets, no codes).
+    /// Ends the run with an error (no secrets, no codes). The users created before it keep their
+    /// codes in `created_users`.
     pub fn fail(mut self, error: String) {
         self.end(JobState::Failed, None, Some(error));
     }
 
-    /// Records how the run ended. Sets `finished`, so the drop does not record a second ending.
+    /// Records how the run ended. Sets `finished`, so the drop does not record a second ending. A
+    /// completed run's report lists its created users, so `created_users` is kept only on failure.
     fn end(&mut self, state: JobState, result: Option<ImportReport>, error: Option<String>) {
         self.finished = true;
         let mut status = lock(&self.shared);
+        if result.is_some() {
+            status.created_users.clear();
+        }
         status.state = state;
         status.stage = None;
         status.result = result;

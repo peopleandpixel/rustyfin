@@ -2636,6 +2636,7 @@ dependencies = [
 name = "plugin-omdb"
 version = "0.17.0"
 dependencies = [
+ "moka",
  "reqwest",
  "rustyfin-model",
  "serde",
@@ -3479,6 +3480,7 @@ dependencies = [
  "fast_image_resize",
  "image",
  "inotify",
+ "ipnet",
  "jpeg-decoder",
  "kamadak-exif",
  "libc",
@@ -3541,6 +3543,9 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
+ "tokio",
+ "tracing",
  "unicase",
  "unicode-normalization",
  "uuid",

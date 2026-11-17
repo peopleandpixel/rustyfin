@@ -56,6 +56,7 @@ function sandbox({ config = {}, prefs = {} } = {}) {
             isAdmin: false,
             isLoggedIn: () => true,
             getLibraries: async () => LIBS,
+            getUserViews: async () => LIBS,
             getNextUp: async () => ({ Items: [{ Id: 'ep1', Type: 'Episode' }] }),
             getMe: async () => ({ Id: 'u1', Configuration: config }),
             get: async url => {

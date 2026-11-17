@@ -76,6 +76,7 @@ async fn login(
     }
     let local = is_local(&state, peer, &headers);
     crate::parental::check_sign_in(&state, &user, &device.device_id, local).await?;
+    adopt_encoded_device_id(&state, &headers, user.id, &device).await;
     let (user, token) = rustyfin_auth::issue_login_token(&state.db, user.id, &device).await?;
     Ok(Json(start_session(&state, &device, user, token).await).into_response())
 }
@@ -98,6 +99,7 @@ async fn quick_connect_sign_in(
         let local = is_local(&state, peer, &headers);
         crate::parental::check_sign_in(&state, &user, &device.device_id, local).await?;
     }
+    adopt_encoded_device_id(&state, &headers, approver, &device).await;
     let (user, token) = rustyfin_auth::authenticate_approved(&state.db, approver, &device).await?;
     Ok(Json(start_session(&state, &device, user, token).await))
 }
@@ -122,6 +124,7 @@ async fn login_with_setup_code(
     }
     let local = is_local(&state, peer, &headers);
     crate::parental::check_sign_in(&state, verified.user(), &device.device_id, local).await?;
+    adopt_encoded_device_id(&state, &headers, verified.user().id, &device).await;
     let (user, token) =
         rustyfin_auth::redeem_setup_code(&state.db, verified, &req.new_pw, &device).await?;
     Ok(Json(start_session(&state, &device, user, token).await))
@@ -132,14 +135,46 @@ fn is_local(state: &AppState, peer: SocketAddr, headers: &HeaderMap) -> bool {
     crate::middleware::resolve_client(peer.ip(), headers, &state.known_proxies).is_local()
 }
 
-/// The device of a sign-in, from its `X-Emby-Authorization` header.
+/// The device of a sign-in, from its `MediaBrowser` header, read by the same parser as every
+/// later request (`middleware::media_browser_header`), so the stored device name and id match
+/// what those requests state. Fields the header lacks are empty.
 pub(crate) fn token_device(headers: &HeaderMap) -> rustyfin_auth::TokenDevice {
-    let (client, version, device, device_id) = parse_emby_auth(headers);
+    let auth = crate::middleware::media_browser_header(headers).unwrap_or_default();
     rustyfin_auth::TokenDevice {
-        device_id,
-        device_name: device,
-        app_name: client,
-        app_version: version,
+        device_id: auth.device_id.unwrap_or_default(),
+        device_name: auth.device.unwrap_or_default(),
+        app_name: auth.client.unwrap_or_default(),
+        app_version: auth.version.unwrap_or_default(),
+    }
+}
+
+/// Sign-in once stored the `DeviceId` as the client sent it, without URL-decoding it. When this
+/// sign-in's id was sent encoded, the user's sessions, tokens and device stored under the encoded
+/// form move to the decoded id first, so the sign-in finds its session (and replaces its token)
+/// instead of starting a second one. A failure is logged and the sign-in goes on.
+async fn adopt_encoded_device_id(
+    state: &AppState,
+    headers: &HeaderMap,
+    user_id: Uuid,
+    device: &rustyfin_auth::TokenDevice,
+) {
+    let Some(as_sent) =
+        crate::middleware::media_browser_header(headers).and_then(|auth| auth.device_id_as_sent)
+    else {
+        return;
+    };
+    if as_sent.is_empty() || device.device_id.is_empty() || as_sent == device.device_id {
+        return;
+    }
+    if let Err(e) = rustyfin_db::repo_session::rename_user_device(
+        &state.db,
+        user_id,
+        &as_sent,
+        &device.device_id,
+    )
+    .await
+    {
+        tracing::warn!("Could not move the user's encoded device id to its decoded form: {e}");
     }
 }
 
@@ -150,21 +185,28 @@ pub(crate) async fn start_session(
     user: User,
     token: String,
 ) -> AuthResponse {
-    // A user keeps their session on a device across sign-ins. Another user signing in with the
-    // same device id gets a session of their own, never this one.
+    // A user keeps their session of a client on a device across sign-ins. Another user, or another
+    // client, signing in with the same device id gets a session of its own, never this one.
     let existing = match device.device_id.as_str() {
         "" => None,
-        id => rustyfin_db::repo_session::find_device_session(&state.db, user.id, id)
-            .await
-            .ok()
-            .flatten(),
-    };
-    // The user's other sessions on the device are replaced below; their play state goes with them
-    if !device.device_id.is_empty() {
-        let ids = rustyfin_db::repo_session::session_ids(
+        id => rustyfin_db::repo_session::find_device_session(
             &state.db,
-            Some(user.id),
-            Some(&device.device_id),
+            user.id,
+            id,
+            Some(&device.app_name),
+        )
+        .await
+        .ok()
+        .flatten(),
+    };
+    // The user's other sessions of this client on the device are replaced below; their play state
+    // goes with them
+    if !device.device_id.is_empty() {
+        let ids = rustyfin_db::repo_session::app_session_ids(
+            &state.db,
+            user.id,
+            &device.device_id,
+            &device.app_name,
         )
         .await
         .unwrap_or_default();
@@ -253,148 +295,96 @@ pub(crate) async fn start_session(
     }
 }
 
-/// Parst den `X-Emby-Authorization`/`Authorization` Header.
-/// Format: `MediaBrowser Client="...", Device="...", DeviceId="...", Version="...", Token="..."`
-fn parse_emby_auth(headers: &HeaderMap) -> (String, String, String, String) {
-    let raw = headers
-        .get("X-Emby-Authorization")
-        .or_else(|| headers.get("x-emby-authorization"))
-        .or_else(|| headers.get("Authorization"))
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("");
-    let mut client = String::new();
-    let mut version = String::new();
-    let mut device = String::new();
-    let mut device_id = String::new();
-    for part in raw.split(',') {
-        let part = part.trim();
-        let part = part.strip_prefix("MediaBrowser").unwrap_or(part).trim();
-        if let Some((k, v)) = part.split_once('=') {
-            let val = v.trim().trim_matches('"').to_string();
-            match k.trim() {
-                "Client" => client = val,
-                "Device" => device = val,
-                "DeviceId" => device_id = val,
-                "Version" => version = val,
-                _ => {}
-            }
-        }
-    }
-    (client, version, device, device_id)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use axum::http::HeaderMap;
 
+    fn device(headers: &[(&'static str, &str)]) -> rustyfin_auth::TokenDevice {
+        let mut map = HeaderMap::new();
+        for (name, value) in headers {
+            map.insert(*name, value.parse().unwrap());
+        }
+        token_device(&map)
+    }
+
+    /// Sign-in reads the header like every later request: a comma inside quotes belongs to the
+    /// value, and values are URL-decoded (`+` and `%XX`).
     #[test]
-    fn test_parse_emby_auth_full() {
-        let mut headers = HeaderMap::new();
-        headers.insert(
+    fn r3security_sign_in_parses_quoted_commas_and_encoded_values() {
+        let d = device(&[(
             "X-Emby-Authorization",
-            "MediaBrowser Client=\"Jellyfin MPV\", Device=\"MPV\", DeviceId=\"test123\", Version=\"1.0.0\", Token=\"abc\""
-                .parse()
-                .unwrap(),
+            r#"MediaBrowser Client="App, Inc", Device="My%20Phone, 2", DeviceId="a%2Bb%3D%26", Version="1.0+beta""#,
+        )]);
+        assert_eq!(d.app_name, "App, Inc");
+        assert_eq!(d.device_name, "My Phone, 2");
+        assert_eq!(d.device_id, "a+b=&");
+        assert_eq!(d.app_version, "1.0 beta");
+        // Non-ASCII, URL-encoded as Jellyfin clients send it
+        let d = device(&[(
+            "Authorization",
+            r#"MediaBrowser Client="Gr%C3%B6%C3%9Fe", DeviceId="d1""#,
+        )]);
+        assert_eq!(d.app_name, "Größe");
+        assert_eq!(d.device_id, "d1");
+    }
+
+    /// What sign-in stores is what the middleware states for the request's device, for the same
+    /// header, so later requests find the session they signed in with.
+    #[test]
+    fn r3security_sign_in_and_middleware_read_the_same_device() {
+        let header =
+            r#"MediaBrowser Client="A, B", Device="C%2CD", DeviceId="x+y", Version="2", Token="t""#;
+        let mut map = HeaderMap::new();
+        map.insert("Authorization", header.parse().unwrap());
+        let signed_in = token_device(&map);
+        let auth = crate::middleware::media_browser_header(&map).unwrap();
+        assert_eq!(Some(signed_in.device_id), auth.device_id);
+        assert_eq!(Some(signed_in.device_name), auth.device);
+        assert_eq!(Some(signed_in.app_name), auth.client);
+        assert_eq!(Some(signed_in.app_version), auth.version);
+    }
+
+    /// `Authorization` comes first, as in Jellyfin's `AuthorizationContext`; a `Bearer` value there
+    /// leaves `X-Emby-Authorization` to name the device. Another scheme names none.
+    #[test]
+    fn r3security_sign_in_header_order_and_scheme() {
+        let d = device(&[
+            ("X-Emby-Authorization", r#"MediaBrowser Client="Emby""#),
+            ("Authorization", r#"MediaBrowser Client="Auth""#),
+        ]);
+        assert_eq!(d.app_name, "Auth");
+        let d = device(&[
+            ("Authorization", "Bearer abc"),
+            ("X-Emby-Authorization", r#"Emby Client="Emby""#),
+        ]);
+        assert_eq!(d.app_name, "Emby");
+        assert_eq!(
+            device(&[("Authorization", r#"Client="NoScheme""#)]).app_name,
+            ""
         );
-        let (client, version, device, device_id) = parse_emby_auth(&headers);
-        assert_eq!(client, "Jellyfin MPV");
-        assert_eq!(version, "1.0.0");
-        assert_eq!(device, "MPV");
-        assert_eq!(device_id, "test123");
+        assert_eq!(device(&[]).device_id, "");
     }
 
     #[test]
-    fn test_parse_emby_auth_lowercase_header() {
-        let mut headers = HeaderMap::new();
-        headers.insert(
+    fn test_token_device_full_and_partial() {
+        let d = device(&[(
             "x-emby-authorization",
-            "MediaBrowser Client=\"Test\", Device=\"Dev\", DeviceId=\"d1\", Version=\"2.0\""
-                .parse()
-                .unwrap(),
-        );
-        let (client, version, device, device_id) = parse_emby_auth(&headers);
-        assert_eq!(client, "Test");
-        assert_eq!(device, "Dev");
-        assert_eq!(device_id, "d1");
-        assert_eq!(version, "2.0");
-    }
-
-    #[test]
-    fn test_parse_emby_auth_authorization_fallback() {
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            "Authorization",
-            "MediaBrowser Client=\"Fallback\", Device=\"Dev\", DeviceId=\"d1\", Version=\"1.0\""
-                .parse()
-                .unwrap(),
-        );
-        let (client, _version, device, _device_id) = parse_emby_auth(&headers);
-        assert_eq!(client, "Fallback");
-        assert_eq!(device, "Dev");
-    }
-
-    #[test]
-    fn test_parse_emby_auth_partial_fields() {
-        let mut headers = HeaderMap::new();
-        headers.insert(
+            r#"MediaBrowser Client="Jellyfin MPV", Device="MPV", DeviceId="test123", Version="1.0.0", Token="abc""#,
+        )]);
+        assert_eq!(d.app_name, "Jellyfin MPV");
+        assert_eq!(d.app_version, "1.0.0");
+        assert_eq!(d.device_name, "MPV");
+        assert_eq!(d.device_id, "test123");
+        let d = device(&[(
             "X-Emby-Authorization",
-            "MediaBrowser Client=\"OnlyClient\"".parse().unwrap(),
+            r#"MediaBrowser Client="OnlyClient""#,
+        )]);
+        assert_eq!(d.app_name, "OnlyClient");
+        assert_eq!(
+            (d.app_version, d.device_name, d.device_id),
+            Default::default()
         );
-        let (client, version, device, device_id) = parse_emby_auth(&headers);
-        assert_eq!(client, "OnlyClient");
-        assert_eq!(version, "");
-        assert_eq!(device, "");
-        assert_eq!(device_id, "");
-    }
-
-    #[test]
-    fn test_parse_emby_auth_empty_header() {
-        let mut headers = HeaderMap::new();
-        headers.insert("X-Emby-Authorization", "".parse().unwrap());
-        let (client, version, device, device_id) = parse_emby_auth(&headers);
-        assert_eq!(client, "");
-        assert_eq!(version, "");
-        assert_eq!(device, "");
-        assert_eq!(device_id, "");
-    }
-
-    #[test]
-    fn test_parse_emby_auth_missing_header() {
-        let headers = HeaderMap::new();
-        let (client, version, device, device_id) = parse_emby_auth(&headers);
-        assert_eq!(client, "");
-        assert_eq!(version, "");
-        assert_eq!(device, "");
-        assert_eq!(device_id, "");
-    }
-
-    #[test]
-    fn test_parse_emby_auth_without_mediabrowser_prefix() {
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            "X-Emby-Authorization",
-            "Client=\"NoPrefix\", Device=\"Dev\", DeviceId=\"d1\", Version=\"1.0\""
-                .parse()
-                .unwrap(),
-        );
-        let (client, _version, device, _device_id) = parse_emby_auth(&headers);
-        assert_eq!(client, "NoPrefix");
-        assert_eq!(device, "Dev");
-    }
-
-    #[test]
-    fn test_parse_emby_auth_x_emby_wins_over_authorization() {
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            "X-Emby-Authorization",
-            "MediaBrowser Client=\"EmbyHeader\"".parse().unwrap(),
-        );
-        headers.insert(
-            "Authorization",
-            "MediaBrowser Client=\"AuthHeader\"".parse().unwrap(),
-        );
-        let (client, _version, _device, _device_id) = parse_emby_auth(&headers);
-        assert_eq!(client, "EmbyHeader");
+        assert_eq!(device(&[("X-Emby-Authorization", "")]).app_name, "");
     }
 }

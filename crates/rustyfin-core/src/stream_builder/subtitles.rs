@@ -15,6 +15,7 @@ use super::{
     PlayMethod, SourceFacts, StreamFacts, StreamKind, StreamRequest, SubtitleDelivery,
     TranscodeReason, TranscodeReasons,
 };
+use crate::query_string::{QueryBuilder, encode_component};
 use crate::subtitle::is_image_subtitle;
 
 /// The profile format that some FFmpeg subtitle codecs are also known by.
@@ -260,11 +261,11 @@ pub(super) fn deliveries(
     } else {
         0
     };
-    let key = if request.access_token.is_empty() {
-        String::new()
-    } else {
-        format!("?ApiKey={}", request.access_token)
-    };
+    // Every part is percent-encoded, so a `&` or `#` in the token or an id can't change the URL
+    let mut key = QueryBuilder::new();
+    if !request.access_token.is_empty() {
+        key.pair("ApiKey", &request.access_token);
+    }
 
     source
         .streams
@@ -280,10 +281,13 @@ pub(super) fn deliveries(
             );
             let url = (method == SubtitleDeliveryMethod::External).then(|| {
                 let format = external_format(stream, &profile.subtitle_profiles).unwrap_or("vtt");
-                format!(
-                    "/Videos/{}/{}/Subtitles/{}/{ticks}/Stream.{format}{key}",
-                    request.item_id, source.id, stream.index
-                )
+                key.url(&format!(
+                    "/Videos/{}/{}/Subtitles/{}/{ticks}/Stream.{}",
+                    encode_component(&request.item_id),
+                    encode_component(&source.id),
+                    stream.index,
+                    encode_component(format),
+                ))
             });
             SubtitleDelivery {
                 index: stream.index,

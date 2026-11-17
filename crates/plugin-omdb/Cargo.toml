@@ -14,4 +14,5 @@ rustyfin-model = { workspace = true }
 reqwest = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+moka = { workspace = true }
 tracing = { workspace = true }

@@ -2,7 +2,7 @@
 <html lang="de" data-theme="dark" class="h-full">
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
     <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
     <meta http-equiv="Pragma" content="no-cache">
     <meta http-equiv="Expires" content="0">
@@ -328,8 +328,8 @@
         <a class="flex items-center gap-2.5 cursor-pointer select-none group" onclick="navigate('home')">
             <img src="/web/assets/logo.png" alt="Rustyfin" class="w-8 h-8 rounded-lg shadow-md transition-transform group-hover:scale-105">
             <div class="flex items-center gap-1.5">
-                <span class="text-base font-bold tracking-tight text-white group-hover:text-[#00a4dc] transition-colors">Rustyfin</span>
-                <span id="version-badge" class="text-[10px] font-semibold px-1.5 py-0.5 rounded bg-white/10 text-white/50 tracking-wider">...</span>
+                <span class="max-sm:hidden text-base font-bold tracking-tight text-white group-hover:text-[#00a4dc] transition-colors">Rustyfin</span>
+                <span id="version-badge" class="max-sm:hidden text-[10px] font-semibold px-1.5 py-0.5 rounded bg-white/10 text-white/50 tracking-wider">...</span>
             </div>
         </a>
     </div>
@@ -346,13 +346,17 @@
 
     <!-- Right Actions -->
     <div class="flex items-center gap-2 flex-shrink-0">
+        <!-- Google Cast: shown once a Cast device is found (cast.js) -->
+        <button id="nav-cast" class="hidden jf-icon-btn" title="Play on" aria-label="Play on" data-i18n-title="remote.play_on" data-i18n-aria-label="remote.play_on" onclick="openPlayOn()">
+            <i data-lucide="cast" class="w-5 h-5"></i>
+        </button>
         <!-- Quick Connect badge -->
         <button id="nav-quick-connect" class="hidden sm:inline-flex jf-icon-btn !w-auto px-2.5 text-xs text-white/60 hover:text-white" title="Quick Connect" aria-label="Quick Connect" data-i18n-title="quick_connect.title" data-i18n-aria-label="quick_connect.title" onclick="showQuickConnectModal()">
             <i data-lucide="smartphone" class="w-4 h-4 mr-1 text-[#00a4dc]"></i>
             <span data-i18n="nav.connect">Connect</span>
         </button>
 
-        <button id="nav-add-lib" class="hidden jf-btn-primary !py-1.5 !px-3 text-xs flex items-center gap-1.5" title="Add a new library" data-i18n-title="nav.add_new_library" onclick="openAddLibrary()">
+        <button id="nav-add-lib" class="hidden max-sm:!hidden jf-btn-primary !py-1.5 !px-3 text-xs flex items-center gap-1.5" title="Add a new library" data-i18n-title="nav.add_new_library" onclick="openAddLibrary()">
             <span class="text-sm leading-none font-bold">＋</span>
             <span class="hidden md:inline" data-i18n="common.library">Library</span>
         </button>
@@ -381,7 +385,30 @@
                         <span data-i18n="nav.server_dashboard">Server Dashboard</span>
                     </a>
                 </div>
+                <!-- The Jellyfin Android app's own screens (modules/nativeshell.js shows the ones it offers) -->
+                <div id="native-menu" class="hidden border-t border-white/10 py-1">
+                    <a class="hidden jf-menu-item flex items-center gap-2" data-native-feature="clientsettings" onclick="nativeShellCommand('clientsettings');closeUserMenu()">
+                        <i data-lucide="smartphone" class="w-4 h-4 text-white/50"></i>
+                        <span data-i18n="native.client_settings">Client Settings</span>
+                    </a>
+                    <a class="hidden jf-menu-item flex items-center gap-2" data-native-feature="downloadmanagement" onclick="nativeShellCommand('downloadmanagement');closeUserMenu()">
+                        <i data-lucide="download" class="w-4 h-4 text-white/50"></i>
+                        <span data-i18n="native.downloads">Downloads</span>
+                    </a>
+                    <a class="hidden jf-menu-item flex items-center gap-2" data-native-feature="multiserver" onclick="nativeShellCommand('multiserver');closeUserMenu()">
+                        <i data-lucide="server" class="w-4 h-4 text-white/50"></i>
+                        <span data-i18n="native.select_server">Select Server</span>
+                    </a>
+                    <a class="hidden jf-menu-item flex items-center gap-2" data-native-feature="exitmenu" onclick="nativeShellCommand('exitmenu')">
+                        <i data-lucide="power" class="w-4 h-4 text-white/50"></i>
+                        <span data-i18n="native.exit">Exit</span>
+                    </a>
+                </div>
                 <div class="border-t border-white/10 py-1">
+                    <a class="jf-menu-item flex items-center gap-2" onclick="switchUser()">
+                        <i data-lucide="users" class="w-4 h-4 text-white/50"></i>
+                        <span data-i18n="nav.switch_user">Switch user</span>
+                    </a>
                     <a class="jf-menu-item text-red-400 hover:text-red-300 flex items-center gap-2" onclick="doLogout()">
                         <i data-lucide="log-out" class="w-4 h-4"></i>
                         <span data-i18n="nav.sign_out">Sign Out</span>
@@ -397,7 +424,7 @@
 <!-- Main Workspace Layout -->
 <div class="flex flex-1 overflow-hidden relative">
     <!-- Desktop Sidebar -->
-    <aside id="sidebar" class="jf-drawer w-64 min-h-full overflow-y-auto hidden lg:block flex-shrink-0 p-3">
+    <aside id="sidebar" class="jf-drawer jf-sidebar-desktop w-64 min-h-full overflow-y-auto flex-shrink-0 p-3">
         <div class="space-y-6">
             <!-- Main navigation -->
             <div>
@@ -442,7 +469,7 @@
 
     <!-- Mobile sidebar overlay & off-canvas drawer -->
     <div id="sidebar-overlay" class="hidden fixed inset-0 bg-black/70 backdrop-blur-sm z-40 lg:hidden" onclick="toggleSidebar()"></div>
-    <aside id="sidebar-mobile" class="jf-drawer fixed left-0 top-16 bottom-0 w-64 z-50 overflow-y-auto hidden lg:hidden transform -translate-x-full transition-transform duration-200 ease-out p-4">
+    <aside id="sidebar-mobile" class="jf-drawer jf-drawer-mobile fixed left-0 top-16 bottom-0 z-50 overflow-y-auto hidden lg:hidden p-4">
         <div id="sidebar-mobile-content"></div>
     </aside>
 
@@ -833,7 +860,7 @@
 
 <!-- Library Options Modal -->
 <dialog id="library-options-modal" class="modal bg-black/70 backdrop-blur-md">
-    <div class="modal-box max-w-md jf-menu rounded-2xl p-6">
+    <div class="modal-box max-w-2xl max-h-[85vh] overflow-y-auto jf-menu rounded-2xl p-6">
         <div class="flex items-center justify-between mb-4 border-b border-white/10 pb-3">
             <h3 class="text-base font-bold text-white flex items-center gap-2">
                 <span class="w-2 h-2 rounded-full bg-[#00a4dc]"></span>
@@ -844,6 +871,7 @@
         <form id="library-options-form" onsubmit="submitLibraryOptions(event)" class="space-y-4">
             <input type="hidden" name="libraryId">
             <div id="library-options-images" class="space-y-3"></div>
+            <div id="library-options-more" class="space-y-3"></div>
             <div class="flex justify-end gap-2 pt-3 border-t border-white/10">
                 <button type="button" onclick="closeLibraryOptions()" class="jf-btn-ghost text-xs" data-i18n="common.cancel">Cancel</button>
                 <button type="submit" id="library-options-submit" class="jf-btn-primary text-xs" data-i18n="library.options_save">Save</button>
@@ -921,6 +949,7 @@
                     <input id="plugin-config-key" type="password" autocomplete="new-password" autocapitalize="off" spellcheck="false" data-1p-ignore data-lpignore="true" class="jf-input w-full">
                     <label id="plugin-config-key-clear-row" class="flex items-center gap-2 mt-1 text-xs text-white/70"><input id="plugin-config-key-clear" type="checkbox" class="checkbox checkbox-xs"> <span data-i18n="settings.key_clear">Remove saved key</span></label>
                 </div>
+                <div id="plugin-config-episodes" class="hidden space-y-3"></div>
                 <label class="flex items-center gap-2 text-xs text-white/70"><input id="plugin-config-enabled" type="checkbox" class="checkbox checkbox-xs"> <span data-i18n="admin.plugin_enabled">Enabled</span></label>
             </div>
             <div id="plugin-config-json-block">
@@ -995,6 +1024,9 @@
         <button id="now-playing-next" type="button" class="jf-icon-btn disabled:opacity-40" onclick="playAdjacentEpisode(1)" title="Next" aria-label="Next" data-i18n-title="player.next_item" data-i18n-aria-label="player.next_item" hidden>
             <i data-lucide="skip-forward" class="w-5 h-5"></i>
         </button>
+        <button id="now-playing-lyrics" type="button" class="jf-icon-btn" onclick="toggleLyrics()" aria-pressed="false" title="Lyrics" aria-label="Lyrics" data-i18n-title="player.lyrics" data-i18n-aria-label="player.lyrics" hidden>
+            <i data-lucide="mic-vocal" class="w-5 h-5"></i>
+        </button>
         <button type="button" class="jf-icon-btn max-sm:hidden" onclick="openFullPlayer()" title="Open player" aria-label="Open player" data-i18n-title="player.open_player" data-i18n-aria-label="player.open_player">
             <i data-lucide="maximize" class="w-5 h-5"></i>
         </button>
@@ -1003,6 +1035,17 @@
         </button>
     </div>
 </div>
+
+<!-- The music player's lyrics (lyrics.js), over the now-playing bar -->
+<aside id="lyrics-panel" class="jf-lyrics-panel" aria-label="Lyrics" data-i18n-aria-label="player.lyrics" hidden>
+    <div class="flex items-center justify-between mb-2">
+        <h2 class="text-sm font-semibold text-white" data-i18n="player.lyrics">Lyrics</h2>
+        <button type="button" class="jf-icon-btn !w-8 !h-8" onclick="toggleLyrics(false)" title="Close" aria-label="Close" data-i18n-title="common.close" data-i18n-aria-label="common.close">
+            <i data-lucide="x" class="w-4 h-4"></i>
+        </button>
+    </div>
+    <div id="lyrics-body" class="jf-lyrics-body"></div>
+</aside>
 
 <!-- Are you still watching? Before the next episode, after a long run (the player's settings menu turns it on) -->
 <dialog id="still-watching" class="modal bg-black/70 backdrop-blur-md">
@@ -1020,10 +1063,13 @@
 
 <script type="module" src="./main.js"></script>
 <script src="/web/assets/hls.min.js"></script>
+<!-- Lets the Jellyfin Android app add its bridge (public/main.jellyfin.bundle.js, modules/nativeshell.js) -->
+<script src="/web/main.jellyfin.bundle.js"></script>
 <script src="./api.js"></script>
 <script type="module" src="./app.js"></script>
 <script>
-if('serviceWorker' in navigator){
+// Not in the Jellyfin Android app: its WebView sees no request a service worker answers
+if('serviceWorker' in navigator && !window.NativeInterface){
   window.addEventListener('load',()=>{
     navigator.serviceWorker.register('/web/sw.js?v=__CACHE_VERSION__').then(function(reg){
       // Check for updates on every load

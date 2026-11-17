@@ -66,6 +66,8 @@ pub struct AudioTags {
     pub album_art: Option<Vec<u8>>,
     /// MIME type of the album art
     pub album_art_mime: Option<String>,
+    /// The lyrics tag (ID3 USLT, Vorbis LYRICS, MP4 ©lyr), see [`crate::lyrics::lyrics_tag`].
+    pub lyrics: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -361,6 +363,7 @@ pub fn add_external_subtitles(
             codec: Some(external_subtitle_codec(&file.format)),
             codec_type: "subtitle".to_string(),
             language: file.language,
+            is_forced: file.forced,
             is_external: true,
             path: Some(file.path.to_string_lossy().into_owned()),
             r#type: MediaStream::stream_type("subtitle", None),
@@ -372,7 +375,7 @@ pub fn add_external_subtitles(
 /// Probes `path` with ffprobe: its embedded streams, format, tags and chapters, in one run at a
 /// low CPU priority.
 async fn probe_streams(path: &str) -> Result<ProbeResult, ProbeError> {
-    let mut cmd = Command::new("ffprobe");
+    let mut cmd = Command::new(crate::media_tools::ffprobe());
     cmd.args([
         "-v",
         "quiet",
@@ -586,6 +589,7 @@ fn extract_audio_tags(
         comment: get("comment"),
         album_art,
         album_art_mime,
+        lyrics: crate::lyrics::lyrics_tag(tags),
     })
 }
 
@@ -625,7 +629,7 @@ fn extract_album_art(streams: &[FfprobeStream]) -> (Option<Vec<u8>>, Option<Stri
 
 /// Reads the chapter markers of a media file with ffprobe; none when it can't.
 pub(crate) async fn read_chapters(path: &str) -> Vec<Chapter> {
-    read_chapters_with("ffprobe", path, CHAPTER_READ_TIMEOUT).await
+    read_chapters_with(&crate::media_tools::ffprobe(), path, CHAPTER_READ_TIMEOUT).await
 }
 
 /// The longest one chapter read may take, so a stalled file can't hold up the re-read list.
@@ -634,7 +638,7 @@ const CHAPTER_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs
 /// `read_chapters` with the ffprobe `program` and a `timeout`, after which ffprobe is killed and
 /// no chapters are given.
 async fn read_chapters_with(
-    program: &str,
+    program: &std::path::Path,
     path: &str,
     timeout: std::time::Duration,
 ) -> Vec<Chapter> {
@@ -1036,6 +1040,17 @@ async fn probe_and_write(
     match probe {
         Ok(result) => {
             if as_primary {
+                // Jellyfin's audio probe keeps a track's lyrics tag as its lyrics
+                // (`AudioFileProber`), which its HasLyrics shows.
+                let embedded = result
+                    .audio_tags
+                    .as_ref()
+                    .is_some_and(|tags| tags.lyrics.is_some());
+                if let Err(e) =
+                    rustyfin_db::repo_lyrics::set_embedded(pool, *item_id, embedded).await
+                {
+                    warn!("failed to record the lyrics tag of '{}': {}", path, e);
+                }
                 save_runtime_and_chapters(
                     pool,
                     item_id,
@@ -1246,7 +1261,7 @@ pub fn spawn_probe_plan(
 
 /// True when `ffprobe -version` runs and exits 0.
 pub async fn ffprobe_runs() -> bool {
-    Command::new("ffprobe")
+    Command::new(crate::media_tools::ffprobe())
         .arg("-version")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -1718,12 +1733,8 @@ mod tests {
         std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
 
         let started = std::time::Instant::now();
-        let got = read_chapters_with(
-            fake.to_str().unwrap(),
-            "/no/such.mkv",
-            std::time::Duration::from_millis(300),
-        )
-        .await;
+        let got =
+            read_chapters_with(&fake, "/no/such.mkv", std::time::Duration::from_millis(300)).await;
         assert!(got.is_empty());
         assert!(started.elapsed() < std::time::Duration::from_secs(5));
         let _ = std::fs::remove_dir_all(&dir);

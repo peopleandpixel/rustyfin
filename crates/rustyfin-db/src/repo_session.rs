@@ -132,19 +132,24 @@ pub async fn get_active_sessions(pool: &SqlitePool) -> Result<Vec<SessionInfo>, 
     Ok(sessions)
 }
 
-/// The session of `user_id` on `device_id`, if it has one. A session belongs to a user and a
-/// device together, so another user signing in with the same device id gets a session of their own.
+/// The session of `user_id` on `device_id` in the client `app_name` (any client when `None`), if
+/// it has one. As in Jellyfin 12.4 (`SessionManager.GetSessionKey`), a session is keyed by the
+/// client, the device and the user together: another user, or another client, with the same
+/// device id gets a session of its own, so no one takes over another user's session by naming its
+/// device.
 pub async fn find_device_session(
     pool: &SqlitePool,
     user_id: Uuid,
     device_id: &str,
+    app_name: Option<&str>,
 ) -> Result<Option<String>, sqlx::Error> {
     sqlx::query_scalar(
-        "SELECT id FROM sessions WHERE user_id = ?1 AND device_id = ?2
+        "SELECT id FROM sessions WHERE user_id = ?1 AND device_id = ?2 AND (?3 IS NULL OR app_name = ?3)
          ORDER BY last_activity DESC LIMIT 1",
     )
     .bind(user_id.to_string())
     .bind(device_id)
+    .bind(app_name)
     .fetch_optional(pool)
     .await
 }
@@ -163,6 +168,52 @@ pub async fn session_ids(
     .bind(device_id)
     .fetch_all(pool)
     .await
+}
+
+/// The ids of the sessions of client `app_name` that `user_id` has on `device_id`: the ones a
+/// sign-in of that client on the device replaces.
+pub async fn app_session_ids(
+    pool: &SqlitePool,
+    user_id: Uuid,
+    device_id: &str,
+    app_name: &str,
+) -> Result<Vec<String>, sqlx::Error> {
+    sqlx::query_scalar(
+        "SELECT id FROM sessions WHERE user_id = ?1 AND device_id = ?2 AND app_name = ?3",
+    )
+    .bind(user_id.to_string())
+    .bind(device_id)
+    .bind(app_name)
+    .fetch_all(pool)
+    .await
+}
+
+/// The sessions that the token with hash `token_hash` made for other devices than its own, the
+/// least recently active first.
+pub async fn token_sessions(
+    pool: &SqlitePool,
+    token_hash: &str,
+) -> Result<Vec<String>, sqlx::Error> {
+    sqlx::query_scalar(
+        "SELECT id FROM sessions WHERE via_token = ?1 ORDER BY last_activity ASC, created_at ASC, id ASC",
+    )
+    .bind(token_hash)
+    .fetch_all(pool)
+    .await
+}
+
+/// Records that the token with hash `token_hash` made the session: the session ends with it.
+pub async fn set_session_token(
+    pool: &SqlitePool,
+    session_id: &str,
+    token_hash: &str,
+) -> Result<(), sqlx::Error> {
+    sqlx::query("UPDATE sessions SET via_token = ?2 WHERE id = ?1")
+        .bind(session_id)
+        .bind(token_hash)
+        .execute_write(pool)
+        .await?;
+    Ok(())
 }
 
 /// The device id of each session `user_id` has, one entry per session.
@@ -258,6 +309,47 @@ pub async fn cleanup_expired_sessions(
     Ok(result.rows_affected())
 }
 
+/// Moves `user_id`'s sessions, access tokens and device stored under device id `from` to `to`,
+/// in one transaction. Sign-in once stored a device id as the client sent it (URL-encoded); this
+/// lets a later sign-in with the decoded id find them. A device row that `to` already has wins,
+/// and the `from` one is removed. Returns how many sessions moved.
+pub async fn rename_user_device(
+    pool: &SqlitePool,
+    user_id: Uuid,
+    from: &str,
+    to: &str,
+) -> Result<u64, sqlx::Error> {
+    let uid = user_id.to_string();
+    let mut tx = crate::begin_write(pool).await?;
+    let moved =
+        sqlx::query("UPDATE sessions SET device_id = ?1 WHERE user_id = ?2 AND device_id = ?3")
+            .bind(to)
+            .bind(&uid)
+            .bind(from)
+            .execute(&mut *tx)
+            .await?
+            .rows_affected();
+    sqlx::query("UPDATE access_tokens SET device_id = ?1 WHERE user_id = ?2 AND device_id = ?3")
+        .bind(to)
+        .bind(&uid)
+        .bind(from)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("UPDATE OR IGNORE devices SET id = ?1 WHERE user_id = ?2 AND id = ?3")
+        .bind(to)
+        .bind(&uid)
+        .bind(from)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("DELETE FROM devices WHERE user_id = ?1 AND id = ?2")
+        .bind(&uid)
+        .bind(from)
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    Ok(moved)
+}
+
 // ── Devices ──
 
 pub async fn upsert_device(
@@ -338,14 +430,18 @@ pub async fn create_session(
 ) -> Result<(), sqlx::Error> {
     let sid = session_id.to_string();
     let uid = user_id.to_string();
-    // One session per user and device: a sign-in replaces that user's older sessions on the device
+    // One session per client, device and user (Jellyfin 12.4's session key): a sign-in replaces
+    // that user's older sessions of the same client on the device
     if !device_id.is_empty() {
-        sqlx::query("DELETE FROM sessions WHERE user_id = ?1 AND device_id = ?2 AND id != ?3")
-            .bind(&uid)
-            .bind(device_id)
-            .bind(&sid)
-            .execute_write(pool)
-            .await?;
+        sqlx::query(
+            "DELETE FROM sessions WHERE user_id = ?1 AND device_id = ?2 AND app_name = ?4 AND id != ?3",
+        )
+        .bind(&uid)
+        .bind(device_id)
+        .bind(&sid)
+        .bind(client)
+        .execute_write(pool)
+        .await?;
     }
     sqlx::query(
         "INSERT INTO sessions (id, user_id, device_id, device_name, app_name, app_version, last_activity, capabilities)

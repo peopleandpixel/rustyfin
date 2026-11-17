@@ -73,6 +73,61 @@ body {
   }
 }
 
+/* Phones: the desktop sidebar is hidden below lg (64rem); the mobile drawer slides by a class, not a
+   Tailwind translate utility. The header keeps clear of the notch (viewport-fit=cover). */
+.jf-sidebar-desktop {
+  display: none;
+}
+@media (width >= 64rem) {
+  .jf-sidebar-desktop {
+    display: block;
+  }
+}
+
+.jf-drawer-mobile {
+  transform: translateX(-100%);
+  transition: transform 0.2s ease-out;
+  width: min(80vw, 280px);
+  padding-bottom: max(1rem, env(safe-area-inset-bottom));
+}
+.jf-drawer-mobile.is-open {
+  transform: none;
+}
+
+/* Same paddings as the header's px-3 / lg:px-6, plus the notch insets (these rules win over utilities) */
+.jf-header {
+  padding-left: max(0.75rem, env(safe-area-inset-left));
+  padding-right: max(0.75rem, env(safe-area-inset-right));
+}
+@media (width >= 64rem) {
+  .jf-header {
+    padding-left: max(1.5rem, env(safe-area-inset-left));
+    padding-right: max(1.5rem, env(safe-area-inset-right));
+  }
+}
+
+/* Touch screens get a 44px-high search field */
+@media (pointer: coarse) {
+  .jf-search {
+    min-height: 2.75rem;
+  }
+}
+
+/* touch: shared buttons, tabs and selects get 44px targets; checkboxes and radios get 20px */
+@media (pointer: coarse) {
+  .jf-btn-ghost, .jf-btn-primary, .jf-btn-secondary, .jf-tab, select.jf-input {
+    min-height: 2.75rem;
+  }
+  .jf-icon-btn {
+    min-width: 2.75rem;
+    min-height: 2.75rem;
+  }
+  input[type=checkbox]:not(.toggle), input[type=radio] {
+    width: 1.25rem;
+    height: 1.25rem;
+  }
+}
+
 .jf-drawer-item {
   display: flex;
   align-items: center;
@@ -110,16 +165,19 @@ body {
   transition: transform 0.25s cubic-bezier(0.16, 1, 0.3, 1), box-shadow 0.25s ease, border-color 0.25s ease;
 }
 
-.jf-card:hover {
-  transform: translateY(-6px) scale(1.02);
-  box-shadow: 0 16px 36px -10px rgba(0, 0, 0, 0.8), 0 0 20px -3px var(--jf-primary-glow);
-  border-color: var(--jf-border-hover);
+/* touch: the hover lift is for a mouse only, so a tap leaves no card lifted */
+@media (hover: hover) {
+  .jf-card:hover {
+    transform: translateY(-6px) scale(1.02);
+    box-shadow: 0 16px 36px -10px rgba(0, 0, 0, 0.8), 0 0 20px -3px var(--jf-primary-glow);
+    border-color: var(--jf-border-hover);
+  }
 }
 
 /* Library grid. Columns and gap are set here, not with Tailwind classes, because the virtual grid
    reads them to place its cells. Breakpoints are Tailwind's sm, md, lg and xl. */
 .jf-lib-grid {
-  --jf-cols: 2;
+  --jf-cols: 3; /* phones: medium posters 3 across, as Jellyfin */
   display: grid;
   grid-template-columns: repeat(var(--jf-cols), minmax(0, 1fr));
   gap: 1rem;
@@ -132,7 +190,7 @@ body {
 
 /* The library's view settings (library.js libraryGridClass): the card shape and size pick the
    columns per breakpoint. Medium posters are the default above. */
-.jf-lib-grid.jf-shape-poster.jf-size-small { --jf-cols: 3; }
+.jf-lib-grid.jf-shape-poster.jf-size-small { --jf-cols: 4; } /* phones: 4 small posters across */
 .jf-lib-grid.jf-shape-poster.jf-size-large { --jf-cols: 2; }
 .jf-lib-grid.jf-shape-backdrop { --jf-cols: 1; }
 .jf-lib-grid.jf-shape-backdrop.jf-size-small { --jf-cols: 2; }
@@ -337,7 +395,7 @@ body {
 
 .jf-card-action {
   width: 2rem;
-  height: 2rem;
+  height: 2rem; /* touch: 2.5rem under (hover: none) below */
   border-radius: 9999px;
   display: inline-flex;
   align-items: center;
@@ -350,6 +408,143 @@ body {
 .jf-card-action:hover {
   background: rgba(0, 0, 0, 0.85);
   color: #fff;
+}
+
+/* Multi-select (multiselect.js): a card's checkbox on hover or focus, on every card while selecting */
+.jf-card-select {
+  position: absolute;
+  top: 0.4rem;
+  left: 0.4rem;
+  z-index: 5;
+  width: 1.75rem;
+  height: 1.75rem;
+  border-radius: 9999px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  color: transparent;
+  background: rgba(0, 0, 0, 0.55);
+  border: 2px solid rgba(255, 255, 255, 0.75);
+  opacity: 0;
+  transition: opacity 0.15s ease;
+}
+
+.jf-card:hover .jf-card-select,
+.jf-card:focus-within .jf-card-select,
+.is-selecting .jf-card-select {
+  opacity: 1;
+}
+
+.jf-card-select[aria-checked="true"] {
+  color: #fff;
+  background: #00a4dc;
+  border-color: #00a4dc;
+}
+
+.jf-card.is-selected {
+  outline: 3px solid #00a4dc;
+  outline-offset: 2px;
+  border-radius: 0.75rem;
+}
+
+.jf-multiselect-bar {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  z-index: 60;
+  display: flex;
+  align-items: center;
+  gap: 0.35rem;
+  padding: 0.6rem 1rem;
+  background: var(--jf-bg-surface);
+  border-bottom: 1px solid var(--jf-border);
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.5);
+  color: var(--jf-text-main);
+}
+
+.jf-multiselect-bar[hidden] {
+  display: none;
+}
+
+.jf-multiselect-btn {
+  width: 2.25rem;
+  height: 2.25rem;
+  border-radius: 9999px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.jf-multiselect-btn:hover,
+.jf-multiselect-btn:focus-visible {
+  background: rgba(255, 255, 255, 0.1);
+}
+
+/* The sign-in page's user tiles (auth.js) */
+.jf-login-tiles {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(7.5rem, 1fr));
+  gap: 1rem;
+}
+
+.jf-login-tile {
+  width: 100%;
+  padding: 0.75rem;
+  border-radius: 0.9rem;
+  text-align: center;
+  transition: background 0.15s ease;
+}
+
+.jf-login-tile:hover,
+.jf-login-tile:focus-visible {
+  background: rgba(255, 255, 255, 0.07);
+}
+
+.jf-login-tile-picture {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  aspect-ratio: 1;
+  border-radius: 0.75rem;
+  overflow: hidden;
+  background: linear-gradient(to top right, #00a4dc, #38bdf8);
+}
+
+/* The backdrop screensaver (screensaver.js) */
+.jf-screensaver {
+  position: fixed;
+  inset: 0;
+  z-index: 200;
+  background: #000;
+  cursor: none;
+}
+
+.jf-screensaver-slide {
+  position: absolute;
+  inset: 0;
+  opacity: 0;
+  transition: opacity 1s ease;
+}
+
+.jf-screensaver-slide.is-shown {
+  opacity: 1;
+}
+
+.jf-screensaver-img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+
+.jf-screensaver-name {
+  position: absolute;
+  left: 2rem;
+  bottom: 2rem;
+  font-size: 1.5rem;
+  font-weight: 700;
+  color: rgba(255, 255, 255, 0.85);
+  text-shadow: 0 2px 8px rgba(0, 0, 0, 0.8);
 }
 
 .jf-card-action.is-on[data-action="card-played"] {
@@ -365,6 +560,14 @@ body {
 }
 
 @media (hover: none) {
+  /* touch: bigger card buttons, and the drawer's scan button is visible without hover */
+  .jf-card-action {
+    width: 2.5rem;
+    height: 2.5rem;
+  }
+  [data-action="scan-library"] {
+    opacity: 0.6;
+  }
   .jf-card-actions {
     opacity: 1;
   }
@@ -945,8 +1148,12 @@ select.jf-input {
   box-shadow: 0 0 10px rgba(0, 164, 220, 0.5);
 }
 
-/* The library's filter menu: a popover (top layer, light dismiss), centred by the UA style */
+/* The library's filter menu: a popover (top layer, light dismiss), centred explicitly (the Android WebView's UA style didn't) */
 .jf-filter-menu {
+  position: fixed;
+  inset: 0;
+  margin: auto;
+  height: fit-content;
   width: min(92vw, 30rem);
   max-height: min(80dvh, 40rem);
   overflow-y: auto;
@@ -956,6 +1163,28 @@ select.jf-input {
   background: var(--jf-bg-surface);
   color: var(--jf-text-main);
   box-shadow: 0 20px 50px rgba(0, 0, 0, 0.6);
+}
+
+/* phones: the filter menu is a bottom sheet */
+@media (width < 40rem) {
+  .jf-filter-menu {
+    inset: auto 0 0 0;
+    width: 100%;
+    max-width: 100%;
+    margin: 0;
+    border-radius: 1rem 1rem 0 0;
+    max-height: 85dvh;
+    padding-bottom: max(1rem, env(safe-area-inset-bottom));
+  }
+}
+
+/* touch: each option row is a 44px target */
+@media (pointer: coarse) {
+  .jf-filter-menu label {
+    min-height: 2.75rem;
+    display: flex;
+    align-items: center;
+  }
 }
 
 .jf-filter-menu::backdrop {
@@ -1050,6 +1279,11 @@ select.jf-input {
   margin-bottom: 1.5rem;
   padding-bottom: 0.5rem;
   overflow-x: auto;
+  scrollbar-width: none; /* the strip still scrolls by swipe; its scrollbar is hidden */
+}
+
+.jf-tabs::-webkit-scrollbar {
+  display: none;
 }
 
 .jf-tab {
@@ -1070,6 +1304,30 @@ select.jf-input {
 .jf-tab[aria-selected="true"] {
   background: #00a4dc;
   color: #fff;
+}
+
+/* A folder's breadcrumbs in a library of mixed content: the library, the folders above, the folder */
+.jf-crumbs {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.375rem;
+  margin-bottom: 1.25rem;
+  font-size: 0.875rem;
+  color: rgb(255 255 255 / 0.4);
+}
+
+.jf-crumb {
+  color: rgb(255 255 255 / 0.7);
+}
+
+button.jf-crumb:hover {
+  color: #00a4dc;
+}
+
+.jf-crumb[aria-current="page"] {
+  color: #fff;
+  font-weight: 600;
 }
 
 /* Album and song track rows: number, title, length */
@@ -1119,6 +1377,36 @@ select.jf-input {
   right: 0;
   background: linear-gradient(to top, rgba(0, 0, 0, 0.95) 0%, rgba(0, 0, 0, 0.6) 60%, transparent 100%);
   padding: 1.5rem 1.5rem 1rem;
+  /* phones: keep the controls clear of the gesture bar and the notch */
+  padding-left: max(1.5rem, env(safe-area-inset-left));
+  padding-right: max(1.5rem, env(safe-area-inset-right));
+  padding-bottom: max(1rem, env(safe-area-inset-bottom));
+}
+
+/* The top bar's paddings come from p-4 lg:p-6; these rules win over them and add the notch insets */
+.jf-player-topbar {
+  padding-top: max(1rem, env(safe-area-inset-top));
+  padding-left: max(1rem, env(safe-area-inset-left));
+  padding-right: max(1rem, env(safe-area-inset-right));
+}
+@media (width >= 64rem) {
+  .jf-player-topbar {
+    padding-top: max(1.5rem, env(safe-area-inset-top));
+    padding-left: max(1.5rem, env(safe-area-inset-left));
+    padding-right: max(1.5rem, env(safe-area-inset-right));
+  }
+}
+
+/* touch: 44px player buttons and a taller seek bar */
+@media (pointer: coarse) {
+  .jf-player-controls .jf-icon-btn,
+  .jf-player-topbar .jf-icon-btn {
+    min-width: 2.75rem;
+    min-height: 2.75rem;
+  }
+  #player-seek {
+    height: 1.75rem;
+  }
 }
 
 /* The top bar (title, back and close) and the bottom controls fade out together when the
@@ -1212,12 +1500,80 @@ select.jf-input {
   gap: 0.75rem;
 }
 
+/* phones: the player's menus are bottom sheets that fit the screen (also on short landscape screens) */
+@media (width < 40rem), (max-height: 30rem) {
+  .jf-player-menu {
+    position: fixed;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    top: auto;
+    width: auto;
+    max-width: none;
+    margin: 0;
+    max-height: 70dvh;
+    border-radius: 1rem 1rem 0 0;
+    padding-bottom: max(0.75rem, env(safe-area-inset-bottom));
+    z-index: 60;
+  }
+}
+
+/* touch: the player menus' rows and buttons are 44px targets */
+@media (pointer: coarse) {
+  .jf-player-menu select,
+  .jf-player-menu-select,
+  .jf-player-menu-btn {
+    min-height: 2.75rem;
+  }
+}
+
 #player-settings > summary::-webkit-details-marker,
 #player-chapters > summary::-webkit-details-marker {
   display: none;
 }
 
 /* Now playing: the music bar along the bottom of every page; the page scrolls clear of it */
+/* The music player's lyrics panel (lyrics.js), over the now-playing bar */
+.jf-lyrics-panel {
+  position: fixed;
+  right: 1rem;
+  bottom: 6rem;
+  z-index: 40;
+  display: flex;
+  flex-direction: column;
+  width: 20rem;
+  max-width: calc(100% - 2rem);
+  max-height: 60vh;
+  padding: 1rem;
+  border-radius: 0.75rem;
+  background: rgb(0 0 0 / 0.8);
+  backdrop-filter: blur(12px);
+  border: 1px solid rgb(255 255 255 / 0.1);
+}
+.jf-lyrics-body {
+  overflow-y: auto;
+  text-align: center;
+}
+.jf-lyric-line {
+  display: block;
+  width: 100%;
+  padding: 0.25rem 0.5rem;
+  color: rgb(255 255 255 / 0.5);
+  font-size: 0.9rem;
+  line-height: 1.5;
+  min-height: 1.5em;
+}
+button.jf-lyric-line {
+  cursor: pointer;
+}
+button.jf-lyric-line:hover {
+  color: rgb(255 255 255 / 0.8);
+}
+.jf-lyric-line.active {
+  color: #fff;
+  font-weight: 600;
+}
+
 .jf-now-playing {
   position: fixed;
   left: 0;
@@ -1414,6 +1770,20 @@ dialog.modal::backdrop {
   -webkit-backdrop-filter: blur(8px);
 }
 
+/* phones: dialogs are bottom sheets, not centred boxes */
+@media (width < 40rem) {
+  .modal {
+    align-items: flex-end;
+  }
+  .modal-box {
+    width: 100%;
+    max-width: 100%;
+    border-radius: 1rem 1rem 0 0;
+    max-height: calc(100dvh - env(safe-area-inset-top) - 1rem);
+    padding-bottom: max(1.5rem, env(safe-area-inset-bottom));
+  }
+}
+
 /* Lazy Loading Image Effects */
 img.jf-lazy-img {
   opacity: 0;
@@ -1500,6 +1870,9 @@ img.jf-thumb-img {
     width: 100%;
     opacity: 0.5;
     animation: none;
+  }
+  .jf-drawer-mobile {
+    transition: none;
   }
 }
 

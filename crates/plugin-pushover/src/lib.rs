@@ -6,7 +6,7 @@ use rustyfin_model::plugin::{NotificationPriority, Plugin, PluginType};
 use serde::{Deserialize, Serialize};
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 /// Configuration for the Pushover plugin.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -31,13 +31,14 @@ pub struct PushoverConfig {
 
 /// Pushover notification provider plugin.
 pub struct PushoverPlugin {
-    config: Mutex<Option<PushoverConfig>>,
+    /// Shared with the registered provider, which reads the current config on each send
+    config: Arc<Mutex<Option<PushoverConfig>>>,
 }
 
 impl Default for PushoverPlugin {
     fn default() -> Self {
         Self {
-            config: Mutex::new(None),
+            config: Arc::new(Mutex::new(None)),
         }
     }
 }
@@ -84,12 +85,6 @@ impl Plugin for PushoverPlugin {
 
     fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
         self
-    }
-}
-
-impl PushoverPlugin {
-    fn config(&self) -> Option<PushoverConfig> {
-        self.config.lock().unwrap().clone()
     }
 }
 
@@ -189,9 +184,7 @@ pub async fn send_notification(
 #[cfg(feature = "dynamic")]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rustyfin_plugin_create() -> *mut std::ffi::c_void {
-    let plugin: Box<dyn Plugin> = Box::new(PushoverPlugin {
-        config: Mutex::new(None),
-    });
+    let plugin: Box<dyn Plugin> = Box::new(PushoverPlugin::default());
     Box::into_raw(Box::new(plugin)).cast()
 }
 
@@ -218,8 +211,8 @@ pub async fn register_pushover_provider<P>(
 where
     P: NotificationProviderRegistrar,
 {
-    let config = plugin.config().ok_or("Pushover plugin not configured")?;
-    let config1 = config.clone();
+    // Always registers; each send reads the plugin's current config, and fails without one
+    let config1 = plugin.config.clone();
     let plugin_id = plugin.id().to_string();
 
     plugin_manager
@@ -229,12 +222,13 @@ where
                   message: &str,
                   priority: NotificationPriority|
                   -> Pin<Box<dyn Future<Output = Result<(), String>> + Send>> {
-                let config = config1.clone();
+                let config = config1.lock().unwrap().clone();
                 let title = title.to_string();
                 let message = message.to_string();
-                Box::pin(
-                    async move { send_notification(&config, &title, &message, priority).await },
-                )
+                Box::pin(async move {
+                    let config = config.ok_or("Pushover plugin not configured")?;
+                    send_notification(&config, &title, &message, priority).await
+                })
             },
         )
         .await;

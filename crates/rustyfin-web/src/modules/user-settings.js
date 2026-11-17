@@ -14,7 +14,15 @@ const HOME_SLOT_DEFAULTS = [
 // The settings Jellyfin Web keeps only on the device, which the player reads there (playerprefs.js):
 // true for those kept per user on the device. The device's value wins, as in Jellyfin Web; the
 // account's fills a device that has none, and a save here writes both.
-const DEVICE_SETTINGS = { maxStreamingBitrate: false, subtitleburnin: false, localplayersubtitleappearance3: true };
+// The screensaver and its idle time are kept per user on the device too (screensaver.js): Jellyfin Web's
+// backdrop screensaver, its default idle time and the idle times the Display settings offer, in seconds.
+const SCREENSAVER_BACKDROP = 'backdropscreensaver';
+const DEFAULT_IDLE_SECONDS = 180;
+const SCREENSAVER_TIMES = [60, 180, 300, 600, 900, 1800];
+const DEVICE_SETTINGS = {
+    maxStreamingBitrate: false, subtitleburnin: false, localplayersubtitleappearance3: true, screensaver: true,
+    screensaverTime: true,
+};
 
 let loaded = null; // { userId, config, prefs }
 let loading = null;
@@ -70,9 +78,13 @@ function userConfiguration() {
     return loaded?.userId === API.userId ? loaded.config : {};
 }
 
-// Saves CustomPrefs values (strings; null or '' removes one), keeping the other settings
+// Saves CustomPrefs values (strings; null or '' removes one), keeping every other setting. A POST
+// replaces the whole stored set, as in Jellyfin 12.4, so the set is read again first (another
+// browser or app may have saved since) and posted back in full with these changes.
 async function saveUserSettings(values) {
     const settings = await loadUserSettings();
+    const fresh = await API.get(prefsPath(settings.userId), { cache: 'no-store' }).catch(() => null);
+    if (fresh) settings.prefs = { ...fresh, CustomPrefs: { ...(fresh.CustomPrefs || {}) } };
     const customPrefs = { ...settings.prefs.CustomPrefs };
     for (const [name, value] of Object.entries(values)) {
         if (value == null || value === '') delete customPrefs[name];
@@ -125,10 +137,30 @@ function homeSlotValues(index, section, get = userSetting) {
     return Object.fromEntries(slots.map((value, i) => [`homesection${i}`, value]));
 }
 
+const libraryKey = id => String(id).toLowerCase().replace(/-/g, '');
+
 // Whether a library's newest items get a "Recently Added" row (UserConfiguration.LatestItemsExcludes)
 function showsInLatest(libraryId, config = userConfiguration()) {
-    const key = id => String(id).toLowerCase().replace(/-/g, '');
-    return !(config.LatestItemsExcludes || []).some(id => key(id) === key(libraryId));
+    return !(config.LatestItemsExcludes || []).some(id => libraryKey(id) === libraryKey(libraryId));
+}
+
+// Whether a library shows in "My Media" and the home page (not in UserConfiguration.MyMediaExcludes)
+function showsInMyMedia(libraryId, config = userConfiguration()) {
+    return !(config.MyMediaExcludes || []).some(id => libraryKey(id) === libraryKey(libraryId));
+}
+
+// The libraries in the user's order, as the server's /UserViews: those UserConfiguration.OrderedViews
+// names first, in its order, then the others in theirs (the settings page lists them so)
+function arrangeLibraries(libs, { config = userConfiguration() } = {}) {
+    const order = (config.OrderedViews || []).map(libraryKey);
+    const rank = lib => {
+        const at = order.indexOf(libraryKey(lib.id || lib.Id));
+        return at < 0 ? Infinity : at;
+    };
+    return (libs || [])
+        .map((lib, i) => [lib, i])
+        .sort((a, b) => (rank(a[0]) - rank(b[0])) || (a[1] - b[1]))
+        .map(([lib]) => lib);
 }
 
 // Jellyfin Web's enableBackdrops. Rustyfin has always shown them, so it stays on unless turned off
@@ -160,5 +192,6 @@ function applyUserSettings() {
 
 export {
     HOME_SECTIONS, HOME_SLOT_DEFAULTS, homeSlots, homeSlotValues, loadUserSettings, userSetting, userConfiguration, saveUserSettings, saveUserConfiguration,
-    homeSections, showsInLatest, showBackdrops, applyUserSettings, avatarUrl, showAvatar,
+    homeSections, showsInLatest, showsInMyMedia, arrangeLibraries, libraryKey, showBackdrops, applyUserSettings, avatarUrl,
+    showAvatar, SCREENSAVER_BACKDROP, DEFAULT_IDLE_SECONDS, SCREENSAVER_TIMES,
 };

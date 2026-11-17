@@ -84,14 +84,20 @@ async fn main() {
     );
 
     // Validate FFmpeg exists and is accessible
-    if let Ok(ffmpeg_path) = std::env::var("RUSTYFIN_FFMPEG_PATH") {
-        if !std::path::Path::new(&ffmpeg_path).exists() {
+    // Every spawn takes its programs from `media_tools`, so this checks what will run
+    let tools = rustyfin_core::media_tools::current();
+    if tools.custom {
+        let ffmpeg_path = tools.ffmpeg.display();
+        if !tools.ffmpeg.exists() {
             tracing::warn!(
                 "FFmpeg path '{}' does not exist — transcoding will fail",
                 ffmpeg_path
             );
         } else {
-            tracing::info!("FFmpeg found at: {}", ffmpeg_path);
+            tracing::info!(
+                "FFmpeg found at: {ffmpeg_path} (ffprobe: {})",
+                tools.ffprobe.display()
+            );
         }
     } else if which::which("ffmpeg").is_ok() {
         tracing::info!("FFmpeg found in PATH");
@@ -99,6 +105,27 @@ async fn main() {
         tracing::warn!(
             "FFmpeg not found — transcoding will not work. Install FFmpeg or set RUSTYFIN_FFMPEG_PATH"
         );
+    }
+
+    // A restore staged in the dashboard replaces the database and settings before either is read
+    if std::env::var_os("RUSTYFIN_DB").is_none() {
+        match rustyfin_api::backup_archive::apply_pending_restore(
+            &data_dir,
+            &data_dir.join("rustyfin.db"),
+        )
+        .await
+        {
+            Ok(Some(name)) => tracing::info!("restored the backup {name}"),
+            Ok(None) => {}
+            Err(e @ rustyfin_api::backup_archive::RestoreError::RolledBack(_)) => {
+                tracing::error!("the staged restore failed: {e}")
+            }
+            // Starting on an empty database would let anyone claim the owner account
+            Err(e @ rustyfin_api::backup_archive::RestoreError::Fatal(_)) => {
+                tracing::error!("the staged restore failed, so the server won't start: {e}");
+                std::process::exit(1);
+            }
+        }
     }
 
     let db_url = std::env::var("RUSTYFIN_DB")
@@ -112,8 +139,13 @@ async fn main() {
 
     let server_id = load_or_create_server_id(&data_dir);
 
+    // The network settings saved in the dashboard, under the environment variables that set the
+    // same things
+    let network = rustyfin_api::named_config::network_startup(&data_dir);
+
     // IPv6 dual-stack: use [::]:8096 to listen on both IPv4 and IPv6
-    let bind_addr = std::env::var("RUSTYFIN_BIND").unwrap_or_else(|_| "0.0.0.0:8096".to_string());
+    let bind_addr =
+        rustyfin_api::named_config::startup_bind(std::env::var("RUSTYFIN_BIND").ok(), network.bind);
 
     let tls_cert = std::env::var("RUSTYFIN_TLS_CERT").ok();
     let tls_key = std::env::var("RUSTYFIN_TLS_KEY").ok();
@@ -143,8 +175,15 @@ async fn main() {
         }
     };
 
-    // Load or create server configuration
-    let mut config = load_config(&data_dir);
+    // Load or create server configuration. A file that can't be read is kept and the server
+    // doesn't start: defaults would lose the settings it holds, and show the startup wizard.
+    let mut config = match load_config(&data_dir) {
+        Ok(config) => config,
+        Err(e) => {
+            tracing::error!("{e}. Fix or remove the file; the server does not start without it.");
+            std::process::exit(1);
+        }
+    };
     // Sort names made from here on use the configuration's rules
     rustyfin_model::sort_name::set_rules(config.sort_rules());
 
@@ -202,6 +241,16 @@ async fn main() {
     transcode_manager.set_encoding_settings(encoding);
     // Start periodic cleanup of stale transcode sessions and old cache directories
     transcode_manager.spawn_cleanup_task();
+    // Finds the video devices and what each decodes, in the background: until it ends, new
+    // transcodes take the saved options; then, while the administrator hasn't chosen a
+    // hardware acceleration type, the best device decodes
+    {
+        let manager = transcode_manager.clone();
+        let data_dir = data_dir.clone();
+        tokio::spawn(async move {
+            manager.detect_hardware(&data_dir).await;
+        });
+    }
 
     let data_dir_arc = Arc::new(data_dir);
 
@@ -249,148 +298,34 @@ async fn main() {
             config.library_monitor_poll_interval.max(1),
         )));
 
-    // Helper: register a built-in plugin, loading config and status from DB if available.
-    // Plugins are DISABLED by default — they must be explicitly enabled via the API or by
-    // storing an Active status in the database. TMDb, OMDb and Fanart.tv are the exceptions: a key
-    // enables them (see install_tmdb_plugin, install_omdb_plugin, install_fanart_plugin). This
-    // ensures fast scans without external API calls.
-    async fn register_builtin_plugin<P: rustyfin_model::plugin::Plugin>(
-        plugin: &P,
-        pm: &rustyfin_core::plugin_manager::PluginManager,
-    ) {
-        // Try to load saved config from DB
-        let mut status = rustyfin_model::plugin::PluginStatus::Disabled;
-        if let Some(saved_config) = pm.load_plugin_config_from_db(plugin.id()).await {
-            if let Err(e) = plugin.set_configuration(saved_config.clone()) {
-                tracing::warn!("failed to apply saved config for {}: {}", plugin.id(), e);
-            }
-            // Check if status was saved
-            if let Some(status_str) = saved_config.get("status").and_then(|v| v.as_str()) {
-                status = match status_str {
-                    "Active" => rustyfin_model::plugin::PluginStatus::Active,
-                    "Disabled" => rustyfin_model::plugin::PluginStatus::Disabled,
-                    "Malfunctioned" => rustyfin_model::plugin::PluginStatus::Malfunctioned,
-                    _ => rustyfin_model::plugin::PluginStatus::Disabled,
-                };
-            }
-        }
-        if status == rustyfin_model::plugin::PluginStatus::Active {
-            tracing::info!("plugin {} enabled (from saved config)", plugin.id());
-        }
-        pm.register_builtin_plugin(rustyfin_core::plugin_manager::BuiltinPluginInfo {
-            name: plugin.name().to_string(),
-            version: plugin.version().to_string(),
-            id: plugin.id().to_string(),
-            description: plugin.description().to_string(),
-            plugin_type: plugin.plugin_type(),
-            status,
-        })
-        .await;
-    }
-
-    // One TMDb client (cache, rate limiter, retries) shared by the provider and AppState.
-    let tmdb = rustyfin_core::tmdb_client::TmdbClient::new(http_client.clone(), tmdb_settings);
+    // Built-in plugins are disabled unless a saved status enables them. TMDb, OMDb and Fanart.tv
+    // are the exceptions: a key enables them (see install_tmdb_plugin, install_omdb_plugin,
+    // install_fanart_plugin). This keeps scans fast, without outside requests.
+    // One TMDb client (cache, rate limiter, retries) shared by the provider and AppState. The
+    // providers' answers are kept under the data dir's cache, across restarts.
+    let metadata_cache = data_dir_arc.join("cache").join("metadata");
+    let tmdb = rustyfin_core::tmdb_client::TmdbClient::new(
+        http_client.clone(),
+        rustyfin_core::tmdb_client::TmdbSettings {
+            cache_dir: Some(metadata_cache.join("tmdb")),
+            ..tmdb_settings
+        },
+    );
 
     // Register TMDb plugin: enabled by a key (env or saved), also when one is saved later
     rustyfin_core::plugin_manager::install_tmdb_plugin(&plugin_manager_with_db, tmdb.clone()).await;
 
     // Register OMDb and Fanart.tv plugins: enabled by a saved key, also when one is saved later
-    rustyfin_core::plugin_manager::install_omdb_plugin(&plugin_manager_with_db).await;
+    rustyfin_core::plugin_manager::install_omdb_plugin(
+        &plugin_manager_with_db,
+        rustyfin_model::answer_store::AnswerStore::new(metadata_cache.join("omdb")),
+    )
+    .await;
     rustyfin_core::plugin_manager::install_fanart_plugin(&plugin_manager_with_db).await;
 
-    // Register Trakt plugin (disabled by default)
-    {
-        let trakt_plugin = plugin_trakt::TraktPlugin::default();
-        register_builtin_plugin(&trakt_plugin, &plugin_manager_with_db).await;
-        if let Err(e) =
-            plugin_trakt::register_trakt_provider(&trakt_plugin, &plugin_manager_with_db).await
-        {
-            tracing::debug!(
-                "Trakt plugin not registered as provider (no API key): {}",
-                e
-            );
-        }
-    }
-
-    // Register TheTVDB plugin (disabled by default)
-    {
-        let tvdb_plugin = plugin_tvdb::TvdbPlugin::default();
-        register_builtin_plugin(&tvdb_plugin, &plugin_manager_with_db).await;
-        plugin_tvdb::register_tvdb_provider(&tvdb_plugin, &plugin_manager_with_db).await;
-    }
-
-    // Register Local NFO plugin (disabled by default)
-    {
-        let local_nfo_plugin = plugin_local_nfo::LocalNfoPlugin::default();
-        register_builtin_plugin(&local_nfo_plugin, &plugin_manager_with_db).await;
-        plugin_local_nfo::register_local_nfo_provider(&local_nfo_plugin, &plugin_manager_with_db)
-            .await;
-    }
-
-    // Register OpenSubtitles plugin (disabled by default)
-    {
-        let opensubtitles_plugin = plugin_opensubtitles::OpenSubtitlesPlugin::default();
-        register_builtin_plugin(&opensubtitles_plugin, &plugin_manager_with_db).await;
-        plugin_opensubtitles::register_opensubtitles_provider(
-            &opensubtitles_plugin,
-            &plugin_manager_with_db,
-        )
-        .await;
-    }
-
-    // Register Podnapisi plugin (disabled by default)
-    {
-        let podnapisi_plugin = plugin_podnapisi::PodnapisiPlugin::default();
-        register_builtin_plugin(&podnapisi_plugin, &plugin_manager_with_db).await;
-        plugin_podnapisi::register_podnapisi_provider(&podnapisi_plugin, &plugin_manager_with_db)
-            .await;
-    }
-
-    // Register MQTT plugin (disabled by default)
-    {
-        let mqtt_plugin = plugin_mqtt::MqttPlugin::default();
-        register_builtin_plugin(&mqtt_plugin, &plugin_manager_with_db).await;
-        if let Err(e) =
-            plugin_mqtt::register_mqtt_provider(&mqtt_plugin, &plugin_manager_with_db).await
-        {
-            tracing::debug!("MQTT plugin not registered as provider: {}", e);
-        }
-    }
-
-    // Register Ntfy plugin (disabled by default)
-    {
-        let ntfy_plugin = plugin_ntfy::NtfyPlugin::default();
-        register_builtin_plugin(&ntfy_plugin, &plugin_manager_with_db).await;
-        if let Err(e) =
-            plugin_ntfy::register_ntfy_provider(&ntfy_plugin, &plugin_manager_with_db).await
-        {
-            tracing::debug!("Ntfy plugin not registered as provider: {}", e);
-        }
-    }
-
-    // Register Pushover plugin (disabled by default)
-    {
-        let pushover_plugin = plugin_pushover::PushoverPlugin::default();
-        register_builtin_plugin(&pushover_plugin, &plugin_manager_with_db).await;
-        if let Err(e) =
-            plugin_pushover::register_pushover_provider(&pushover_plugin, &plugin_manager_with_db)
-                .await
-        {
-            tracing::debug!("Pushover plugin not registered as provider: {}", e);
-        }
-    }
-
-    // Register Webhook plugin (disabled by default)
-    {
-        let webhook_plugin = plugin_webhook::WebhookPlugin::default();
-        register_builtin_plugin(&webhook_plugin, &plugin_manager_with_db).await;
-        if let Err(e) =
-            plugin_webhook::register_webhook_provider(&webhook_plugin, &plugin_manager_with_db)
-                .await
-        {
-            tracing::debug!("Webhook plugin not registered as provider: {}", e);
-        }
-    }
+    // Trakt, TheTVDB, Local NFO, OpenSubtitles, Podnapisi, MQTT, ntfy, Pushover and Webhook:
+    // disabled unless enabled; a config saved later applies without a restart
+    rustyfin_core::plugin_manager::install_other_plugins(&plugin_manager_with_db).await;
 
     // Use the DB-backed plugin manager for the app state
     let plugin_manager = plugin_manager_with_db;
@@ -425,7 +360,10 @@ async fn main() {
     // Reverse proxies we trust to set X-Forwarded-For (comma-separated CIDRs or IPs). Loopback is
     // trusted only when listed.
     let known_proxies = Arc::new(rustyfin_api::middleware::parse_known_proxies(
-        &std::env::var("RUSTYFIN_KNOWN_PROXIES").unwrap_or_default(),
+        &std::env::var("RUSTYFIN_KNOWN_PROXIES")
+            .ok()
+            .or(network.known_proxies)
+            .unwrap_or_default(),
     ));
 
     // In-memory response caches
@@ -442,8 +380,10 @@ async fn main() {
         bind_addr: Arc::new(bind_addr.clone()),
         published_url: std::env::var("RUSTYFIN_PUBLISHED_URL")
             .ok()
+            .or(network.published_url)
             .filter(|url| !url.trim().is_empty())
             .map(Arc::new),
+        published_subnets: Arc::new(network.published_subnets),
         api_key: api_key.map(Arc::new),
         quick_connect: Arc::new(RwLock::new(std::collections::HashMap::new())),
         transcode_manager,
@@ -466,14 +406,12 @@ async fn main() {
         session_runtime: Default::default(),
     };
 
-    // A scheduled library scan clears the same caches as a scan from the API or the monitor.
+    // A scheduled task that writes items (the library scan, the metadata refresh, the missing
+    // episodes) clears the same caches as a scan from the API or the monitor.
     {
         let cache = state.cache.clone();
         let image_cache = state.image_cache.clone();
-        task_scheduler.set_on_scan(move || {
-            cache.invalidate_on_scan();
-            image_cache.invalidate_all();
-        });
+        task_scheduler.set_on_items_changed(move || cache.library_changed(&image_cache));
     }
 
     let transcodes = state.transcode_manager.clone();
@@ -548,44 +486,57 @@ async fn main() {
         .and_then(|p| p.parse().ok())
         .unwrap_or(8096);
 
-    // Background task: SSDP discovery (DLNA), only when the DLNA server is on
-    if state.config.read().await.enable_dlna_server {
+    // Background tasks: SSDP discovery (DLNA). They follow EnableDlnaServer as it is now: the
+    // responder holds port 1900 and the advertiser announces only while the DLNA server is on, so
+    // the dashboard's switch applies without a restart.
+    {
         let dlna_config = std::sync::Arc::new(rustyfin_core::dlna::DlnaConfig {
-            server_name: "Rustyfin".to_string(),
+            server_name: String::new(),
             server_id: state.server_id.to_string(),
             http_port,
             bind_ip: std::net::Ipv4Addr::UNSPECIFIED,
+            published_url: state.published_url.as_deref().cloned(),
+            published_subnets: (*state.published_subnets).clone(),
         });
         let shutdown_rx = state.shutdown_tx.subscribe();
-        let cfg = dlna_config.clone();
+        let (cfg, settings) = (dlna_config.clone(), state.config.clone());
         tokio::spawn(async move {
-            rustyfin_core::dlna::run_ssdp_responder(cfg, shutdown_rx).await;
+            rustyfin_core::dlna::run_ssdp_responder(cfg, settings, shutdown_rx).await;
         });
         let shutdown_rx = state.shutdown_tx.subscribe();
+        let settings = state.config.clone();
         tokio::spawn(async move {
-            rustyfin_core::dlna::run_ssdp_advertiser(dlna_config, shutdown_rx).await;
+            rustyfin_core::dlna::run_ssdp_advertiser(dlna_config, settings, shutdown_rx).await;
         });
     }
 
-    // Background task: UDP discovery (Jellyfin client auto-discovery on port 7359)
+    // Background task: UDP discovery (Jellyfin client auto-discovery on port 7359), answering with
+    // the configured server name as it is now
     {
         let udp_config = std::sync::Arc::new(rustyfin_core::udp_discovery::UdpDiscoveryConfig {
-            server_name: "Rustyfin".to_string(),
             server_id: state.server_id.to_string(),
             http_port,
             bind_ip: std::net::Ipv4Addr::UNSPECIFIED,
             endpoint_address: state.published_url.as_deref().cloned(),
+            published_subnets: (*state.published_subnets).clone(),
         });
         let shutdown_rx = state.shutdown_tx.subscribe();
+        let settings = state.config.clone();
         tokio::spawn(async move {
-            rustyfin_core::udp_discovery::run_udp_discovery(udp_config, shutdown_rx).await;
+            rustyfin_core::udp_discovery::run_udp_discovery(udp_config, settings, shutdown_rx)
+                .await;
         });
     }
 
     // Background task: mDNS/Bonjour service discovery
     {
+        // The service is registered once: a rename shows here at the next start.
+        let mdns_name = match state.config.read().await.server_name.trim() {
+            "" => "Rustyfin".to_string(),
+            name => name.to_string(),
+        };
         let mdns_config = std::sync::Arc::new(rustyfin_core::mdns::MdnsConfig {
-            server_name: "Rustyfin".to_string(),
+            server_name: mdns_name,
             server_id: state.server_id.to_string(),
             http_port,
             bind_ip: std::net::Ipv4Addr::UNSPECIFIED,
@@ -736,9 +687,16 @@ async fn main() {
                 loop {
                     if sig.recv().await.is_some() {
                         tracing::info!("SIGHUP received, reloading configuration");
-                        let new_config = load_config(&data_dir);
+                        // The file is read under the write lock that every save holds through its
+                        // write, so a save in flight is never undone by the file it replaces
                         let mut cfg = config.write().await;
-                        *cfg = new_config;
+                        match load_config(&data_dir) {
+                            Ok(new_config) => *cfg = new_config,
+                            Err(e) => {
+                                tracing::error!("{e}; the configuration in use is kept");
+                                continue;
+                            }
+                        }
                         changes.set_delay(std::time::Duration::from_secs(u64::from(
                             cfg.library_monitor_delay,
                         )));
@@ -850,37 +808,10 @@ async fn shutdown_signal() -> &'static str {
     }
 }
 
-fn load_config(data_dir: &std::path::Path) -> ServerConfiguration {
-    let config_path = data_dir.join("config.json");
-    if config_path.exists() {
-        match std::fs::read_to_string(&config_path) {
-            Ok(content) => match serde_json::from_str::<ServerConfiguration>(&content) {
-                Ok(mut cfg) => {
-                    tracing::info!("loaded configuration from {}", config_path.display());
-                    // A file from an older Rustyfin is brought up to date once, and saved so
-                    if cfg.upgrade()
-                        && let Err(e) =
-                            rustyfin_core::config_file::write_config_atomic(&config_path, &cfg)
-                    {
-                        tracing::warn!("could not save the upgraded config.json: {}", e);
-                    }
-                    return cfg;
-                }
-                Err(e) => {
-                    tracing::warn!("failed to parse config.json, using defaults: {}", e);
-                }
-            },
-            Err(e) => {
-                tracing::warn!("failed to read config.json, using defaults: {}", e);
-            }
-        }
-    }
-    let cfg = ServerConfiguration::default();
-    // Persist default config
-    if let Ok(json) = serde_json::to_string_pretty(&cfg) {
-        std::fs::write(&config_path, &json).ok();
-    }
-    cfg
+fn load_config(
+    data_dir: &std::path::Path,
+) -> Result<ServerConfiguration, rustyfin_core::config_file::LoadError> {
+    rustyfin_core::config_file::load_config(&data_dir.join("config.json"))
 }
 
 fn load_tls_config(cert_path: &str, key_path: &str) -> rustls::ServerConfig {

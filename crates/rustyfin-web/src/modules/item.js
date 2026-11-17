@@ -2,11 +2,16 @@
 import { $, icon, toast, escapeHtml, formatRuntime } from './util.js';
 import { backdropUrl, createCardElement, sectionRow } from './cards.js';
 import { resumePositionTicks } from './player.js';
-import { navigate } from './router.js';
+import { navigate, currentPage } from './router.js';
+import { userDataChanged } from './userdata.js';
 import { albumTrackList } from './music.js';
 import { containerSectionHtml, renderContainerItems } from './collections.js';
 import { playThemeSong } from './theme-media.js';
 let currentDetailId = null;
+// Each item and person page draw takes the next number; a response for a draw that isn't the latest
+// (the user went on to another item, or the page drew again) is dropped, so it can't draw over it
+let detailRender = 0;
+let personRender = 0;
 let activeItem = null;
 // The detail page's version, audio and subtitle choice: { itemId, sources, mediaSourceId, audioIndex,
 // subtitleIndex }. A null index is untouched, so the player picks its own default for it.
@@ -333,6 +338,8 @@ function specialFeaturesHtml(features) {
 // --- Detail View Renderer (Movies, TV Series, Music) ---
 async function renderDetail(itemId) {
     const session = API.token;
+    const render = ++detailRender;
+    const stale = () => render !== detailRender || API.token !== session;
     currentDetailId = itemId;
     const page = $('page-detail');
     // Show skeleton for detail view
@@ -361,7 +368,7 @@ async function renderDetail(itemId) {
 
     try {
         const item = await API.getItem(itemId);
-        if (API.token !== session) return;
+        if (stale()) return;
         activeItem = item;
         const name = item.Name || item.name || '';
         const overview = item.Overview || item.overview || '';
@@ -378,10 +385,11 @@ async function renderDetail(itemId) {
 
         const imgSrc = item.ImageTags?.Primary ? API.imageUrl(id, 'Primary', { maxWidth: 500, tag: item.ImageTags.Primary }) : '';
         const backdropSrc = backdropUrl(item, 1920);
-        const canPlay = ['Movie', 'Episode', 'Audio', 'MusicVideo', 'Video'].includes(type);
+        // A photo's Play opens the photo viewer (photos.js)
+        const canPlay = ['Movie', 'Episode', 'Audio', 'MusicVideo', 'Video', 'Photo'].includes(type);
         // Containers play their items as a queue: Play all from the start, Shuffle in a random order
         const canPlayAll = ['Series', 'Season', 'MusicAlbum', 'MusicArtist', 'Playlist', 'BoxSet', 'Folder'].includes(type);
-        const streamType = type === 'Audio' ? 'Audio' : 'Videos';
+        const streamType = type === 'Audio' ? 'Audio' : type === 'Photo' ? 'Photo' : 'Videos';
         const resumeTicks = streamType === 'Videos' ? resumePositionTicks(item) : 0;
         detailChoice = canPlay && streamType === 'Videos'
             ? { itemId: id, sources: item.MediaSources || [], mediaSourceId: null, audioIndex: null, subtitleIndex: null }
@@ -393,15 +401,16 @@ async function renderDetail(itemId) {
         // Parallel fetch: Children/Seasons/Episodes AND Similar media
         // Previously these were sequential, causing a waterfall effect
         const isContainer = ['Series', 'Season', 'MusicAlbum', 'Folder'].includes(type);
-        // The extras: trailer files for the Trailer button, and special features on movie, series and season pages
-        const showsSpecials = ['Movie', 'Series', 'Season'].includes(type);
+        // The extras: trailer files for the Trailer button, and special features on movie, series, season and
+        // episode pages
+        const showsSpecials = ['Movie', 'Series', 'Season', 'Episode'].includes(type);
         const [childrenData, similarData, localTrailers, specialFeatures] = await Promise.all([
             isContainer ? API.getChildren(id).catch(() => ({ Items: [] })) : Promise.resolve({ Items: [] }),
             API.getSimilar(id).catch(() => ({ Items: [] })),
             item.LocalTrailerCount > 0 ? API.getLocalTrailers(id).catch(() => []) : Promise.resolve([]),
             showsSpecials && item.SpecialFeatureCount > 0 ? API.getSpecialFeatures(id).catch(() => []) : Promise.resolve([]),
         ]);
-        if (API.token !== session) return;
+        if (stale()) return;
 
         // Children / Seasons / Episodes
         let seasonsOrEpisodesHtml = '';
@@ -584,6 +593,8 @@ async function renderDetail(itemId) {
                                 ${played ? `<span class="inline-flex items-center gap-1 text-emerald-400">${icon('Check', { size: 14 })} ${isContainerOfEpisodes ? t('detail.all_played') : t('detail.played')}</span>` : `<span class="inline-flex items-center gap-1 text-white/60">${icon('Circle', { size: 14 })} ${isContainerOfEpisodes ? t('detail.mark_all_played') : t('detail.unplayed')}</span>`}
                             </button>
 
+                            ${downloadShareButtons(item)}
+
                             ${API.isAdmin ? `
                             <button class="jf-btn-ghost h-11 !py-0 w-11 !px-0" title="${escapeHtml(t('detail.refresh_metadata'))}" aria-label="${escapeHtml(t('detail.refresh_metadata'))}" data-action="refresh-item" data-id="${escapeHtml(id)}">
                                 ${icon('RefreshCw', { size: 18, class: 'jf-busy-spin' })}
@@ -641,13 +652,15 @@ async function renderDetail(itemId) {
         if (type === 'BoxSet' || type === 'Playlist') renderContainerItems(item);
         playThemeSong(id, () => currentDetailId === itemId && API.token === session);
     } catch (e) {
-        if (API.token !== session) return;
+        if (stale()) return;
         page.innerHTML = `<div class="p-6 rounded-xl bg-red-500/10 text-red-400">${escapeHtml(e.message)}</div>`;
     }
 }
 
 // --- Person Detail View ---
 async function renderPerson(personId) {
+    const render = ++personRender;
+    const stale = () => render !== personRender;
     const page = $('page-person');
     page.innerHTML = '<div class="flex justify-center items-center py-24"><div class="w-10 h-10 border-3 border-[#00a4dc] border-t-transparent rounded-full animate-spin"></div></div>';
     try {
@@ -655,6 +668,7 @@ async function renderPerson(personId) {
             API.getPerson(personId),
             API.getPersonItems(personId).catch(() => ({ Items: [] }))
         ]);
+        if (stale()) return;
         const pName = person.Name || person.name || t('person.fallback_name');
         const pOverview = person.Overview || person.overview || '';
         const items = itemsData.Items || itemsData.items || [];
@@ -690,8 +704,22 @@ async function renderPerson(personId) {
             }
         }
     } catch (e) {
+        if (stale()) return;
         page.innerHTML = `<div class="p-6 rounded-xl bg-red-500/10 text-red-400">${escapeHtml(e.message)}</div>`;
     }
+}
+
+// The open item page draws again when its item's user data changes (its own buttons, another card,
+// or the server's UserDataChanged from another device), once for changes close together
+const DETAIL_REDRAW_DELAY_MS = 150;
+let detailRedraw = 0;
+function detailUserDataChanged(e) {
+    const id = e?.detail?.id;
+    if (currentPage !== 'detail' || !currentDetailId || String(id) !== String(currentDetailId)) return;
+    clearTimeout(detailRedraw);
+    detailRedraw = setTimeout(() => {
+        if (currentPage === 'detail' && String(currentDetailId) === String(id)) renderDetail(currentDetailId);
+    }, DETAIL_REDRAW_DELAY_MS);
 }
 
 // --- Action Helpers (Favorites / Played) ---
@@ -700,7 +728,8 @@ async function toggleFavorite(id, current) {
         if (current) await API.unsetFavorite(id);
         else await API.setFavorite(id);
         toast(current ? t('detail.favorite_removed') : t('detail.favorite_added'));
-        if (currentDetailId === id) renderDetail(id);
+        // The page redraws from the change, as from the server's (detailUserDataChanged)
+        userDataChanged(id, { IsFavorite: !current });
     } catch (e) {
         toast(e.message, 'error');
     }
@@ -714,24 +743,60 @@ function playedButtonTitle(all, played) {
 
 async function togglePlayed(id, current, all = false) {
     try {
-        if (current) await API.markUnplayed(id);
-        else await API.markPlayed(id);
-        // Marking changes the item's (and a show's episodes') watch data, so drop the cached lists before re-rendering
-        API.invalidateCache('/Items');
-        API.invalidateCache('/Shows');
+        const answer = current ? await API.markUnplayed(id) : await API.markPlayed(id);
         if (all) toast(current ? t('detail.all_marked_unplayed') : t('detail.all_marked_played'));
         else toast(current ? t('detail.marked_unplayed') : t('detail.marked_played'));
-        if (currentDetailId === id) renderDetail(id);
+        // The page redraws from the change, as from the server's (detailUserDataChanged); a show's
+        // episodes follow from the server's message
+        userDataChanged(id, { ...(answer && answer.Played !== undefined ? answer : {}), Played: !current });
     } catch (e) {
         toast(e.message, 'error');
     }
 }
 
-// Admin: the metadata editor, Identify (for the types the provider knows) and the image editor
+// Download, when the server says the user may (CanDownload: the user's EnableContentDownloading and a
+// file of the item's own), as a plain link Jellyfin Web also uses; and Share, for every item
+function downloadShareButtons(item) {
+    const download = item.CanDownload ? `<a class="jf-btn-ghost h-11 !py-0 w-11 !px-0 inline-flex items-center justify-center" href="${escapeHtml(API.downloadUrl(item.Id))}" download title="${escapeHtml(t('detail.download'))}" aria-label="${escapeHtml(t('detail.download'))}">
+                                ${icon('Download', { size: 18 })}
+                            </a>` : '';
+    return `${download}<button class="jf-btn-ghost h-11 !py-0 w-11 !px-0" title="${escapeHtml(t('detail.share'))}" aria-label="${escapeHtml(t('detail.share'))}" data-action="share-item" data-id="${escapeHtml(item.Id)}" data-name="${escapeHtml(item.Name || '')}">
+                                ${icon('Share2', { size: 18 })}
+                            </button>`;
+}
+
+// The item page's address, for Share
+function itemShareUrl(id) {
+    return `${location.origin}${location.pathname}#detail/${encodeURIComponent(id)}`;
+}
+
+// Share: the system share sheet where the browser has one (as Jellyfin Web does), else the link is
+// copied; where the clipboard is refused too, a prompt shows it to copy by hand
+async function shareItem({ id, name = '' }) {
+    const url = itemShareUrl(id);
+    if (typeof navigator.share === 'function') {
+        try {
+            await navigator.share({ title: name, url });
+            return;
+        } catch (e) {
+            if (e?.name === 'AbortError') return;
+        }
+    }
+    try {
+        await navigator.clipboard.writeText(url);
+        toast(t('detail.share_copied'));
+    } catch {
+        window.prompt(t('detail.share_copy_prompt'), url);
+    }
+}
+
+// Admin: the metadata editor, Identify (for the types the provider knows), the image editor, and the
+// subtitle editor for videos
 function metadataToolButtons(item) {
     const tools = [['edit-metadata', 'Pencil', 'metadata.edit_metadata']];
     if (item.Type === 'Movie' || item.Type === 'Series') tools.push(['identify-item', 'ScanSearch', 'metadata.identify']);
     tools.push(['edit-images', 'Images', 'metadata.edit_images']);
+    if (['Movie', 'Episode', 'Video'].includes(item.Type)) tools.push(['edit-subtitles', 'Captions', 'subtitles.edit']);
     return tools.map(([action, name, key]) => `<button class="jf-btn-ghost h-11 !py-0 w-11 !px-0" title="${escapeHtml(t(key))}" aria-label="${escapeHtml(t(key))}" data-action="${action}" data-id="${escapeHtml(item.Id)}">
                                 ${icon(name, { size: 18 })}
                             </button>`).join('');
@@ -777,6 +842,7 @@ document.addEventListener('change', e => {
 });
 
 export {
+    detailUserDataChanged,
     currentDetailId, renderDetail, renderPerson, toggleFavorite, togglePlayed, deleteItemFromDetail, detailSelection,
-    versionLabels,
+    versionLabels, shareItem,
 };

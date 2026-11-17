@@ -11,7 +11,7 @@ use serde::Deserialize;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::LazyLock;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 const TRAKT_BASE: &str = "https://api.trakt.tv";
 #[allow(dead_code)]
@@ -536,15 +536,21 @@ pub async fn get_images(
 
 /// Trakt.tv plugin that registers itself as a metadata provider.
 pub struct TraktPlugin {
-    api_key: Mutex<Option<String>>,
+    /// Shared with the registered provider, which reads the current key on each call
+    api_key: Arc<Mutex<Option<String>>>,
 }
 
 impl Default for TraktPlugin {
     fn default() -> Self {
         Self {
-            api_key: Mutex::new(None),
+            api_key: Arc::new(Mutex::new(None)),
         }
     }
+}
+
+/// The key to call Trakt with: the current key, or `None` when it is missing or blank.
+fn usable_key(key: &Mutex<Option<String>>) -> Option<String> {
+    key.lock().unwrap().clone().filter(|k| !k.trim().is_empty())
 }
 
 impl Plugin for TraktPlugin {
@@ -591,12 +597,6 @@ impl Plugin for TraktPlugin {
     }
 }
 
-impl TraktPlugin {
-    fn api_key(&self) -> Option<String> {
-        self.api_key.lock().unwrap().clone()
-    }
-}
-
 /// FFI entry point for dynamic loading.
 /// Returns a raw pointer to a `Box<dyn Plugin>` for FFI safety.
 ///
@@ -606,9 +606,7 @@ impl TraktPlugin {
 #[cfg(feature = "dynamic")]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rustyfin_plugin_create() -> *mut std::ffi::c_void {
-    let plugin: Box<dyn Plugin> = Box::new(TraktPlugin {
-        api_key: Mutex::new(None),
-    });
+    let plugin: Box<dyn Plugin> = Box::new(TraktPlugin::default());
     Box::into_raw(Box::new(plugin)).cast()
 }
 
@@ -620,10 +618,9 @@ pub async fn register_trakt_provider<P>(
 where
     P: MetadataProviderRegistrar,
 {
-    let api_key = plugin.api_key().ok_or("Trakt API key not configured")?;
-    let api_key1 = api_key.clone();
-    let api_key2 = api_key.clone();
-    let api_key3 = api_key.clone();
+    // Always registers; each call reads the plugin's current key and asks nothing without one
+    let api_key1 = plugin.api_key.clone();
+    let api_key2 = plugin.api_key.clone();
 
     let plugin_id = plugin.id().to_string();
     plugin_manager
@@ -634,31 +631,36 @@ where
                   name: &str,
                   year: Option<i32>|
                   -> Pin<Box<dyn Future<Output = Option<ExternalMetadata>> + Send>> {
-                let api_key = api_key1.clone();
+                let key = api_key1.clone();
                 let name = name.to_string();
                 let client = client.clone();
-                Box::pin(async move { search_movie(&client, &api_key, &name, year).await })
+                Box::pin(async move {
+                    let api_key = usable_key(&key)?;
+                    search_movie(&client, &api_key, &name, year).await
+                })
             },
             move |client: &reqwest::Client,
                   name: &str|
                   -> Pin<Box<dyn Future<Output = Option<ExternalMetadata>> + Send>> {
-                let api_key = api_key2.clone();
+                let key = api_key2.clone();
                 let name = name.to_string();
                 let client = client.clone();
-                Box::pin(async move { search_tv(&client, &api_key, &name).await })
+                Box::pin(async move {
+                    let api_key = usable_key(&key)?;
+                    search_tv(&client, &api_key, &name).await
+                })
             },
             move |client: &reqwest::Client,
                   tmdb_id: Option<i64>,
                   tvdb_id: Option<i64>,
                   media_type: MediaType|
                   -> Pin<Box<dyn Future<Output = Vec<MetadataImage>> + Send>> {
-                let api_key = api_key3.clone();
                 let client = client.clone();
                 Box::pin(async move {
                     // Trakt uses its own IDs, so we can't directly look up by TMDB/TVDB ID.
                     // This is a limitation — Trakt images require Trakt IDs.
                     // We return empty for now since we don't have a Trakt ID mapping.
-                    let _ = (client, api_key, tmdb_id, tvdb_id, media_type);
+                    let _ = (client, tmdb_id, tvdb_id, media_type);
                     Vec::new()
                 })
             },
@@ -718,7 +720,7 @@ mod tests {
 
     #[test]
     fn test_urlencoded() {
-        assert_eq!(urlencoded("The Dark Knight"), "The+Dark+Knight");
+        assert_eq!(urlencoded("The Pale Lantern"), "The+Pale+Lantern");
         assert_eq!(
             urlencoded("Türkisch für Anfänger"),
             "T%C3%BCrkisch+f%C3%BCr+Anf%C3%A4nger"

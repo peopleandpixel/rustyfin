@@ -164,6 +164,8 @@ pub async fn scan_with_metadata(
         _ => scan_flat_library(pool, library, scope, ticket).await?,
     };
 
+    // The new playable items, for the "new library content" notification
+    let mut added: Vec<Uuid> = Vec::new();
     // Refresh metadata only for newly added items, not all items in the library.
     // This avoids unnecessary API calls on incremental scans.
     if !new_item_ids.is_empty() {
@@ -184,16 +186,20 @@ pub async fn scan_with_metadata(
         let mut later = Vec::new();
         for new_id in new_item_ids {
             match rustyfin_db::repo_media::get_item_by_id(pool, new_id).await {
-                Ok(Some(item))
+                Ok(Some(item)) => {
+                    use rustyfin_model::media::MediaType;
                     if matches!(
                         item.media_type,
-                        rustyfin_model::media::MediaType::Season
-                            | rustyfin_model::media::MediaType::Episode
-                    ) =>
-                {
-                    later.push(item)
+                        MediaType::Movie | MediaType::Episode | MediaType::Audio | MediaType::Video
+                    ) {
+                        added.push(item.id);
+                    }
+                    if matches!(item.media_type, MediaType::Season | MediaType::Episode) {
+                        later.push(item)
+                    } else {
+                        first.push(item)
+                    }
                 }
-                Ok(Some(item)) => first.push(item),
                 _ if counted => {
                     // An item that can't be loaded has nothing to refresh, but it still counts.
                     ticket.advance(1);
@@ -201,6 +207,8 @@ pub async fn scan_with_metadata(
                 _ => {}
             }
         }
+        // A stop skips the lookups not started yet
+        let stop = std::sync::Arc::new(ticket.clone());
         for wave in [first, later] {
             let mut handles = Vec::new();
             for item in wave {
@@ -208,8 +216,12 @@ pub async fn scan_with_metadata(
                 let pool = pool.clone();
                 let client = http_client.clone();
                 let pm = plugin_manager.clone();
+                let stop = stop.clone();
                 let handle = tokio::spawn(async move {
                     let _perm = sem.acquire().await;
+                    if stop.is_cancelled() {
+                        return;
+                    }
                     if let Err(e) = crate::metadata::refresh_item_metadata_with(
                         &pool,
                         &client,
@@ -272,7 +284,30 @@ pub async fn scan_with_metadata(
         tracing::warn!("failed to rebuild filter indexes: {}", e);
     }
 
+    notify_new_content(pool, plugin_manager, &added).await;
     Ok(changes)
+}
+
+/// Tells the notification providers about a scan's new playable items, as Jellyfin's
+/// NewLibraryContent: one item by its name (as its refresh left it), more by their number.
+async fn notify_new_content(pool: &SqlitePool, plugin_manager: &PluginManager, added: &[Uuid]) {
+    let message = match added {
+        [] => return,
+        [one] => {
+            let name = rustyfin_db::repo_media::get_item_by_id(pool, *one)
+                .await
+                .ok()
+                .flatten()
+                .map_or_else(|| "A new item".to_string(), |item| item.name);
+            format!("{name} has been added to your media library")
+        }
+        many => format!("{} items have been added to your media library", many.len()),
+    };
+    plugin_manager.notify(
+        crate::plugin_manager::NotificationEvent::NewLibraryContent,
+        "New content added",
+        &message,
+    );
 }
 
 /// Reads the photos of `scope` that were never read or whose file changed since, and stores what each
@@ -718,7 +753,10 @@ async fn restamp_local_images(
 
 /// `batch_upsert_media_items`, tried again while another writer holds the lock: it is one
 /// transaction, so a try that failed wrote nothing.
-async fn upsert_items(pool: &SqlitePool, items: &[MediaItem]) -> Result<(), sqlx::Error> {
+pub(crate) async fn upsert_items(
+    pool: &SqlitePool,
+    items: &[MediaItem],
+) -> Result<(), sqlx::Error> {
     rustyfin_db::busy::retry_busy("saving scanned items", || {
         rustyfin_db::repo_media::batch_upsert_media_items(pool, items)
     })
@@ -917,6 +955,17 @@ async fn remove_uncollected(
 }
 
 /// Flat scan for Movies, Photos, Mixed libraries
+/// Whether the scan was stopped (Stop on the library scan task) before its walk: it then ends
+/// with no change. A walk that has begun runs to its end, as its removal of missing items needs
+/// the whole walk; the metadata lookups after it stop.
+fn stopped_before_walk(library: &Library, ticket: &ScanTicket) -> bool {
+    let stopped = ticket.is_cancelled();
+    if stopped {
+        tracing::info!("the scan of library '{}' was stopped", library.name);
+    }
+    stopped
+}
+
 async fn scan_flat_library(
     pool: &SqlitePool,
     library: &Library,
@@ -925,6 +974,9 @@ async fn scan_flat_library(
 ) -> Result<(ScanChanges, Vec<Uuid>), sqlx::Error> {
     let guard = SCAN_LOCK.lock().await;
     ticket.start();
+    if stopped_before_walk(library, ticket) {
+        return Ok(Default::default());
+    }
     let filter = path_scope(scope);
     let mut count = 0u32;
     let mut existing_count = 0u32;
@@ -1084,6 +1136,47 @@ async fn scan_flat_library(
     // it doesn't name) is a movie file like any other, and a stored extra there becomes a movie again,
     // keeping its id.
     let is_root = |folder: &Path| library.paths.iter().any(|p| Path::new(p) == folder);
+    // A movie split into files (`movie-cd1.mkv`, `movie-cd2.mkv`) is one movie at its part 1, as in
+    // Jellyfin's StackResolver; the later parts are stored as its parts (`ExtraKind::Part`).
+    let mut part_extras: Vec<extras::FoundExtra> = Vec::new();
+    let mut stack_names: HashMap<PathBuf, String> = HashMap::new();
+    if reads_extras {
+        for (folder, files) in movie_files.iter_mut() {
+            for stack in naming::video_stacks(files) {
+                let (first, rest) = stack.files.split_first().expect("a stack has parts");
+                files.retain(|file| !rest.contains(file));
+                part_extras.extend(rest.iter().map(|part| extras::FoundExtra {
+                    path: part.clone(),
+                    owner_dir: folder.clone(),
+                    kind: naming::ExtraKind::Part,
+                    owner_name: String::new(),
+                    owner_paths: vec![first.clone()],
+                    of_episode: false,
+                }));
+                stack_names.insert(first.clone(), stack.name);
+            }
+        }
+    }
+    // A stored part that is no part now (its stack broke up: part 1 renamed or deleted) is a movie
+    // again, keeping its id, so the reconcile below finds it at its path instead of adding a second
+    // movie there. A part whose file is gone becomes a movie that the removal then deletes.
+    let stale_parts: Vec<String> = if reads_extras {
+        let parts: HashSet<String> = part_extras
+            .iter()
+            .map(|part| part.path.to_string_lossy().into_owned())
+            .collect();
+        rustyfin_db::repo_extras::items_by_path(pool, library.id, &filter)
+            .await?
+            .into_iter()
+            .filter(|(path, row)| {
+                row.extra_type.as_deref() == Some(naming::ExtraKind::Part.as_str())
+                    && !parts.contains(path)
+            })
+            .map(|(path, _)| path)
+            .collect()
+    } else {
+        Vec::new()
+    };
     let folder_groups: HashMap<PathBuf, Vec<naming::VersionGroup>> = movie_files
         .iter()
         .map(|(folder, files)| {
@@ -1092,7 +1185,7 @@ async fn scan_flat_library(
         })
         .collect();
     let movie_folders: HashSet<PathBuf> = movie_files.keys().cloned().collect();
-    let mut released: Vec<String> = Vec::new();
+    let mut released: Vec<String> = stale_parts;
     let mut owned_extras: Vec<extras::FoundExtra> = Vec::new();
     let unowned_files = found_extras
         .into_iter()
@@ -1127,7 +1220,7 @@ async fn scan_flat_library(
                 .push(file);
         }
     }
-    let found_extras = owned_extras;
+    let mut found_extras = owned_extras;
     // A failure here stops the scan: the reconcile would otherwise add a second movie at the same path.
     rustyfin_db::repo_extras::release_extras(pool, library.id, &released, "Movie").await?;
 
@@ -1138,8 +1231,32 @@ async fn scan_flat_library(
             .paths
             .iter()
             .any(|p| Path::new(p) == folder.as_path());
-        movie_groups.extend(naming::group_movie_files(folder, files, is_library_root));
+        let mut groups = naming::group_movie_files(folder, files, is_library_root);
+        for group in &mut groups {
+            prefer_stack(group, folder, &stack_names);
+        }
+        // In a library root the title comes from the file: a stacked movie's from its stack's name.
+        if is_library_root {
+            for group in &mut groups {
+                if let Some(name) = stack_names.get(&group.files[0]) {
+                    let clean = naming::clean_name(name);
+                    group.title = clean.title;
+                    group.year = clean.year.or(group.year);
+                }
+            }
+        }
+        movie_groups.extend(groups);
     }
+    // A part belongs to the movie its part 1 is a version of, whichever version is the movie's file.
+    for part in &mut part_extras {
+        if let Some(group) = movie_groups
+            .iter()
+            .find(|group| group.files.contains(&part.owner_paths[0]))
+        {
+            part.owner_paths = group.files.clone();
+        }
+    }
+    found_extras.append(&mut part_extras);
     // The items whose file is gone are read first: a group with no owner may take one over.
     let gone =
         scan_sync::gone_items(pool, library, &filter, &collected, &unreadable, &loops).await?;
@@ -1236,7 +1353,16 @@ async fn scan_flat_library(
     );
 
     // Remove the items that this scan no longer collects. A failure is logged, not returned.
-    let removed = remove_uncollected(pool, library, &filter, &collected, &unreadable, &loops).await;
+    let mut removed =
+        remove_uncollected(pool, library, &filter, &collected, &unreadable, &loops).await;
+    // A photo or mixed library's subfolders, as Jellyfin's Folder items. A failure is logged, not returned.
+    match crate::scan_folders::sync_folders(pool, library, &filter).await {
+        Ok((added, deleted)) => {
+            count += added;
+            removed += deleted;
+        }
+        Err(e) => tracing::error!("failed to save the folders of '{}': {e}", library.name),
+    }
     spawn_plans_under_lock(
         pool.clone(),
         guard,
@@ -1251,6 +1377,28 @@ async fn scan_flat_library(
         images: 0,
     };
     Ok((changes, new_item_ids))
+}
+
+/// Makes a stacked movie (part 1 of a movie split into files) the primary of its versions, as Jellyfin's
+/// `VideoListResolver.OrganizeAlternateVersions` prefers the version with more than one part, unless the
+/// primary is the file named exactly like its folder, which Jellyfin keeps first.
+fn prefer_stack(
+    group: &mut naming::VersionGroup,
+    folder: &Path,
+    stack_names: &HashMap<PathBuf, String>,
+) {
+    let named_like_folder = group.files[0].file_stem() == folder.file_name();
+    if named_like_folder || stack_names.contains_key(&group.files[0]) {
+        return;
+    }
+    if let Some(i) = group
+        .files
+        .iter()
+        .position(|file| stack_names.contains_key(file))
+    {
+        let head = group.files.remove(i);
+        group.files.insert(0, head);
+    }
 }
 
 /// A series folder that a TV scan walked.
@@ -1272,6 +1420,9 @@ async fn scan_tv_library(
 ) -> Result<(ScanChanges, Vec<Uuid>), sqlx::Error> {
     let guard = SCAN_LOCK.lock().await;
     ticket.start();
+    if stopped_before_walk(library, ticket) {
+        return Ok(Default::default());
+    }
     let filter = path_scope(scope);
     let mut count = 0u32;
     let mut plans: Vec<(Uuid, Vec<probe::ProbeStep>)> = Vec::new();
@@ -1279,6 +1430,11 @@ async fn scan_tv_library(
     let mut reread = 0u32;
     let rereads = scan_sync::RereadGate::new();
     let mut new_item_ids: Vec<Uuid> = Vec::new();
+    // Virtual items that a file arriving for them takes over: their ids are kept, and they are
+    // materialized once their rows are stored.
+    let mut virtuals = rustyfin_db::repo_virtual::library_virtuals(pool, library.id).await?;
+    let mut reused_season_ids: Vec<Uuid> = Vec::new();
+    let mut reused_episode_ids: Vec<Uuid> = Vec::new();
 
     // Load all existing paths into a HashSet for O(1) existence checks.
     let existing_paths: HashSet<String> =
@@ -1338,11 +1494,45 @@ async fn scan_tv_library(
             lib_path
         );
 
+        let classes: Vec<extras::Classified> = files
+            .iter()
+            .map(|file| extras::classify_tv_file(file, path))
+            .collect();
+        // The episode files by folder: an episode's extras belong to one of the episodes next to them.
+        let mut episodes_by_dir: HashMap<PathBuf, Vec<PathBuf>> = HashMap::new();
+        for (file, class) in files.iter().zip(&classes) {
+            if *class == extras::Classified::No
+                && is_episode_file(file)
+                && let Some(dir) = file.parent()
+            {
+                episodes_by_dir
+                    .entry(dir.to_path_buf())
+                    .or_default()
+                    .push(file.clone());
+            }
+        }
+
         let mut scanned_files = 0u32;
         let mut skipped_ext = 0u32;
-        for file_path_buf in files {
+        for (file_path_buf, class) in files.into_iter().zip(classes) {
             scanned_files += 1;
-            match extras::classify_tv_file(&file_path_buf, path) {
+            match class {
+                extras::Classified::Extra(mut found) if found.of_episode => {
+                    let episodes = episodes_by_dir
+                        .get(&found.owner_dir)
+                        .map(Vec::as_slice)
+                        .unwrap_or_default();
+                    found.owner_paths = extras::owning_episode(&found, episodes);
+                    if !found.owner_paths.is_empty() {
+                        found_extras.push(found);
+                        continue;
+                    }
+                    // An episode folder's extras folder with no one episode next to it is skipped; a suffix
+                    // file that names no episode next to it is an episode, as before.
+                    if found.owner_name.trim().is_empty() {
+                        continue;
+                    }
+                }
                 extras::Classified::Extra(mut found) => {
                     // The series or season folder; it owns the extra once it is stored.
                     found.owner_paths = vec![found.owner_dir.clone()];
@@ -1446,7 +1636,9 @@ async fn scan_tv_library(
                 season_map.insert(season_path.clone(), id);
                 id
             } else {
-                let id = Uuid::new_v4();
+                let reused = season_number.and_then(|n| virtuals.seasons.remove(&(series_id, n)));
+                reused_season_ids.extend(reused);
+                let id = reused.unwrap_or_else(Uuid::new_v4);
                 let season_item = MediaItem {
                     id,
                     name: season_name.clone(),
@@ -1504,6 +1696,8 @@ async fn scan_tv_library(
         // library need their seasons, so this runs before any episode is reconciled.
         if !new_items.is_empty() {
             upsert_items(pool, &new_items).await?;
+            rustyfin_db::repo_virtual::materialize(pool, &reused_season_ids, chrono::Utc::now())
+                .await?;
             // Find and save local images for series and seasons
             let mut all_images: Vec<rustyfin_model::image::ItemImage> = Vec::new();
             for item in &new_items {
@@ -1668,8 +1862,17 @@ async fn scan_tv_library(
                     .unwrap_or("Unknown")
                     .to_string();
                 let date_created = date_added(Path::new(&path)).await;
+                let reused = match (group.parent_index_number, group.index_number) {
+                    (Some(season), Some(episode)) => {
+                        virtuals
+                            .episodes
+                            .remove(&(group.series_id, season, episode))
+                    }
+                    _ => None,
+                };
+                reused_episode_ids.extend(reused);
                 let item = MediaItem {
-                    id: Uuid::new_v4(),
+                    id: reused.unwrap_or_else(Uuid::new_v4),
                     sort_name: auto_sort_name(
                         MediaType::Episode,
                         &name,
@@ -1710,6 +1913,8 @@ async fn scan_tv_library(
             plans.append(&mut new_episode_plans);
             count += new_episodes.len() as u32;
             new_item_ids.extend(new_episodes.iter().map(|item| item.id));
+            rustyfin_db::repo_virtual::materialize(pool, &reused_episode_ids, chrono::Utc::now())
+                .await?;
         }
     }
 
@@ -1979,6 +2184,9 @@ async fn scan_music_library(
 ) -> Result<(ScanChanges, Vec<Uuid>), sqlx::Error> {
     let guard = SCAN_LOCK.lock().await;
     ticket.start();
+    if stopped_before_walk(library, ticket) {
+        return Ok(Default::default());
+    }
     let filter = path_scope(scope);
     let mut count = 0u32;
     let mut existing_count = 0u32;
@@ -2500,8 +2708,18 @@ async fn scan_music_library(
 
     // Remove the items that this scan no longer collects. A failure is logged, not returned.
     let covers = local_images::embedded_cover_paths(pool, library.id).await;
+    let uploads = crate::lyrics::uploads_in_library(pool, library.id).await;
     let removed = remove_uncollected(pool, library, &filter, &collected, &unreadable, &loops).await;
     local_images::remove_orphaned_covers(pool, &covers).await;
+    crate::lyrics::remove_orphaned_uploads(pool, &uploads).await;
+    // The lyric files beside the tracks, as Jellyfin finds them on a scan, for their HasLyrics.
+    if let Err(e) = crate::lyrics::sync_sidecars(pool, library.id, &filter).await {
+        tracing::error!(
+            "failed to record the lyric files of '{}': {}",
+            library.name,
+            e
+        );
+    }
     tracing::info!(
         "scanned music library '{}': {} new items added ({} existing items unchanged)",
         library.name,

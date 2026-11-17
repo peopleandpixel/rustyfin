@@ -2,23 +2,33 @@
 //! Only an argon2 hash of a code is stored.
 
 use chrono::{DateTime, Utc};
-use rustyfin_model::user::User;
+use rustyfin_model::user::{NameMatch, User};
 use sqlx::SqlitePool;
 use uuid::Uuid;
 
 /// Inserts `user` (the columns `repo_user::create_user` writes) and its code row in one
-/// transaction; the code row's `created_at` is the user's, as RFC 3339.
+/// transaction, unless a user's name matches the new one (`NameMatch`, as
+/// `repo_user::create_user_unless_taken`). The code row's `created_at` is the user's, as RFC 3339.
+/// Returns false, with nothing written, when the name is taken.
 pub async fn create_user_with_code(
     pool: &SqlitePool,
     user: &User,
     code_hash: &str,
-) -> Result<(), sqlx::Error> {
+) -> Result<bool, sqlx::Error> {
     let id = user.id.to_string();
     let created = user.created_at.to_rfc3339();
     let is_admin = user.is_administrator as i32;
     let config = user.configuration.to_string();
 
     let mut tx = crate::begin_write(pool).await?;
+    let names: Vec<String> = sqlx::query_scalar("SELECT name FROM users")
+        .fetch_all(&mut *tx)
+        .await?;
+    let matcher = NameMatch::new(&user.name);
+    if names.iter().any(|name| matcher.matches(name)) {
+        // Dropping `tx` rolls the transaction back.
+        return Ok(false);
+    }
     sqlx::query(
         "INSERT INTO users (id, name, password_hash, is_administrator, created_at, configuration) VALUES (?, ?, ?, ?, ?, ?)",
     )
@@ -36,7 +46,8 @@ pub async fn create_user_with_code(
         .bind(&created)
         .execute(&mut *tx)
         .await?;
-    tx.commit().await
+    tx.commit().await?;
+    Ok(true)
 }
 
 /// A user with a setup code: its id and name, and when the current code was made.

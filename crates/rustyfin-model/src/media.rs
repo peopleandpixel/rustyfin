@@ -187,6 +187,9 @@ pub enum MediaType {
     /// A collection: Jellyfin's `BoxSet`.
     BoxSet,
     Playlist,
+    /// A subfolder of a photo, home videos or mixed library: Jellyfin's `Folder`. It has no file of
+    /// its own; its files and subfolders point at it through `parent_id`.
+    Folder,
     Unknown,
 }
 
@@ -207,6 +210,7 @@ impl std::str::FromStr for MediaType {
             "Genre" => Ok(MediaType::Genre),
             "BoxSet" => Ok(MediaType::BoxSet),
             "Playlist" => Ok(MediaType::Playlist),
+            "Folder" => Ok(MediaType::Folder),
             _ => Ok(MediaType::Unknown),
         }
     }
@@ -234,7 +238,7 @@ impl MediaType {
             MediaType::Genre => "Genre",
             MediaType::BoxSet => "BoxSet",
             MediaType::Playlist => "Playlist",
-            MediaType::Unknown => "Folder",
+            MediaType::Folder | MediaType::Unknown => "Folder",
         }
     }
 
@@ -246,7 +250,7 @@ impl MediaType {
             MediaType::Audio | MediaType::MusicAlbum | MediaType::MusicArtist => "Audio",
             MediaType::Photo => "Photo",
             MediaType::Genre | MediaType::BoxSet | MediaType::Playlist => "Unknown",
-            MediaType::Unknown => "Unknown",
+            MediaType::Folder | MediaType::Unknown => "Unknown",
         }
     }
 
@@ -260,6 +264,7 @@ impl MediaType {
                 | MediaType::Genre
                 | MediaType::BoxSet
                 | MediaType::Playlist
+                | MediaType::Folder
         )
     }
 }
@@ -293,7 +298,7 @@ pub struct MediaItem {
     pub tmdb_id: Option<i64>,
     /// TheTVDB ID for the item, used to fetch fanart.tv images for TV shows
     pub tvdb_id: Option<i64>,
-    /// Media sources (files) for this item, populated from DB when needed
+    /// Media sources (files) for this item, populated from DB when needed; each sent with its Name
     #[serde(default)]
     pub media_sources: Vec<MediaSourceResponse>,
 
@@ -423,7 +428,7 @@ pub struct MediaItem {
     /// Chapters array
     #[serde(default)]
     pub chapters: Vec<ChapterInfo>,
-    /// Media streams (flattened from MediaSources for convenience)
+    /// Media streams (flattened from MediaSources for convenience), each sent with its DisplayTitle
     #[serde(default)]
     pub media_streams: Vec<crate::media_source::MediaStream>,
     /// Current program for live TV channels
@@ -699,6 +704,10 @@ pub struct MediaItem {
     /// GPS altitude in metres, below sea level negative
     #[serde(default)]
     pub altitude: Option<f64>,
+    /// Whether an audio item has lyrics: a lyric file beside it, one uploaded, or a lyrics tag.
+    /// Jellyfin sends it for audio items only.
+    #[serde(default)]
+    pub has_lyrics: Option<bool>,
 }
 
 impl MediaItem {
@@ -860,6 +869,7 @@ impl MediaItem {
             latitude: None,
             longitude: None,
             altitude: None,
+            has_lyrics: None,
         }
     }
 }
@@ -902,7 +912,10 @@ impl Serialize for MediaItem {
             s.skip_field("IndexNumberEnd")?;
         }
         s.serialize_field("ParentIndexNumber", &self.parent_index_number)?;
-        s.serialize_field("MediaSources", &self.media_sources)?;
+        s.serialize_field(
+            "MediaSources",
+            &crate::media_source::NamedSources(&self.media_sources),
+        )?;
         // --- MediaItem DTO Fields ---
         s.serialize_field("UserData", &self.user_data)?;
         s.serialize_field("ImageTags", &self.image_tags)?;
@@ -946,7 +959,10 @@ impl Serialize for MediaItem {
         s.serialize_field("ExternalUrls", &self.external_urls)?;
         s.serialize_field("RemoteTrailers", &self.remote_trailers)?;
         s.serialize_field("Chapters", &self.chapters)?;
-        s.serialize_field("MediaStreams", &self.media_streams)?;
+        s.serialize_field(
+            "MediaStreams",
+            &crate::media_source::TitledStreams(&self.media_streams),
+        )?;
         s.serialize_field("CurrentProgram", &self.current_program)?;
         s.serialize_field("TimerId", &self.timer_id)?;
         s.serialize_field("SeriesTimerId", &self.series_timer_id)?;
@@ -1059,6 +1075,7 @@ impl Serialize for MediaItem {
         some_field!("Latitude", self.latitude);
         some_field!("Longitude", self.longitude);
         some_field!("Altitude", self.altitude);
+        some_field!("HasLyrics", self.has_lyrics);
         s.end()
     }
 }
@@ -1345,7 +1362,7 @@ mod tests {
     fn b32_a_virtual_season_gives_no_path() {
         let made_up = MediaItem {
             media_type: MediaType::Season,
-            path: "/tv/One Night (2023)/Season 1".to_string(),
+            path: "/tv/Owl Hollow (2023)/Season 1".to_string(),
             location_type: LocationType::Virtual,
             ..MediaItem::default_dto_fields()
         };
@@ -1358,7 +1375,7 @@ mod tests {
         };
         let json = serde_json::to_value(&folder).unwrap();
         assert_eq!(json["LocationType"], "FileSystem");
-        assert_eq!(json["Path"], "/tv/One Night (2023)/Season 1");
+        assert_eq!(json["Path"], "/tv/Owl Hollow (2023)/Season 1");
     }
 
     #[test]
@@ -1367,7 +1384,7 @@ mod tests {
         // `Dto/DtoService.cs:1517-1521`).
         let made_up = MediaItem {
             media_type: MediaType::Season,
-            path: "/tv/One Night (2023)/Season 1".to_string(),
+            path: "/tv/Owl Hollow (2023)/Season 1".to_string(),
             location_type: LocationType::Virtual,
             index_number: Some(1),
             ..MediaItem::default_dto_fields()
@@ -1384,7 +1401,7 @@ mod tests {
 
         let double = MediaItem {
             media_type: MediaType::Episode,
-            path: "/tv/One Night (2023)/Season 1/One Night S01E03-E04.mkv".to_string(),
+            path: "/tv/Owl Hollow (2023)/Season 1/Owl Hollow S01E03-E04.mkv".to_string(),
             index_number: Some(3),
             index_number_end: Some(4),
             ..MediaItem::default_dto_fields()

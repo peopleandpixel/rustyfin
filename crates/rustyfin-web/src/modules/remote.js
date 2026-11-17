@@ -4,7 +4,7 @@
 // the socket's messages with onSocketMessage and send on it with sendSocket.
 import { $, toast } from './util.js';
 import {
-    nowPlaying, seekToTicks, playItem, closePlayer, togglePlayPause, setVolume, toggleMute, changeAudioTrack,
+    nowPlaying, seekToTicks, playItem, stopNowPlaying, togglePlayPause, setVolume, toggleMute, changeAudioTrack,
     changeSubtitleTrack, skipTime, playAdjacentEpisode, toggleFullscreen,
 } from './player.js';
 import { playContainer, playQueueAt, queueStreamType } from './queue.js';
@@ -44,7 +44,7 @@ const PLAYSTATE = {
     Pause: () => video()?.pause(),
     Unpause: () => video()?.play(),
     PlayPause: () => togglePlayPause(),
-    Stop: () => closePlayer(),
+    Stop: () => stopNowPlaying(),
     Seek: d => seekToTicks(Number(d.SeekPositionTicks) || 0),
     NextTrack: () => playAdjacentEpisode(1),
     PreviousTrack: () => playAdjacentEpisode(-1),
@@ -108,10 +108,11 @@ function handleMessage(msg) {
     case 'Playstate': remotePlaystate(msg.Data); break;
     case 'GeneralCommand': remoteCommand(msg.Data); break;
     }
-    for (const fn of listeners.get(msg.MessageType) || []) fn(msg.Data);
+    for (const fn of listeners.get(msg.MessageType) || []) fn(msg.Data, msg);
 }
 
-// Calls fn with the Data of each message of type; 'SocketOpen' runs on each (re)connect. Returns the unsubscriber.
+// Calls fn with the Data of each message of type, and the whole message (some events carry their
+// fields at the top, without Data); 'SocketOpen' runs on each (re)connect. Returns the unsubscriber.
 function onSocketMessage(type, fn) {
     if (!listeners.has(type)) listeners.set(type, new Set());
     listeners.get(type).add(fn);

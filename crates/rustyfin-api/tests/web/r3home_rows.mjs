@@ -54,6 +54,7 @@ function sandbox(answers = {}, { libs = LIBS } = {}) {
             getMe: async () => ({ Id: 'u1', Configuration: {} }),
             get: async () => ({ CustomPrefs: {} }),
             getLibraries: async () => libs,
+            getUserViews: async () => libs,
             getNextUp: async () => ({ Items: [] }),
             async cachedGet(url) {
                 gets.push(url);

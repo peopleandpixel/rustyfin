@@ -50,6 +50,9 @@ RUN useradd -r -s /bin/false -m -d /data rustyfin
 USER rustyfin
 WORKDIR /data
 
+# The rustyfin user's home, also when the container runs as another uid (--user), so GPU
+# drivers never look for a cache under "/". ffmpeg children cache in /data/cache/gpu.
+ENV HOME=/data
 ENV RUSTYFIN_DATA=/data
 ENV RUSTYFIN_BIND=0.0.0.0:8096
 ENV RUSTYFIN_WEBCLIENT_DIR=/usr/local/share/rustyfin/web
@@ -57,8 +60,13 @@ ENV RUST_LOG=info
 
 EXPOSE 8096
 
-HEALTHCHECK --interval=30s --timeout=10s --retries=3 \
-    CMD curl -f http://localhost:8096/System/Info/Public || exit 1
+# The port (and the address, unless it is every address) come from RUSTYFIN_BIND, as the
+# server reads it; https when RUSTYFIN_TLS_CERT is set
+HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
+    CMD bind="${RUSTYFIN_BIND:-0.0.0.0:8096}"; port="${bind##*:}"; host="${bind%:*}"; \
+        case "$host" in ""|0.0.0.0|"[::]") host=127.0.0.1 ;; esac; \
+        scheme=http; [ -n "$RUSTYFIN_TLS_CERT" ] && scheme=https; \
+        curl -fsk -o /dev/null "$scheme://$host:$port/System/Info/Public" || exit 1
 
 ENTRYPOINT ["rustyfin"]
 

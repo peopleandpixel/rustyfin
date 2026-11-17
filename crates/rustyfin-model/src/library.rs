@@ -3,13 +3,33 @@ use uuid::Uuid;
 
 use crate::media::MediaType;
 
+/// A library's kind. Read from Rustyfin's names (`Photos`) or Jellyfin's collection types
+/// (`homevideos`, `HomeVideos`, `photos`, ...) in any case; written as Rustyfin's.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "String")]
 pub enum LibraryContentType {
     Movies,
     TvShows,
     Music,
     Photos,
     Mixed,
+}
+
+impl TryFrom<String> for LibraryContentType {
+    type Error = String;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        match value.to_ascii_lowercase().as_str() {
+            "movies" => Ok(Self::Movies),
+            "tvshows" => Ok(Self::TvShows),
+            "music" => Ok(Self::Music),
+            "photos" | "homevideos" => Ok(Self::Photos),
+            "mixed" => Ok(Self::Mixed),
+            _ => Err(format!(
+                "unknown library type \"{value}\": expected Movies, TvShows, Music, HomeVideos (Photos) or Mixed"
+            )),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -63,7 +83,14 @@ pub struct LibraryOptions {
     /// Watch the library folders for changes in real time
     #[serde(default = "default_true")]
     pub enable_realtime_monitor: bool,
+    /// Jellyfin's other library options (metadata language and country, fetchers and their order,
+    /// savers, subtitle options, …), kept as a client sent them so every field round-trips.
+    #[serde(flatten)]
+    pub other: serde_json::Map<String, serde_json::Value>,
 }
+
+/// Jellyfin's per-library fields that Rustyfin computes from the library itself, never stored.
+const COMPUTED_FIELDS: [&str; 1] = ["PathInfos"];
 
 impl Default for LibraryOptions {
     fn default() -> Self {
@@ -77,6 +104,7 @@ impl Default for LibraryOptions {
             extract_trickplay_images_during_library_scan: false,
             enable_intro_detection: false,
             enable_realtime_monitor: true,
+            other: serde_json::Map::new(),
         }
     }
 }
@@ -110,6 +138,8 @@ pub struct LibraryOptionsUpdate {
     enable_intro_detection: bool,
     #[serde(default = "default_true")]
     enable_realtime_monitor: bool,
+    #[serde(flatten)]
+    other: serde_json::Map<String, serde_json::Value>,
 }
 
 /// One setting sent under two names. When both are sent and disagree, one of them is the value
@@ -155,6 +185,11 @@ impl LibraryOptionsUpdate {
                 .extract_trickplay_images_during_library_scan,
             enable_intro_detection: o.enable_intro_detection,
             enable_realtime_monitor: o.enable_realtime_monitor,
+            other: o
+                .other
+                .into_iter()
+                .filter(|(k, _)| !COMPUTED_FIELDS.contains(&k.as_str()))
+                .collect(),
         }
     }
 }
@@ -197,6 +232,23 @@ impl LibraryContentType {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn content_type_reads_jellyfin_collection_types() {
+        let read = |s: &str| serde_json::from_value::<LibraryContentType>(serde_json::json!(s));
+        for name in ["HomeVideos", "homevideos", "Photos", "photos"] {
+            assert_eq!(read(name).unwrap(), LibraryContentType::Photos, "{name}");
+        }
+        assert_eq!(read("tvshows").unwrap(), LibraryContentType::TvShows);
+        assert_eq!(read("MOVIES").unwrap(), LibraryContentType::Movies);
+        assert_eq!(read("Mixed").unwrap(), LibraryContentType::Mixed);
+        assert!(read("books").is_err());
+        // Written as before
+        assert_eq!(
+            serde_json::to_value(LibraryContentType::Photos).unwrap(),
+            "Photos"
+        );
+    }
 
     #[test]
     fn r2chapters_options_take_either_name_and_prefer_jellyfins() {
@@ -281,6 +333,26 @@ mod tests {
             "{stored}"
         );
         assert_eq!(stored["EnableChapterExtraction"], true);
+    }
+
+    #[test]
+    fn r3dash3_jellyfin_options_round_trip() {
+        let o: LibraryOptions = serde_json::from_str(
+            r#"{"PreferredMetadataLanguage":"de","MetadataSavers":["Nfo"],
+                "TypeOptions":[{"Type":"Movie","MetadataFetcherOrder":["TheMovieDb"]}],
+                "PathInfos":[{"Path":"/old"}],"EnableRealtimeMonitor":false}"#,
+        )
+        .unwrap();
+        assert!(!o.enable_realtime_monitor);
+        let back = serde_json::to_value(&o).unwrap();
+        assert_eq!(back["PreferredMetadataLanguage"], "de");
+        assert_eq!(back["MetadataSavers"][0], "Nfo");
+        assert_eq!(
+            back["TypeOptions"][0]["MetadataFetcherOrder"][0],
+            "TheMovieDb"
+        );
+        // The library's folders are its own, never a stored copy
+        assert!(back.get("PathInfos").is_none(), "{back}");
     }
 
     // ── LibraryContentType::default_media_type ──
