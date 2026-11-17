@@ -15705,6 +15705,7 @@ async fn g12_stub() -> (String, G12Hits) {
             "/movie/7101" => serde_json::json!({
                 "id": 7101,
                 "title": "Wrong Film",
+                "original_language": "en",
                 "overview": "Not the item's film",
                 "release_date": "1985-03-01"
             }),
