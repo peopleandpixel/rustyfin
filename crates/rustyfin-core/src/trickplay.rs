@@ -1160,7 +1160,7 @@ impl Feed<'_> {
 
     /// Sends the key frames ffprobe prints (`-show_data`) with `probe_args`. Dropping it kills
     /// ffprobe.
-    async fn from_probe(&mut self, probe_args: &[&str]) -> Result<(), String> {
+    async fn send_from_probe(&mut self, probe_args: &[&str]) -> Result<(), String> {
         use tokio::io::{AsyncBufReadExt, BufReader};
 
         let mut probe = tool("ffprobe");
@@ -1215,7 +1215,7 @@ impl Feed<'_> {
 
     /// Sends the key frame each of `targets` seeks to in `index`, from the file at `path`, each
     /// read while the one before goes to ffmpeg.
-    async fn from_index(
+    async fn send_from_index(
         &mut self,
         index: &Arc<MkvIndex>,
         path: &str,
@@ -1342,10 +1342,10 @@ async fn pipe_key_frames(
                     "default=noprint_wrappers=1",
                     path,
                 ];
-                feed.from_probe(&probe_args).await?;
+                feed.send_from_probe(&probe_args).await?;
             }
             PacketSource::Index { index, targets } => {
-                feed.from_index(index, path, targets).await?;
+                feed.send_from_index(index, path, targets).await?;
             }
         }
         // ffmpeg's input ends here
