@@ -186,6 +186,11 @@ async fn get_seasons(
     HiddenItems::for_caller(&state, &claims)
         .await?
         .retain(&mut seasons);
+    if !display_missing_episodes(&state.db_ro, user_id).await {
+        let virtual_ids =
+            rustyfin_db::repo_media::virtual_item_ids(&state.db_ro, series_id).await?;
+        seasons.retain(|s| !virtual_ids.contains(&s.id));
+    }
     let total = seasons.len() as i64;
 
     let tmdb_key = state
@@ -278,6 +283,12 @@ async fn get_episodes(
         .await?
         .retain(&mut episodes);
 
+    // Virtual episodes are left out unless DisplayMissingEpisodes (or an API key) asks for them
+    if !(claims.sub.is_nil() || display_missing_episodes(&state.db_ro, user_id).await) {
+        let virtual_ids =
+            rustyfin_db::repo_media::virtual_item_ids(&state.db_ro, series_id).await?;
+        episodes.retain(|e| !virtual_ids.contains(&e.id));
+    }
     if let Some(missing) = is_missing {
         // Jellyfin's IsMissingEpisode: a Virtual episode.
         episodes.retain(|e| (e.location_type == LocationType::Virtual) == missing);
@@ -334,6 +345,18 @@ async fn get_episodes(
         total_record_count: total,
         start_index: start as i64,
     }))
+}
+
+/// Whether `user` set DisplayMissingEpisodes, so that virtual items (missing and unaired episodes,
+/// and seasons holding only those) are listed. False for no user.
+pub(crate) async fn display_missing_episodes(pool: &sqlx::SqlitePool, user: Option<Uuid>) -> bool {
+    let Some(user) = user else { return false };
+    rustyfin_db::repo_user::get_user_by_id(pool, user)
+        .await
+        .ok()
+        .flatten()
+        .map(|u| rustyfin_model::user::jellyfin_configuration(&u.configuration))
+        .is_some_and(|config| config["DisplayMissingEpisodes"].as_bool() == Some(true))
 }
 
 /// The items hidden from the user a route answers for: `user` (an administrator's `userId`), else

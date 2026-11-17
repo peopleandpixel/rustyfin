@@ -47,7 +47,8 @@ pub async fn get_user_item_data(
 
 /// For each Series or Season in `folder_ids`, counts its episodes and the ones `user_id` has not
 /// played, as `(episodes, unplayed)`. A season's episodes are its children; a series' episodes
-/// are those of its seasons, specials included. Only the episodes that pass `visible` (a
+/// are those of its seasons, specials included. Virtual episodes (missing and unaired ones, with
+/// no file) never count, as in Jellyfin. Only the episodes that pass `visible` (a
 /// `repo_parental::filter_json` filter) count; `None` counts them all. Folders with no episodes
 /// have no entry.
 pub async fn get_unplayed_counts(
@@ -78,14 +79,14 @@ pub async fn get_unplayed_counts(
              SELECT e.id AS episode_id, p.id AS folder_id \
              FROM media_items e JOIN media_items p ON p.id = e.parent_id \
              WHERE e.media_type = 'Episode' AND p.media_type = 'Season' AND p.id IN ({ph}) \
-               AND {shown} \
+               AND e.is_virtual_item = 0 AND {shown} \
              UNION ALL \
              SELECT e.id, g.id \
              FROM media_items e \
              JOIN media_items p ON p.id = e.parent_id AND p.media_type = 'Season' \
              JOIN media_items g ON g.id = p.parent_id \
              WHERE e.media_type = 'Episode' AND g.media_type = 'Series' AND g.id IN ({ph}) \
-               AND {shown} \
+               AND e.is_virtual_item = 0 AND {shown} \
          ) ef \
          LEFT JOIN user_item_data ud ON ud.item_id = ef.episode_id AND ud.user_id = ?1 \
          GROUP BY ef.folder_id",

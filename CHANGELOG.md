@@ -8,6 +8,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Missing and upcoming episodes**, as in Jellyfin 12.4: the TMDb plugin's settings turn on virtual entries for the episodes TMDb lists that a series has no file for, unaired (`ImportUnairedEpisodes`), already aired (`ImportMissingEpisodes`) and specials (`ImportSpecials`), in the TV libraries chosen (`EnabledMissingEpisodeLibraries`), with a grace period before recently aired placeholders go (`UpcomingEpisodeGracePeriodDays`).
+  - The Library task "Refresh upcoming and missing episodes (TheMovieDb)" (`TmdbRefreshUpcomingEpisodes`, every 7 days) creates and prunes them for each series that has not ended. It asks TMDb for a series' season list once a run, and for a season only when its episode count has changed; the rest comes from the cache.
+  - Virtual episodes and seasons have `LocationType: Virtual` and no path. As in Jellyfin they stay out of a series' episode and season lists (unless the user's `DisplayMissingEpisodes` is on), Next Up, Latest and the item counts, show in Upcoming, and `/Items` filters them with `IsMissing`, `IsUnaired`, `LocationTypes` and `ExcludeLocationTypes`.
+  - A scan never removes one as a missing file. When the file arrives, it takes the virtual episode's place: same id, so its played state and other user data stay.
 - **Library tabs in the web client**: A movie library has Jellyfin Web's Movies, Suggestions, Favorites, Collections and Genres tabs, and a TV library Shows, Suggestions, Upcoming, Genres, Networks and Episodes. The open tab is kept in the address, so back and refresh return to it.
   - Suggestions shows Continue Watching, the latest movies or episodes, Next Up for TV, and for movies rows like "Because you watched …" and "Because you like …".
   - Upcoming lists the library's episodes still to air, a row per day; Networks shows a card per network, which opens that network's shows.

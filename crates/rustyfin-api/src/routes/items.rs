@@ -777,7 +777,8 @@ async fn enrich_item(
     // --- Folder counts (for Series, Season, MusicAlbum, Folder), of every child: `media_item`
     // caches this item for every user and counts again for a user with limits ---
     if item.media_type.is_folder() {
-        if let Ok(counts) = rustyfin_db::repo_media::count_items_by_type(pool, item.id, None).await
+        if let Ok(counts) =
+            rustyfin_db::repo_media::count_items_by_type(pool, item.id, None, false).await
         {
             set_folder_counts(item, counts);
         }
@@ -1154,7 +1155,8 @@ pub(crate) async fn enrich_items_with(
         );
     }
 
-    // Batch query 5: Folder counts for folder items
+    // Batch query 5: Folder counts for folder items (virtual items only with DisplayMissingEpisodes)
+    let include_virtual = crate::routes::shows::display_missing_episodes(pool, user_id).await;
     let folder_ids: Vec<Uuid> = items
         .iter()
         .filter(|item| item.media_type.is_folder())
@@ -1163,9 +1165,14 @@ pub(crate) async fn enrich_items_with(
     let folder_counts_map = if folder_ids.is_empty() {
         std::collections::HashMap::new()
     } else {
-        rustyfin_db::repo_media::get_folder_counts_batch(pool, &folder_ids, visible.as_deref())
-            .await
-            .unwrap_or_default()
+        rustyfin_db::repo_media::get_folder_counts_batch(
+            pool,
+            &folder_ids,
+            visible.as_deref(),
+            include_virtual,
+        )
+        .await
+        .unwrap_or_default()
     };
 
     // Batch query 6: All images for all items - populates image_tags. Only the image types and
@@ -2026,6 +2033,18 @@ struct ItemsQuery {
     is_favorite: Option<bool>,
     #[serde(rename = "isFavorite")]
     is_favorite_lower: Option<bool>,
+    is_missing: Option<bool>,
+    #[serde(rename = "isMissing")]
+    is_missing_lower: Option<bool>,
+    is_unaired: Option<bool>,
+    #[serde(rename = "isUnaired")]
+    is_unaired_lower: Option<bool>,
+    location_types: Option<String>,
+    #[serde(rename = "locationTypes")]
+    location_types_lower: Option<String>,
+    exclude_location_types: Option<String>,
+    #[serde(rename = "excludeLocationTypes")]
+    exclude_location_types_lower: Option<String>,
     is_unplayed: Option<bool>,
     #[serde(rename = "isUnplayed")]
     is_unplayed_lower: Option<bool>,
@@ -2240,6 +2259,22 @@ impl ItemsQuery {
     }
     fn image_types_limit(&self) -> Option<i32> {
         self.image_types_limit.or(self.image_types_limit_lower)
+    }
+    fn is_missing(&self) -> Option<bool> {
+        self.is_missing.or(self.is_missing_lower)
+    }
+    fn is_unaired(&self) -> Option<bool> {
+        self.is_unaired.or(self.is_unaired_lower)
+    }
+    fn location_types(&self) -> Option<&str> {
+        self.location_types
+            .as_deref()
+            .or(self.location_types_lower.as_deref())
+    }
+    fn exclude_location_types(&self) -> Option<&str> {
+        self.exclude_location_types
+            .as_deref()
+            .or(self.exclude_location_types_lower.as_deref())
     }
     fn is_favorite(&self) -> Option<bool> {
         self.is_favorite.or(self.is_favorite_lower)
@@ -2621,10 +2656,47 @@ async fn get_items(
             }
         }
     }
+    // Virtual items (`is_virtual_item`): IsMissing and LocationTypes / ExcludeLocationTypes naming
+    // Virtual, as Jellyfin's TranslateQuery reads them. Plain requests leave them in.
+    let names = |s: Option<&str>| {
+        s.map(|s| {
+            s.split(',')
+                .map(|t| t.trim().to_ascii_lowercase())
+                .collect::<Vec<String>>()
+        })
+    };
+    let location_types = names(query.location_types());
+    let excluded_types = names(query.exclude_location_types()).unwrap_or_default();
+    let names_virtual = |types: &[String]| types.iter().any(|t| t == "virtual");
+    let mut virtual_filter = rustyfin_db::repo_media::VirtualFilter {
+        unaired: query.is_unaired(),
+        // A series' virtual seasons are left out unless DisplayMissingEpisodes (or an API key)
+        hide_seasons: parent_id.is_some()
+            && !(claims.sub.is_nil()
+                || crate::routes::shows::display_missing_episodes(&state.db_ro, Some(claims.sub))
+                    .await),
+        ..Default::default()
+    };
+    match query.is_missing() {
+        Some(true) => virtual_filter.only = true,
+        Some(false) => virtual_filter.none = true,
+        None => {}
+    }
+    if let Some(types) = &location_types {
+        if names_virtual(types) {
+            virtual_filter.only = true;
+        } else if !types.is_empty() {
+            virtual_filter.none = true;
+        }
+    }
+    if names_virtual(&excluded_types) {
+        virtual_filter.none = true;
+    }
+
     let hidden = HiddenItems::for_caller(&state, &claims).await?;
     let hidden_json = hide_also(hidden.json(), without);
 
-    let (items, total) = rustyfin_db::repo_media::get_items_filtered(
+    let (items, total) = rustyfin_db::repo_media::get_items_filtered_virtual(
         &state.db_ro,
         parent_id,
         query.library_id(),
@@ -2654,6 +2726,7 @@ async fn get_items(
         Some(claims.sub),
         item_ids.as_deref(),
         hidden_json.as_deref(),
+        virtual_filter,
     )
     .await?;
 
@@ -2941,9 +3014,16 @@ pub(crate) async fn media_item(
         true => crate::parental::user_filter(&state.db_ro, Some(user)).await,
         false => None,
     };
-    if visible.is_some()
-        && let Ok(counts) =
-            rustyfin_db::repo_media::count_items_by_type(&state.db_ro, id, visible.as_deref()).await
+    let include_virtual =
+        crate::routes::shows::display_missing_episodes(&state.db_ro, Some(user)).await;
+    if (visible.is_some() || include_virtual)
+        && let Ok(counts) = rustyfin_db::repo_media::count_items_by_type(
+            &state.db_ro,
+            id,
+            visible.as_deref(),
+            include_virtual,
+        )
+        .await
     {
         set_folder_counts(&mut item, counts);
     }

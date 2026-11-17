@@ -829,6 +829,7 @@ pub(crate) struct FilterShape {
     is_unplayed: Option<bool>,
     is_played: Option<bool>,
     sort: Vec<SortTerm>,
+    virtual_filter: VirtualFilter,
 }
 
 /// Build the cache key: the request's shape. Lists that parse to the same sort terms have equal
@@ -861,6 +862,7 @@ pub(crate) fn filter_cache_key(
         is_unplayed,
         is_played,
         sort: parse_sort(sort_by, sort_order),
+        virtual_filter: VirtualFilter::default(),
     }
 }
 
@@ -1145,6 +1147,8 @@ fn order_by_clause(terms: &[SortTerm]) -> String {
 /// The key is built here, from the filter this call renders, so no caller can pair a key with a
 /// different filter.
 #[allow(clippy::too_many_arguments)]
+/// `build_filtered_query_virtual` with no virtual-item filter.
+#[cfg(test)]
 fn build_filtered_query(
     recursive: bool,
     media_types: Option<&[String]>,
@@ -1159,6 +1163,40 @@ fn build_filtered_query(
     is_played: Option<bool>,
     sort_by: &str,
     sort_order: &str,
+) -> (String, String) {
+    build_filtered_query_virtual(
+        recursive,
+        media_types,
+        exclude_media_types,
+        genres,
+        years,
+        official_ratings,
+        tags,
+        media_types_filter,
+        is_favorite,
+        is_unplayed,
+        is_played,
+        sort_by,
+        sort_order,
+        VirtualFilter::default(),
+    )
+}
+
+fn build_filtered_query_virtual(
+    recursive: bool,
+    media_types: Option<&[String]>,
+    exclude_media_types: Option<&[String]>,
+    genres: Option<&[String]>,
+    years: Option<&[i32]>,
+    official_ratings: Option<&[String]>,
+    tags: Option<&[String]>,
+    media_types_filter: Option<&[String]>,
+    is_favorite: Option<bool>,
+    is_unplayed: Option<bool>,
+    is_played: Option<bool>,
+    sort_by: &str,
+    sort_order: &str,
+    virtual_filter: VirtualFilter,
 ) -> (String, String) {
     let cache_key = filter_cache_key(
         media_types.map(|t| t.len()).unwrap_or(0),
@@ -1175,6 +1213,11 @@ fn build_filtered_query(
         sort_by,
         sort_order,
     );
+
+    let cache_key = FilterShape {
+        virtual_filter,
+        ..cache_key
+    };
 
     // Check cache first: a hit needs a stored shape equal to this one, not just an equal hash.
     {
@@ -1279,6 +1322,23 @@ fn build_filtered_query(
         where_parts.push(format!("NOT {PLAYED_CLAUSE}"));
     } else if is_unplayed == Some(false) {
         where_parts.push(PLAYED_CLAUSE.to_string());
+    }
+
+    // Virtual items: literal SQL, except IsUnaired's date, which get_items_filtered_virtual binds
+    // after the played clauses, as an RFC 3339 string (the form premiere_date is stored in).
+    if virtual_filter.only {
+        where_parts.push("is_virtual_item = 1".to_string());
+    }
+    if virtual_filter.none {
+        where_parts.push("is_virtual_item = 0".to_string());
+    }
+    if virtual_filter.hide_seasons {
+        where_parts.push("NOT (is_virtual_item = 1 AND media_type = 'Season')".to_string());
+    }
+    match virtual_filter.unaired {
+        Some(true) => where_parts.push("premiere_date >= ?".to_string()),
+        Some(false) => where_parts.push("premiere_date < ?".to_string()),
+        None => {}
     }
 
     // Build the static base WHERE clause for single-value params.
@@ -1390,6 +1450,21 @@ async fn played_folder_ids(
     Ok(serde_json::to_string(&ids).unwrap_or_else(|_| "[]".to_string()))
 }
 
+/// Virtual items (`is_virtual_item`) as `/Items` filters them. The default leaves every item in.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub struct VirtualFilter {
+    /// Only virtual items (`IsMissing=true`, or `LocationTypes` naming Virtual).
+    pub only: bool,
+    /// No virtual items (`IsMissing=false`, `ExcludeLocationTypes` naming Virtual, or a
+    /// `LocationTypes` list without Virtual).
+    pub none: bool,
+    /// `IsUnaired=true`: premiere on or after now. `false`: before now.
+    pub unaired: Option<bool>,
+    /// Virtual seasons are left out (a series' seasons, unless DisplayMissingEpisodes).
+    pub hide_seasons: bool,
+}
+
+/// `get_items_filtered_virtual` with no virtual-item filter.
 #[allow(clippy::too_many_arguments)]
 pub async fn get_items_filtered(
     pool: &SqlitePool,
@@ -1421,6 +1496,75 @@ pub async fn get_items_filtered(
     user_id: Option<Uuid>,
     item_ids: Option<&[String]>,
     hidden_ids_json: Option<&str>,
+) -> Result<(Vec<MediaItem>, i64), sqlx::Error> {
+    get_items_filtered_virtual(
+        pool,
+        parent_id,
+        library_id,
+        media_types,
+        exclude_media_types,
+        genres,
+        years,
+        search_term,
+        name_starts_with,
+        name_starts_with_or_greater,
+        sort_by,
+        sort_order,
+        start_index,
+        limit,
+        recursive,
+        is_favorite,
+        is_unplayed,
+        is_played,
+        official_ratings,
+        tags,
+        media_types_filter,
+        start_date,
+        end_date,
+        premiere_date,
+        date_created,
+        runtime,
+        user_id,
+        item_ids,
+        hidden_ids_json,
+        VirtualFilter::default(),
+    )
+    .await
+}
+
+/// `get_items_filtered`, also filtered by `virtual_filter`.
+#[allow(clippy::too_many_arguments)]
+pub async fn get_items_filtered_virtual(
+    pool: &SqlitePool,
+    parent_id: Option<Uuid>,
+    library_id: Option<Uuid>,
+    media_types: Option<&[String]>,
+    exclude_media_types: Option<&[String]>,
+    genres: Option<&[String]>,
+    years: Option<&[i32]>,
+    search_term: Option<&str>,
+    name_starts_with: Option<&str>,
+    name_starts_with_or_greater: Option<&str>,
+    sort_by: Option<&str>,
+    sort_order: Option<&str>,
+    start_index: i64,
+    limit: i64,
+    recursive: bool,
+    is_favorite: Option<bool>,
+    is_unplayed: Option<bool>,
+    is_played: Option<bool>,
+    official_ratings: Option<&[String]>,
+    tags: Option<&[String]>,
+    media_types_filter: Option<&[String]>,
+    start_date: Option<&str>,
+    end_date: Option<&str>,
+    premiere_date: Option<&str>,
+    date_created: Option<&str>,
+    runtime: Option<(i32, i32)>,
+    user_id: Option<Uuid>,
+    item_ids: Option<&[String]>,
+    hidden_ids_json: Option<&str>,
+    virtual_filter: VirtualFilter,
 ) -> Result<(Vec<MediaItem>, i64), sqlx::Error> {
     // Convert options to strings for the (? IS NULL OR ? = '' OR col = ?) pattern
     let pid_str = parent_id.map(|u| u.to_string()).unwrap_or_default();
@@ -1475,7 +1619,7 @@ pub async fn get_items_filtered(
     let sort_order_str = sort_order.unwrap_or("Ascending");
 
     // Get cached query strings — same array sizes → same plan
-    let (count_sql, data_sql) = build_filtered_query(
+    let (count_sql, data_sql) = build_filtered_query_virtual(
         recursive,
         media_types,
         exclude_media_types,
@@ -1489,6 +1633,7 @@ pub async fn get_items_filtered(
         is_played,
         &sort_by_str,
         &sort_order_str,
+        virtual_filter,
     );
 
     // Recursive flag: 1 = recursive, 0 = non-recursive
@@ -1611,6 +1756,9 @@ pub async fn get_items_filtered(
     if is_unplayed.is_some() {
         count_q = count_q.bind(&played_folders).bind(&uid_str);
     }
+    if virtual_filter.unaired.is_some() {
+        count_q = count_q.bind(chrono::Utc::now().to_rfc3339());
+    }
 
     let total: i64 = count_q.fetch_one(pool).await.unwrap_or(0);
 
@@ -1728,6 +1876,9 @@ pub async fn get_items_filtered(
     }
     if is_unplayed.is_some() {
         data_q = data_q.bind(&played_folders).bind(&uid_str);
+    }
+    if virtual_filter.unaired.is_some() {
+        data_q = data_q.bind(chrono::Utc::now().to_rfc3339());
     }
 
     // The sort keys' binds: the user id (play count, date played), the rating scores
@@ -2986,7 +3137,7 @@ pub async fn get_next_up(
                     "SELECT se.parent_id, MAX(ud.last_played_date), \
                  MAX(CASE WHEN ud.played = 1 THEN ud.last_played_date END) \
                  FROM user_item_data ud \
-                 JOIN media_items e ON e.id = ud.item_id AND e.media_type = 'Episode' \
+                 JOIN media_items e ON e.id = ud.item_id AND e.media_type = 'Episode' AND e.is_virtual_item = 0 \
                  JOIN media_items se ON se.id = e.parent_id AND se.media_type = 'Season' \
                  WHERE ud.user_id = ? AND ud.last_played_date IS NOT NULL \
                  AND (ud.played = 1 OR ud.playback_position_ticks > 0) \
@@ -3036,7 +3187,7 @@ pub async fn get_next_up(
              FROM media_items e \
              JOIN media_items se ON se.id = e.parent_id AND se.media_type = 'Season' \
              LEFT JOIN user_item_data ud ON ud.item_id = e.id AND ud.user_id = ? \
-             WHERE se.parent_id = ? AND e.media_type = 'Episode' \
+             WHERE se.parent_id = ? AND e.media_type = 'Episode' AND e.is_virtual_item = 0 \
              AND (e.parent_index_number IS NULL OR e.parent_index_number <> 0)",
         )
         .bind(uid.as_deref())
@@ -3631,18 +3782,39 @@ pub async fn count_items_by_type(
     pool: &SqlitePool,
     parent_id: uuid::Uuid,
     visible: Option<&str>,
+    include_virtual: bool,
 ) -> Result<Vec<(String, i64)>, sqlx::Error> {
     let pid = parent_id.to_string();
+    // Virtual items (`is_virtual_item`) count only with DisplayMissingEpisodes
     let sql = format!(
         "SELECT media_type, COUNT(*) FROM media_items WHERE parent_id = ?1 AND {} \
-         GROUP BY media_type",
+         AND (?3 = 1 OR is_virtual_item = 0) GROUP BY media_type",
         crate::repo_parental::visible_sql("id", "library_id", "?2"),
     );
     sqlx::query_as::<_, (String, i64)>(sqlx::AssertSqlSafe(sql))
         .bind(&pid)
         .bind(visible)
+        .bind(include_virtual)
         .fetch_all(pool)
         .await
+}
+
+/// The virtual items (`is_virtual_item`) of a series: its virtual seasons and episodes.
+pub async fn virtual_item_ids(
+    pool: &SqlitePool,
+    series_id: Uuid,
+) -> Result<std::collections::HashSet<Uuid>, sqlx::Error> {
+    let ids: Vec<String> = sqlx::query_scalar(
+        "SELECT id FROM media_items WHERE is_virtual_item = 1 AND (parent_id = ?1 \
+         OR parent_id IN (SELECT id FROM media_items WHERE parent_id = ?1))",
+    )
+    .bind(series_id.to_string())
+    .fetch_all(pool)
+    .await?;
+    Ok(ids
+        .iter()
+        .filter_map(|id| Uuid::parse_str(id).ok())
+        .collect())
 }
 
 /// Get a parent item by ID (for inherited image tags and series info).
@@ -4256,6 +4428,7 @@ pub async fn get_folder_counts_batch(
     pool: &SqlitePool,
     parent_ids: &[uuid::Uuid],
     visible: Option<&str>,
+    include_virtual: bool,
 ) -> Result<std::collections::HashMap<String, std::collections::HashMap<String, i64>>, sqlx::Error>
 {
     if parent_ids.is_empty() {
@@ -4264,7 +4437,7 @@ pub async fn get_folder_counts_batch(
     let mut results: std::collections::HashMap<String, std::collections::HashMap<String, i64>> =
         std::collections::HashMap::new();
     for pid in parent_ids {
-        let counts = count_items_by_type(pool, *pid, visible).await?;
+        let counts = count_items_by_type(pool, *pid, visible, include_virtual).await?;
         let mut map = std::collections::HashMap::new();
         for (media_type, count) in counts {
             map.insert(media_type, count);
