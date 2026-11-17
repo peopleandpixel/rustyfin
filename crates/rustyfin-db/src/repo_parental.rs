@@ -73,6 +73,7 @@ fn policy_from_row((max, sub, unrated, blocked, allowed, access): Row) -> Parent
         AccessPolicy {
             enable_all_folders: false,
             enable_remote_access: false,
+            enable_content_downloading: false,
             access_schedules: vec![rustyfin_model::parental::AccessSchedule {
                 day_of_week: "Never".into(),
                 start_hour: 0.0,

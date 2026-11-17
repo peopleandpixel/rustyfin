@@ -169,13 +169,30 @@ async fn reported_runtime(
     Ok(version.or(item.runtime_ticks))
 }
 
-/// The token of the request, for finding its session.
-type Token = Option<Extension<rustyfin_auth::RequestToken>>;
+/// The token of the request and the device its header names, for finding its session.
+type Token = crate::sessions::Caller;
 
-/// The caller's session, from the request's token.
+/// The item a playback report names, or `None` for an id that is no media item or one `user`'s
+/// limits hide. Such a report stores nothing and sets no now-playing item, so a limited user can't
+/// read a hidden item's name back from their session.
+async fn reported_item(
+    state: &AppState,
+    user: Uuid,
+    item_id: Uuid,
+) -> Result<Option<rustyfin_model::media::MediaItem>, ApiError> {
+    let item = rustyfin_db::repo_media::get_item_by_id(&state.db_ro, item_id).await?;
+    if item.is_some() && !user.is_nil() {
+        let policy = crate::parental::user_policy(state, user).await?;
+        if rustyfin_db::repo_parental::is_item_hidden(&state.db_ro, &policy, item_id).await? {
+            return Ok(None);
+        }
+    }
+    Ok(item)
+}
+
+/// The caller's session, from the request's token and stated device.
 async fn caller_session(state: &AppState, token: &Token) -> Result<Option<String>, ApiError> {
-    let token = token.as_ref().map(|Extension(rt)| rt.0.as_str());
-    crate::sessions::for_token(state, token).await
+    token.session(state).await
 }
 
 async fn playing(
@@ -205,7 +222,7 @@ async fn report_start(
     );
     // Jellyfin writes user data only for an item it finds, and has no now-playing item for one it
     // does not (SessionManager.OnPlaybackStart), so a non-media id stores nothing and reports null.
-    let media_type = rustyfin_db::repo_media::get_item_by_id(&state.db_ro, req.item_id)
+    let media_type = reported_item(&state, claims.sub, req.item_id)
         .await?
         .map(|item| item.media_type);
     let is_media = media_type.is_some();
@@ -284,7 +301,7 @@ async fn report_progress(
         "Playback progress"
     );
     // Same as `playing`: a non-media id stores nothing and reports a null now-playing item.
-    let item = rustyfin_db::repo_media::get_item_by_id(&state.db_ro, req.item_id).await?;
+    let item = reported_item(&state, claims.sub, req.item_id).await?;
     let is_media = item.is_some();
     let runtime = match &item {
         Some(item) => reported_runtime(&state, item, req.media_source_id.as_deref()).await?,
@@ -382,7 +399,7 @@ pub(crate) async fn record_stop(
     req: &PlaybackStopInfo,
 ) -> Result<(), ApiError> {
     // Same as `playing`: a non-media id stores nothing.
-    let item = rustyfin_db::repo_media::get_item_by_id(&state.db_ro, req.item_id).await?;
+    let item = reported_item(state, user, req.item_id).await?;
     let Some(item) = item else {
         return Ok(());
     };
@@ -891,12 +908,18 @@ pub(crate) async fn folder_answer(
         data.played_percentage = Some(100.0 * data.playback_position_ticks as f64 / runtime as f64);
     }
     if is_folder {
-        let counts =
-            rustyfin_db::repo_playback::get_unplayed_counts(&state.db, user_id, &[item_id])
-                .await?
-                .get(&item_id.to_string())
-                .copied()
-                .unwrap_or((0, 0));
+        // Only the episodes the user may see count.
+        let visible = crate::parental::user_filter(&state.db, Some(user_id)).await;
+        let counts = rustyfin_db::repo_playback::get_unplayed_counts(
+            &state.db,
+            user_id,
+            &[item_id],
+            visible.as_deref(),
+        )
+        .await?
+        .get(&item_id.to_string())
+        .copied()
+        .unwrap_or((0, 0));
         data.played = rustyfin_db::repo_playback::folder_played(counts);
         data.unplayed_item_count = Some(counts.1 as i32);
     }

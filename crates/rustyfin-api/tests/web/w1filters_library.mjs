@@ -35,6 +35,7 @@ function sandbox() {
          ${slice('const LAYOUT_IMAGE_TYPES = ', ';\n')}
          ${slice('function libraryViewCustom(')}
          ${slice('const LIBRARY_FILTER_PARAMS = ', ';\n')}
+         ${slice('const LIBRARY_CUSTOM_KEYS = ', ';\n')}
          ${slice('const LIBRARY_PREFS_CLIENT = ', ';\n')}
          ${slice('function librarySort(')}
          ${slice('function libraryFilterQuery(')}
@@ -43,7 +44,7 @@ function sandbox() {
          ${slice('function libraryPrefsToDisplay(')}
          ${slice('function libraryFilterMenu(')}
          ${slice('function libraryListQuery(')}
-         var currentLibraryTab = '', currentLibraryGenre = null;
+         var currentLibraryTab = '', currentLibraryGenre = null, currentLibraryScope = null;
          var libraryPrefs = libraryPrefsFromDisplay(null);
          this.fns = { librarySort, libraryFilterQuery, libraryFilterCount, libraryPrefsFromDisplay,
              libraryPrefsToDisplay, libraryFilterMenu, libraryListQuery };
@@ -131,7 +132,12 @@ test('the saved body has every field the server reads back, and the order it lis
         Client: 'rustyfin',
         SortBy: 'SortName,ProductionYear',
         SortOrder: 'Descending',
-        CustomPrefs: { Filters: 'IsPlayed' },
+        // The server merges CustomPrefs key by key, so the keys the list writes but leaves unset
+        // are sent as null to clear them
+        CustomPrefs: {
+            Filters: 'IsPlayed', SeriesStatus: null, Genres: null, OfficialRatings: null, Years: null,
+            ViewMode: null, ImageType: null, CardSize: null,
+        },
         RememberIndexing: false,
         RememberSorting: true,
         PrimaryImageHeight: 0,
@@ -222,6 +228,7 @@ test('preference saves go one at a time, in order, so the last one is kept', asy
     vm.runInContext(
         `${slice('const LIBRARY_SORTS = [', '\n];\n')}
          ${slice('const LIBRARY_FILTER_PARAMS = ', ';\n')}
+         ${slice('const LIBRARY_CUSTOM_KEYS = ', ';\n')}
          ${slice('const LIBRARY_PREFS_CLIENT = ', ';\n')}
          ${slice('const LAYOUT_IMAGE_TYPES = ', ';\n')}
          ${slice('function libraryViewCustom(')}

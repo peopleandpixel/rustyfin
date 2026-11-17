@@ -1,5 +1,6 @@
 //! Extras: trailers, special features and theme media. Each is a media item with an `extra_type` and the
-//! `owner_id` of the movie, series or season it belongs to (migration 100). Library listings leave them out.
+//! `owner_id` of the movie, series, season or episode it belongs to (migration 100). Library listings leave
+//! them out.
 
 use std::collections::HashMap;
 
@@ -9,7 +10,7 @@ use uuid::Uuid;
 
 use crate::repo_media::PathScope;
 
-/// The stored movies, series and seasons of `library` at `paths` (not extras themselves), as path to id. A
+/// The stored movies, series, seasons and episodes of `library` at `paths` (not extras themselves), as path to id. A
 /// path held by several gives the first by id. Only these paths can own extras: the caller passes the files
 /// and folders a scan just found, so a row whose file is gone never owns anything.
 pub async fn owners_at(
@@ -24,7 +25,7 @@ pub async fn owners_at(
     let rows: Vec<(String, String)> = sqlx::query_as(
         "SELECT path, MIN(id) FROM media_items
          WHERE library_id = ?1 AND extra_type IS NULL
-           AND media_type IN ('Movie', 'Series', 'Season')
+           AND media_type IN ('Movie', 'Series', 'Season', 'Episode')
            AND path IN (SELECT value FROM json_each(?2))
          GROUP BY path",
     )
@@ -35,11 +36,14 @@ pub async fn owners_at(
     Ok(rows.into_iter().collect())
 }
 
-/// A stored item of a library by its path: its id, extra type and owner.
+/// A stored item of a library by its path: its id, extra type and owner, its name, and the size and
+/// modification time stored with its source at that path, when it has one.
 pub struct PathRow {
     pub id: String,
     pub extra_type: Option<String>,
     pub owner_id: Option<String>,
+    pub name: String,
+    pub stamp: Option<(i64, i64)>,
 }
 
 /// The items of `library` in `scope`, by path. A path held by several items gives the first by id.
@@ -48,29 +52,83 @@ pub async fn items_by_path(
     library_id: Uuid,
     scope: &PathScope,
 ) -> Result<HashMap<String, PathRow>, sqlx::Error> {
-    let rows: Vec<(String, String, Option<String>, Option<String>)> =
-        sqlx::query_as(sqlx::AssertSqlSafe(format!(
-            "SELECT id, path, extra_type, owner_id FROM media_items
-             WHERE library_id = ?1 AND {} ORDER BY id DESC",
-            scope.sql("path", 2)
-        )))
-        .bind(library_id.to_string())
-        .bind(scope.param())
-        .fetch_all(pool)
-        .await?;
+    #[allow(clippy::type_complexity)]
+    let rows: Vec<(
+        String,
+        String,
+        Option<String>,
+        Option<String>,
+        String,
+        Option<i64>,
+        Option<i64>,
+    )> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+        "SELECT m.id, m.path, m.extra_type, m.owner_id, m.name, s.size, s.modified
+         FROM media_items AS m
+         LEFT JOIN media_sources AS s ON s.item_id = m.id AND s.path = m.path
+         WHERE m.library_id = ?1 AND {} ORDER BY m.id DESC",
+        scope.sql("m.path", 2)
+    )))
+    .bind(library_id.to_string())
+    .bind(scope.param())
+    .fetch_all(pool)
+    .await?;
     Ok(rows
         .into_iter()
-        .map(|(id, path, extra_type, owner_id)| {
+        .map(|(id, path, extra_type, owner_id, name, size, modified)| {
             (
                 path,
                 PathRow {
                     id,
                     extra_type,
                     owner_id,
+                    name,
+                    stamp: size.zip(modified),
                 },
             )
         })
         .collect())
+}
+
+/// Gives the stored extra `id`, whose file is gone, the file at `path` (renamed or moved): it keeps its id,
+/// so its user data, and takes `owner_id`, `extra_type` and `media_type`. Its name becomes `name` when it was
+/// its old file's name, and its source at `old_path` moves to `path`, so a probe of the unchanged file keeps
+/// it. In one transaction.
+#[allow(clippy::too_many_arguments)]
+pub async fn move_extra(
+    pool: &SqlitePool,
+    id: &str,
+    old_path: &str,
+    old_name: &str,
+    path: &str,
+    owner_id: &str,
+    extra_type: &str,
+    media_type: &str,
+    name: &str,
+) -> Result<(), sqlx::Error> {
+    let mut tx = crate::begin_write(pool).await?;
+    sqlx::query(
+        "UPDATE media_items SET path = ?2, owner_id = ?3, extra_type = ?4, media_type = ?5,
+                name = CASE WHEN name = ?6 THEN ?7 ELSE name END,
+                sort_name = CASE WHEN name = ?6 THEN ?7 ELSE sort_name END,
+                parent_id = NULL
+         WHERE id = ?1",
+    )
+    .bind(id)
+    .bind(path)
+    .bind(owner_id)
+    .bind(extra_type)
+    .bind(media_type)
+    .bind(old_name)
+    .bind(name)
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query("UPDATE media_sources SET path = ?3 WHERE item_id = ?1 AND path = ?2")
+        .bind(id)
+        .bind(old_path)
+        .bind(path)
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await
 }
 
 /// Makes the item `id` an extra of `owner_id`: sets its type, extra type and name. An item that was a
@@ -253,6 +311,37 @@ pub async fn extra_counts(
         .into_iter()
         .map(|(owner, trailers, specials)| (owner, (trailers as i32, specials as i32)))
         .collect())
+}
+
+/// The ids of the items that own an extra with one of `types`, with every item above them (a season and
+/// series over an episode) and the collections and playlists that hold them: `/Items?HasTrailer`,
+/// `HasSpecialFeature`, `HasThemeSong` and `HasThemeVideo` keep (true) or leave out (false) these, as
+/// Jellyfin 12.4's `WhereItemOrDescendantMatches` does (`BaseItemRepository.TranslateQuery.cs:1211-1272`,
+/// `FolderAwareFilterExtensions.cs`). Jellyfin also counts an extra of an alternate version for its main
+/// item; here versions are sources of one item, which owns the extras itself. The list is as long as the
+/// items that have such extras and their parents, never the whole library.
+pub async fn owners_with_extras(
+    pool: &SqlitePool,
+    types: &[&str],
+) -> Result<Vec<String>, sqlx::Error> {
+    let types = serde_json::to_string(types).unwrap_or_else(|_| "[]".to_string());
+    sqlx::query_scalar(
+        "WITH RECURSIVE
+             owners(id) AS (
+                 SELECT owner_id FROM media_items
+                 WHERE owner_id IS NOT NULL AND extra_type IN (SELECT value FROM json_each(?1))),
+             up(id) AS (
+                 SELECT id FROM owners
+                 UNION
+                 SELECT m.parent_id FROM media_items AS m JOIN up ON m.id = up.id
+                 WHERE m.parent_id IS NOT NULL)
+         SELECT id FROM up
+         UNION SELECT collection_id FROM collection_items WHERE item_id IN (SELECT id FROM owners)
+         UNION SELECT playlist_id FROM playlist_items WHERE item_id IN (SELECT id FROM owners)",
+    )
+    .bind(types)
+    .fetch_all(pool)
+    .await
 }
 
 /// How many parts after its first a movie split into files has (extras of type `Part`).

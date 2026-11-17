@@ -83,7 +83,7 @@ pub fn admin_routes() -> Router<AppState> {
         .route("/Users/{userId}", delete(delete_user_by_id))
         .route("/Users/{userId}/Delete", post(delete_user))
         .route("/Users/{userId}/Policy", post(update_policy))
-        .route("/Auth/Keys", get(get_auth_keys))
+        .route("/Auth/Keys", get(get_auth_keys).post(create_auth_key))
         .route("/Auth/Keys/{key}", delete(delete_auth_key))
         .route("/Auth/Providers", get(get_auth_providers))
         .route(
@@ -155,27 +155,40 @@ async fn get_user(
     }))
 }
 
+/// The sign-in page's user tiles. As in Jellyfin, a hidden user (IsHidden) signs in by typing the
+/// name, and a client outside the local network sees only the users with remote access.
 async fn get_public_users(
     State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
 ) -> Result<Json<Vec<PublicUserDto>>, ApiError> {
     let users = rustyfin_db::repo_user::get_public_users(&state.db_ro).await?;
     let tags = rustyfin_db::repo_user::primary_image_tags(&state.db_ro).await?;
-    // A hidden user (IsHidden) signs in by typing the name, as in Jellyfin.
     let policies = rustyfin_db::repo_parental::all_policies(&state.db_ro).await?;
-    Ok(Json(
-        users
-            .into_iter()
-            .filter(|u| !policies.get(&u.id).is_some_and(|p| p.access.is_hidden))
-            .map(|u| {
-                let primary_image_tag = tags.get(&u.id).cloned();
-                PublicUserDto {
-                    primary_image_tag,
-                    ..PublicUserDto::from(u)
-                }
-            })
-            .collect(),
-    ))
+    let local = resolve_client(peer.ip(), &headers, &state.known_proxies).is_local();
+    let mut out = Vec::with_capacity(users.len());
+    for u in users.into_iter().filter(|u| {
+        policies
+            .get(&u.id)
+            .is_none_or(|p| !p.access.is_hidden && (local || p.access.enable_remote_access))
+    }) {
+        let primary_image_tag = tags.get(&u.id).cloned();
+        out.push(PublicUserDto {
+            primary_image_tag,
+            ..PublicUserDto::from(u)
+        });
+    }
+    Ok(Json(out))
 }
+
+/// Whether the client is on the local network (see `resolve_client`). Password resets start and
+/// finish only there.
+fn client_is_local(state: &AppState, peer: SocketAddr, headers: &HeaderMap) -> bool {
+    resolve_client(peer.ip(), headers, &state.known_proxies).is_local()
+}
+
+/// The answer to a reset PIN that matches nothing, which a PIN from outside the local network gets too.
+const INVALID_RESET_PIN: &str = "invalid or expired PIN";
 
 async fn create_user(
     State(state): State<AppState>,
@@ -509,6 +522,10 @@ fn parental_policy(
         &mut access.force_remote_source_transcoding,
         req.force_remote_source_transcoding,
     );
+    set(
+        &mut access.enable_content_downloading,
+        req.enable_content_downloading,
+    );
     if req.enable_content_deletion.is_some() {
         access.enable_content_deletion = req.enable_content_deletion;
     }
@@ -581,12 +598,13 @@ async fn update_configuration(
 /// timing reveals neither whether the name exists nor whether the reset work was slow.
 const FORGOT_PASSWORD_DELAY: std::time::Duration = std::time::Duration::from_millis(250);
 
-/// Start a password reset. The response is uniform whether or not the user exists, so it never
-/// reveals account existence, and it never contains the PIN. The PIN is written (mode 0600 on Unix)
+/// Start a password reset. As in Jellyfin 12.4, every client gets `PinCode` with the reset file's
+/// path, whether or not the user exists and wherever the client is, so the answer reveals neither,
+/// and it never contains the PIN. The PIN is written (mode 0600 on Unix)
 /// to a file under the data dir ONLY when the user exists AND the resolved client (see
 /// `resolve_client`) is on the local network AND the user has no pending or voided reset, since a
-/// new request never replaces an open reset. Every other request gets the same 200 with a file path
-/// that is not created. Every answer comes `FORGOT_PASSWORD_DELAY` (250 ms) after the request
+/// new request never replaces an open reset. Every other request gets the same 200 with a file
+/// path that is not created. Every answer comes `FORGOT_PASSWORD_DELAY` (250 ms) after the request
 /// reached the handler. The reset work runs in its own task: it finishes before the answer when it
 /// is quick, and in the background when it takes longer.
 async fn forgot_password(
@@ -601,7 +619,7 @@ async fn forgot_password(
         .join(rustyfin_auth::reset_pin_filename(&req.entered_username));
     let expires_at = (Utc::now() + chrono::Duration::minutes(30)).to_rfc3339();
 
-    if resolve_client(peer.ip(), &headers, &state.known_proxies).is_local() {
+    if client_is_local(&state, peer, &headers) {
         let handle = tokio::spawn(issue_reset_pin(
             state.db.clone(),
             req.entered_username.clone(),
@@ -684,14 +702,22 @@ fn write_reset_file(path: &std::path::Path, contents: &str) -> Result<(), ApiErr
 
 /// Redeem a reset PIN (no username). Success: set the user's password to the PIN itself, revoke all
 /// their tokens, delete the reset file, return `{Success:true, UsersReset:[name]}`. No match → 404.
+/// Outside the local network the PIN is not tried, so wrong guesses from the internet can neither
+/// spend the attempt limit nor void the open resets; the answer is a wrong PIN's 404. (Jellyfin
+/// 12.4 tries the PIN from anywhere; it has no attempt limit to protect.)
 async fn reset_password_pin(
     State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
     Json(req): Json<ForgotPasswordPinRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    if !client_is_local(&state, peer, &headers) {
+        return Err(ApiError::NotFound(INVALID_RESET_PIN.to_string()));
+    }
     let uid = rustyfin_auth::redeem_reset_pin(&state.db, &req.pin)
         .await
         .map_err(|e| ApiError::Internal(e.to_string()))?
-        .ok_or_else(|| ApiError::NotFound("invalid or expired PIN".to_string()))?;
+        .ok_or_else(|| ApiError::NotFound(INVALID_RESET_PIN.to_string()))?;
 
     let user = rustyfin_db::repo_user::get_user_by_id(&state.db, uid)
         .await?
@@ -731,8 +757,15 @@ fn remove_reset_pin_files(data_dir: &std::path::Path, name: &str) {
 
 async fn reset_password(
     State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
     Json(req): Json<ResetPasswordRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    // As for the PIN redeem: from outside the local network no PIN is tried, and the answer is a
+    // wrong PIN's
+    if !client_is_local(&state, peer, &headers) {
+        return Err(ApiError::BadRequest(INVALID_RESET_PIN.to_string()));
+    }
     // Look up the user by username. An unknown user gets the wrong-PIN error, so the response does
     // not reveal whether the account exists.
     let user = rustyfin_db::repo_user::find_user_for_sign_in(&state.db, &req.username)
@@ -929,18 +962,76 @@ async fn delete_user_by_id(
 }
 
 /// GET /Auth/Keys - List API keys
-async fn get_auth_keys(
-    State(_state): State<AppState>,
-) -> Result<Json<serde_json::Value>, ApiError> {
-    Ok(Json(serde_json::json!([])))
+async fn get_auth_keys(State(state): State<AppState>) -> Result<Json<serde_json::Value>, ApiError> {
+    let keys = rustyfin_db::repo_api_key::list(&state.db_ro).await?;
+    // Jellyfin's `QueryResult<AuthenticationInfo>`. Only a key's hash is stored, so `AccessToken`
+    // is its last four characters after an ellipsis; `Id` names the key to revoke.
+    let items: Vec<serde_json::Value> = keys
+        .into_iter()
+        .map(|k| {
+            serde_json::json!({
+                "Id": k.id,
+                "AccessToken": format!("…{}", k.hint),
+                "AppName": k.app_name,
+                "AppVersion": "",
+                "DeviceId": "",
+                "DeviceName": "",
+                "UserId": uuid::Uuid::nil(),
+                "IsActive": true,
+                "DateCreated": k.date_created,
+                "DateRevoked": null,
+                "DateLastActivity": k.date_last_activity.unwrap_or_else(|| k.date_created.clone()),
+                "UserName": null,
+            })
+        })
+        .collect();
+    Ok(Json(serde_json::json!({
+        "Items": items,
+        "TotalRecordCount": items.len(),
+        "StartIndex": 0,
+    })))
 }
 
-/// DELETE /Auth/Keys/{key} - Revoke API key
-async fn delete_auth_key(
-    State(_state): State<AppState>,
-    Path(_key): Path<String>,
+/// The longest app name of an API key, in bytes.
+const MAX_KEY_APP_NAME_BYTES: usize = 256;
+
+/// POST /Auth/Keys?app= - creates an API key for the app. Jellyfin answers 204; Rustyfin also
+/// returns `{Id, AccessToken}`, the only time the key is shown. The key is never logged.
+async fn create_auth_key(
+    State(state): State<AppState>,
+    Query(params): Query<Vec<(String, String)>>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    Ok(Json(serde_json::json!({})))
+    let app = crate::query::first_value(&params, "app")
+        .map(str::trim)
+        .filter(|a| !a.is_empty())
+        .ok_or_else(|| ApiError::BadRequest("app is required".to_string()))?;
+    if app.len() > MAX_KEY_APP_NAME_BYTES {
+        return Err(ApiError::BadRequest(format!(
+            "app: longer than {MAX_KEY_APP_NAME_BYTES} bytes"
+        )));
+    }
+    let (id, key) = rustyfin_auth::create_api_key(&state.db, app)
+        .await
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
+    tracing::info!("API key created for {app}");
+    Ok(Json(
+        serde_json::json!({ "Id": id, "AccessToken": key, "AppName": app }),
+    ))
+}
+
+/// DELETE /Auth/Keys/{key} - revokes the API key with this id, or this key (Jellyfin's form):
+/// 204, or 404 for an unknown one
+async fn delete_auth_key(
+    State(state): State<AppState>,
+    Path(key): Path<String>,
+) -> Result<StatusCode, ApiError> {
+    let revoked = rustyfin_auth::revoke_api_key(&state.db, &key)
+        .await
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
+    if !revoked {
+        return Err(ApiError::NotFound("API key not found".to_string()));
+    }
+    Ok(StatusCode::NO_CONTENT)
 }
 
 /// GET /Auth/Providers - List authentication providers
