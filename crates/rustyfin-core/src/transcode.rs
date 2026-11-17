@@ -4616,7 +4616,14 @@ exec sleep 30
         assert_eq!(mgr.hardware_health().device_failures, 0);
         let gpu = dir.0.join("cache").join("gpu");
         let env = std::fs::read_to_string(playlist.parent().unwrap().join("env.txt")).unwrap();
-        assert_eq!(env, format!("{}\n{}\n", gpu.display(), gpu.display()));
+        assert_eq!(
+            env,
+            format!(
+                "{}\n{}\n",
+                gpu.display(),
+                gpu.join("mesa_shader_cache").display()
+            )
+        );
         assert!(gpu.is_dir());
         // The notices never count as the device failing to open
         for line in [

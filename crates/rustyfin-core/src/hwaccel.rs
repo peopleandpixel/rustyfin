@@ -463,7 +463,9 @@ pub fn gpu_cache_dir(data_dir: &Path) -> PathBuf {
 /// The environment every ffmpeg child gets, so GPU drivers cache in `gpu_cache_dir` (created
 /// here when missing) rather than under a `$HOME` that may be unset or not writable, as in a
 /// container run as another user (Mesa then prints "Failed to create //.cache for shader
-/// cache"). Transcodes, the hardware detection and trickplay pass it with `Command::envs`.
+/// cache"). Mesa's shader cache goes in its `mesa_shader_cache` subfolder. Transcodes and the
+/// hardware detection pass it with `Command::envs`; it is the shared form of trickplay's
+/// `driver_env::vars` (same folders), which trickplay switches to.
 pub fn ffmpeg_env(data_dir: &Path) -> [(&'static str, PathBuf); 2] {
     let dir = gpu_cache_dir(data_dir);
     if let Err(e) = std::fs::create_dir_all(&dir) {
@@ -481,7 +483,7 @@ pub fn ffmpeg_env(data_dir: &Path) -> [(&'static str, PathBuf); 2] {
     }
     [
         ("XDG_CACHE_HOME", dir.clone()),
-        ("MESA_SHADER_CACHE_DIR", dir),
+        ("MESA_SHADER_CACHE_DIR", dir.join("mesa_shader_cache")),
     ]
 }
 
