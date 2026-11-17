@@ -61,9 +61,10 @@ function sandbox({ users = [], api = {} } = {}) {
     return { fns: context.fns, log, keys, elements, pages, consoleLines, api: context.API };
 }
 
+// As Jellyfin 12.4 sends them: HasPassword is always true
 const USERS = [
     { Id: 'u1', Name: 'Karl', HasPassword: true, PrimaryImageTag: 'tag1' },
-    { Id: 'u2', Name: 'Kid <3', HasPassword: false },
+    { Id: 'u2', Name: 'Kid <3', HasPassword: true },
 ];
 
 test('the sign-in page shows the public users as tiles, with Manual login and Forgot password', async () => {
@@ -101,24 +102,20 @@ test('someone already typing keeps the form when the tiles arrive', async () => 
     assert.equal(box.pages.length, 1);
 });
 
-test('a tile of a user without a password signs in at once, with an empty password', async () => {
-    const box = sandbox({ users: USERS });
-    box.fns.renderLogin();
-    await tick();
-    await box.fns.signInFromTile('u2');
-    assert.deepEqual(box.log.find(e => e[0] === 'login'), ['login', 'Kid <3', '']);
-    assert.ok(box.log.some(e => e[0] === 'navigate' && e[1] === 'home'));
-});
-
-test('a tile of a user with a password opens the form with the name filled in', async () => {
-    const box = sandbox({ users: USERS });
-    box.fns.renderLogin();
-    await tick();
-    await box.fns.signInFromTile('u1');
-    assert.ok(!box.log.some(e => e[0] === 'login'), 'no sign-in without the password');
-    const form = box.pages.at(-1);
-    assert.match(form, /id="login-user"[^>]*value="Karl"/);
-    assert.match(form, /data-login="users"/, 'the form leads back to the tiles');
+test('every tile opens the form with the name filled in, as Jellyfin Web 12.4', async () => {
+    for (const [id, name] of [['u1', 'Karl'], ['u2', 'Kid &lt;3']]) {
+        const box = sandbox({ users: USERS });
+        box.fns.renderLogin();
+        await tick();
+        // Even a user once known to have no password: the empty password is typed (left empty) in the form
+        box.fns.getUsers()[1].HasPassword = false;
+        await box.fns.signInFromTile(id);
+        assert.ok(!box.log.some(e => e[0] === 'login'), 'no sign-in from the tile itself');
+        const form = box.pages.at(-1);
+        assert.match(form, new RegExp(`id="login-user"[^>]*value="${name}"`));
+        assert.match(form, /id="login-pass"/);
+        assert.match(form, /data-login="users"/, 'the form leads back to the tiles');
+    }
 });
 
 const submitEvent = () => ({ preventDefault() {}, target: { querySelector: () => ({ disabled: false }) } });
@@ -174,7 +171,7 @@ test('the PIN step resets the password, clears the field, and never logs the PIN
     assert.ok(!box.consoleLines.some(l => l.includes('1A-2B')), 'the PIN is never logged');
 });
 
-test('outside the local network the PIN step says to try from home', async () => {
+test('a failed PIN result reads as an invalid PIN, as in Jellyfin Web', async () => {
     const box = sandbox({ api: { async redeemResetPin() { return { Success: false, UsersReset: [] }; } } });
     box.fns.renderLogin('forgot-pin');
     const message = fakeElement();
@@ -182,7 +179,7 @@ test('outside the local network the PIN step says to try from home', async () =>
     box.elements['forgot-pin'] = input;
     box.elements['forgot-message'] = message;
     await box.fns.submitForgotPin(submitEvent());
-    assert.equal(message.textContent, 'login.forgot_in_network');
+    assert.equal(message.textContent, 'login.pin_invalid');
     assert.equal(input.value, '');
     assert.doesNotMatch(box.pages.at(-1), /pin_done/);
 });
