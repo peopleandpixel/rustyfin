@@ -523,8 +523,9 @@ async fn socket_viewer(state: &AppState, token: &str) -> Viewer {
 }
 
 /// Whether a socket gets a broadcast event. Session and playback events go to administrators and
-/// to the user their `UserId` names, as in Jellyfin's SessionInfoWebSocketListener; log lines go
-/// to administrators only. Everything else goes to everyone.
+/// to the user their `UserId` names, as in Jellyfin's SessionInfoWebSocketListener; user data
+/// changes only to the user they name; log lines go to administrators only. Everything else goes to
+/// everyone.
 fn receives(viewer: &Viewer, event: &rustyfin_model::ws_event::WsEvent) -> bool {
     use rustyfin_model::ws_event::WsEvent;
     match event {
@@ -538,6 +539,11 @@ fn receives(viewer: &Viewer, event: &rustyfin_model::ws_event::WsEvent) -> bool 
                     .and_then(|id| uuid::Uuid::parse_str(id).ok())
                     .is_some_and(|id| !id.is_nil() && id == viewer.user_id)
         }
+        // Jellyfin's UserDataChangeNotifier sends to the user's own sessions only.
+        WsEvent::UserDataChanged { data } => data["UserId"]
+            .as_str()
+            .and_then(|id| uuid::Uuid::parse_str(id).ok())
+            .is_some_and(|id| !id.is_nil() && id == viewer.user_id),
         WsEvent::LogMessage { .. } => viewer.is_admin,
         // A library the user's library access leaves out
         WsEvent::LibraryChanged { data } => viewer.libraries.as_ref().is_none_or(|libs| {
@@ -552,6 +558,31 @@ fn receives(viewer: &Viewer, event: &rustyfin_model::ws_event::WsEvent) -> bool 
 #[cfg(test)]
 mod tests {
     use super::{Viewer, is_api_key, receives};
+
+    #[test]
+    fn r3endpoints_user_data_changes_reach_only_their_user() {
+        use rustyfin_model::ws_event::WsEvent;
+        let user = uuid::Uuid::new_v4();
+        let event = WsEvent::UserDataChanged {
+            data: serde_json::json!({ "UserId": user.to_string(), "UserDataList": [] }),
+        };
+        let viewer = |user_id: uuid::Uuid, is_admin: bool| Viewer {
+            user_id,
+            is_admin,
+            libraries: None,
+        };
+        assert!(receives(&viewer(user, false), &event));
+        // Not even an administrator or the API key gets another user's data.
+        assert!(!receives(&viewer(uuid::Uuid::new_v4(), true), &event));
+        assert!(!receives(&viewer(uuid::Uuid::nil(), true), &event));
+        assert_eq!(
+            serde_json::to_value(&event).unwrap(),
+            serde_json::json!({
+                "MessageType": "UserDataChanged",
+                "Data": { "UserId": user.to_string(), "UserDataList": [] }
+            })
+        );
+    }
 
     #[test]
     fn r3parental_library_changes_reach_only_users_who_may_see_the_library() {

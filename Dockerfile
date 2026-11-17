@@ -50,6 +50,9 @@ RUN useradd -r -s /bin/false -m -d /data rustyfin
 USER rustyfin
 WORKDIR /data
 
+# The rustyfin user's home, also when the container runs as another uid (--user), so GPU
+# drivers never look for a cache under "/". ffmpeg children cache in /data/cache/gpu.
+ENV HOME=/data
 ENV RUSTYFIN_DATA=/data
 ENV RUSTYFIN_BIND=0.0.0.0:8096
 ENV RUSTYFIN_WEBCLIENT_DIR=/usr/local/share/rustyfin/web

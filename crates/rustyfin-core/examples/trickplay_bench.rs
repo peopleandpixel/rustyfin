@@ -6,7 +6,10 @@
 //!
 //! `each` runs the task once per video, each in a library of its own, and prints the time of each
 //! run; `all` runs it once over a library holding every video, as the scheduled task does. Both
-//! print each video's tile set info. The tiles are left under `<data dir>/<mode>/data`.
+//! print each video's tile set info. The tiles are left under `<data dir>/<mode>/data`. With
+//! `TRICKPLAY_BENCH_HWACCEL=auto`, the run first detects the video devices and takes the
+//! encoding settings a server with no saved options would: hardware decoding on the detected
+//! device.
 
 use std::path::Path;
 use std::time::Instant;
@@ -50,6 +53,11 @@ async fn library(pool: &SqlitePool, dir: &Path, videos: &[(Uuid, &str)]) -> Stri
 
 #[tokio::main]
 async fn main() {
+    // RUST_LOG=rustyfin_core::trickplay=debug logs each tile's waits and times to stderr
+    tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .with_writer(std::io::stderr)
+        .init();
     let args: Vec<String> = std::env::args().skip(1).collect();
     let [mode, root, paths @ ..] = args.as_slice() else {
         eprintln!("usage: trickplay_bench <each|all> <data dir> <video>...");
@@ -59,6 +67,18 @@ async fn main() {
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     let data = dir.join("data");
+    if std::env::var("TRICKPLAY_BENCH_HWACCEL").as_deref() == Ok("auto") {
+        std::fs::create_dir_all(&data).unwrap();
+        let manager = rustyfin_core::transcode::TranscodeManager::new(&data);
+        manager.detect_hardware(&data).await;
+        let settings = rustyfin_core::encoding::current();
+        println!(
+            "hwaccel\t{:?}\t{}\t{}",
+            settings.hardware_acceleration,
+            settings.vaapi_device,
+            settings.hardware_decoding_codecs.join(",")
+        );
+    }
     let pool = rustyfin_db::init_db(dir.join("bench.db").to_str().unwrap())
         .await
         .unwrap();

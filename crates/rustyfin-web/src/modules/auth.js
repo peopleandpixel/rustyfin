@@ -1,9 +1,10 @@
 // Sign-in (password, single sign-on, Quick Connect), sign-up of the owner and sign-out
 import { $, html, show, hide, toast, escapeHtml } from './util.js';
-import { currentPage, navigate } from './router.js';
+import { currentPage, navigate, closeUserMenu } from './router.js';
 import { renderSettings } from './settings.js';
 import { loadUserSettings } from './user-settings.js';
 import { jiChoice, jiConfirm, jiShownCodes } from './jellyfin-import.js';
+import { showLoginDisclaimer } from './branding.js';
 import { loadSidebar, initScanProgressWebSocket, stopScanProgressWebSocket } from './library-admin.js';
 
 // --- OpenID Connect: helpers for the sign-in page and the profile ---
@@ -161,29 +162,53 @@ function oidcCardHtml(enabled, account) {
 
 // --- Login Page Renderer ---
 let pendingSetup = null; // { username, code } of an imported user's one-time code; memory only
-function renderLogin(data) {
-    pendingSetup = null;
-    const oidcError = oidcErrorCode(data);
-    if (oidcError !== null && API.isLoggedIn()) {
-        leaveOidcReturnSignedIn(oidcErrorText(oidcError));
-        return;
-    }
-    html('page-login', `
+// The sign-in page's user tiles from /Users/Public, as Jellyfin Web's: the users not hidden from it
+let loginUsers = [];
+// Counts sign-in page renders: a user list for an earlier render is dropped
+let loginSeq = 0;
+
+// The card every sign-in step is drawn in: the logo, a title and a line under it, then `body`
+function loginCard(title, subtitle, body, wide = false) {
+    return `
     <div class="flex justify-center items-center min-h-[70vh] jf-page px-4">
-        <div class="w-full max-w-sm p-8 rounded-2xl bg-[#131822] border border-white/10 shadow-2xl">
+        <div class="w-full ${wide ? 'max-w-3xl' : 'max-w-sm'} p-8 rounded-2xl bg-[#131822] border border-white/10 shadow-2xl">
             <div class="text-center mb-8">
                 <img src="/web/assets/logo.png" alt="Rustyfin" class="w-20 h-20 mx-auto rounded-2xl shadow-xl mb-3 p-1 bg-white/5 border border-white/10">
-                <h2 class="text-2xl font-black text-white tracking-tight">${t('nav.sign_in')}</h2>
-                <p class="text-white/40 text-xs mt-1">${t('login.subtitle')}</p>
+                <h2 class="text-2xl font-black text-white tracking-tight">${escapeHtml(title)}</h2>
+                <p class="text-white/40 text-xs mt-1">${escapeHtml(subtitle)}</p>
             </div>
+            ${body}
+            <p id="login-disclaimer" class="hidden mt-6 text-xs text-white/50 text-center whitespace-pre-line"></p>
+        </div>
+    </div>`;
+}
+
+const LINK_BUTTON = 'w-full text-xs text-white/50 hover:text-white transition py-2';
+
+// One user tile: the profile picture or the initial, and the name. The router-free buttons are
+// handled by the page's own click listener (loginClick), so no name reaches inline JavaScript.
+function loginTileHtml(user) {
+    const name = user.Name || '';
+    const picture = user.PrimaryImageTag
+        ? `<img alt="" class="w-full h-full object-cover" src="${escapeHtml(`${API.base}/UserImage?userId=${encodeURIComponent(user.Id)}&tag=${encodeURIComponent(user.PrimaryImageTag)}`)}">`
+        : `<span class="text-3xl font-black text-white">${escapeHtml((name[0] || '?').toUpperCase())}</span>`;
+    return `<button type="button" class="jf-login-tile" data-login="user" data-user-id="${escapeHtml(user.Id)}">
+            <span class="jf-login-tile-picture">${picture}</span>
+            <span class="block text-sm font-semibold text-white truncate mt-2">${escapeHtml(name)}</span>
+        </button>`;
+}
+
+// The manual form: the name (filled in from a tile), the password, and the links under it
+function loginFormHtml(name = '') {
+    return `
             <form id="login-form" onsubmit="handleLogin(event)" class="space-y-4">
                 <div>
-                    <label class="block text-xs font-semibold text-white/70 mb-1.5">${t('common.username')}</label>
-                    <input type="text" id="login-user" class="jf-input w-full" placeholder="${escapeHtml(t('common.username'))}" required autofocus>
+                    <label for="login-user" class="block text-xs font-semibold text-white/70 mb-1.5">${t('common.username')}</label>
+                    <input type="text" id="login-user" class="jf-input w-full" autocomplete="username" placeholder="${escapeHtml(t('common.username'))}" value="${escapeHtml(name)}" required>
                 </div>
                 <div>
-                    <label class="block text-xs font-semibold text-white/70 mb-1.5">${t('common.password')}</label>
-                    <input type="password" id="login-pass" class="jf-input w-full" placeholder="${escapeHtml(t('common.password'))}">
+                    <label for="login-pass" class="block text-xs font-semibold text-white/70 mb-1.5">${t('common.password')}</label>
+                    <input type="password" id="login-pass" class="jf-input w-full" autocomplete="current-password" placeholder="${escapeHtml(t('common.password'))}">
                 </div>
                 <button type="submit" class="jf-btn-primary w-full !py-3 font-bold text-sm shadow-lg mt-2">
                     ${t('login.submit')}
@@ -191,11 +216,176 @@ function renderLogin(data) {
                 <div id="login-error" class="text-red-400 text-xs text-center hidden p-2 rounded bg-red-500/10 border border-red-500/20"></div>
             </form>
             <div id="oidc-sign-in"></div>
-        </div>
-    </div>`);
+            <div class="mt-4 flex flex-col">
+                ${loginUsers.length ? `<button type="button" class="${LINK_BUTTON}" data-login="users">${escapeHtml(t('login.choose_user'))}</button>` : ''}
+                <button type="button" class="${LINK_BUTTON}" data-login="forgot">${escapeHtml(t('login.forgot_password'))}</button>
+            </div>`;
+}
+
+// The user tiles, with Manual login and Forgot password under them
+function loginUsersHtml() {
+    return `
+            <div class="jf-login-tiles" role="list">${loginUsers.map(u => `<div role="listitem">${loginTileHtml(u)}</div>`).join('')}</div>
+            <div id="login-error" class="text-red-400 text-xs text-center hidden p-2 rounded bg-red-500/10 border border-red-500/20 mt-4"></div>
+            <div id="oidc-sign-in" class="max-w-sm mx-auto"></div>
+            <div class="mt-6 flex flex-col max-w-sm mx-auto">
+                <button type="button" class="jf-btn-ghost w-full !py-2.5 text-sm" data-login="manual">${escapeHtml(t('login.manual_login'))}</button>
+                <button type="button" class="${LINK_BUTTON} mt-2" data-login="forgot">${escapeHtml(t('login.forgot_password'))}</button>
+            </div>`;
+}
+
+// Draws the tiles when there are any, else the form; `name` fills the form's name and asks for the password
+function showLoginStep(step, name = '') {
+    const tiles = step === 'users' && loginUsers.length > 0;
+    html('page-login', loginCard(
+        tiles ? t('login.choose_user_title') : t('nav.sign_in'),
+        t('login.subtitle'),
+        tiles ? loginUsersHtml() : loginFormHtml(name),
+        tiles,
+    ));
     loadOidcSignIn();
-    if (data === 'oidc') completeOidcSignIn();
-    else if (oidcError !== null) showLoginError(oidcErrorText(oidcError));
+    showLoginDisclaimer($('login-disclaimer'));
+    if (tiles) document.querySelector('#page-login [data-login="user"]')?.focus();
+    else (name ? $('login-pass') : $('login-user'))?.focus();
+}
+
+function renderLogin(data) {
+    pendingSetup = null;
+    const seq = ++loginSeq;
+    const oidcError = oidcErrorCode(data);
+    if (oidcError !== null && API.isLoggedIn()) {
+        leaveOidcReturnSignedIn(oidcErrorText(oidcError));
+        return;
+    }
+    if (data === 'forgot') { renderForgotPassword(); return; }
+    if (data === 'forgot-pin') { renderForgotPin(); return; }
+    // The form first, so the page works at once; the tiles replace it when the list comes
+    showLoginStep('manual');
+    if (data === 'oidc') { completeOidcSignIn(); return; }
+    if (oidcError !== null) { showLoginError(oidcErrorText(oidcError)); return; }
+    API.publicUsers().then(users => {
+        if (seq !== loginSeq || API.isLoggedIn()) return;
+        loginUsers = Array.isArray(users) ? users : [];
+        // Someone already typing keeps the form
+        const typing = $('login-user')?.value || $('login-pass')?.value;
+        if (loginUsers.length && !typing) showLoginStep('users');
+    }).catch(() => { loginUsers = []; });
+}
+
+// A tile opens the form with the user's name filled in and the password field focused, as Jellyfin Web 12.4
+// does for every user (an empty password still signs in from there)
+function signInFromTile(userId) {
+    const user = loginUsers.find(u => u.Id === userId);
+    if (user) showLoginStep('manual', user.Name);
+}
+
+// The page's own buttons (data-login): the tiles, Manual login, back to the tiles and Forgot password
+function loginClick(e) {
+    const el = e.target.closest?.('#page-login [data-login]');
+    if (!el) return;
+    const step = el.dataset.login;
+    if (step === 'user') signInFromTile(el.dataset.userId);
+    else if (step === 'manual' || step === 'users') showLoginStep(step);
+    else if (step === 'forgot') navigate('login', 'forgot');
+    else if (step === 'back') navigate('login');
+    else if (step === 'pin') navigate('login', 'forgot-pin');
+}
+document.addEventListener('click', loginClick);
+
+// --- Forgot password: Jellyfin's two steps. The server writes a PIN file on its own disk, only for
+// a request from the local network; the PIN, typed in the second step, becomes the new password ---
+function forgotMessage(text, kind = 'info') {
+    const box = $('forgot-message');
+    if (!box) return;
+    box.textContent = text;
+    box.className = `text-xs text-center p-3 rounded border ${kind === 'error' ? 'text-red-400 bg-red-500/10 border-red-500/20' : 'text-white/80 bg-white/5 border-white/10'}`;
+    box.hidden = false;
+}
+
+function renderForgotPassword() {
+    html('page-login', loginCard(t('login.forgot_title'), t('login.forgot_text'), `
+            <form id="forgot-form" class="space-y-4">
+                <div>
+                    <label for="forgot-user" class="block text-xs font-semibold text-white/70 mb-1.5">${t('common.username')}</label>
+                    <input type="text" id="forgot-user" class="jf-input w-full" autocomplete="username" required>
+                </div>
+                <button type="submit" class="jf-btn-primary w-full !py-3 font-bold text-sm shadow-lg">${escapeHtml(t('login.forgot_submit'))}</button>
+                <p id="forgot-message" role="status" hidden></p>
+            </form>
+            <div class="mt-4 flex flex-col">
+                <button type="button" class="${LINK_BUTTON}" data-login="pin">${escapeHtml(t('login.have_pin'))}</button>
+                <button type="button" class="${LINK_BUTTON}" data-login="back">${escapeHtml(t('login.back_to_sign_in'))}</button>
+            </div>`));
+    $('forgot-form').addEventListener('submit', submitForgotPassword);
+    $('forgot-user').focus();
+}
+
+async function submitForgotPassword(e) {
+    e.preventDefault();
+    const button = e.target.querySelector('[type="submit"]');
+    const name = $('forgot-user').value.trim();
+    if (!name || button.disabled) return;
+    button.disabled = true;
+    try {
+        const result = await API.forgotPassword(name);
+        if (result.Action === 'PinCode') {
+            const expires = result.PinExpirationDate ? new Date(result.PinExpirationDate).toLocaleString() : '';
+            renderForgotPin(t('login.forgot_pin_written', { file: result.PinFile || '', expires }));
+            return;
+        }
+        forgotMessage(t(result.Action === 'InNetworkRequired' ? 'login.forgot_in_network' : 'login.forgot_contact_admin'));
+    } catch (err) {
+        forgotMessage(err.status === 429 ? t('login.too_many_attempts') : err.message, 'error');
+    } finally {
+        button.disabled = false;
+    }
+}
+
+// The PIN step; `note` says where the server wrote the PIN file
+function renderForgotPin(note = '') {
+    html('page-login', loginCard(t('login.pin_title'), t('login.pin_text'), `
+            ${note ? `<p class="text-xs text-white/80 p-3 rounded bg-white/5 border border-white/10 mb-4 break-words">${escapeHtml(note)}</p>` : ''}
+            <form id="pin-form" class="space-y-4">
+                <div>
+                    <label for="forgot-pin" class="block text-xs font-semibold text-white/70 mb-1.5">${escapeHtml(t('login.pin'))}</label>
+                    <input type="text" id="forgot-pin" class="jf-input w-full font-mono" autocomplete="one-time-code" autocapitalize="characters" spellcheck="false" required>
+                </div>
+                <button type="submit" class="jf-btn-primary w-full !py-3 font-bold text-sm shadow-lg">${escapeHtml(t('login.pin_submit'))}</button>
+                <p id="forgot-message" role="status" hidden></p>
+            </form>
+            <div class="mt-4 flex flex-col">
+                <button type="button" class="${LINK_BUTTON}" data-login="back">${escapeHtml(t('login.back_to_sign_in'))}</button>
+            </div>`));
+    $('pin-form').addEventListener('submit', submitForgotPin);
+    $('forgot-pin').focus();
+}
+
+async function submitForgotPin(e) {
+    e.preventDefault();
+    const button = e.target.querySelector('[type="submit"]');
+    const input = $('forgot-pin');
+    const pin = input.value.trim();
+    if (!pin || button.disabled) return;
+    button.disabled = true;
+    try {
+        const result = await API.redeemResetPin(pin);
+        input.value = '';
+        // Jellyfin Web shows any failed result as an invalid PIN
+        if (result.Success === false) {
+            forgotMessage(t('login.pin_invalid'), 'error');
+            return;
+        }
+        // The PIN is the new password now
+        const names = (result.UsersReset || []).join(', ');
+        html('page-login', loginCard(t('login.pin_done_title'), t('login.pin_done_text', { names }), `
+            <button type="button" class="jf-btn-primary w-full !py-3 font-bold text-sm" data-login="back">${escapeHtml(t('login.back_to_sign_in'))}</button>`));
+        document.querySelector('#page-login [data-login="back"]')?.focus();
+    } catch (err) {
+        const key = err.status === 429 ? 'login.too_many_attempts' : err.status === 403 ? 'oidc.password_sign_in_off' : 'login.pin_invalid';
+        forgotMessage(t(key), 'error');
+    } finally {
+        button.disabled = false;
+    }
 }
 
 // The steps after any sign-in: password, setup code or OpenID Connect.
@@ -277,6 +467,13 @@ function doLogout() {
     API.logout();
     navigate('home');
     toast(t('login.signed_out'));
+}
+
+// The user menu's Switch user: signs out and opens the sign-in page with its user tiles
+function switchUser() {
+    closeUserMenu();
+    API.logout();
+    navigate('login');
 }
 
 // --- Quick Connect Modal Trigger ---
@@ -363,7 +560,8 @@ window.addEventListener('storage', e => {
 
 export {
     startOidcSignIn, startOidcLink, unlinkOidc, showOidcLinkResult, oidcCardHtml, renderLogin, handleLogin,
-    handleSetupPassword, doLogout, showQuickConnectModal, authorizeQuickConnect, updateAuthUI,
+    handleSetupPassword, doLogout, switchUser, showQuickConnectModal, authorizeQuickConnect, updateAuthUI,
+    signInFromTile, loginClick, submitForgotPassword, submitForgotPin,
 };
 
 // Shared state that inline handlers or other modules assign: reached through window

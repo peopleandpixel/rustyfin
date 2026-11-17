@@ -2601,6 +2601,153 @@ async fn r3transcoding_encoding_options_round_trip_and_reach_the_transcoder() {
     );
 }
 
+// ── r3hwaccel: the detected device decodes while the administrator hasn't chosen ──
+
+#[tokio::test]
+async fn r3hwaccel_detected_device_shapes_the_encoding_options_until_one_is_chosen() {
+    use rustyfin_core::encoding::HardwareAccelerationType;
+    use rustyfin_core::hwaccel::{DetectedDevice, HardwareDetection};
+    let (state, app, admin, (bob, _), _path) = r2admin_world().await;
+    let device = DetectedDevice {
+        accel: HardwareAccelerationType::Vaapi,
+        device: "/dev/dri/renderD128".into(),
+        usable: true,
+        error: None,
+        hardware_decoding_codecs: vec!["h264".into(), "hevc".into(), "av1".into()],
+        enable_decoding_color_depth_10_hevc: true,
+        enable_decoding_color_depth_10_vp9: false,
+    };
+    let unusable = DetectedDevice {
+        device: "/dev/dri/renderD129".into(),
+        usable: false,
+        error: Some("permission denied".into()),
+        hardware_decoding_codecs: vec![],
+        enable_decoding_color_depth_10_hevc: false,
+        ..device.clone()
+    };
+    state.transcode_manager.set_hardware_detection(
+        &state.data_dir,
+        HardwareDetection {
+            devices: vec![device.clone(), unusable],
+            selected: Some(device),
+            detected_at: chrono::Utc::now(),
+        },
+    );
+    let hw = "/System/MediaEncoder/HardwareAcceleration";
+
+    // The detection, for administrators only
+    let (status, _) = send_authed(&app, "GET", hw, &bob, None).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let (status, found) = send_authed(&app, "GET", hw, &admin, None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(found["Automatic"], true, "{found}");
+    assert_eq!(found["Detecting"], false, "{found}");
+    let selected = &found["Detection"]["Selected"];
+    assert_eq!(selected["Type"], "vaapi", "{found}");
+    assert_eq!(selected["Device"], "/dev/dri/renderD128", "{found}");
+    assert_eq!(
+        selected["HardwareDecodingCodecs"],
+        serde_json::json!(["h264", "hevc", "av1"])
+    );
+    assert_eq!(selected["EnableDecodingColorDepth10Hevc"], true);
+    assert_eq!(selected["EnableDecodingColorDepth10Vp9"], false);
+    let devices = found["Detection"]["Devices"].as_array().unwrap();
+    assert_eq!(devices.len(), 2);
+    assert_eq!(devices[1]["Usable"], false);
+    assert_eq!(devices[1]["Error"], "permission denied");
+    assert!(found["Detection"]["DetectedAt"].is_string());
+
+    // Never set: the encoding options are the detected device's, in Jellyfin's fields
+    let (_, mut encoding) =
+        send_authed(&app, "GET", "/System/Configuration/encoding", &admin, None).await;
+    assert_eq!(encoding["HardwareAccelerationType"], "vaapi", "{encoding}");
+    assert_eq!(encoding["VaapiDevice"], "/dev/dri/renderD128");
+    assert_eq!(
+        encoding["HardwareDecodingCodecs"],
+        serde_json::json!(["h264", "hevc", "av1"])
+    );
+    assert_eq!(encoding["EnableDecodingColorDepth10Hevc"], true);
+    assert_eq!(encoding["EnableDecodingColorDepth10Vp9"], false);
+    let settings = state.transcode_manager.encoding_settings();
+    assert_eq!(
+        settings.hardware_acceleration,
+        HardwareAccelerationType::Vaapi
+    );
+    assert_eq!(settings.hardware_decoding_codecs, ["h264", "hevc", "av1"]);
+
+    let post = |body: serde_json::Value| {
+        let app = app.clone();
+        let admin = admin.clone();
+        async move {
+            let (status, _) = send_authed(
+                &app,
+                "POST",
+                "/System/Configuration/encoding",
+                &admin,
+                Some(&body.to_string()),
+            )
+            .await;
+            assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+        }
+    };
+    let stored = || {
+        let text = std::fs::read_to_string(state.data_dir.join("encoding.json")).unwrap();
+        serde_json::from_str::<serde_json::Value>(&text).unwrap()
+    };
+
+    // Saving the page with "Automatic" (a null type) and another change stays automatic
+    encoding["HardwareAccelerationType"] = serde_json::Value::Null;
+    encoding["H264Crf"] = serde_json::json!(20);
+    post(encoding.clone()).await;
+    assert!(
+        stored().get("HardwareAccelerationType").is_none(),
+        "{}",
+        stored()
+    );
+    let settings = state.transcode_manager.encoding_settings();
+    assert_eq!(
+        settings.hardware_acceleration,
+        HardwareAccelerationType::Vaapi
+    );
+    assert_eq!(settings.h264_crf, 20);
+
+    // A named type is stored as the administrator's choice, the detected one included
+    encoding["HardwareAccelerationType"] = serde_json::json!("vaapi");
+    post(encoding.clone()).await;
+    assert_eq!(stored()["HardwareAccelerationType"], "vaapi");
+    let (_, found) = send_authed(&app, "GET", hw, &admin, None).await;
+    assert_eq!(found["Automatic"], false, "{found}");
+
+    // An explicit none wins over the detection
+    encoding["HardwareAccelerationType"] = serde_json::json!("none");
+    post(encoding.clone()).await;
+    assert_eq!(stored()["HardwareAccelerationType"], "none");
+    assert_eq!(
+        state
+            .transcode_manager
+            .encoding_settings()
+            .hardware_acceleration,
+        HardwareAccelerationType::None
+    );
+    let (_, found) = send_authed(&app, "GET", hw, &admin, None).await;
+    assert_eq!(found["Automatic"], false, "{found}");
+    let (_, now) = send_authed(&app, "GET", "/System/Configuration/encoding", &admin, None).await;
+    assert_eq!(now["HardwareAccelerationType"], "none", "{now}");
+
+    // A null type goes back to the detected device
+    encoding["HardwareAccelerationType"] = serde_json::Value::Null;
+    post(encoding).await;
+    assert_eq!(
+        state
+            .transcode_manager
+            .encoding_settings()
+            .hardware_acceleration,
+        HardwareAccelerationType::Vaapi
+    );
+    let (_, found) = send_authed(&app, "GET", hw, &admin, None).await;
+    assert_eq!(found["Automatic"], true, "{found}");
+}
+
 #[tokio::test]
 async fn r2admin_configuration_keys_match_without_case_and_stay_bounded() {
     // With the provider plugins installed, so a TMDb key can be saved.
@@ -3612,18 +3759,27 @@ async fn b118_validate_path_admin_only_after_owner() {
 const B124_WEB_MODULES: &[&str] = &[
     "admin.js",
     "auth.js",
+    "branding.js",
     "cardmenu.js",
     "cards.js",
+    "cast.js",
     "collections.js",
     "dashboard.js",
+    "dlna-admin.js",
     "genres.js",
     "home.js",
     "item.js",
     "jellyfin-import.js",
     "library-admin.js",
+    "library-options.js",
     "library.js",
+    "libtabs.js",
+    "lyrics.js",
     "metadata-admin.js",
+    "multiselect.js",
     "music.js",
+    "nativeshell.js",
+    "photos.js",
     "playback-admin.js",
     "player.js",
     "playerprefs.js",
@@ -3631,9 +3787,12 @@ const B124_WEB_MODULES: &[&str] = &[
     "queue.js",
     "remote.js",
     "router.js",
+    "screensaver.js",
     "search.js",
+    "server-admin.js",
     "sessions.js",
     "settings.js",
+    "subtitle-admin.js",
     "theme-media.js",
     "user-editor.js",
     "user-settings.js",
@@ -7121,9 +7280,19 @@ async fn r1auth_parent_id_filters_seasons_and_episodes() {
             .await,
             r1auth_sorted(&[lib.episode, other_episode])
         );
+        // With item types, a library lists its contents recursively unless Recursive is given,
+        // as Jellyfin 12.4's ItemsController does (`recursive ??= true` for a collection folder).
         assert_eq!(
             get(format!(
                 "ParentId={}&IncludeItemTypes=Movie,Series",
+                lib.library
+            ))
+            .await,
+            r1auth_sorted(&[lib.movie, lib.series, other, shelved])
+        );
+        assert_eq!(
+            get(format!(
+                "ParentId={}&IncludeItemTypes=Movie,Series&Recursive=false",
                 lib.library
             ))
             .await,
@@ -7193,7 +7362,8 @@ async fn r1auth_users_have_policy_and_configuration() {
     assert_eq!(policy["IsAdministrator"], false);
     assert_eq!(policy["EnableContentDeletion"], false);
     assert_eq!(policy["EnableMediaPlayback"], true);
-    assert_eq!(policy["EnableContentDownloading"], false);
+    // On for a new user, Jellyfin's UserPolicy default, now that /Items/{id}/Download exists
+    assert_eq!(policy["EnableContentDownloading"], true);
     assert_eq!(policy["EnableAllFolders"], true);
 
     // A Jellyfin client saves the whole policy back; the account keeps its role.
@@ -9648,6 +9818,1003 @@ async fn test_branding_splashscreen() {
     .unwrap();
 
     // Endpoint may not be implemented yet; accept any response
+}
+
+// R3 client endpoints: UserDataChanged, the 10.9+ user settings forms, splash screen, movie parts
+
+/// The `UserDataChanged` events on `events` until none has come for `quiet`.
+async fn r3endpoints_user_data_events(
+    events: &mut broadcast::Receiver<WsEvent>,
+    quiet: std::time::Duration,
+) -> Vec<serde_json::Value> {
+    let mut found = Vec::new();
+    while let Ok(Ok(event)) = tokio::time::timeout(quiet, events.recv()).await {
+        if let WsEvent::UserDataChanged { data } = event {
+            found.push(data);
+        }
+    }
+    found
+}
+
+/// Writes made close together reach each user as one `UserDataChanged` per user, as Jellyfin's
+/// UserDataChangeNotifier batches them, with the item's user data and its `ItemId`; a progress
+/// report sends none.
+#[tokio::test]
+async fn r3endpoints_user_data_changes_are_sent_per_user_in_one_batch() {
+    let state = test_state().await;
+    let app = app(state.clone());
+    let (owner, owner_id, viewer, viewer_id) = g1_owner_and_viewer(&state, &app).await;
+    let movie = g1_insert_movie(&state).await;
+    let mut events = state.ws_broadcast.subscribe();
+
+    for (token, uri) in [
+        (&owner, format!("/UserFavoriteItems/{movie}")),
+        (&owner, format!("/UserPlayedItems/{movie}")),
+        (&viewer, format!("/UserFavoriteItems/{movie}")),
+    ] {
+        let (status, body) = send(&app, request("POST", &uri, Some(token), None)).await;
+        assert_eq!(status, StatusCode::OK, "{uri}: {body}");
+    }
+    let sent = r3endpoints_user_data_events(&mut events, std::time::Duration::from_secs(2)).await;
+    assert_eq!(sent.len(), 2, "one message per user: {sent:?}");
+    let for_user = |id: &str| {
+        let id = uuid::Uuid::parse_str(id).unwrap();
+        sent.iter()
+            .find(|data| uuid::Uuid::parse_str(data["UserId"].as_str().unwrap()).unwrap() == id)
+            .unwrap_or_else(|| panic!("no message for {id}: {sent:?}"))
+            .clone()
+    };
+    let owners = for_user(&owner_id);
+    let list = owners["UserDataList"].as_array().unwrap();
+    assert_eq!(list.len(), 1, "the movie once: {owners}");
+    assert_eq!(list[0]["ItemId"], movie.to_string());
+    assert_eq!(list[0]["IsFavorite"], true);
+    assert_eq!(list[0]["Played"], true);
+    let viewers = for_user(&viewer_id);
+    assert_eq!(viewers["UserDataList"][0]["IsFavorite"], true);
+    assert_eq!(viewers["UserDataList"][0]["Played"], false);
+
+    // Progress reports are left out, as in Jellyfin (UserDataSaveReason.PlaybackProgress).
+    let progress = serde_json::json!({ "ItemId": movie.to_string(), "PositionTicks": 50_000_000 });
+    let req = request(
+        "POST",
+        "/Sessions/Playing/Progress",
+        Some(&owner),
+        Some(progress),
+    );
+    assert!(send(&app, req).await.0.is_success());
+    let sent = r3endpoints_user_data_events(&mut events, std::time::Duration::from_secs(1)).await;
+    assert_eq!(sent, Vec::<serde_json::Value>::new());
+
+    // Marking it unplayed sends again.
+    let uri = format!("/UserPlayedItems/{movie}");
+    let req = request("DELETE", &uri, Some(&owner), None);
+    assert_eq!(send(&app, req).await.0, StatusCode::OK);
+    let sent = r3endpoints_user_data_events(&mut events, std::time::Duration::from_secs(2)).await;
+    assert_eq!(sent.len(), 1, "{sent:?}");
+    assert_eq!(sent[0]["UserDataList"][0]["Played"], false);
+}
+
+/// Jellyfin 10.9+'s `POST /Users?userId=`, `/Users/Password?userId=` and
+/// `/Users/Configuration?userId=` act like the `/Users/{userId}/...` forms, with the same rules;
+/// without `userId` they act for the caller.
+#[tokio::test]
+async fn r3endpoints_user_settings_take_the_user_from_the_query() {
+    let state = test_state().await;
+    let app = app(state.clone());
+    let (owner, owner_id, viewer, viewer_id) = g1_owner_and_viewer(&state, &app).await;
+
+    let config = serde_json::json!({ "PlayDefaultAudioTrack": false });
+    let uri = format!("/Users/Configuration?userId={viewer_id}");
+    let req = request("POST", &uri, Some(&viewer), Some(config.clone()));
+    assert!(send(&app, req).await.0.is_success(), "{uri}");
+    let req = request("GET", &format!("/Users/{viewer_id}"), Some(&viewer), None);
+    let (_, me) = send(&app, req).await;
+    assert_eq!(me["Configuration"]["PlayDefaultAudioTrack"], false, "{me}");
+    // Another user's settings: refused to a non-administrator.
+    let uri = format!("/Users/Configuration?userId={owner_id}");
+    let req = request("POST", &uri, Some(&viewer), Some(config));
+    assert_eq!(send(&app, req).await.0, StatusCode::FORBIDDEN);
+    // So are another user's password and name, and both stay as they were.
+    let uri = format!("/Users/Password?userId={owner_id}");
+    let pw = serde_json::json!({ "CurrentPw": "ownerpass", "NewPw": "taken" });
+    let req = request("POST", &uri, Some(&viewer), Some(pw));
+    assert_eq!(send(&app, req).await.0, StatusCode::FORBIDDEN, "{uri}");
+    let uri = format!("/Users?userId={owner_id}");
+    let name = serde_json::json!({ "Name": "renamed" });
+    let req = request("POST", &uri, Some(&viewer), Some(name));
+    assert_eq!(send(&app, req).await.0, StatusCode::FORBIDDEN, "{uri}");
+    assert!(login(&app, "owner", "ownerpass").await.is_some());
+
+    let uri = format!("/Users?userId={viewer_id}");
+    let name = serde_json::json!({ "Name": "viewer2" });
+    let req = request("POST", &uri, Some(&owner), Some(name));
+    assert!(send(&app, req).await.0.is_success(), "{uri}");
+    let req = request("GET", &format!("/Users/{viewer_id}"), Some(&owner), None);
+    assert_eq!(send(&app, req).await.1["Name"], "viewer2");
+
+    // A wrong current password is refused; without `userId` the caller changes their own.
+    let wrong = serde_json::json!({ "CurrentPw": "nope", "NewPw": "newpass" });
+    let req = request("POST", "/Users/Password", Some(&viewer), Some(wrong));
+    assert_eq!(send(&app, req).await.0, StatusCode::UNAUTHORIZED);
+    let right = serde_json::json!({ "CurrentPw": "viewerpass", "NewPw": "newpass" });
+    let req = request("POST", "/Users/Password", Some(&viewer), Some(right));
+    assert!(send(&app, req).await.0.is_success());
+    assert!(login(&app, "viewer2", "newpass").await.is_some());
+    assert!(login(&app, "viewer2", "viewerpass").await.is_none());
+}
+
+/// `GET /Branding/Splashscreen` answers the splash image from the data dir, without sign-in, and
+/// 404 while there is none, as Jellyfin does.
+#[tokio::test]
+async fn r3endpoints_splashscreen_is_served_from_the_data_dir() {
+    let state = test_state().await;
+    let app = app(state.clone());
+    let req = request("GET", "/Branding/Splashscreen", None, None);
+    assert_eq!(send(&app, req).await.0, StatusCode::NOT_FOUND);
+
+    std::fs::create_dir_all(&*state.data_dir).unwrap();
+    let png = b"\x89PNG\r\n\x1a\nr3endpoints";
+    std::fs::write(state.data_dir.join("splashscreen.png"), png).unwrap();
+    let req = request("GET", "/Branding/Splashscreen", None, None);
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(resp.headers()["content-type"], "image/png");
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    assert_eq!(&bytes[..], &png[..]);
+}
+
+/// A movie split into files (`-cd1` to `-cd3`, or ` part1`, ` part2` in the library root) is one
+/// movie at part 1, as Jellyfin's StackResolver makes it: the listings show it once, with its
+/// stack's name, it has a PartCount, its later parts come from `/Videos/{id}/AdditionalParts` in
+/// order and without an ExtraType, and they are no special features.
+#[tokio::test]
+async fn r3endpoints_movie_parts_stack_into_one_movie_with_additional_parts() {
+    let state = test_state().await;
+    let app = app(state.clone());
+    let (token, _) = admin_session(&state).await;
+    let root = std::path::PathBuf::from(media_folder(&state, "r3endpoints parts"));
+    let film = root.join("Lantern Bay (1999)");
+    for part in ["cd1", "cd2", "cd3"] {
+        if !r3extras_media(&film.join(format!("Lantern Bay (1999)-{part}.mkv")), false) {
+            return;
+        }
+    }
+    for part in ["part1", "part2"] {
+        let file = root.join(format!("Quiet Orchard (2004) {part}.mkv"));
+        assert!(r3extras_media(&file, false));
+    }
+    let lib = rustyfin_model::library::Library {
+        id: uuid::Uuid::new_v4(),
+        name: "R3 Endpoints Parts".to_string(),
+        content_type: rustyfin_model::library::LibraryContentType::Movies,
+        paths: vec![root.to_str().unwrap().to_string()],
+    };
+    rustyfin_db::repo_library::create_library(&state.db, &lib)
+        .await
+        .unwrap();
+    rustyfin_core::scanner::scan_library(&state.db, &lib)
+        .await
+        .unwrap();
+    rustyfin_core::scanner::wait_for_idle().await;
+
+    let uri = format!("/Items?ParentId={}&Recursive=true&SortBy=SortName", lib.id);
+    let (status, body) = send_authed(&app, "GET", &uri, &token, None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let items = body["Items"].as_array().unwrap().clone();
+    let names: Vec<&str> = items.iter().filter_map(|i| i["Name"].as_str()).collect();
+    assert_eq!(names, ["Lantern Bay", "Quiet Orchard"], "{body}");
+
+    for (movie, count, second) in [
+        (&items[0], 3, "Lantern Bay (1999)-cd2"),
+        (&items[1], 2, "Quiet Orchard (2004) part2"),
+    ] {
+        let movie = movie["Id"].as_str().unwrap();
+        let (status, item) =
+            send_authed(&app, "GET", &format!("/Items/{movie}"), &token, None).await;
+        assert_eq!(status, StatusCode::OK, "{item}");
+        assert_eq!(item["PartCount"], count, "{item}");
+        assert_eq!(item["SpecialFeatureCount"], 0, "{item}");
+        let uri = format!("/Videos/{movie}/AdditionalParts");
+        let (status, parts) = send_authed(&app, "GET", &uri, &token, None).await;
+        assert_eq!(status, StatusCode::OK, "{parts}");
+        let list = parts["Items"].as_array().unwrap();
+        assert_eq!(list.len(), count - 1, "{parts}");
+        assert_eq!(parts["TotalRecordCount"], count - 1);
+        assert_eq!(list[0]["Name"], second, "{parts}");
+        assert!(list.iter().all(|p| p["ExtraType"].is_null()), "{parts}");
+        let uri = format!("/Items/{movie}/SpecialFeatures");
+        let (_, specials) = send_authed(&app, "GET", &uri, &token, None).await;
+        assert_eq!(specials, serde_json::json!([]), "{specials}");
+    }
+
+    let uri = format!("/Videos/{}/AdditionalParts", uuid::Uuid::new_v4());
+    let (status, _) = send_authed(&app, "GET", &uri, &token, None).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+/// A movies library at a new folder `name` under the data dir, created but not scanned.
+async fn r3endpoints_movies_library(
+    state: &AppState,
+    name: &str,
+) -> (std::path::PathBuf, rustyfin_model::library::Library) {
+    let root = std::path::PathBuf::from(media_folder(state, name));
+    let lib = rustyfin_model::library::Library {
+        id: uuid::Uuid::new_v4(),
+        name: name.to_string(),
+        content_type: rustyfin_model::library::LibraryContentType::Movies,
+        paths: vec![root.to_str().unwrap().to_string()],
+    };
+    rustyfin_db::repo_library::create_library(&state.db, &lib)
+        .await
+        .unwrap();
+    (root, lib)
+}
+
+async fn r3endpoints_scan(state: &AppState, lib: &rustyfin_model::library::Library) {
+    rustyfin_core::scanner::scan_library(&state.db, lib)
+        .await
+        .unwrap();
+    rustyfin_core::scanner::wait_for_idle().await;
+}
+
+/// A stored row: `(id, path file name, media_type, extra_type, owner_id)`.
+type R3endpointsRow = (String, String, String, Option<String>, Option<String>);
+
+/// The stored rows of a library, by path.
+async fn r3endpoints_rows(
+    state: &AppState,
+    lib: &rustyfin_model::library::Library,
+) -> Vec<R3endpointsRow> {
+    let rows: Vec<R3endpointsRow> = sqlx::query_as(
+        "SELECT id, path, media_type, extra_type, owner_id FROM media_items
+         WHERE library_id = ?1 ORDER BY path",
+    )
+    .bind(lib.id.to_string())
+    .fetch_all(&state.db)
+    .await
+    .unwrap();
+    rows.into_iter()
+        .map(|(id, path, kind, extra, owner)| {
+            let file = path.rsplit('/').next().unwrap().to_string();
+            (id, file, kind, extra, owner)
+        })
+        .collect()
+}
+
+/// A stack that breaks up (part 1 deleted) leaves no orphan part: the stored part is the movie again,
+/// with its id, and no second movie is added at its path.
+#[tokio::test]
+async fn r3endpoints_a_broken_stack_makes_its_part_the_movie_again() {
+    let state = test_state().await;
+    let (root, lib) = r3endpoints_movies_library(&state, "r3endpoints broken stack").await;
+    let film = root.join("Copper Vale (2007)");
+    for part in ["cd1", "cd2"] {
+        if !r3extras_media(&film.join(format!("Copper Vale (2007)-{part}.mkv")), false) {
+            return;
+        }
+    }
+    r3endpoints_scan(&state, &lib).await;
+    let rows = r3endpoints_rows(&state, &lib).await;
+    let part = rows
+        .iter()
+        .find(|row| row.1 == "Copper Vale (2007)-cd2.mkv")
+        .unwrap();
+    assert_eq!(part.3.as_deref(), Some("Part"), "{rows:?}");
+    let part_id = part.0.clone();
+
+    std::fs::remove_file(film.join("Copper Vale (2007)-cd1.mkv")).unwrap();
+    r3endpoints_scan(&state, &lib).await;
+    let rows = r3endpoints_rows(&state, &lib).await;
+    assert_eq!(
+        rows,
+        vec![(
+            part_id,
+            "Copper Vale (2007)-cd2.mkv".to_string(),
+            "Movie".to_string(),
+            None,
+            None
+        )],
+        "one movie at the former part's path, with its id"
+    );
+}
+
+/// Two movies that a scan now stacks (an older scan stored part 1 and part 2 as movies of their own):
+/// part 2's watch state is merged into the movie once, and the movie keeps its own resume point.
+#[tokio::test]
+async fn r3endpoints_two_movies_that_stack_merge_their_user_data() {
+    let state = test_state().await;
+    let app = app(state.clone());
+    let (token, _) = admin_session(&state).await;
+    let (root, lib) = r3endpoints_movies_library(&state, "r3endpoints merged parts").await;
+    let film = root.join("Birch Hollow (2011)");
+    let files: Vec<std::path::PathBuf> = ["part1", "part2"]
+        .iter()
+        .map(|p| film.join(format!("Birch Hollow (2011) {p}.mkv")))
+        .collect();
+    for file in &files {
+        if !r3extras_media(file, false) {
+            return;
+        }
+    }
+    // As an older scan left them: two movies, one per file.
+    let ids: Vec<String> = (0..2).map(|_| uuid::Uuid::new_v4().to_string()).collect();
+    for (id, file) in ids.iter().zip(&files) {
+        sqlx::query(
+            "INSERT INTO media_items (id, library_id, name, media_type, path) VALUES (?, ?, ?, 'Movie', ?)",
+        )
+        .bind(id)
+        .bind(lib.id.to_string())
+        .bind("Birch Hollow")
+        .bind(file.to_str().unwrap())
+        .execute(&state.db)
+        .await
+        .unwrap();
+    }
+    let user_data = [
+        serde_json::json!({ "PlaybackPositionTicks": 70_000_000, "PlayCount": 1 }),
+        serde_json::json!({
+            "PlaybackPositionTicks": 90_000_000, "PlayCount": 3, "Played": true,
+            "IsFavorite": true, "LastPlayedDate": "2026-01-02T03:04:05Z"
+        }),
+    ];
+    for (id, data) in ids.iter().zip(user_data) {
+        let uri = format!("/UserItems/{id}/UserData");
+        let body = data.to_string();
+        let (status, answer) = send_authed(&app, "POST", &uri, &token, Some(&body)).await;
+        assert_eq!(status, StatusCode::OK, "{answer}");
+    }
+
+    r3endpoints_scan(&state, &lib).await;
+    let rows = r3endpoints_rows(&state, &lib).await;
+    assert_eq!(rows.len(), 2, "{rows:?}");
+    assert_eq!(
+        (rows[0].0.as_str(), rows[0].3.as_deref()),
+        (ids[0].as_str(), None)
+    );
+    assert_eq!(
+        (
+            rows[1].0.as_str(),
+            rows[1].3.as_deref(),
+            rows[1].4.as_deref()
+        ),
+        (ids[1].as_str(), Some("Part"), Some(ids[0].as_str())),
+        "{rows:?}"
+    );
+    let uri = format!("/UserItems/{}/UserData", ids[0]);
+    let (status, data) = send_authed(&app, "GET", &uri, &token, None).await;
+    assert_eq!(status, StatusCode::OK, "{data}");
+    assert_eq!(data["Played"], true, "{data}");
+    assert_eq!(data["IsFavorite"], true, "{data}");
+    assert_eq!(data["PlayCount"], 3, "{data}");
+    assert_eq!(data["PlaybackPositionTicks"], 70_000_000, "{data}");
+    assert!(
+        data["LastPlayedDate"]
+            .as_str()
+            .unwrap()
+            .starts_with("2026-01-02"),
+        "{data}"
+    );
+
+    // Once only: a rescan doesn't merge again.
+    let uri = format!("/UserItems/{}/UserData", ids[0]);
+    let body = serde_json::json!({ "Played": false, "IsFavorite": false }).to_string();
+    assert_eq!(
+        send_authed(&app, "POST", &uri, &token, Some(&body)).await.0,
+        StatusCode::OK
+    );
+    r3endpoints_scan(&state, &lib).await;
+    let (_, data) = send_authed(&app, "GET", &uri, &token, None).await;
+    assert_eq!(data["Played"], false, "{data}");
+    assert_eq!(data["IsFavorite"], false, "{data}");
+}
+
+/// A library whose `-cd1`/`-cd2` files an older scan stored as two versions of one movie: the
+/// rescan keeps the movie and its id, drops the part 2 version, and makes part 2 its part.
+#[tokio::test]
+async fn r3endpoints_parts_stored_as_versions_become_parts_on_rescan() {
+    let state = test_state().await;
+    let app = app(state.clone());
+    let (token, _) = admin_session(&state).await;
+    let (root, lib) = r3endpoints_movies_library(&state, "r3endpoints versions").await;
+    let film = root.join("Slate Harbor (2016)");
+    let cd1 = film.join("Slate Harbor (2016)-cd1.mkv");
+    let cd2 = film.join("Slate Harbor (2016)-cd2.mkv");
+    if !r3extras_media(&cd1, false) {
+        return;
+    }
+    r3endpoints_scan(&state, &lib).await;
+    let movies = j5_movie_ids(&state).await;
+    assert_eq!(movies.len(), 1);
+    let movie = movies[0].clone();
+    // As an older scan left them: part 2 is a second media source (version) of the movie.
+    assert!(r3extras_media(&cd2, false));
+    sqlx::query("INSERT INTO media_sources (id, item_id, uid, path) VALUES (?, ?, ?, ?)")
+        .bind(uuid::Uuid::new_v4().simple().to_string())
+        .bind(&movie)
+        .bind(uuid::Uuid::new_v4().simple().to_string())
+        .bind(cd2.to_str().unwrap())
+        .execute(&state.db)
+        .await
+        .unwrap();
+
+    r3endpoints_scan(&state, &lib).await;
+    assert_eq!(
+        j5_movie_ids(&state).await,
+        vec![movie.clone()],
+        "the same movie"
+    );
+    let (status, item) = send_authed(&app, "GET", &format!("/Items/{movie}"), &token, None).await;
+    assert_eq!(status, StatusCode::OK, "{item}");
+    assert_eq!(item["PartCount"], 2, "{item}");
+    let sources: Vec<&str> = item["MediaSources"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|s| s["Path"].as_str())
+        .collect();
+    assert_eq!(sources, [cd1.to_str().unwrap()], "{item}");
+    let uri = format!("/Videos/{movie}/AdditionalParts");
+    let (_, parts) = send_authed(&app, "GET", &uri, &token, None).await;
+    assert_eq!(parts["TotalRecordCount"], 1, "{parts}");
+    assert_eq!(parts["Items"][0]["Path"], cd2.to_str().unwrap(), "{parts}");
+}
+
+/// A library under the data dir, holding one item of each `(media_type, name)` pair.
+async fn r3endpoints_library_with(state: &AppState, items: &[(&str, &str)]) -> uuid::Uuid {
+    let dir = state
+        .data_dir
+        .join(format!("r3e-{}", uuid::Uuid::new_v4().simple()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let lib = rustyfin_model::library::Library {
+        id: uuid::Uuid::new_v4(),
+        name: format!("R3E {}", uuid::Uuid::new_v4().simple()),
+        content_type: rustyfin_model::library::LibraryContentType::Movies,
+        paths: vec![dir.to_str().unwrap().to_string()],
+    };
+    rustyfin_db::repo_library::create_library(&state.db, &lib)
+        .await
+        .unwrap();
+    for (media_type, name) in items {
+        let path = dir.join(format!("{}.mkv", uuid::Uuid::new_v4().simple()));
+        sqlx::query(
+            "INSERT INTO media_items (id, library_id, name, media_type, path) VALUES (?, ?, ?, ?, ?)",
+        )
+        .bind(uuid::Uuid::new_v4().to_string())
+        .bind(lib.id.to_string())
+        .bind(*name)
+        .bind(*media_type)
+        .bind(path.to_str().unwrap())
+        .execute(&state.db)
+        .await
+        .unwrap();
+    }
+    lib.id
+}
+
+/// The `Name`s of the items in a `/Items/Suggestions` answer, sorted.
+fn r3endpoints_names(body: &serde_json::Value) -> Vec<String> {
+    let mut names: Vec<String> = body["Items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|item| item["Name"].as_str().unwrap().to_string())
+        .collect();
+    names.sort();
+    names
+}
+
+#[tokio::test]
+async fn r3endpoints_suggestions_returns_only_requested_types() {
+    let state = test_state().await;
+    let (token, _) = admin_session(&state).await;
+    r3endpoints_library_with(
+        &state,
+        &[
+            ("Movie", "R3E Movie"),
+            ("Series", "R3E Series"),
+            ("Episode", "R3E Episode"),
+        ],
+    )
+    .await;
+    let app = app(state);
+
+    let (status, body) = send(
+        &app,
+        request(
+            "GET",
+            "/Items/Suggestions?type=Movie&type=Series&limit=6",
+            Some(&token),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(r3endpoints_names(&body), ["R3E Movie", "R3E Series"]);
+    assert_eq!(body["TotalRecordCount"], 2);
+    assert_eq!(body["StartIndex"], 0);
+
+    // The comma form names the same types.
+    let (status, body) = send(
+        &app,
+        request(
+            "GET",
+            "/Items/Suggestions?type=Movie,Series",
+            Some(&token),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(r3endpoints_names(&body), ["R3E Movie", "R3E Series"]);
+}
+
+#[tokio::test]
+async fn r3endpoints_suggestions_respects_limit() {
+    let state = test_state().await;
+    let (token, _) = admin_session(&state).await;
+    r3endpoints_library_with(
+        &state,
+        &[
+            ("Movie", "R3E One"),
+            ("Movie", "R3E Two"),
+            ("Movie", "R3E Three"),
+        ],
+    )
+    .await;
+    let app = app(state);
+
+    let (status, body) = send(
+        &app,
+        request(
+            "GET",
+            "/Items/Suggestions?type=Movie&limit=2",
+            Some(&token),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["Items"].as_array().unwrap().len(), 2);
+    // Without enableTotalRecordCount the total is the count of the returned items.
+    assert_eq!(body["TotalRecordCount"], 2);
+
+    let (status, body) = send(
+        &app,
+        request(
+            "GET",
+            "/Items/Suggestions?type=Movie&limit=2&enableTotalRecordCount=true",
+            Some(&token),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["Items"].as_array().unwrap().len(), 2);
+    assert_eq!(body["TotalRecordCount"], 3);
+}
+
+#[tokio::test]
+async fn r3endpoints_suggestions_requires_a_token() {
+    let state = test_state().await;
+    let app = app(state);
+
+    let (status, _) = send(
+        &app,
+        request("GET", "/Items/Suggestions?type=Movie&limit=6", None, None),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn r3endpoints_clientlog_requires_auth() {
+    let state = test_state().await;
+    let app = app(state);
+    let req = Request::builder()
+        .method("POST")
+        .uri("/ClientLog/Document")
+        .header("Content-Type", "text/plain")
+        .body(Body::from("no token"))
+        .unwrap();
+    let (status, _) = send(&app, req).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn r3endpoints_clientlog_writes_sanitised_file() {
+    let state = test_state().await;
+    let username = format!("logger_{}", uuid::Uuid::new_v4().simple());
+    rustyfin_auth::create_initial_user(&state.db, &username, "pw")
+        .await
+        .unwrap();
+    let user = rustyfin_db::repo_user::get_user_by_name(&state.db, &username)
+        .await
+        .unwrap()
+        .unwrap();
+    let device = rustyfin_auth::TokenDevice {
+        device_id: "r3-device".to_string(),
+        device_name: "Dev".to_string(),
+        app_name: "../x".to_string(),
+        app_version: "1.0 beta".to_string(),
+    };
+    let token = rustyfin_auth::create_token(&state.db, &user, &device)
+        .await
+        .unwrap();
+
+    let logs_dir = state.data_dir.join("logs");
+    let app = app(state.clone());
+    let body = "hello log\nline 2";
+    let req = Request::builder()
+        .method("POST")
+        .uri("/ClientLog/Document")
+        .header("Authorization", format!("Bearer {token}"))
+        .header("Content-Type", "text/plain")
+        .body(Body::from(body))
+        .unwrap();
+    let (status, json) = send(&app, req).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let name = json["FileName"].as_str().expect("FileName").to_string();
+    assert!(name.starts_with("upload_"), "{name}");
+    assert!(name.ends_with(".log"), "{name}");
+    assert!(name.contains("_1.0_beta_"), "{name}");
+    assert!(!name.contains('/') && !name.contains('\\'), "{name}");
+    assert!(!name.contains(".."), "{name}");
+
+    let written = std::fs::read_to_string(logs_dir.join(&name)).expect("log file exists");
+    assert_eq!(written, body);
+}
+
+#[tokio::test]
+async fn r3endpoints_clientlog_size_limit_is_413() {
+    let state = test_state().await;
+    let (token, _) = admin_session(&state).await;
+    let app = app(state);
+    let req = Request::builder()
+        .method("POST")
+        .uri("/ClientLog/Document")
+        .header("Authorization", format!("Bearer {token}"))
+        .header("Content-Type", "text/plain")
+        .body(Body::from(vec![b'a'; 1_000_001]))
+        .unwrap();
+    let (status, _) = send(&app, req).await;
+    assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+}
+
+/// Only the newest 50 uploads are kept: an upload deletes the oldest beyond that, and leaves the
+/// server's own log files alone.
+#[tokio::test]
+async fn r3endpoints_clientlog_keeps_the_newest_50_uploads() {
+    let state = test_state().await;
+    let (token, _) = admin_session(&state).await;
+    let logs_dir = state.data_dir.join("logs");
+    std::fs::create_dir_all(&logs_dir).unwrap();
+    let old = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+    for i in 0..60 {
+        let file =
+            std::fs::File::create(logs_dir.join(format!("upload_old_1_{i:02}.log"))).unwrap();
+        file.set_modified(old + std::time::Duration::from_secs(i))
+            .unwrap();
+    }
+    std::fs::write(logs_dir.join("rustyfin.log"), "server").unwrap();
+    let app = app(state);
+    let req = Request::builder()
+        .method("POST")
+        .uri("/ClientLog/Document")
+        .header("Authorization", format!("Bearer {token}"))
+        .body(Body::from("new"))
+        .unwrap();
+    let (status, json) = send(&app, req).await;
+    assert_eq!(status, StatusCode::OK, "{json}");
+    let mut uploads: Vec<String> = std::fs::read_dir(&logs_dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|name| name.starts_with("upload_"))
+        .collect();
+    uploads.sort();
+    assert_eq!(uploads.len(), 50, "{uploads:?}");
+    assert!(uploads.contains(&json["FileName"].as_str().unwrap().to_string()));
+    // The 11 oldest went: 00 to 10.
+    assert_eq!(uploads[0], "upload_old_1_11.log");
+    assert!(logs_dir.join("rustyfin.log").exists());
+}
+
+/// Inserts a tuner host, a channel on it, and one guide entry on that channel.
+/// Returns (channel_id, program_id).
+async fn r3endpoints_livetv_seed(state: &AppState) -> (String, String) {
+    let host_id = uuid::Uuid::new_v4().to_string();
+    let channel_id = uuid::Uuid::new_v4().to_string();
+    let program_id = uuid::Uuid::new_v4().to_string();
+    sqlx::query(
+        "INSERT INTO live_tv_tuner_hosts (id, name, type, hostname, port, username, password)
+         VALUES (?1, 'r3 host', 'm3u', 'localhost', 0, '', '')",
+    )
+    .bind(&host_id)
+    .execute(&state.db)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO live_tv_channels (id, name, channel_number, tuner_host_id, epg_id,
+                display_name, logo_url, is_radio)
+         VALUES (?1, 'r3 channel', '7', ?2, '', 'r3 channel', '', 0)",
+    )
+    .bind(&channel_id)
+    .bind(&host_id)
+    .execute(&state.db)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO live_tv_guide_entries (id, channel_id, name, description, start_time, end_time)
+         VALUES (?1, ?2, 'r3 show', 'r3 overview', '2026-11-16T18:00:00Z', '2026-11-16T19:00:00Z')",
+    )
+    .bind(&program_id)
+    .bind(&channel_id)
+    .execute(&state.db)
+    .await
+    .unwrap();
+    (channel_id, program_id)
+}
+
+#[tokio::test]
+async fn r3endpoints_livetv_recommended_programs_static_path() {
+    let state = test_state().await;
+    let (token, _) = admin_session(&state).await;
+    let app = app(state);
+
+    // New path, with the query parameters clients send (camelCase and PascalCase).
+    for uri in [
+        "/LiveTv/Programs/Recommended",
+        "/LiveTv/Programs/Recommended?isAiring=true&hasAired=false&limit=10&fields=Overview&userId=x",
+        "/LiveTv/Programs/Recommended?IsAiring=true&HasAired=false&Limit=10&UserId=x",
+    ] {
+        let (status, json) = send(&app, request("GET", uri, Some(&token), None)).await;
+        assert_eq!(status, StatusCode::OK, "{uri}");
+        assert!(json["Items"].is_array(), "{uri}: {json}");
+        assert!(json["TotalRecordCount"].is_number(), "{uri}: {json}");
+    }
+
+    // Old alias still answers.
+    let (status, json) = send(
+        &app,
+        request("GET", "/LiveTv/RecommendedPrograms", Some(&token), None),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(json["Items"].is_array());
+}
+
+#[tokio::test]
+async fn r3endpoints_livetv_recommended_is_not_swallowed_by_program_id() {
+    let state = test_state().await;
+    let (token, _) = admin_session(&state).await;
+    let app = app(state);
+
+    // Program-by-id is a Uuid path: a non-Uuid segment must not reach it, and a Uuid one must.
+    let (status, _) = send(
+        &app,
+        request("GET", "/LiveTv/Programs/Recommended", Some(&token), None),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let unknown = uuid::Uuid::new_v4();
+    let (status, _) = send(
+        &app,
+        request(
+            "GET",
+            &format!("/LiveTv/Programs/{unknown}"),
+            Some(&token),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn r3endpoints_livetv_program_by_id_still_answers() {
+    let state = test_state().await;
+    let (_, program_id) = r3endpoints_livetv_seed(&state).await;
+    let (token, _) = admin_session(&state).await;
+    let app = app(state);
+
+    let (status, json) = send(
+        &app,
+        request(
+            "GET",
+            &format!("/LiveTv/Programs/{program_id}"),
+            Some(&token),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(json["Id"], program_id);
+    assert_eq!(json["Name"], "r3 show");
+}
+
+#[tokio::test]
+async fn r3endpoints_livetv_timer_defaults_without_program() {
+    let state = test_state().await;
+    let (token, _) = admin_session(&state).await;
+    let app = app(state);
+
+    let (status, json) = send(
+        &app,
+        request("GET", "/LiveTv/Timers/Defaults", Some(&token), None),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(json["KeepUntil"], "UntilDeleted");
+    assert_eq!(json["KeepUpTo"], 0);
+    assert_eq!(json["Priority"], 0);
+    assert_eq!(json["PrePaddingSeconds"], 0);
+    assert_eq!(json["PostPaddingSeconds"], 0);
+    assert_eq!(json["IsPrePaddingRequired"], false);
+    assert_eq!(json["IsPostPaddingRequired"], false);
+    assert_eq!(json["RecordAnyTime"], true);
+    assert_eq!(json["RecordAnyChannel"], false);
+    assert_eq!(json["RecordNewOnly"], true);
+    assert_eq!(json["SkipEpisodesInLibrary"], false);
+    assert_eq!(json["Days"].as_array().map(Vec::len), Some(7), "{json}");
+    assert!(json["DayPattern"].is_null());
+    assert!(json.get("ProgramId").is_none());
+    assert!(json.get("ChannelId").is_none());
+}
+
+#[tokio::test]
+async fn r3endpoints_livetv_timer_defaults_from_program() {
+    let state = test_state().await;
+    let (channel_id, program_id) = r3endpoints_livetv_seed(&state).await;
+    let (token, _) = admin_session(&state).await;
+    let app = app(state);
+
+    for query in [
+        format!("programId={program_id}"),
+        format!("ProgramId={program_id}"),
+    ] {
+        let uri = format!("/LiveTv/Timers/Defaults?{query}");
+        let (status, json) = send(&app, request("GET", &uri, Some(&token), None)).await;
+        assert_eq!(status, StatusCode::OK, "{uri}");
+        assert_eq!(json["ProgramId"], program_id, "{uri}");
+        assert_eq!(json["ChannelId"], channel_id, "{uri}");
+        assert_eq!(json["ChannelName"], "r3 channel", "{uri}");
+        assert_eq!(json["Name"], "r3 show", "{uri}");
+        assert_eq!(json["Overview"], "r3 overview", "{uri}");
+        assert_eq!(json["StartDate"], "2026-11-16T18:00:00Z", "{uri}");
+        assert_eq!(json["EndDate"], "2026-11-16T19:00:00Z", "{uri}");
+        assert_eq!(json["ServiceName"], "m3u", "{uri}");
+        assert_eq!(json["KeepUntil"], "UntilDeleted", "{uri}");
+    }
+}
+
+#[tokio::test]
+async fn r3endpoints_livetv_timer_defaults_unknown_program_is_404() {
+    let state = test_state().await;
+    let (token, _) = admin_session(&state).await;
+    let app = app(state);
+
+    let uri = format!("/LiveTv/Timers/Defaults?programId={}", uuid::Uuid::new_v4());
+    let (status, _) = send(&app, request("GET", &uri, Some(&token), None)).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn r3endpoints_livetv_timer_by_id_still_routed() {
+    let state = test_state().await;
+    let (token, _) = admin_session(&state).await;
+    let app = app(state);
+
+    // Static Defaults must not swallow the timer-by-id route, and that route still answers.
+    let (status, json) = send(&app, request("GET", "/LiveTv/Timers", Some(&token), None)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(json["Items"].is_array());
+
+    let unknown = uuid::Uuid::new_v4();
+    let (status, _) = send(
+        &app,
+        request(
+            "GET",
+            &format!("/LiveTv/Timers/{unknown}"),
+            Some(&token),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn r3endpoints_livetv_live_streams_open_answers_null_media_source() {
+    let state = test_state().await;
+    let (token, _) = admin_session(&state).await;
+    let app = app(state);
+
+    let body = serde_json::json!({
+        "OpenToken": "r3-token",
+        "ItemId": uuid::Uuid::new_v4().to_string(),
+        "UserId": uuid::Uuid::new_v4().to_string(),
+        "PlaySessionId": "r3-play",
+        "MaxStreamingBitrate": 20000000,
+        "DeviceProfile": {}
+    });
+    let (status, json) = send(
+        &app,
+        request("POST", "/LiveStreams/Open", Some(&token), Some(body)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(json.get("MediaSource").is_some());
+    assert!(json["MediaSource"].is_null());
+
+    // Query-string form, no body.
+    let (status, json) = send(
+        &app,
+        request(
+            "POST",
+            "/LiveStreams/Open?openToken=r3-token&playSessionId=r3-play",
+            Some(&token),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(json["MediaSource"].is_null());
+}
+
+#[tokio::test]
+async fn r3endpoints_livetv_live_streams_close_is_204() {
+    let state = test_state().await;
+    let (token, _) = admin_session(&state).await;
+    let app = app(state);
+
+    let (status, _) = send(
+        &app,
+        request(
+            "POST",
+            "/LiveStreams/Close?liveStreamId=r3-unknown",
+            Some(&token),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+}
+
+#[tokio::test]
+async fn r3endpoints_livetv_new_paths_require_auth() {
+    let state = test_state().await;
+    let app = app(state);
+
+    for (method, uri) in [
+        ("GET", "/LiveTv/Programs/Recommended"),
+        ("GET", "/LiveTv/Timers/Defaults"),
+        ("POST", "/LiveStreams/Open"),
+        ("POST", "/LiveStreams/Close?liveStreamId=x"),
+    ] {
+        let (status, _) = send(&app, request(method, uri, None, None)).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{method} {uri}");
+    }
+}
+
+#[tokio::test]
+async fn r3endpoints_livetv_old_live_stream_path_still_answers() {
+    let state = test_state().await;
+    let (token, _) = admin_session(&state).await;
+    let app = app(state);
+
+    let (status, _) = send(
+        &app,
+        request(
+            "POST",
+            "/LiveTv/LiveStream",
+            Some(&token),
+            Some(serde_json::json!({ "OpenToken": "r3" })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
 }
 
 // ── Quick Connect Tests ──
@@ -14691,6 +15858,14 @@ async fn g12_stub() -> (String, G12Hits) {
                 "backdrops": [{"file_path": "/g12-backdrop.jpg"}]
             }),
             "/movie/9001/credits" => serde_json::json!({"id": 9001, "cast": [], "crew": []}),
+            // Another film, that an item can be wrongly identified as
+            "/movie/7101" => serde_json::json!({
+                "id": 7101,
+                "title": "Wrong Film",
+                "original_language": "en",
+                "overview": "Not the item's film",
+                "release_date": "1985-03-01"
+            }),
             "/movie/9001/videos" => serde_json::json!({"results": [
                 {"key": "g12trailer", "name": "G12 Trailer", "type": "Trailer", "site": "YouTube"}
             ]}),
@@ -14897,11 +16072,11 @@ async fn r3metadata_identify_lists_matches_and_applies_one() {
     assert_eq!(results[0]["Name"], "Alpha Film", "{results}");
     assert_eq!(results[0]["ProviderIds"]["Tmdb"], "9001");
     assert_eq!(results[0]["SearchProviderName"], "TheMovieDb");
-    // The same search again comes from the TMDb client's cache
+    // A manual search always asks TMDb again
     server
         .json("POST", "/Items/RemoteSearch/Movie", search)
         .await;
-    assert_eq!(server.hits_to("/search/movie"), 1);
+    assert_eq!(server.hits_to("/search/movie"), 2);
 
     // A TMDb id is looked up directly
     let by_id = server
@@ -14953,6 +16128,91 @@ async fn r3metadata_identify_lists_matches_and_applies_one() {
         )
         .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+/// An item identified as the wrong film keeps that TMDb id through every refresh, "replace all
+/// metadata" included: as in Jellyfin, a refresh looks an id up and never searches again
+/// (MetadataService passes the item's provider ids to the providers). Identify is the way to
+/// re-identify it, and it replaces the wrong film's metadata.
+#[tokio::test]
+async fn r3meta_a_wrong_id_stays_until_identify_replaces_it() {
+    let server = g12_server(Some("r3-key"), None).await;
+    let id = server.insert_movie().await;
+    sqlx::query("UPDATE media_items SET tmdb_id = 7101 WHERE id = ?")
+        .bind(id.to_string())
+        .execute(&server.db)
+        .await
+        .unwrap();
+
+    let (status, body) = server
+        .send(
+            "POST",
+            &format!(
+                "/Items/{id}/Refresh?MetadataRefreshMode=FullRefresh\
+                 &ImageRefreshMode=FullRefresh&ReplaceAllMetadata=true&ReplaceAllImages=false"
+            ),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let item = server.item(id).await;
+    assert_eq!(item.tmdb_id, Some(7101));
+    assert_eq!(item.name, "Wrong Film");
+    assert_eq!(server.hits_to("/search/movie"), 0);
+
+    let (status, body) = server
+        .send(
+            "POST",
+            &format!("/Items/RemoteSearch/Apply/{id}"),
+            Some(
+                serde_json::json!({"Name": "Alpha Film", "ProviderIds": {"Tmdb": "9001"}})
+                    .to_string(),
+            ),
+        )
+        .await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+    let item = server.item(id).await;
+    assert_eq!(item.tmdb_id, Some(9001));
+    assert_eq!(item.name, "Alpha Film");
+    assert_eq!(item.overview.as_deref(), Some("G12 stub overview"));
+    assert_eq!(item.production_year, Some(2001));
+}
+
+/// An admin's "replace all metadata" refresh asks TMDb again about the item, past the answer
+/// cache: by its id, or, with no id yet, by a new search. Other refreshes use the cache.
+#[tokio::test]
+async fn r3meta_replace_all_asks_tmdb_again() {
+    let server = g12_server(Some("r3-key"), None).await;
+    let id = server.insert_movie().await;
+    let refresh = |replace: bool| {
+        format!(
+            "/Items/{id}/Refresh?MetadataRefreshMode=FullRefresh&ImageRefreshMode=FullRefresh\
+             &ReplaceAllMetadata={replace}&ReplaceAllImages=false"
+        )
+    };
+    for _ in 0..2 {
+        let (status, body) = server.send("POST", &refresh(false), None).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+    }
+    assert_eq!(server.item(id).await.tmdb_id, Some(9001));
+    assert_eq!(server.hits_to("/search/movie"), 1);
+    assert_eq!(server.hits_to("/movie/9001"), 1);
+
+    let (status, body) = server.send("POST", &refresh(true), None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(server.hits_to("/movie/9001"), 2);
+    assert_eq!(server.hits_to("/search/movie"), 1);
+
+    // Not identified any more: the replace-all searches again instead of using the cached search
+    sqlx::query("UPDATE media_items SET tmdb_id = NULL WHERE id = ?")
+        .bind(id.to_string())
+        .execute(&server.db)
+        .await
+        .unwrap();
+    let (status, body) = server.send("POST", &refresh(true), None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(server.hits_to("/search/movie"), 2);
+    assert_eq!(server.item(id).await.tmdb_id, Some(9001));
 }
 
 #[tokio::test]
@@ -17579,6 +18839,444 @@ async fn r3extras_show_extras_belong_to_series_and_seasons() {
         .collect();
     types.sort();
     assert_eq!(types, ["Episode", "Season", "Series"], "{all}");
+}
+
+// R3 extras round 2: TV extras, the Has* filters, renamed and moved extras
+
+/// The `Name`s of the items in a JSON list, sorted.
+fn r3extras2_names(body: &serde_json::Value) -> Vec<String> {
+    let mut names: Vec<String> = body["Items"]
+        .as_array()
+        .or_else(|| body.as_array())
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|i| i["Name"].as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+    names.sort();
+    names
+}
+
+/// The id of the item of `lib` named `name` that is not an extra.
+async fn r3extras2_id(
+    state: &AppState,
+    lib: &rustyfin_model::library::Library,
+    name: &str,
+) -> String {
+    sqlx::query_scalar(
+        "SELECT id FROM media_items WHERE library_id = ? AND name = ? AND extra_type IS NULL",
+    )
+    .bind(lib.id.to_string())
+    .bind(name)
+    .fetch_one(&state.db)
+    .await
+    .unwrap_or_else(|e| panic!("{name}: {e}"))
+}
+
+/// A show's `Extras` folder holds the series' extras, as in Jellyfin, while `Specials` is season 0. An
+/// episode's suffix files and its episode folder's extras folders are its extras, never episodes; a suffix
+/// file that names no episode next to it stays an episode. The episode pages' counts and lists show them,
+/// and, as in Jellyfin 12.4, `HasSpecialFeature` and `HasTrailer` find the items that have some and the
+/// season and series above them; the series' own `Unknown` extra (`Extras/`) is no special feature there.
+#[tokio::test]
+async fn r3extras2_tv_extras_belong_to_series_seasons_and_episodes() {
+    let state = test_state().await;
+    let app = app(state.clone());
+    let (token, user) = admin_session(&state).await;
+    let root = std::path::PathBuf::from(media_folder(&state, "r3extras2 shows"));
+    let show = root.join("Show");
+    if !r3extras_media(&show.join("Season 1/S01E01.mkv"), false) {
+        return;
+    }
+    for file in [
+        "Extras/Gag Reel.mkv",
+        "Specials/S00E01.mkv",
+        "Season 1/S01E01-featurette.mkv",
+        "Season 1/S01E02/S01E02.mkv",
+        "Season 1/S01E02/behind the scenes/On Set.mkv",
+        "Season 1/S01E09-short.mkv",
+        "Season 1/trailers/Season Teaser.mkv",
+    ] {
+        assert!(r3extras_media(&show.join(file), false));
+    }
+    let lib = rustyfin_model::library::Library {
+        id: uuid::Uuid::new_v4(),
+        name: "R3 Extras2 Shows".to_string(),
+        content_type: rustyfin_model::library::LibraryContentType::TvShows,
+        paths: vec![root.to_str().unwrap().to_string()],
+    };
+    rustyfin_db::repo_library::create_library(&state.db, &lib)
+        .await
+        .unwrap();
+    r3extras_rescan(&state, &lib).await;
+
+    let get = |uri: String| {
+        let app = app.clone();
+        let token = token.clone();
+        async move {
+            let (status, body) = send_authed(&app, "GET", &uri, &token, None).await;
+            assert_eq!(status, StatusCode::OK, "{uri}: {body}");
+            body
+        }
+    };
+    // The episodes: the specials' one, and the suffix file that names no episode next to it.
+    let episodes = get(format!(
+        "/Items?ParentId={}&Recursive=true&IncludeItemTypes=Episode",
+        lib.id
+    ))
+    .await;
+    assert_eq!(
+        r3extras2_names(&episodes),
+        ["S00E01", "S01E01", "S01E02", "S01E09-short"],
+        "{episodes}"
+    );
+    let seasons = get(format!(
+        "/Items?ParentId={}&Recursive=true&IncludeItemTypes=Season",
+        lib.id
+    ))
+    .await;
+    assert_eq!(
+        seasons["TotalRecordCount"], 2,
+        "Season 1 and Specials: {seasons}"
+    );
+
+    let series = r3extras2_id(&state, &lib, "Show").await;
+    let season = r3extras2_id(&state, &lib, "Season 1").await;
+    let e1 = r3extras2_id(&state, &lib, "S01E01").await;
+    let e2 = r3extras2_id(&state, &lib, "S01E02").await;
+    let features = |id: String| get(format!("/Items/{id}/SpecialFeatures"));
+    assert_eq!(r3extras_types(&features(series.clone()).await), ["Unknown"]);
+    assert_eq!(r3extras_types(&features(e1.clone()).await), ["Featurette"]);
+    assert_eq!(
+        r3extras_types(&features(e2.clone()).await),
+        ["BehindTheScenes"]
+    );
+    assert_eq!(
+        r3extras_types(&get(format!("/Items/{season}/LocalTrailers")).await),
+        ["Trailer"]
+    );
+    let (_, item) = send_authed(
+        &app,
+        "GET",
+        &format!("/Users/{user}/Items/{e1}"),
+        &token,
+        None,
+    )
+    .await;
+    assert_eq!(item["SpecialFeatureCount"], 1, "{item}");
+    assert_eq!(item["LocalTrailerCount"], 0, "{item}");
+
+    let with = get(format!(
+        "/Items?ParentId={}&Recursive=true&HasSpecialFeature=true",
+        lib.id
+    ))
+    .await;
+    assert_eq!(
+        r3extras2_names(&with),
+        ["S01E01", "S01E02", "Season 1", "Show"],
+        "{with}"
+    );
+    let trailers = get(format!(
+        "/Items?ParentId={}&Recursive=true&hasTrailer=true",
+        lib.id
+    ))
+    .await;
+    assert_eq!(
+        r3extras2_names(&trailers),
+        ["Season 1", "Show"],
+        "{trailers}"
+    );
+}
+
+/// `/Items?HasTrailer`, `HasSpecialFeature`, `HasThemeSong` and `HasThemeVideo` keep the items with (true) or
+/// without (false) that kind of extra, as Jellyfin 12.4 does: an `Unknown` extra (`extras/`) is no special
+/// feature for the filter.
+#[tokio::test]
+async fn r3extras2_has_filters_find_items_by_their_extras() {
+    let state = test_state().await;
+    let app = app(state.clone());
+    let (token, _) = admin_session(&state).await;
+    let Some((lib, _)) = r3extras_library(
+        &state,
+        "r3extras2 filters",
+        &[
+            "Alpha/Alpha.mkv",
+            "Alpha/Alpha-trailer.mkv",
+            "Alpha/theme.mp3",
+            "Beta/Beta.mkv",
+            "Beta/backdrops/Loop.mkv",
+            "Gamma/Gamma.mkv",
+            "Gamma/featurettes/Making Of.mkv",
+            "Delta/Delta.mkv",
+            "Delta/extras/Bonus.mkv",
+        ],
+    )
+    .await
+    else {
+        return;
+    };
+    let names = |filter: &'static str| {
+        let app = app.clone();
+        let token = token.clone();
+        let uri = format!("/Items?ParentId={}&Recursive=true&{filter}", lib.id);
+        async move {
+            let (status, body) = send_authed(&app, "GET", &uri, &token, None).await;
+            assert_eq!(status, StatusCode::OK, "{uri}: {body}");
+            r3extras2_names(&body)
+        }
+    };
+    assert_eq!(names("HasTrailer=true").await, ["Alpha"]);
+    assert_eq!(names("hasTrailer=false").await, ["Beta", "Delta", "Gamma"]);
+    assert_eq!(names("HasThemeSong=true").await, ["Alpha"]);
+    assert_eq!(names("HasThemeVideo=true").await, ["Beta"]);
+    assert_eq!(names("HasSpecialFeature=true").await, ["Gamma"]);
+    assert_eq!(
+        names("HasSpecialFeature=false").await,
+        ["Alpha", "Beta", "Delta"]
+    );
+    assert_eq!(
+        names("HasTrailer=false&HasThemeVideo=false").await,
+        ["Delta", "Gamma"]
+    );
+    assert_eq!(
+        names("HasTrailer=true&HasThemeVideo=true").await,
+        Vec::<String>::new()
+    );
+}
+
+/// An extra that is renamed, or moved to another extras folder or owner, keeps its id and so its user data,
+/// as main items do; it takes its new name, type and owner. A new extra file is a new item.
+#[tokio::test]
+async fn r3extras2_a_renamed_or_moved_extra_keeps_its_watch_state() {
+    let state = test_state().await;
+    let app = app(state.clone());
+    let (token, user) = admin_session(&state).await;
+    let Some((lib, root)) = r3extras_library(
+        &state,
+        "r3extras2 moves",
+        &[
+            "Alpha/Alpha.mkv",
+            "Alpha/featurettes/One.mkv",
+            "Beta/Beta.mkv",
+        ],
+    )
+    .await
+    else {
+        return;
+    };
+    let extra: String = sqlx::query_scalar(
+        "SELECT id FROM media_items WHERE library_id = ? AND extra_type IS NOT NULL",
+    )
+    .bind(lib.id.to_string())
+    .fetch_one(&state.db)
+    .await
+    .unwrap();
+    let (status, _) = send_authed(
+        &app,
+        "POST",
+        &format!("/Users/{user}/PlayedItems/{extra}"),
+        &token,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let check = |name: &'static str, extra_type: &'static str, owner: &'static str| {
+        let state = state.clone();
+        let app = app.clone();
+        let token = token.clone();
+        let extra = extra.clone();
+        let lib = lib.clone();
+        async move {
+            let rows: Vec<(String, String, String, String)> = sqlx::query_as(
+                "SELECT id, name, extra_type, owner_id FROM media_items
+                 WHERE library_id = ? AND extra_type IS NOT NULL",
+            )
+            .bind(lib.id.to_string())
+            .fetch_all(&state.db)
+            .await
+            .unwrap();
+            let owner_id = r3extras2_id(&state, &lib, owner).await;
+            assert_eq!(
+                rows,
+                [(
+                    extra.clone(),
+                    name.to_string(),
+                    extra_type.to_string(),
+                    owner_id
+                )]
+            );
+            let (_, item) = send_authed(
+                &app,
+                "GET",
+                &format!("/Users/{user}/Items/{extra}"),
+                &token,
+                None,
+            )
+            .await;
+            assert_eq!(item["UserData"]["Played"], true, "{item}");
+            assert!(
+                item["MediaSources"][0]["Path"]
+                    .as_str()
+                    .is_some_and(|p| p.ends_with(&format!("{name}.mkv"))),
+                "{item}"
+            );
+        }
+    };
+    let alpha = root.join("Alpha");
+    // Renamed in its folder.
+    std::fs::rename(
+        alpha.join("featurettes/One.mkv"),
+        alpha.join("featurettes/Uno.mkv"),
+    )
+    .unwrap();
+    r3extras_rescan(&state, &lib).await;
+    check("Uno", "Featurette", "Alpha").await;
+    // Moved to another extras folder.
+    std::fs::create_dir_all(alpha.join("behind the scenes")).unwrap();
+    std::fs::rename(
+        alpha.join("featurettes/Uno.mkv"),
+        alpha.join("behind the scenes/Uno.mkv"),
+    )
+    .unwrap();
+    r3extras_rescan(&state, &lib).await;
+    check("Uno", "BehindTheScenes", "Alpha").await;
+    // Moved to another movie.
+    let beta = root.join("Beta");
+    std::fs::create_dir_all(beta.join("extras")).unwrap();
+    std::fs::rename(
+        alpha.join("behind the scenes/Uno.mkv"),
+        beta.join("extras/Uno.mkv"),
+    )
+    .unwrap();
+    r3extras_rescan(&state, &lib).await;
+    check("Uno", "Unknown", "Beta").await;
+    // Replaced by another file of that name in another extras folder (a re-downloaded trailer, with another
+    // modification time): a new item, with no user data.
+    std::fs::remove_file(beta.join("extras/Uno.mkv")).unwrap();
+    let fresh = beta.join("trailers/Uno.mkv");
+    assert!(r3extras_media(&fresh, false));
+    std::fs::File::options()
+        .write(true)
+        .open(&fresh)
+        .unwrap()
+        .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000))
+        .unwrap();
+    r3extras_rescan(&state, &lib).await;
+    let rows: Vec<(String, String)> = sqlx::query_as(
+        "SELECT id, extra_type FROM media_items WHERE library_id = ? AND extra_type IS NOT NULL",
+    )
+    .bind(lib.id.to_string())
+    .fetch_all(&state.db)
+    .await
+    .unwrap();
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_ne!(rows[0].0, extra, "a re-downloaded file is a new item");
+    assert_eq!(rows[0].1, "Trailer");
+    let (_, item) = send_authed(
+        &app,
+        "GET",
+        &format!("/Users/{user}/Items/{}", rows[0].0),
+        &token,
+        None,
+    )
+    .await;
+    assert_eq!(item["UserData"]["Played"], false, "{item}");
+}
+
+/// A show's `Extras` folder that an older scan stored as a specials season: the next scan makes its
+/// episodes the series' extras, keeping their ids and user data, and removes the season left empty.
+#[tokio::test]
+async fn r3extras2_an_old_extras_season_becomes_series_extras_and_goes() {
+    let state = test_state().await;
+    let app = app(state.clone());
+    let (token, user) = admin_session(&state).await;
+    let root = std::path::PathBuf::from(media_folder(&state, "r3extras2 old extras"));
+    let show = root.join("Show");
+    if !r3extras_media(&show.join("Season 1/S01E01.mkv"), false) {
+        return;
+    }
+    let lib = rustyfin_model::library::Library {
+        id: uuid::Uuid::new_v4(),
+        name: "R3 Extras2 Old".to_string(),
+        content_type: rustyfin_model::library::LibraryContentType::TvShows,
+        paths: vec![root.to_str().unwrap().to_string()],
+    };
+    rustyfin_db::repo_library::create_library(&state.db, &lib)
+        .await
+        .unwrap();
+    r3extras_rescan(&state, &lib).await;
+    let series = r3extras2_id(&state, &lib, "Show").await;
+
+    // What an older scan stored for `Show/Extras/Gag Reel.mkv`: season 0 at the folder, an episode in it.
+    let gag = show.join("Extras/Gag Reel.mkv");
+    assert!(r3extras_media(&gag, false));
+    let season = uuid::Uuid::new_v4().to_string();
+    let episode = uuid::Uuid::new_v4().to_string();
+    for (id, name, media_type, path, parent, index) in [
+        (&season, "Extras", "Season", show.join("Extras"), &series, 0),
+        (&episode, "Gag Reel", "Episode", gag.clone(), &season, 1),
+    ] {
+        sqlx::query(
+            "INSERT INTO media_items (id, library_id, name, media_type, path, parent_id, index_number)
+             VALUES (?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(id)
+        .bind(lib.id.to_string())
+        .bind(name)
+        .bind(media_type)
+        .bind(path.to_str().unwrap())
+        .bind(parent)
+        .bind(index)
+        .execute(&state.db)
+        .await
+        .unwrap();
+    }
+    let (status, _) = send_authed(
+        &app,
+        "POST",
+        &format!("/Users/{user}/PlayedItems/{episode}"),
+        &token,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    r3extras_rescan(&state, &lib).await;
+    let rows = r3extras_rows(&state, &lib).await;
+    assert_eq!(
+        rows,
+        [
+            (
+                "Gag Reel".to_string(),
+                "Video".to_string(),
+                Some("Unknown".to_string())
+            ),
+            ("S01E01".to_string(), "Episode".to_string(), None),
+            ("Season 1".to_string(), "Season".to_string(), None),
+            ("Show".to_string(), "Series".to_string(), None),
+        ],
+        "the empty Extras season is gone"
+    );
+    let (_, features) = send_authed(
+        &app,
+        "GET",
+        &format!("/Items/{series}/SpecialFeatures"),
+        &token,
+        None,
+    )
+    .await;
+    assert_eq!(r3extras_ids(&features), std::slice::from_ref(&episode));
+    let (_, item) = send_authed(
+        &app,
+        "GET",
+        &format!("/Users/{user}/Items/{episode}"),
+        &token,
+        None,
+    )
+    .await;
+    assert_eq!(item["UserData"]["Played"], true, "{item}");
 }
 
 #[tokio::test]
@@ -23295,10 +24993,6 @@ async fn r2parental_lists_leave_out_items_above_the_limit() {
     let ids_query = format!("/Items?Ids={},{gentle}", w.id("Rough"));
     let checks = [
         ("/Items/Latest?Limit=100".to_string(), "Rough"),
-        (
-            format!("/Users/{}/Items/Latest?Limit=100", w.kid_id),
-            "Rough",
-        ),
         ("/Search/Hints?searchTerm=Ro".to_string(), "Rough"),
         ("/Search/Hints?searchTerm=Grim".to_string(), "Grim Show"),
         ("/Search?Term=Rough".to_string(), "Rough"),
@@ -23308,14 +25002,10 @@ async fn r2parental_lists_leave_out_items_above_the_limit() {
         ),
         ("/Shows/NextUp".to_string(), "Grim Mild Episode"),
         ("/Shows/Upcoming".to_string(), "Grim Mild Episode"),
-        ("/Movies/Recommendations".to_string(), "Rough"),
+        // /Movies/Recommendations draws on a user's history, which this world has none of
         ("/Movies/Featured".to_string(), "Rough"),
         (format!("/Items/{gentle}/Similar"), "Edgy"),
         (format!("/Movies/{gentle}/Similar"), "Edgy"),
-        (
-            format!("/Users/{}/Items/{gentle}/InstantMix", w.kid_id),
-            "Edgy",
-        ),
         // `Ids` isn't read on this base, so this checks only that the list leaves Rough out.
         (ids_query, "Rough"),
         ("/Genres".to_string(), "Thriller"),
@@ -23342,6 +25032,13 @@ async fn r2parental_lists_leave_out_items_above_the_limit() {
                 "{uri}: {hidden} in {names:?}"
             );
         }
+    }
+    // The kid's Latest is the kid's, as in Jellyfin, even when the administrator asks for it.
+    let uri = format!("/Users/{}/Items/Latest?Limit=100", w.kid_id);
+    for token in [&w.admin, &w.kid] {
+        let (names, _) = w.names(token, &uri).await;
+        assert!(!names.is_empty(), "{uri}");
+        assert!(!names.contains(&"Rough".to_string()), "{uri}: {names:?}");
     }
 
     assert_eq!(
@@ -25004,6 +26701,713 @@ async fn r3parental_jellyfin_import_carries_library_access() {
     );
 }
 
+// ── R3 parental follow-ups: counts, sessions, DLNA, IsMovie/IsSeries and list fields ──
+// A visible series or season counts only the episodes the user may see; a session never names an
+// item the viewer may not see; the DLNA server browses as its configured user; IsMovie and
+// IsSeries filter as in Jellyfin; and list and detail items carry the fields Jellyfin Web reads.
+
+impl R2Parental {
+    /// A TV-MA episode, "Kind Late Episode", in the TV-G "Kind Season": with
+    /// `MaxParentalRating: 10` the season stays visible and this episode is hidden by its own
+    /// rating.
+    async fn late_episode(&self) -> uuid::Uuid {
+        let id = uuid::Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO media_items (id, library_id, name, media_type, path, parent_id, \
+             official_rating, index_number, parent_index_number) \
+             VALUES (?, ?, 'Kind Late Episode', 'Episode', ?, ?, 'TV-MA', 2, 1)",
+        )
+        .bind(id.to_string())
+        .bind(self.library_id().await)
+        .bind(format!("/nowhere/{id}.mkv"))
+        .bind(self.id("Kind Season").to_string())
+        .execute(&self.state.db)
+        .await
+        .unwrap();
+        id
+    }
+
+    /// Gives the kid the password "kidpw" (which signs them out everywhere).
+    async fn reset_kid_password(&self) {
+        let uri = format!("/Users/{}/Password", self.kid_id);
+        let body = serde_json::json!({ "NewPw": "kidpw" });
+        let (status, _) = send(
+            &self.app,
+            request("POST", &uri, Some(&self.admin), Some(body)),
+        )
+        .await;
+        assert!(status.is_success(), "password reset: {status}");
+    }
+
+    /// A token from the kid's sign-in on `device`, so requests with it belong to a session.
+    async fn kid_device(&self, device: &str) -> String {
+        let (status, body) = send(&self.app, r3parental_login("kid", "kidpw", device)).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        body["AccessToken"].as_str().unwrap().to_string()
+    }
+
+    /// Changes server configuration fields as the administrator.
+    async fn configure(&self, changes: serde_json::Value) {
+        let (status, mut config) = self.get(&self.admin, "/System/Configuration").await;
+        assert_eq!(status, StatusCode::OK);
+        for (key, value) in changes.as_object().unwrap() {
+            config[key] = value.clone();
+        }
+        let req = request(
+            "POST",
+            "/System/Configuration",
+            Some(&self.admin),
+            Some(config),
+        );
+        assert!(send(&self.app, req).await.0.is_success());
+    }
+
+    /// The DLNA ContentDirectory's answer to a Browse of `object` with `flag`.
+    async fn dlna_browse(&self, object: &str, flag: &str) -> String {
+        let req = Self::dlna_browse_request(object, flag);
+        let (status, text) = g1_send_raw(&self.app, req).await;
+        assert_eq!(status, StatusCode::OK, "{text}");
+        text
+    }
+
+    /// A DLNA Browse request of `object` with `flag`.
+    fn dlna_browse_request(object: &str, flag: &str) -> Request<Body> {
+        let body = format!(
+            concat!(
+                r#"<?xml version="1.0"?><s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/">"#,
+                r#"<s:Body><u:Browse xmlns:u="urn:schemas-upnp-org:service:ContentDirectory:1">"#,
+                "<ObjectID>{}</ObjectID><BrowseFlag>{}</BrowseFlag><Filter>*</Filter>",
+                "<StartingIndex>0</StartingIndex><RequestedCount>50</RequestedCount>",
+                "<SortCriteria></SortCriteria></u:Browse></s:Body></s:Envelope>"
+            ),
+            object, flag
+        );
+        Request::builder()
+            .method("POST")
+            .uri("/dlna/control/ContentDirectory")
+            .header("Content-Type", "text/xml")
+            .header(
+                "SOAPACTION",
+                r#""urn:schemas-upnp-org:service:ContentDirectory:1#Browse""#,
+            )
+            .body(Body::from(body))
+            .unwrap()
+    }
+}
+
+/// The `(ChildCount, UserData.UnplayedItemCount)` of an item.
+fn r3parental_counts(item: &serde_json::Value) -> (serde_json::Value, serde_json::Value) {
+    (
+        item["ChildCount"].clone(),
+        item["UserData"]["UnplayedItemCount"].clone(),
+    )
+}
+
+#[tokio::test]
+async fn r3parental_series_and_season_counts_leave_out_hidden_episodes() {
+    let w = r2parental().await;
+    w.late_episode().await;
+    let (season, show) = (w.id("Kind Season"), w.id("Kind Show"));
+    let one = format!("/Items/{season}");
+    let both = (serde_json::json!(2), serde_json::json!(2));
+    // The administrator first, so the details cache, shared by every user, holds the season.
+    assert_eq!(r3parental_counts(&w.get(&w.admin, &one).await.1), both);
+    assert_eq!(
+        r3parental_counts(&w.get(&w.kid, &one).await.1),
+        both,
+        "no limits yet"
+    );
+
+    w.set_policy(serde_json::json!({ "MaxParentalRating": 10 }))
+        .await;
+    let visible = (serde_json::json!(1), serde_json::json!(1));
+    assert_eq!(r3parental_counts(&w.get(&w.kid, &one).await.1), visible);
+    assert_eq!(
+        r3parental_counts(&w.get(&w.admin, &one).await.1),
+        both,
+        "the cache still counts every episode for the administrator"
+    );
+    let (_, series) = w.get(&w.kid, &format!("/Items/{show}")).await;
+    assert_eq!(series["UserData"]["UnplayedItemCount"], 1, "{series}");
+
+    // Lists count the same, with and without user data.
+    for uri in [
+        format!("/Items?ParentId={show}"),
+        format!("/Items?ParentId={show}&EnableUserData=false"),
+    ] {
+        let (status, body) = w.get(&w.kid, &uri).await;
+        assert_eq!(status, StatusCode::OK, "{uri}");
+        let entry = body["Items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|i| i["Name"] == "Kind Season")
+            .unwrap_or_else(|| panic!("{uri}: {body}"))
+            .clone();
+        assert_eq!(entry["ChildCount"], 1, "{uri}: {entry}");
+        if !uri.contains("EnableUserData") {
+            assert_eq!(entry["UserData"]["UnplayedItemCount"], 1, "{uri}: {entry}");
+        }
+    }
+
+    // The one episode the kid may see played: the season is played for them.
+    let played = format!("/Users/{}/PlayedItems/{}", w.kid_id, w.id("Kind Episode"));
+    let (status, data) = send(&w.app, request("POST", &played, Some(&w.kid), None)).await;
+    assert_eq!(status, StatusCode::OK, "{data}");
+    let (_, body) = w.get(&w.kid, &one).await;
+    assert_eq!(body["UserData"]["UnplayedItemCount"], 0, "{body}");
+    assert_eq!(body["UserData"]["Played"], true, "{body}");
+}
+
+#[tokio::test]
+async fn r3parental_session_now_playing_never_names_a_hidden_item() {
+    let w = r2parental().await;
+    w.reset_kid_password().await;
+    let play = |token: &str, item: uuid::Uuid| {
+        let body = serde_json::json!({
+            "ItemId": item, "PositionTicks": 0, "MediaSourceId": item.simple().to_string(),
+            "PlaylistItemId": format!("r3parental-{item}"),
+        });
+        request("POST", "/Sessions/Playing", Some(token), Some(body))
+    };
+    // No form of the id: hyphenated, or as Jellyfin's 32-digit MediaSourceId.
+    let names = |text: &str, item: uuid::Uuid| {
+        text.contains(&item.to_string()) || text.contains(&item.simple().to_string())
+    };
+    let session = |all: &serde_json::Value, device: &str| {
+        all.as_array()
+            .unwrap()
+            .iter()
+            .find(|s| s["DeviceId"] == device)
+            .cloned()
+            .unwrap_or_else(|| panic!("no session on {device}: {all}"))
+    };
+
+    // The kid, without limits yet, plays Rough; the administrator sees it.
+    let kid = w.kid_device("r3parental-np-a").await;
+    assert_eq!(
+        send(&w.app, play(&kid, w.id("Rough"))).await.0,
+        StatusCode::NO_CONTENT
+    );
+    let (_, all) = w.get(&w.admin, "/Sessions").await;
+    let s = session(&all, "r3parental-np-a");
+    assert_eq!(s["NowPlayingItem"]["Name"], "Rough");
+    assert_eq!(
+        s["PlayState"]["MediaSourceId"],
+        w.id("Rough").simple().to_string(),
+        "{s}"
+    );
+
+    // An administrator with limits sees the session, but not the item it plays.
+    let (_, me) = w.get(&w.admin, "/Users/Me").await;
+    let admin_policy = format!("/Users/{}/Policy", me["Id"].as_str().unwrap());
+    let body = serde_json::json!({ "MaxParentalRating": 10 });
+    let (status, answer) = send(
+        &w.app,
+        request("POST", &admin_policy, Some(&w.admin), Some(body)),
+    )
+    .await;
+    assert!(status.is_success(), "{status} {answer}");
+    let (_, all) = w.get(&w.admin, "/Sessions").await;
+    let s = session(&all, "r3parental-np-a");
+    assert!(s["NowPlayingItem"].is_null(), "{s}");
+    assert!(s["PlayState"]["MediaSourceId"].is_null(), "{s}");
+    assert!(s["PlaylistItemId"].is_null(), "{s}");
+    assert!(!all.to_string().contains("Rough"), "{all}");
+    assert!(!names(&all.to_string(), w.id("Rough")), "{all}");
+    let uri = format!(
+        "/Sessions/Playing/NowPlayingItem?SessionId={}",
+        s["Id"].as_str().unwrap()
+    );
+    let (status, body) = w.get(&w.admin, &uri).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.is_null(), "{body}");
+
+    // A limited user's report of a hidden item sets no now-playing item and stores nothing.
+    w.set_policy(serde_json::json!({ "MaxParentalRating": 10 }))
+        .await;
+    let kid = w.kid_device("r3parental-np-b").await;
+    let edgy = w.id("Edgy");
+    assert_eq!(
+        send(&w.app, play(&kid, edgy)).await.0,
+        StatusCode::NO_CONTENT
+    );
+    let (_, mine) = w.get(&kid, "/Sessions").await;
+    assert!(
+        session(&mine, "r3parental-np-b")["NowPlayingItem"].is_null(),
+        "{mine}"
+    );
+    for name in ["Edgy", "Rough"] {
+        assert!(!mine.to_string().contains(name), "{name}: {mine}");
+        assert!(!names(&mine.to_string(), w.id(name)), "{name}: {mine}");
+    }
+    let rows: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM user_item_data WHERE user_id = ? AND item_id = ?")
+            .bind(w.kid_id.to_string())
+            .bind(edgy.to_string())
+            .fetch_one(&w.state.db)
+            .await
+            .unwrap();
+    assert_eq!(rows, 0, "a hidden item's play stores nothing");
+
+    // A visible item is reported as before.
+    assert_eq!(
+        send(&w.app, play(&kid, w.id("Gentle"))).await.0,
+        StatusCode::NO_CONTENT
+    );
+    let (_, mine) = w.get(&kid, "/Sessions").await;
+    assert_eq!(
+        session(&mine, "r3parental-np-b")["NowPlayingItem"]["Name"],
+        "Gentle"
+    );
+}
+
+#[tokio::test]
+async fn r3parental_dlna_browses_as_the_dlna_user_with_its_limits() {
+    let w = r2parental().await;
+    let lib = w.library_id().await;
+    let (_, far) = w.other_library().await;
+    w.late_episode().await;
+    w.configure(serde_json::json!({ "EnableDlnaServer": true }))
+        .await;
+    let gentle = w.id("Gentle").to_string();
+    let rough = w.id("Rough").to_string();
+    let kind_season = w.id("Kind Season").to_string();
+    let grim_season = w.id("Grim Season").to_string();
+
+    // A DLNA stream, with an optional Range header: its status and body.
+    let world = &w;
+    let stream = move |item: &str, range: Option<&str>| {
+        let uri = format!("/Dlna/{}/Items/{item}/Stream", world.state.server_id);
+        let mut req = Request::builder().uri(uri);
+        if let Some(range) = range {
+            req = req.header("Range", range);
+        }
+        g1_send_raw(&world.app, req.body(Body::empty()).unwrap())
+    };
+
+    // No DLNA user: DLNA devices don't sign in, so nothing is listed or streamed.
+    let root = w.dlna_browse("0", "BrowseDirectChildren").await;
+    assert!(root.contains("<TotalMatches>0</TotalMatches>"), "{root}");
+    assert!(!root.contains("Parental"), "{root}");
+    let one = w.dlna_browse(&gentle, "BrowseMetadata").await;
+    assert!(!one.contains("Gentle"), "{one}");
+    assert_eq!(stream(&gentle, None).await.0, StatusCode::NOT_FOUND);
+
+    // The kid as the DLNA user, without limits: everything.
+    w.configure(serde_json::json!({ "DlnaDefaultUserId": w.kid_id.to_string() }))
+        .await;
+    let root = w.dlna_browse("0", "BrowseDirectChildren").await;
+    assert!(
+        root.contains("Parental") && root.contains("Elsewhere"),
+        "{root}"
+    );
+    let one = w.dlna_browse(&rough, "BrowseMetadata").await;
+    assert!(one.contains("Rough"), "{one}");
+
+    // With the kid's limits: one library, and nothing their rating hides.
+    w.set_policy(serde_json::json!({
+        "MaxParentalRating": 10, "EnableAllFolders": false, "EnabledFolders": [lib]
+    }))
+    .await;
+    let root = w.dlna_browse("0", "BrowseDirectChildren").await;
+    assert!(root.contains("Parental"), "{root}");
+    assert!(!root.contains("Elsewhere"), "{root}");
+    assert!(root.contains("<TotalMatches>1</TotalMatches>"), "{root}");
+    let one = w.dlna_browse(&rough, "BrowseMetadata").await;
+    assert!(!one.contains("Rough"), "{one}");
+    let one = w.dlna_browse(&gentle, "BrowseMetadata").await;
+    assert!(one.contains("Gentle"), "{one}");
+    // The item's stream URL is the DLNA route, which checks the DLNA user on every request.
+    let url = format!("/Dlna/{}/Items/{gentle}/Stream", w.state.server_id);
+    assert!(one.contains(&url), "{one}");
+    assert_eq!(
+        stream(&gentle, None).await,
+        (StatusCode::OK, "r2parental video bytes".to_string())
+    );
+    assert_eq!(
+        stream(&gentle, Some("bytes=0-9")).await,
+        (StatusCode::PARTIAL_CONTENT, "r2parental".to_string())
+    );
+    // Hidden by rating, and in a library the user may not see: 404, whatever the id.
+    assert_eq!(stream(&rough, None).await.0, StatusCode::NOT_FOUND);
+    assert_eq!(
+        stream(&far.to_string(), None).await.0,
+        StatusCode::NOT_FOUND
+    );
+    let children = w.dlna_browse(&kind_season, "BrowseDirectChildren").await;
+    assert!(children.contains("Kind Episode"), "{children}");
+    assert!(!children.contains("Kind Late Episode"), "{children}");
+    assert!(
+        children.contains("<TotalMatches>1</TotalMatches>"),
+        "{children}"
+    );
+    let children = w.dlna_browse(&grim_season, "BrowseDirectChildren").await;
+    assert!(
+        children.contains("<TotalMatches>0</TotalMatches>"),
+        "{children}"
+    );
+
+    // DLNA answers only the local network: a remote peer gets no listing and no stream, and
+    // neither does a forwarding header from a peer that isn't a trusted proxy, remote or not.
+    let remote = remote_app(w.state.clone());
+    let stream_uri = format!("/Dlna/{}/Items/{gentle}/Stream", w.state.server_id);
+    let spoofed = |mut req: Request<Body>| {
+        req.headers_mut()
+            .insert("X-Forwarded-For", "192.168.1.5".parse().unwrap());
+        req
+    };
+    for (app, spoof, label) in [
+        (&remote, false, "remote peer"),
+        (&remote, true, "remote peer, spoofed local X-Forwarded-For"),
+        (
+            &w.app,
+            true,
+            "loopback peer that isn't a trusted proxy, X-Forwarded-For",
+        ),
+    ] {
+        let wrap = |req| if spoof { spoofed(req) } else { req };
+        let browse = R2Parental::dlna_browse_request("0", "BrowseDirectChildren");
+        let (status, text) = g1_send_raw(app, wrap(browse)).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{label}: {text}");
+        assert!(!text.contains("Parental"), "{label}: {text}");
+        let get = Request::builder()
+            .uri(&stream_uri)
+            .body(Body::empty())
+            .unwrap();
+        let (status, text) = g1_send_raw(app, wrap(get)).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{label}");
+        assert!(!text.contains("r2parental video bytes"), "{label}");
+    }
+    assert_eq!(stream(&gentle, None).await.0, StatusCode::OK, "local still");
+
+    // DLNA switched off: 404 on every DLNA route, the stream included, with a user set.
+    w.configure(serde_json::json!({ "EnableDlnaServer": false }))
+        .await;
+    let browse = R2Parental::dlna_browse_request("0", "BrowseDirectChildren");
+    assert_eq!(g1_send_raw(&w.app, browse).await.0, StatusCode::NOT_FOUND);
+    assert_eq!(stream(&gentle, None).await.0, StatusCode::NOT_FOUND);
+    let description = Request::builder()
+        .uri("/dlna/description.xml")
+        .body(Body::empty())
+        .unwrap();
+    assert_eq!(
+        g1_send_raw(&w.app, description).await.0,
+        StatusCode::NOT_FOUND
+    );
+    w.configure(serde_json::json!({ "EnableDlnaServer": true }))
+        .await;
+    assert_eq!(stream(&gentle, None).await.0, StatusCode::OK);
+
+    // The DLNA user may not play media: nothing streams.
+    w.set_policy(serde_json::json!({ "EnableMediaPlayback": false }))
+        .await;
+    assert_eq!(stream(&gentle, None).await.0, StatusCode::NOT_FOUND);
+    w.set_policy(serde_json::json!({ "EnableMediaPlayback": true }))
+        .await;
+    assert_eq!(stream(&gentle, None).await.0, StatusCode::OK);
+
+    // A disabled DLNA user lists and streams nothing.
+    w.set_policy(serde_json::json!({ "IsDisabled": true }))
+        .await;
+    let root = w.dlna_browse("0", "BrowseDirectChildren").await;
+    assert!(root.contains("<TotalMatches>0</TotalMatches>"), "{root}");
+    assert!(!root.contains("Parental"), "{root}");
+    assert_eq!(stream(&gentle, None).await.0, StatusCode::NOT_FOUND);
+    w.set_policy(serde_json::json!({ "IsDisabled": false }))
+        .await;
+
+    // A DLNA user that doesn't exist lists nothing.
+    w.configure(serde_json::json!({ "DlnaDefaultUserId": uuid::Uuid::new_v4().to_string() }))
+        .await;
+    let root = w.dlna_browse("0", "BrowseDirectChildren").await;
+    assert!(root.contains("<TotalMatches>0</TotalMatches>"), "{root}");
+}
+
+#[tokio::test]
+async fn r3parental_person_lists_leave_out_people_only_in_hidden_items() {
+    let w = r2parental().await;
+    let mut people = HashMap::new();
+    for (person, item) in [("Gina Gentle", "Gentle"), ("Rhea Rough", "Rough")] {
+        let id = uuid::Uuid::new_v4().to_string();
+        sqlx::query("INSERT INTO people (id, name) VALUES (?, ?)")
+            .bind(&id)
+            .bind(person)
+            .execute(&w.state.db)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO item_people (item_id, person_id) VALUES (?, ?)")
+            .bind(w.id(item).to_string())
+            .bind(&id)
+            .execute(&w.state.db)
+            .await
+            .unwrap();
+        people.insert(person, id);
+    }
+    w.set_policy(serde_json::json!({ "MaxParentalRating": 10 }))
+        .await;
+    let (_, listed) = w.get(&w.kid, "/Persons").await;
+    assert!(listed.to_string().contains("Gina Gentle"), "{listed}");
+    assert!(!listed.to_string().contains("Rhea Rough"), "{listed}");
+    let (_, listed) = w.get(&w.admin, "/Persons").await;
+    assert!(listed.to_string().contains("Rhea Rough"), "{listed}");
+    let one = format!("/Persons/{}", people["Rhea Rough"]);
+    assert_eq!(w.get(&w.kid, &one).await.0, StatusCode::NOT_FOUND);
+    assert_eq!(w.get(&w.admin, &one).await.0, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn r3parental_is_movie_and_is_series_filter_as_jellyfin_and_latest_types_match() {
+    let w = r2parental().await;
+    let all = w.names(&w.admin, "/Items?Recursive=true").await;
+    let movies = w
+        .names(&w.admin, "/Items?Recursive=true&IncludeItemTypes=Movie")
+        .await;
+    assert!(movies.0.contains(&"Gentle".to_string()), "{movies:?}");
+    // Library items are never Live TV programs: IsMovie=true filters nothing when the include
+    // types are empty or name Movie, and keeps nothing for other types; IsSeries=true keeps
+    // nothing; false filters nothing.
+    for (uri, expected) in [
+        ("/Items?Recursive=true&IsMovie=true", &all),
+        ("/Items?Recursive=true&IsMovie=false", &all),
+        ("/Items?Recursive=true&IsSeries=false", &all),
+        (
+            "/Items?Recursive=true&IsMovie=true&IncludeItemTypes=Movie",
+            &movies,
+        ),
+    ] {
+        assert_eq!(&w.names(&w.admin, uri).await, expected, "{uri}");
+    }
+    for uri in [
+        "/Items?Recursive=true&IsMovie=true&IncludeItemTypes=Series",
+        "/Items?Recursive=true&IsSeries=true",
+        "/Items?Recursive=true&IsSeries=true&IncludeItemTypes=Series",
+    ] {
+        assert_eq!(w.names(&w.admin, uri).await.1, 0, "{uri}");
+    }
+
+    // Latest with a type lists that type.
+    let (latest, _) = w
+        .names(&w.admin, "/Items/Latest?IncludeItemTypes=Movie&Limit=50")
+        .await;
+    assert!(latest.contains(&"Gentle".to_string()), "{latest:?}");
+    assert!(!latest.contains(&"Kind Show".to_string()), "{latest:?}");
+    let (latest, _) = w
+        .names(&w.admin, "/Items/Latest?IncludeItemTypes=Series&Limit=50")
+        .await;
+    assert!(latest.contains(&"Kind Show".to_string()), "{latest:?}");
+    assert!(!latest.contains(&"Gentle".to_string()), "{latest:?}");
+
+    // The kid's limits still apply.
+    w.set_policy(serde_json::json!({ "MaxParentalRating": 10 }))
+        .await;
+    for uri in [
+        "/Items?Recursive=true&IsMovie=true&IncludeItemTypes=Movie",
+        "/Items/Latest?IncludeItemTypes=Movie&Limit=50",
+    ] {
+        let (names, _) = w.names(&w.kid, uri).await;
+        assert!(names.contains(&"Gentle".to_string()), "{uri}: {names:?}");
+        assert!(!names.contains(&"Rough".to_string()), "{uri}: {names:?}");
+    }
+}
+
+#[tokio::test]
+async fn r3parental_items_carry_the_fields_jellyfin_web_reads() {
+    let w = r2parental().await;
+    let gentle = w.id("Gentle");
+    let lib = w.library_id().await;
+    // An H.264 1080p MKV with a 5.1 AC-3 English track and a forced German SubRip track, a
+    // premiere date, a 1000 by 500 primary image and a studio.
+    let path: String = sqlx::query_scalar("SELECT path FROM media_items WHERE id = ?")
+        .bind(gentle.to_string())
+        .fetch_one(&w.state.db)
+        .await
+        .unwrap();
+    let source = uuid::Uuid::new_v4().to_string();
+    sqlx::query(
+        "INSERT INTO media_sources (id, item_id, uid, container, path) VALUES (?, ?, ?, 'mkv', ?)",
+    )
+    .bind(&source)
+    .bind(gentle.to_string())
+    .bind(uuid::Uuid::new_v4().to_string())
+    .bind(&path)
+    .execute(&w.state.db)
+    .await
+    .unwrap();
+    type Stream = (
+        i32,
+        &'static str,
+        &'static str,
+        Option<&'static str>,
+        Option<i32>,
+        Option<i32>,
+        Option<i32>,
+        Option<&'static str>,
+        bool,
+        bool,
+    );
+    let streams: [Stream; 3] = [
+        (
+            0,
+            "h264",
+            "video",
+            None,
+            Some(1920),
+            Some(1080),
+            None,
+            None,
+            true,
+            false,
+        ),
+        (
+            1,
+            "ac3",
+            "audio",
+            Some("eng"),
+            None,
+            None,
+            Some(6),
+            Some("5.1"),
+            true,
+            false,
+        ),
+        (
+            2,
+            "subrip",
+            "subtitle",
+            Some("ger"),
+            None,
+            None,
+            None,
+            None,
+            false,
+            true,
+        ),
+    ];
+    for (index, codec, kind, language, width, height, channels, layout, default, forced) in streams
+    {
+        sqlx::query(
+            "INSERT INTO media_streams (id, source_id, stream_index, codec, codec_type, language, \
+             width, height, channels, channel_layout, is_default, is_forced) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(uuid::Uuid::new_v4().to_string())
+        .bind(&source)
+        .bind(index)
+        .bind(codec)
+        .bind(kind)
+        .bind(language)
+        .bind(width)
+        .bind(height)
+        .bind(channels)
+        .bind(layout)
+        .bind(default)
+        .bind(forced)
+        .execute(&w.state.db)
+        .await
+        .unwrap();
+    }
+    for sql in [
+        "UPDATE media_items SET premiere_date = '2001-05-04T00:00:00Z' WHERE id = ?",
+        "UPDATE item_images SET width = 1000, height = 500 WHERE item_id = ? AND image_type = 'Primary'",
+    ] {
+        sqlx::query(sql)
+            .bind(gentle.to_string())
+            .execute(&w.state.db)
+            .await
+            .unwrap();
+    }
+    j5_studio(&w.state, gentle, "Gentle Films").await;
+
+    let find = |body: &serde_json::Value, uri: &str| {
+        body.get("Items")
+            .unwrap_or(body)
+            .as_array()
+            .unwrap_or_else(|| panic!("{uri}: {body}"))
+            .iter()
+            .find(|i| i["Name"] == "Gentle")
+            .cloned()
+            .unwrap_or_else(|| panic!("{uri}: no Gentle in {body}"))
+    };
+    for uri in [
+        "/Items?Recursive=true&IncludeItemTypes=Movie",
+        "/Items/Latest?Limit=50",
+    ] {
+        let (status, body) = w.get(&w.kid, uri).await;
+        assert_eq!(status, StatusCode::OK, "{uri}");
+        let item = find(&body, uri);
+        assert_eq!(item["Container"], "mkv", "{uri}: {item}");
+        assert_eq!(item["PrimaryImageAspectRatio"], 2.0, "{uri}: {item}");
+        assert!(
+            item["PremiereDate"]
+                .as_str()
+                .is_some_and(|d| d.starts_with("2001-05-04")),
+            "{uri}: {item}"
+        );
+        assert_eq!(item["ParentId"], lib.as_str(), "{uri}: {item}");
+        assert_eq!(item["UserData"]["Played"], false, "{uri}: {item}");
+        // Every movie has UserData, played or not.
+        for entry in body.get("Items").unwrap_or(&body).as_array().unwrap() {
+            assert!(entry["UserData"].is_object(), "{uri}: {entry}");
+        }
+    }
+    // Fields given empty: no optional field, PrimaryImageAspectRatio included.
+    let uri = "/Items?Recursive=true&IncludeItemTypes=Movie&Fields=";
+    let item = find(&w.get(&w.kid, uri).await.1, uri);
+    assert!(item.get("PrimaryImageAspectRatio").is_none(), "{item}");
+    assert!(item["UserData"].is_object(), "{item}");
+
+    // Details: the streams' DisplayTitle and the source's Name.
+    let (status, item) = w.get(&w.kid, &format!("/Items/{gentle}")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(item["Container"], "mkv", "{item}");
+    assert_eq!(item["ParentId"], lib.as_str(), "{item}");
+    assert_eq!(item["PrimaryImageAspectRatio"], 2.0, "{item}");
+    let source = &item["MediaSources"][0];
+    assert_eq!(source["Name"], "Gentle", "{source}");
+    let streams = source["MediaStreams"].as_array().unwrap();
+    let titles: Vec<&str> = streams
+        .iter()
+        .map(|s| s["DisplayTitle"].as_str().unwrap_or("?"))
+        .collect();
+    assert_eq!(
+        titles,
+        [
+            "1080p H264 SDR",
+            "English - Dolby Digital - 5.1 - Default",
+            "German - Forced - SUBRIP",
+        ],
+        "{source}"
+    );
+    let kinds: Vec<&str> = streams
+        .iter()
+        .map(|s| s["Type"].as_str().unwrap_or("?"))
+        .collect();
+    assert_eq!(kinds, ["Video", "Audio", "Subtitle"]);
+    assert_eq!(streams[1]["Language"], "eng");
+
+    // The studio list's entries have UserData.
+    let (status, body) = w.get(&w.kid, "/Studios").await;
+    assert_eq!(status, StatusCode::OK);
+    let studio = body["Items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["Name"] == "Gentle Films")
+        .cloned()
+        .unwrap_or_else(|| panic!("{body}"));
+    assert_eq!(studio["UserData"]["IsFavorite"], false, "{studio}");
+    assert_eq!(studio["UserData"]["ItemId"], studio["Id"], "{studio}");
+    // As in Jellyfin: not with EnableUserData=false, and never on the genre lists.
+    for uri in ["/Studios?EnableUserData=false", "/Genres", "/MusicGenres"] {
+        let (status, body) = w.get(&w.kid, uri).await;
+        assert_eq!(status, StatusCode::OK, "{uri}");
+        assert!(!body.to_string().contains("UserData"), "{uri}: {body}");
+    }
+    let (_, genres) = w.get(&w.kid, "/Genres").await;
+    assert!(genres.to_string().contains("Family"), "{genres}");
+}
+
 // ── G1: authorization ──
 // Admin endpoints answer 401 without a valid token and 403 to a non-admin. Setup endpoints are
 // open only while the server has no users. Names taken from a request stay inside their directory.
@@ -25361,18 +27765,27 @@ async fn g1_item_admin_routes() {
             true,
         ),
         ("DELETE", format!("/Items/{item}/Subtitles/0"), None, true),
+        // Jellyfin's remote subtitle routes (search by language, download by id), and upload
+        // and delete; the older non-Jellyfin search and download paths are gone
         (
             "GET",
-            format!("/Items/{item}/RemoteSearch/Subtitles"),
+            format!("/Items/{item}/RemoteSearch/Subtitles/eng"),
             None,
             false,
         ),
         (
             "POST",
-            format!("/Videos/{item}/Subtitles/0/Download"),
+            format!("/Items/{item}/RemoteSearch/Subtitles/some-id"),
             None,
             false,
         ),
+        (
+            "POST",
+            format!("/Videos/{item}/Subtitles"),
+            Some(serde_json::json!({"Language": "eng", "Format": "srt", "Data": "aGk="})),
+            false,
+        ),
+        ("DELETE", format!("/Videos/{item}/Subtitles/0"), None, false),
         ("POST", "/Collections?Name=G1".to_string(), None, true),
         ("DELETE", format!("/Collections/{coll}"), None, true),
         (
@@ -26187,7 +28600,11 @@ async fn b142_server() -> (AppState, axum::Router, String, String) {
     state.plugin_manager = state.plugin_manager.with_database(state.db.clone());
     let pm = &state.plugin_manager;
     rustyfin_core::plugin_manager::install_tmdb_plugin(pm, state.tmdb.clone()).await;
-    rustyfin_core::plugin_manager::install_omdb_plugin(pm).await;
+    rustyfin_core::plugin_manager::install_omdb_plugin(
+        pm,
+        rustyfin_model::answer_store::AnswerStore::memory_only(),
+    )
+    .await;
     rustyfin_core::plugin_manager::install_fanart_plugin(pm).await;
     let app = app(state.clone());
     let (owner, _, viewer, _) = g1_owner_and_viewer(&state, &app).await;
@@ -26759,6 +29176,13 @@ fn r3player_controls() {
     b124_node_test("r3player_controls.mjs");
 }
 
+// R3 player preferences: the next episode's tracks follow the Remember settings and match by language
+// and title; C and S toggle subtitles; a focused menu or text field keeps the player's keys
+#[test]
+fn r3prefs_player() {
+    b124_node_test("r3prefs_player.mjs");
+}
+
 // The album page's Play queues every track in disc and track order; a track plays the album from it
 #[test]
 fn r3player_album() {
@@ -26826,11 +29250,29 @@ fn r3item_play() {
     b124_node_test("r3item_play.mjs");
 }
 
+// R3 Android app: the page answers the Jellyfin Android app's NativeShell contract (the app's player, its
+// notification, Back, downloads, its menu screens) and leaves a browser alone (tests/web/r3android_*.mjs)
+#[test]
+fn r3android_shell() {
+    b124_node_test("r3android_shell.mjs");
+}
+
+#[test]
+fn r3android_page() {
+    b124_node_test("r3android_page.mjs");
+}
+
 // R3 item extras: the Trailer button, the Special Features row and theme songs in the web client
 // (tests/web/r3extras_web.mjs)
 #[test]
 fn r3extras_web() {
     b124_node_test("r3extras_web.mjs");
+}
+
+// R3 extras round 2: series, season and episode pages show their extras (tests/web/r3extras2_web.mjs)
+#[test]
+fn r3extras2_web() {
+    b124_node_test("r3extras2_web.mjs");
 }
 
 // R3 metadata: the admin's refresh, Identify, image and metadata editor dialogs in the web client
@@ -26845,6 +29287,26 @@ fn r3metadata_web() {
 #[test]
 fn r3cards_cards() {
     b124_node_test("r3cards_cards.mjs");
+}
+
+// The sign-in page's user tiles, Manual login, Forgot password and its PIN step, and Switch user
+// (tests/web/r3users2_login.mjs)
+#[test]
+fn r3users2_login() {
+    b124_node_test("r3users2_login.mjs");
+}
+
+// Multi-select and bulk actions in the library grid (tests/web/r3users2_multiselect.mjs)
+#[test]
+fn r3users2_multiselect() {
+    b124_node_test("r3users2_multiselect.mjs");
+}
+
+// The backdrop screensaver: off by default, after the idle time, never during playback
+// (tests/web/r3users2_screensaver.mjs)
+#[test]
+fn r3users2_screensaver() {
+    b124_node_test("r3users2_screensaver.mjs");
 }
 
 // The web client's library page: the sort menu per list, view settings, the Episodes and Genres tabs
@@ -27078,6 +29540,13 @@ fn r3music_tabs() {
     b124_node_test("r3music_tabs.mjs");
 }
 
+// A movie or TV library's tabs (Suggestions, Favorites, Upcoming, Networks), a mixed library's
+// folders opened in place, and the empty search's suggestions (tests/web/r3tabs_library.mjs)
+#[test]
+fn r3tabs_library() {
+    b124_node_test("r3tabs_library.mjs");
+}
+
 // R3 collections: the web client's collection and playlist lists, pages, Remove and reordering
 // (tests/web/r3collections_web.mjs)
 #[test]
@@ -27094,6 +29563,513 @@ fn r3home_rows() {
 #[test]
 fn r3settings_home() {
     b124_node_test("r3settings_home.mjs");
+}
+
+// R3 photos and home: the photo library's folders, the viewer and slideshow, and the home layout
+// settings (homesection0..n, OrderedViews, MyMediaExcludes, LatestItemsExcludes)
+#[test]
+fn r3photos_web() {
+    b124_node_test("r3photos_library.mjs");
+    b124_node_test("r3photos_home.mjs");
+}
+
+/// The names `uri` lists as views, in order
+async fn r3photos_view_names(app: &axum::Router, token: &str, uri: &str) -> Vec<String> {
+    let (status, views) = send_authed(app, "GET", uri, token, None).await;
+    assert_eq!(status, StatusCode::OK, "{uri}: {views}");
+    let items = views["Items"].as_array().unwrap();
+    assert_eq!(views["TotalRecordCount"], items.len(), "{uri}");
+    items
+        .iter()
+        .map(|v| v["Name"].as_str().unwrap().to_string())
+        .collect()
+}
+
+/// The names, types and ids of the items `uri` lists, in order
+async fn r3photos_list(
+    app: &axum::Router,
+    token: &str,
+    uri: &str,
+) -> Vec<(String, String, String)> {
+    let (status, body) = send_authed(app, "GET", uri, token, None).await;
+    assert_eq!(status, StatusCode::OK, "{uri}: {body}");
+    body["Items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|i| {
+            let s = |k: &str| i[k].as_str().unwrap_or_default().to_string();
+            (s("Name"), s("Type"), s("Id"))
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn r3photos_library_subfolders_are_folder_items() {
+    let state = test_state().await;
+    let app = app(state.clone());
+    let (token, _) = admin_session(&state).await;
+    let lib = create_library_via_api(&app, &state, &token, "R3PF", "Photos").await;
+    let root = std::path::PathBuf::from(media_folder(&state, "r3pf"));
+    for file in [
+        "top.jpg",
+        "Trips/2024/b.jpg",
+        "Trips/2024/a.jpg",
+        "Trips/c.jpg",
+    ] {
+        let path = root.join(file);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, b"").unwrap();
+    }
+    std::fs::create_dir_all(root.join("Empty")).unwrap();
+    let refresh = format!("/Library/VirtualFolders/{lib}/Refresh");
+    let (status, body) = send_authed(&app, "POST", &refresh, &token, None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    // The library's top: its folder, then its photo; a folder with no media gets no item
+    let names = |list: &[(String, String, String)]| -> Vec<(String, String)> {
+        list.iter()
+            .map(|(n, t, _)| (n.clone(), t.clone()))
+            .collect()
+    };
+    let order = "SortBy=IsFolder,SortName&SortOrder=Ascending";
+    let top = r3photos_list(&app, &token, &format!("/Items?ParentId={lib}&{order}")).await;
+    assert_eq!(
+        names(&top),
+        [
+            ("Trips".into(), "Folder".into()),
+            ("top".into(), "Photo".into())
+        ]
+    );
+    let trips = top[0].2.clone();
+    let (_, folder) = send_authed(&app, "GET", &format!("/Items/{trips}"), &token, None).await;
+    assert_eq!(folder["IsFolder"], true);
+    assert_eq!(folder["Type"], "Folder");
+
+    let inside = r3photos_list(&app, &token, &format!("/Items?ParentId={trips}&{order}")).await;
+    assert_eq!(
+        names(&inside),
+        [
+            ("2024".into(), "Folder".into()),
+            ("c".into(), "Photo".into())
+        ]
+    );
+    let year = inside[0].2.clone();
+    let photos = r3photos_list(&app, &token, &format!("/Items?ParentId={year}&{order}")).await;
+    assert_eq!(
+        names(&photos),
+        [("a".into(), "Photo".into()), ("b".into(), "Photo".into())]
+    );
+    let (_, a) = send_authed(
+        &app,
+        "GET",
+        &format!("/Items/{}", photos[0].2),
+        &token,
+        None,
+    )
+    .await;
+    assert_eq!(a["ParentId"].as_str(), Some(year.as_str()));
+    // A folder's ancestors: the folders above it, nearest first, then the library
+    let ancestors = r3photos_list_plain(&app, &token, &format!("/Items/{year}/Ancestors")).await;
+    assert_eq!(ancestors[0], trips);
+    assert!(ancestors.contains(&lib.to_string()), "{ancestors:?}");
+    // Recursively, the library still lists every photo
+    let all = r3photos_list(
+        &app,
+        &token,
+        &format!("/Items?ParentId={lib}&Recursive=true&IncludeItemTypes=Photo"),
+    )
+    .await;
+    assert_eq!(all.len(), 4);
+    // Latest lists the photos, never the folders (Jellyfin asks IsFolder = false there)
+    let (_, latest) = send_authed(
+        &app,
+        "GET",
+        &format!("/Items/Latest?ParentId={lib}"),
+        &token,
+        None,
+    )
+    .await;
+    let latest = latest.as_array().unwrap();
+    assert_eq!(latest.len(), 4, "{latest:?}");
+    assert!(latest.iter().all(|i| i["Type"] == "Photo"));
+
+    // A folder whose files are gone goes; the others keep their ids
+    std::fs::remove_dir_all(root.join("Trips/2024")).unwrap();
+    let (status, _) = send_authed(&app, "POST", &refresh, &token, None).await;
+    assert_eq!(status, StatusCode::OK);
+    let top = r3photos_list(&app, &token, &format!("/Items?ParentId={lib}&{order}")).await;
+    assert_eq!(top[0].2, trips);
+    let inside = r3photos_list(&app, &token, &format!("/Items?ParentId={trips}&{order}")).await;
+    assert_eq!(names(&inside), [("c".into(), "Photo".into())]);
+    let (status, _) = send_authed(&app, "GET", &format!("/Items/{year}"), &token, None).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+/// Writes empty files at `files` under `root` (a scan lists them by name)
+fn r3photos_files(root: &std::path::Path, files: &[&str]) {
+    for file in files {
+        let path = root.join(file);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, b"").unwrap();
+    }
+}
+
+/// The id of the folder named `name` that `parent` lists
+async fn r3photos_folder(
+    app: &axum::Router,
+    token: &str,
+    parent: &str,
+    name: &str,
+) -> Option<String> {
+    r3photos_list(app, token, &format!("/Items?ParentId={parent}"))
+        .await
+        .into_iter()
+        .find(|(n, t, _)| n == name && t == "Folder")
+        .map(|(_, _, id)| id)
+}
+
+#[tokio::test]
+async fn r3photos_mixed_folders_keep_ids_and_go_when_emptied() {
+    let state = test_state().await;
+    let app = app(state.clone());
+    let (token, _) = admin_session(&state).await;
+    let lib = create_library_via_api(&app, &state, &token, "R3PX", "Mixed").await;
+    let root = std::path::PathBuf::from(media_folder(&state, "r3px"));
+    r3photos_files(&root, &["Trips/a.jpg", "Home/b.jpg", "Home/Garden/c.jpg"]);
+    let refresh = format!("/Library/VirtualFolders/{lib}/Refresh");
+    let scan = || async {
+        let (status, body) = send_authed(&app, "POST", &refresh, &token, None).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+    };
+    scan().await;
+    let lib_id = lib.to_string();
+    let trips = r3photos_folder(&app, &token, &lib_id, "Trips")
+        .await
+        .unwrap();
+    let home = r3photos_folder(&app, &token, &lib_id, "Home")
+        .await
+        .unwrap();
+    let garden = r3photos_folder(&app, &token, &home, "Garden")
+        .await
+        .unwrap();
+
+    // A rescan keeps every folder's id
+    scan().await;
+    assert_eq!(
+        r3photos_folder(&app, &token, &lib_id, "Trips")
+            .await
+            .unwrap(),
+        trips
+    );
+    assert_eq!(
+        r3photos_folder(&app, &token, &home, "Garden")
+            .await
+            .unwrap(),
+        garden
+    );
+
+    // A folder whose only photo is gone goes, and so does nothing else
+    std::fs::remove_file(root.join("Trips/a.jpg")).unwrap();
+    scan().await;
+    assert_eq!(r3photos_folder(&app, &token, &lib_id, "Trips").await, None);
+    let (status, _) = send_authed(&app, "GET", &format!("/Items/{trips}"), &token, None).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(
+        r3photos_folder(&app, &token, &lib_id, "Home")
+            .await
+            .unwrap(),
+        home
+    );
+
+    // The photo back: the folder comes back with the same id
+    r3photos_files(&root, &["Trips/a.jpg"]);
+    scan().await;
+    assert_eq!(
+        r3photos_folder(&app, &token, &lib_id, "Trips")
+            .await
+            .unwrap(),
+        trips
+    );
+}
+
+#[tokio::test]
+async fn r3photos_folder_counts_and_ancestors_follow_access() {
+    let state = test_state().await;
+    let app = app(state.clone());
+    let (admin, _) = admin_session(&state).await;
+    let lib = create_library_via_api(&app, &state, &admin, "R3PA2", "Photos").await;
+    let root = std::path::PathBuf::from(media_folder(&state, "r3pa2"));
+    r3photos_files(
+        &root,
+        &["Album/one.jpg", "Album/two.jpg", "Album/Inner/three.jpg"],
+    );
+    let (status, _) = send_authed(
+        &app,
+        "POST",
+        &format!("/Library/VirtualFolders/{lib}/Refresh"),
+        &admin,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    sqlx::query("UPDATE media_items SET tags = 'Private' WHERE name = 'two'")
+        .execute(&state.db)
+        .await
+        .unwrap();
+    let album = r3photos_folder(&app, &admin, &lib.to_string(), "Album")
+        .await
+        .unwrap();
+    let inner = r3photos_folder(&app, &admin, &album, "Inner")
+        .await
+        .unwrap();
+
+    // A user who may not see the "Private" tag, and one without this library
+    let set_policy = |user: String, change: serde_json::Value| {
+        let (app, admin) = (app.clone(), admin.clone());
+        async move {
+            let (_, got) = send_authed(&app, "GET", &format!("/Users/{user}"), &admin, None).await;
+            let mut policy = got["Policy"].clone();
+            for (k, v) in change.as_object().unwrap() {
+                policy[k] = v.clone();
+            }
+            let uri = format!("/Users/{user}/Policy");
+            let (status, _) =
+                send_authed(&app, "POST", &uri, &admin, Some(&policy.to_string())).await;
+            assert!(status.is_success(), "{status}");
+        }
+    };
+    let kid = add_user(&state, "r3p-kid", "r3p-pass", false).await;
+    set_policy(
+        kid.to_string(),
+        serde_json::json!({ "BlockedTags": ["Private"] }),
+    )
+    .await;
+    let other = add_user(&state, "r3p-other", "r3p-pass", false).await;
+    set_policy(
+        other.to_string(),
+        serde_json::json!({ "EnableAllFolders": false, "EnabledFolders": [] }),
+    )
+    .await;
+    let (kid_token, _) = login(&app, "r3p-kid", "r3p-pass").await.unwrap();
+    let (other_token, _) = login(&app, "r3p-other", "r3p-pass").await.unwrap();
+
+    // ChildCount: the folder's details and a list count only what the user may see
+    let count = |token: String, uri: String| {
+        let app = app.clone();
+        async move { send_authed(&app, "GET", &uri, &token, None).await.1["ChildCount"].clone() }
+    };
+    assert_eq!(count(admin.clone(), format!("/Items/{album}")).await, 3);
+    assert_eq!(count(kid_token.clone(), format!("/Items/{album}")).await, 2);
+    let (_, listed) = send_authed(
+        &app,
+        "GET",
+        &format!("/Items?ParentId={lib}"),
+        &kid_token,
+        None,
+    )
+    .await;
+    let album_row = listed["Items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|i| i["Id"] == album.as_str())
+        .cloned()
+        .unwrap();
+    assert_eq!(album_row["ChildCount"], 2);
+
+    // Ancestors: a visible folder's way up for the kid; not found without the library
+    let (status, up) = send_authed(
+        &app,
+        "GET",
+        &format!("/Items/{inner}/Ancestors"),
+        &kid_token,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(up[0]["Id"], album.as_str());
+    let (status, _) = send_authed(
+        &app,
+        "GET",
+        &format!("/Items/{inner}/Ancestors"),
+        &other_token,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let (status, _) =
+        send_authed(&app, "GET", &format!("/Items/{album}"), &other_token, None).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+/// The ids of the items `uri` answers with as a plain array
+async fn r3photos_list_plain(app: &axum::Router, token: &str, uri: &str) -> Vec<String> {
+    let (status, body) = send_authed(app, "GET", uri, token, None).await;
+    assert_eq!(status, StatusCode::OK, "{uri}: {body}");
+    let items = body
+        .as_array()
+        .or_else(|| body["Items"].as_array())
+        .unwrap();
+    items
+        .iter()
+        .map(|i| i["Id"].as_str().unwrap_or_default().to_string())
+        .collect()
+}
+
+#[tokio::test]
+async fn r3photos_movie_libraries_get_no_folder_items() {
+    let state = test_state().await;
+    let app = app(state.clone());
+    let (token, _) = admin_session(&state).await;
+    let lib = create_library_via_api(&app, &state, &token, "R3PM", "Movies").await;
+    let root = std::path::PathBuf::from(media_folder(&state, "r3pm"));
+    std::fs::create_dir_all(root.join("Some Film (2001)")).unwrap();
+    std::fs::write(root.join("Some Film (2001)/Some Film (2001).mkv"), b"").unwrap();
+    let refresh = format!("/Library/VirtualFolders/{lib}/Refresh");
+    let (status, body) = send_authed(&app, "POST", &refresh, &token, None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let folders = r3photos_list(
+        &app,
+        &token,
+        &format!("/Items?ParentId={lib}&Recursive=true&IncludeItemTypes=Folder"),
+    )
+    .await;
+    assert!(folders.is_empty(), "{folders:?}");
+    let top = r3photos_list(&app, &token, &format!("/Items?ParentId={lib}")).await;
+    assert_eq!(top.len(), 1);
+    assert_eq!(top[0].1, "Movie");
+}
+
+#[tokio::test]
+async fn r3photos_library_type_homevideos_is_accepted() {
+    let state = test_state().await;
+    let app = app(state.clone());
+    let (token, _) = admin_session(&state).await;
+    for (name, kind) in [("R3HV1", "HomeVideos"), ("R3HV2", "homevideos")] {
+        let body = serde_json::json!({
+            "Name": name,
+            "ContentType": kind,
+            "Paths": [media_folder(&state, &name.to_lowercase())],
+        })
+        .to_string();
+        let (status, created) =
+            send_authed(&app, "POST", "/Library/VirtualFolders", &token, Some(&body)).await;
+        assert_eq!(status, StatusCode::OK, "{kind}: {created}");
+        assert_eq!(created["ContentType"], "Photos", "{kind}");
+    }
+    let (_, views) = send_authed(&app, "GET", "/UserViews", &token, None).await;
+    let kinds: Vec<_> = views["Items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v["CollectionType"].clone())
+        .collect();
+    assert_eq!(kinds, ["homevideos", "homevideos"]);
+    // A type Rustyfin doesn't have is still refused
+    let body = serde_json::json!({"Name": "R3HV3", "ContentType": "books", "Paths": [media_folder(&state, "r3hv3")]})
+        .to_string();
+    let (status, _) =
+        send_authed(&app, "POST", "/Library/VirtualFolders", &token, Some(&body)).await;
+    assert!(status.is_client_error(), "{status}");
+}
+
+#[tokio::test]
+async fn r3photos_home_settings_round_trip() {
+    let state = test_state().await;
+    let app = app(state.clone());
+    let (token, user) = admin_session(&state).await;
+    let a = create_library_via_api(&app, &state, &token, "R3PA", "Movies").await;
+    let b = create_library_via_api(&app, &state, &token, "R3PB", "Photos").await;
+    // UserConfiguration's library lists come back as saved, ids in Jellyfin's dashed form
+    let (_, me) = send_authed(&app, "GET", &format!("/Users/{user}"), &token, None).await;
+    let mut config = me["Configuration"].clone();
+    config["OrderedViews"] = serde_json::json!([b, a]);
+    config["LatestItemsExcludes"] = serde_json::json!([b]);
+    config["MyMediaExcludes"] = serde_json::json!([a]);
+    let (status, _) = send_authed(
+        &app,
+        "POST",
+        &format!("/Users/{user}/Configuration"),
+        &token,
+        Some(&config.to_string()),
+    )
+    .await;
+    assert!(status.is_success(), "{status}");
+    let (_, me) = send_authed(&app, "GET", &format!("/Users/{user}"), &token, None).await;
+    for key in ["OrderedViews", "LatestItemsExcludes", "MyMediaExcludes"] {
+        assert_eq!(me["Configuration"][key], config[key], "{key}");
+    }
+
+    // The usersettings CustomPrefs come back from a body with only some fields; a null value is
+    // kept and given back as null, as Jellyfin 12.4 stores it
+    let prefs = format!("/DisplayPreferences/usersettings?userId={user}&client=emby");
+    let body = r#"{"Id":"usersettings","CustomPrefs":{"homesection0":"latestmedia","homesection1":"none","homesection2":null}}"#;
+    let (status, _) = send_authed(&app, "POST", &prefs, &token, Some(body)).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let (_, got) = send_authed(&app, "GET", &prefs, &token, None).await;
+    assert_eq!(
+        got["CustomPrefs"],
+        serde_json::json!({"homesection0": "latestmedia", "homesection1": "none", "homesection2": null})
+    );
+    assert_eq!(got["Client"], "emby");
+    assert_eq!(got["SortBy"], "SortName");
+
+    // As in Jellyfin 12.4 (DisplayPreferencesManager), a POST replaces the whole set: its
+    // CustomPrefs are all there is afterwards, and one without CustomPrefs leaves none
+    let body = r#"{"CustomPrefs":{"homesection1":null,"homesection3":"nextup"}}"#;
+    let (status, _) = send_authed(&app, "POST", &prefs, &token, Some(body)).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let (_, got) = send_authed(&app, "GET", &prefs, &token, None).await;
+    assert_eq!(
+        got["CustomPrefs"],
+        serde_json::json!({"homesection1": null, "homesection3": "nextup"})
+    );
+    let (status, _) = send_authed(
+        &app,
+        "POST",
+        &prefs,
+        &token,
+        Some(r#"{"SortBy":"DateCreated"}"#),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let (_, got) = send_authed(&app, "GET", &prefs, &token, None).await;
+    assert_eq!(got["SortBy"], "DateCreated");
+    assert_eq!(got["CustomPrefs"], serde_json::json!({}));
+}
+
+#[tokio::test]
+async fn r3photos_user_views_follow_ordered_views() {
+    let state = test_state().await;
+    let app = app(state.clone());
+    let (token, user) = admin_session(&state).await;
+    let mut ids = Vec::new();
+    for name in ["R3VA", "R3VB", "R3VC"] {
+        ids.push(create_library_via_api(&app, &state, &token, name, "Movies").await);
+    }
+    let all = r3photos_view_names(&app, &token, "/UserViews").await;
+    let own: Vec<_> = all
+        .iter()
+        .filter(|n| n.starts_with("R3V"))
+        .cloned()
+        .collect();
+    assert_eq!(own, ["R3VA", "R3VB", "R3VC"]);
+
+    // OrderedViews puts C then A first (dashless, upper-case ids match too); B, unnamed, follows.
+    // (MyMediaExcludes and includeHidden are the client queues change's, tested there.)
+    let (_, me) = send_authed(&app, "GET", &format!("/Users/{user}"), &token, None).await;
+    let mut config = me["Configuration"].clone();
+    config["OrderedViews"] =
+        serde_json::json!([ids[2].simple().to_string().to_uppercase(), ids[0]]);
+    let uri = format!("/Users/{user}/Configuration");
+    let (status, _) = send_authed(&app, "POST", &uri, &token, Some(&config.to_string())).await;
+    assert!(status.is_success(), "{status}");
+
+    let shown = r3photos_view_names(&app, &token, "/UserViews").await;
+    assert_eq!(shown, ["R3VC", "R3VA", "R3VB"]);
+    let per_user = r3photos_view_names(&app, &token, &format!("/Users/{user}/Views")).await;
+    assert_eq!(per_user, shown);
 }
 
 // R3 settings: the settings page saves each setting where Jellyfin keeps it
@@ -28019,6 +30995,682 @@ async fn g1f_sessions_list_own_unless_admin() {
 }
 
 // ── B15: Next Up ──
+// R3 library tabs: a movie library's Suggestions rows (GET /Movies/Recommendations, Jellyfin's
+// RecommendationDto list) and a TV library's own Next Up and Upcoming (ParentId)
+
+/// Inserts movies `(name, year)` into a new movie library and returns it and the ids by name.
+async fn r3tabs_movies(
+    state: &AppState,
+    name: &str,
+    movies: &[(&str, i32)],
+) -> (uuid::Uuid, HashMap<String, uuid::Uuid>) {
+    let folder = media_folder(state, name);
+    let lib = rustyfin_model::library::Library {
+        id: uuid::Uuid::new_v4(),
+        name: name.to_string(),
+        content_type: rustyfin_model::library::LibraryContentType::Movies,
+        paths: vec![folder.clone()],
+    };
+    rustyfin_db::repo_library::create_library(&state.db, &lib)
+        .await
+        .unwrap();
+    let mut ids = HashMap::new();
+    for (movie, year) in movies {
+        let id = uuid::Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO media_items (id, library_id, name, media_type, path, production_year) \
+             VALUES (?, ?, ?, 'Movie', ?, ?)",
+        )
+        .bind(id.to_string())
+        .bind(lib.id.to_string())
+        .bind(movie)
+        .bind(format!("{folder}/{movie}.mkv"))
+        .bind(year)
+        .execute(&state.db)
+        .await
+        .unwrap();
+        ids.insert(movie.to_string(), id);
+    }
+    (lib.id, ids)
+}
+
+/// The (RecommendationType, BaselineItemName, item names) of each row of `uri`'s answer.
+async fn r3tabs_rows(
+    app: &axum::Router,
+    token: &str,
+    uri: &str,
+) -> Vec<(String, String, Vec<String>)> {
+    let (status, json) = send(app, request("GET", uri, Some(token), None)).await;
+    assert_eq!(status, StatusCode::OK, "{uri}: {json}");
+    json.as_array()
+        .unwrap_or_else(|| panic!("{uri}: an array of rows: {json}"))
+        .iter()
+        .map(|row| {
+            let mut names: Vec<String> = row["Items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|i| i["Name"].as_str().unwrap().to_string())
+                .collect();
+            names.sort();
+            (
+                row["RecommendationType"].as_str().unwrap().to_string(),
+                row["BaselineItemName"].as_str().unwrap().to_string(),
+                names,
+            )
+        })
+        .collect()
+}
+
+// Rows of unplayed movies like the ones the viewer played (newest first) and liked, taking turns,
+// then ordered by kind; CategoryLimit, ItemLimit and ParentId narrow them, and a user with no
+// history gets none.
+#[tokio::test]
+async fn r3tabs_movie_recommendations_are_jellyfin_rows() {
+    let state = test_state().await;
+    let app = app(state.clone());
+    let (owner, _, viewer, viewer_id) = g1_owner_and_viewer(&state, &app).await;
+    let viewer_id: uuid::Uuid = viewer_id.parse().unwrap();
+    // Similar here means close in year: the 2000s and the 1960s
+    let (lib, ids) = r3tabs_movies(
+        &state,
+        "R3 Tabs Movies",
+        &[
+            ("Seen", 2000),
+            ("Watched", 2000),
+            ("Near", 2001),
+            ("Nearer", 2000),
+            ("Liked", 1960),
+            ("Old", 1961),
+        ],
+    )
+    .await;
+    for (movie, day) in [("Watched", 1), ("Seen", 2)] {
+        rustyfin_db::repo_playback::mark_played(&state.db, viewer_id, ids[movie])
+            .await
+            .unwrap();
+        sqlx::query(
+            "UPDATE user_item_data SET last_played_date = ? WHERE user_id = ? AND item_id = ?",
+        )
+        .bind(format!("2026-01-{day:02}T20:00:00+00:00"))
+        .bind(viewer_id.to_string())
+        .bind(ids[movie].to_string())
+        .execute(&state.db)
+        .await
+        .unwrap();
+    }
+    rustyfin_db::repo_playback::set_favorite(&state.db, viewer_id, ids["Liked"], true)
+        .await
+        .unwrap();
+
+    let recent = "SimilarToRecentlyPlayed";
+    let rows = r3tabs_rows(
+        &app,
+        &viewer,
+        &format!("/Movies/Recommendations?ParentId={lib}"),
+    )
+    .await;
+    assert_eq!(
+        rows.iter()
+            .map(|(kind, baseline, _)| (kind.as_str(), baseline.as_str()))
+            .collect::<Vec<_>>(),
+        vec![
+            (recent, "Seen"),
+            (recent, "Watched"),
+            ("SimilarToLikedItem", "Liked")
+        ]
+    );
+    for (_, baseline, items) in &rows {
+        assert!(items.contains(&"Near".to_string()), "{baseline}: {items:?}");
+        assert!(
+            !items
+                .iter()
+                .any(|i| i == "Seen" || i == "Watched" || i == baseline),
+            "played movies and the baseline are left out: {baseline}: {items:?}"
+        );
+    }
+    assert_eq!(
+        r3tabs_rows(
+            &app,
+            &viewer,
+            "/Movies/Recommendations?categoryLimit=2&itemLimit=1"
+        )
+        .await
+        .iter()
+        .map(|(kind, baseline, items)| (kind.as_str(), baseline.as_str(), items.len()))
+        .collect::<Vec<_>>(),
+        vec![(recent, "Seen", 1), ("SimilarToLikedItem", "Liked", 1)],
+        "the two kinds take turns"
+    );
+    let other = uuid::Uuid::new_v4();
+    assert!(
+        r3tabs_rows(
+            &app,
+            &viewer,
+            &format!("/Movies/Recommendations?ParentId={other}")
+        )
+        .await
+        .is_empty()
+    );
+    assert!(
+        r3tabs_rows(&app, &owner, "/Movies/Recommendations")
+            .await
+            .is_empty(),
+        "no history, no rows"
+    );
+}
+
+// A user with a parental limit gets no row headed by a movie above it, and no such movie in a row.
+#[tokio::test]
+async fn r3tabs_recommendations_leave_out_hidden_movies() {
+    let w = r2parental().await;
+    w.set_policy(serde_json::json!({ "MaxParentalRating": 10 }))
+        .await;
+    // The kid played Gentle and Rough (R) and likes Pleasant and Edgy (PG-13)
+    for (name, played, favorite, day) in [
+        ("Gentle", 1, 0, 2),
+        ("Rough", 1, 0, 3),
+        ("Pleasant", 0, 1, 1),
+        ("Edgy", 0, 1, 1),
+    ] {
+        sqlx::query(
+            "INSERT INTO user_item_data (user_id, item_id, played, is_favorite, last_played_date) \
+             VALUES (?, ?, ?, ?, ?)",
+        )
+        .bind(w.kid_id.to_string())
+        .bind(w.id(name).to_string())
+        .bind(played)
+        .bind(favorite)
+        .bind(format!("2026-01-{day:02}T20:00:00+00:00"))
+        .execute(&w.state.db)
+        .await
+        .unwrap();
+    }
+    let allowed = ["Gentle", "Odd", "Plain", "Pleasant", "Spooky"];
+    let rows = r3tabs_rows(&w.app, &w.kid, "/Movies/Recommendations").await;
+    assert!(
+        rows.iter()
+            .any(|(_, baseline, items)| baseline == "Gentle"
+                && items.contains(&"Pleasant".to_string())),
+        "Gentle's row, with Pleasant in it: {rows:?}"
+    );
+    for (kind, baseline, items) in &rows {
+        assert!(
+            allowed.contains(&baseline.as_str()),
+            "{kind} headed by {baseline}"
+        );
+        for item in items {
+            assert!(
+                allowed.contains(&item.as_str()),
+                "{baseline}'s row holds {item}"
+            );
+        }
+    }
+}
+
+// A library's Latest row asks /Items/Latest with its IncludeItemTypes, which keeps that type.
+#[tokio::test]
+async fn r3tabs_latest_keeps_include_item_types() {
+    let state = test_state().await;
+    let app = app(state.clone());
+    let (owner, _, _, _) = g1_owner_and_viewer(&state, &app).await;
+    let (lib, _) = r3tabs_movies(&state, "R3 Tabs Latest", &[("Kilo", 2000), ("Lima", 2001)]).await;
+    for (types, expected) in [("Movie", 2), ("Episode", 0)] {
+        let uri = format!("/Items/Latest?ParentId={lib}&IncludeItemTypes={types}");
+        let (status, json) = send(&app, request("GET", &uri, Some(&owner), None)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            json.as_array().map(Vec::len),
+            Some(expected),
+            "{uri}: {json}"
+        );
+    }
+}
+
+// A TV library's Next Up and Upcoming list only its own episodes when asked with ParentId.
+#[tokio::test]
+async fn r3tabs_next_up_and_upcoming_keep_to_parent_library() {
+    let s = b15_shows().await;
+    let lib = rustyfin_db::repo_media::get_item_by_id(&s.state.db, s.ids["Hotel"])
+        .await
+        .unwrap()
+        .unwrap()
+        .library_id;
+    // India, its seasons and its episodes move to a second TV library
+    let folder = media_folder(&s.state, "r3tabs-other-shows");
+    let other = rustyfin_model::library::Library {
+        id: uuid::Uuid::new_v4(),
+        name: "R3 Tabs Other Shows".to_string(),
+        content_type: rustyfin_model::library::LibraryContentType::TvShows,
+        paths: vec![folder],
+    };
+    rustyfin_db::repo_library::create_library(&s.state.db, &other)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE media_items SET library_id = ? WHERE name LIKE 'India%'")
+        .bind(other.id.to_string())
+        .execute(&s.state.db)
+        .await
+        .unwrap();
+    s.play(s.viewer_id, "Hotel S01E01", 1).await;
+    s.play(s.viewer_id, "India S01E01", 2).await;
+    assert_eq!(
+        s.next_up(&s.viewer, "").await,
+        b15_ok(&["India S01E02", "Hotel S01E02"], 2),
+        "without ParentId, both libraries"
+    );
+    assert_eq!(
+        s.next_up(&s.viewer, &format!("ParentId={lib}")).await,
+        b15_ok(&["Hotel S01E02"], 1)
+    );
+    assert_eq!(
+        s.next_up(&s.viewer, &format!("parentId={}", other.id))
+            .await,
+        b15_ok(&["India S01E02"], 1)
+    );
+    // Upcoming: an episode of each library that airs tomorrow
+    for label in ["Quiet S01E02", "India S02E01"] {
+        sqlx::query("UPDATE media_items SET premiere_date = date('now', '+1 day') WHERE id = ?")
+            .bind(s.ids[label].to_string())
+            .execute(&s.state.db)
+            .await
+            .unwrap();
+    }
+    for (parent, expected) in [
+        (String::new(), 2),
+        (format!("ParentId={lib}"), 1),
+        (format!("ParentId={}", other.id), 1),
+    ] {
+        let uri = format!("/Shows/Upcoming?{parent}");
+        let (status, json) = send(&s.app, request("GET", &uri, Some(&s.viewer), None)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["TotalRecordCount"], expected, "{uri}: {json}");
+    }
+    let uri = format!("/Shows/Upcoming?ParentId={}", other.id);
+    let (_, json) = send(&s.app, request("GET", &uri, Some(&s.viewer), None)).await;
+    assert_eq!(json["Items"][0]["Id"], s.ids["India S02E01"].to_string());
+}
+
+// r3missing: missing and upcoming episodes (virtual items)
+//
+// Jellyfin 12.4's TMDb missing-episode provider makes virtual episodes, and virtual seasons holding
+// only those, with no file (IsVirtualItem, LocationType Virtual). They stay out of a series'
+// episode and season lists unless the user's DisplayMissingEpisodes is on, out of Next Up, Latest
+// and the counts, show in Upcoming, and /Items filters them with IsMissing, IsUnaired,
+// LocationTypes and ExcludeLocationTypes (Series.cs, TvShowsController.cs, NextUpService.cs,
+// UserViewManager.cs, ItemCountService.cs, BaseItemRepository.TranslateQuery.cs).
+
+/// Show A: season 1 (a folder) with real S1E1 and S1E3 and a virtual S1E2 that aired 10 days ago;
+/// a virtual season 2 with a virtual S2E1 airing in 30 days. Real episodes aired a year ago.
+struct R3Missing {
+    app: axum::Router,
+    owner: String,
+    owner_id: String,
+    library: uuid::Uuid,
+    ids: HashMap<&'static str, uuid::Uuid>,
+}
+
+async fn r3missing_world() -> R3Missing {
+    let state = test_state().await;
+    let app = app(state.clone());
+    let (owner, owner_id, _viewer, _viewer_id) = g1_owner_and_viewer(&state, &app).await;
+    let folder = media_folder(&state, "r3missing");
+    let lib = rustyfin_model::library::Library {
+        id: uuid::Uuid::new_v4(),
+        name: "R3 Missing".to_string(),
+        content_type: rustyfin_model::library::LibraryContentType::TvShows,
+        paths: vec![folder.clone()],
+    };
+    rustyfin_db::repo_library::create_library(&state.db, &lib)
+        .await
+        .unwrap();
+    let now = chrono::Utc::now();
+    let day = |offset: i64| (now + chrono::Duration::days(offset)).to_rfc3339();
+    let mut ids = HashMap::new();
+    for key in [
+        "series", "season1", "season2", "s1e1", "s1e2", "s1e3", "s2e1",
+    ] {
+        ids.insert(key, uuid::Uuid::new_v4());
+    }
+    // (key, name, type, parent, index, season number, premiere, virtual)
+    type Row<'a> = (
+        &'a str,
+        &'a str,
+        &'a str,
+        Option<&'a str>,
+        Option<i32>,
+        Option<i32>,
+        Option<String>,
+        bool,
+    );
+    let rows: [Row; 7] = [
+        ("series", "Show A", "Series", None, None, None, None, false),
+        (
+            "season1",
+            "Season 1",
+            "Season",
+            Some("series"),
+            Some(1),
+            None,
+            None,
+            false,
+        ),
+        (
+            "season2",
+            "Season 2",
+            "Season",
+            Some("series"),
+            Some(2),
+            None,
+            None,
+            true,
+        ),
+        (
+            "s1e1",
+            "Episode One",
+            "Episode",
+            Some("season1"),
+            Some(1),
+            Some(1),
+            Some(day(-365)),
+            false,
+        ),
+        (
+            "s1e2",
+            "Episode Two",
+            "Episode",
+            Some("season1"),
+            Some(2),
+            Some(1),
+            Some(day(-10)),
+            true,
+        ),
+        (
+            "s1e3",
+            "Episode Three",
+            "Episode",
+            Some("season1"),
+            Some(3),
+            Some(1),
+            Some(day(-360)),
+            false,
+        ),
+        (
+            "s2e1",
+            "Episode Four",
+            "Episode",
+            Some("season2"),
+            Some(1),
+            Some(2),
+            Some(day(30)),
+            true,
+        ),
+    ];
+    for (key, name, media_type, parent, index, season, premiere, is_virtual) in rows {
+        let path = match (is_virtual, media_type) {
+            (true, _) => String::new(),
+            (false, "Episode") => format!("{folder}/Show A/Season 1/{name}.mkv"),
+            (false, "Season") => format!("{folder}/Show A/Season 1"),
+            _ => format!("{folder}/Show A"),
+        };
+        sqlx::query(
+            "INSERT INTO media_items (id, library_id, name, media_type, path, parent_id, \
+             index_number, parent_index_number, premiere_date, location_type, is_virtual_item, \
+             date_created) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(ids[key].to_string())
+        .bind(lib.id.to_string())
+        .bind(name)
+        .bind(media_type)
+        .bind(path)
+        .bind(parent.map(|p| ids[p].to_string()))
+        .bind(index)
+        .bind(season)
+        .bind(premiere)
+        .bind(if is_virtual { "Virtual" } else { "FileSystem" })
+        .bind(is_virtual)
+        .bind(now.to_rfc3339())
+        .execute(&state.db)
+        .await
+        .unwrap();
+    }
+    R3Missing {
+        app,
+        owner,
+        owner_id,
+        library: lib.id,
+        ids,
+    }
+}
+
+impl R3Missing {
+    async fn get(&self, uri: &str) -> serde_json::Value {
+        let (status, json) = send_authed(&self.app, "GET", uri, &self.owner, None).await;
+        assert_eq!(status, StatusCode::OK, "{uri}: {json}");
+        json
+    }
+
+    /// The keys of the items in `json["Items"]` (or a bare array), in order.
+    fn keys(&self, json: &serde_json::Value) -> Vec<&'static str> {
+        let items = json
+            .get("Items")
+            .unwrap_or(json)
+            .as_array()
+            .unwrap()
+            .clone();
+        items
+            .iter()
+            .map(|i| {
+                let id: uuid::Uuid = i["Id"].as_str().unwrap().parse().unwrap();
+                *self.ids.iter().find(|(_, v)| **v == id).unwrap().0
+            })
+            .collect()
+    }
+
+    async fn display_missing(&self) {
+        let uri = format!("/Users/{}/Configuration", self.owner_id);
+        let body = serde_json::json!({ "DisplayMissingEpisodes": true }).to_string();
+        let (status, json) = send_authed(&self.app, "POST", &uri, &self.owner, Some(&body)).await;
+        assert!(status.is_success(), "{json}");
+    }
+}
+
+#[tokio::test]
+async fn r3missing_virtual_episode_dto_is_virtual_without_a_path() {
+    let w = r3missing_world().await;
+    let uri = format!("/Users/{}/Items/{}", w.owner_id, w.ids["s1e2"]);
+    let json = w.get(&uri).await;
+    assert_eq!(json["LocationType"], "Virtual", "{json}");
+    assert!(json.get("Path").is_none(), "{json}");
+    let real = w
+        .get(&format!("/Users/{}/Items/{}", w.owner_id, w.ids["s1e1"]))
+        .await;
+    assert_eq!(real["LocationType"], "FileSystem");
+}
+
+#[tokio::test]
+async fn r3missing_series_episodes_hide_virtual_unless_display_missing() {
+    let w = r3missing_world().await;
+    let uri = format!("/Shows/{}/Episodes?userId={}", w.ids["series"], w.owner_id);
+    assert_eq!(w.keys(&w.get(&uri).await), vec!["s1e1", "s1e3"]);
+    // isMissing filters what is listed, so it finds nothing hidden
+    let missing = format!("{uri}&isMissing=true");
+    assert!(w.keys(&w.get(&missing).await).is_empty());
+
+    w.display_missing().await;
+    assert_eq!(
+        w.keys(&w.get(&uri).await),
+        vec!["s1e1", "s1e2", "s1e3", "s2e1"]
+    );
+    assert_eq!(w.keys(&w.get(&missing).await), vec!["s1e2", "s2e1"]);
+    let present = format!("{uri}&isMissing=false");
+    assert_eq!(w.keys(&w.get(&present).await), vec!["s1e1", "s1e3"]);
+}
+
+#[tokio::test]
+async fn r3missing_series_seasons_hide_virtual_seasons_unless_display_missing() {
+    let w = r3missing_world().await;
+    let seasons = format!("/Shows/{}/Seasons?userId={}", w.ids["series"], w.owner_id);
+    let children = format!("/Items?ParentId={}", w.ids["series"]);
+    assert_eq!(w.keys(&w.get(&seasons).await), vec!["season1"]);
+    assert_eq!(w.keys(&w.get(&children).await), vec!["season1"]);
+
+    w.display_missing().await;
+    assert_eq!(w.keys(&w.get(&seasons).await), vec!["season1", "season2"]);
+    assert_eq!(w.keys(&w.get(&children).await), vec!["season1", "season2"]);
+}
+
+#[tokio::test]
+async fn r3missing_next_up_skips_virtual_episodes() {
+    let w = r3missing_world().await;
+    let uri = format!("/Users/{}/PlayedItems/{}", w.owner_id, w.ids["s1e1"]);
+    let (status, _) = send_authed(&w.app, "POST", &uri, &w.owner, None).await;
+    assert!(status.is_success());
+    let next = format!("/Shows/NextUp?userId={}", w.owner_id);
+    assert_eq!(w.keys(&w.get(&next).await), vec!["s1e3"]);
+}
+
+#[tokio::test]
+async fn r3missing_marking_a_series_played_skips_virtual_episodes() {
+    let w = r3missing_world().await;
+    let uri = format!("/Users/{}/PlayedItems/{}", w.owner_id, w.ids["series"]);
+    let (status, _) = send_authed(&w.app, "POST", &uri, &w.owner, None).await;
+    assert!(status.is_success());
+    for (key, played) in [
+        ("s1e1", true),
+        ("s1e3", true),
+        ("s1e2", false),
+        ("s2e1", false),
+    ] {
+        let item = w
+            .get(&format!("/Users/{}/Items/{}", w.owner_id, w.ids[key]))
+            .await;
+        assert_eq!(item["UserData"]["Played"], played, "{key}: {item}");
+    }
+    let series = w
+        .get(&format!("/Users/{}/Items/{}", w.owner_id, w.ids["series"]))
+        .await;
+    assert_eq!(series["UserData"]["Played"], true, "{series}");
+
+    // Unmarking leaves them alone too
+    let (status, _) = send_authed(&w.app, "DELETE", &uri, &w.owner, None).await;
+    assert!(status.is_success());
+    let s1e1 = w
+        .get(&format!("/Users/{}/Items/{}", w.owner_id, w.ids["s1e1"]))
+        .await;
+    assert_eq!(s1e1["UserData"]["Played"], false);
+}
+
+#[tokio::test]
+async fn r3missing_search_and_playback_skip_virtual_episodes() {
+    let w = r3missing_world().await;
+    // 12.4's SqlSearchProvider leaves virtual items out
+    let hints = w
+        .get(&format!(
+            "/Search/Hints?SearchTerm=Episode&userId={}",
+            w.owner_id
+        ))
+        .await;
+    let mut names: Vec<&str> = hints["SearchHints"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|h| h["Name"].as_str())
+        .collect();
+    names.sort();
+    assert_eq!(names, vec!["Episode One", "Episode Three"], "{hints}");
+
+    // No file, no stream: MediaSources empty and NoCompatibleStream (12.4 MediaInfoHelper)
+    let uri = format!(
+        "/Items/{}/PlaybackInfo?userId={}",
+        w.ids["s1e2"], w.owner_id
+    );
+    let (status, info) = send_authed(&w.app, "POST", &uri, &w.owner, Some("{}")).await;
+    assert_eq!(status, StatusCode::OK, "{info}");
+    assert_eq!(info["MediaSources"], serde_json::json!([]), "{info}");
+    assert_eq!(info["ErrorCode"], "NoCompatibleStream", "{info}");
+}
+
+#[tokio::test]
+async fn r3missing_counts_leave_virtual_items_out() {
+    let w = r3missing_world().await;
+    let series = w
+        .get(&format!("/Users/{}/Items/{}", w.owner_id, w.ids["series"]))
+        .await;
+    assert_eq!(series["ChildCount"], 1, "{series}");
+    assert_eq!(series["UserData"]["UnplayedItemCount"], 2, "{series}");
+    let season = w
+        .get(&format!("/Users/{}/Items/{}", w.owner_id, w.ids["season1"]))
+        .await;
+    assert_eq!(season["ChildCount"], 2, "{season}");
+}
+
+#[tokio::test]
+async fn r3missing_items_filters_for_virtual_items() {
+    let w = r3missing_world().await;
+    let base = format!(
+        "/Items?Recursive=true&IncludeItemTypes=Episode&ParentId={}&SortBy=PremiereDate&SortOrder=Ascending",
+        w.library
+    );
+    // A plain request leaves them in
+    assert_eq!(
+        w.keys(&w.get(&base).await),
+        vec!["s1e1", "s1e3", "s1e2", "s2e1"]
+    );
+    assert_eq!(
+        w.keys(&w.get(&format!("{base}&IsMissing=true")).await),
+        vec!["s1e2", "s2e1"]
+    );
+    assert_eq!(
+        w.keys(&w.get(&format!("{base}&IsMissing=false")).await),
+        vec!["s1e1", "s1e3"]
+    );
+    assert_eq!(
+        w.keys(&w.get(&format!("{base}&IsUnaired=true")).await),
+        vec!["s2e1"]
+    );
+    assert_eq!(
+        w.keys(&w.get(&format!("{base}&IsUnaired=false")).await),
+        vec!["s1e1", "s1e3", "s1e2"]
+    );
+    assert_eq!(
+        w.keys(&w.get(&format!("{base}&LocationTypes=Virtual")).await),
+        vec!["s1e2", "s2e1"]
+    );
+    assert_eq!(
+        w.keys(&w.get(&format!("{base}&LocationTypes=FileSystem")).await),
+        vec!["s1e1", "s1e3"]
+    );
+    assert_eq!(
+        w.keys(&w.get(&format!("{base}&ExcludeLocationTypes=Virtual")).await),
+        vec!["s1e1", "s1e3"]
+    );
+    // The total counts the same items
+    let total = w
+        .get(&format!("{base}&IsMissing=true&IsUnaired=true"))
+        .await;
+    assert_eq!(total["TotalRecordCount"], 1, "{total}");
+}
+
+#[tokio::test]
+async fn r3missing_latest_leaves_virtual_episodes_out() {
+    let w = r3missing_world().await;
+    let uri = format!(
+        "/Users/{}/Items/Latest?ParentId={}&GroupItems=false&IncludeItemTypes=Episode",
+        w.owner_id, w.library
+    );
+    let mut keys = w.keys(&w.get(&uri).await);
+    keys.sort();
+    assert_eq!(keys, vec!["s1e1", "s1e3"]);
+}
+
+#[tokio::test]
+async fn r3missing_upcoming_lists_virtual_unaired_episodes() {
+    let w = r3missing_world().await;
+    let uri = format!("/Shows/Upcoming?userId={}", w.owner_id);
+    assert_eq!(w.keys(&w.get(&uri).await), vec!["s2e1"]);
+}
+
 // GET /Shows/NextUp lists one episode per series the user has started: the first unplayed episode
 // after their highest played one, outside season 0. Series sort newest first by when that episode
 // was played, and StartIndex, Limit and TotalRecordCount count series (Jellyfin's
@@ -29373,6 +33025,305 @@ async fn g2_login_response_has_fresh_last_login_date() {
         "the first login response carries the updated LastLoginDate, got {:?}",
         json["User"]["LastLoginDate"]
     );
+}
+
+// ── R3 users 2: the sign-in page's user tiles and forgot password ──
+
+/// The `GET /Users/Public` answer of `app`, by name.
+async fn r3users2_public(
+    app: &axum::Router,
+) -> std::collections::HashMap<String, serde_json::Value> {
+    let (status, json) = send(app, request("GET", "/Users/Public", None, None)).await;
+    assert_eq!(status, StatusCode::OK, "{json}");
+    json.as_array()
+        .unwrap()
+        .iter()
+        .map(|u| (u["Name"].as_str().unwrap().to_string(), u.clone()))
+        .collect()
+}
+
+#[tokio::test]
+async fn r3users2_public_users_always_report_a_password() {
+    let state = test_state().await;
+    let app = app(state.clone());
+    assert_eq!(
+        post_startup_user(&app, None, "owner", "pw-owner").await,
+        StatusCode::NO_CONTENT
+    );
+    // A password set to the empty one, and no password hash at all (password sign-in off)
+    add_user(&state, "kid", "", false).await;
+    let sso = add_user(&state, "sso", "pw-sso", false).await;
+    sqlx::query("UPDATE users SET password_hash = '' WHERE id = ?")
+        .bind(sso.to_string())
+        .execute(&state.db)
+        .await
+        .unwrap();
+
+    // As in Jellyfin 12.4, HasPassword and HasConfiguredPassword are always true, on any network
+    for app in [app.clone(), remote_app(state.clone())] {
+        let users = r3users2_public(&app).await;
+        for name in ["owner", "kid", "sso"] {
+            assert_eq!(users[name]["HasPassword"], true, "{name}: {users:?}");
+            assert_eq!(users[name]["HasConfiguredPassword"], true, "{name}");
+        }
+        // Only what a tile needs: no policy, configuration or hash
+        assert!(users["owner"].get("Policy").is_none());
+        assert!(users["owner"].get("PasswordHash").is_none());
+    }
+
+    // An empty password still signs in, through the form the tile opens
+    assert!(login(&app, "kid", "").await.is_some());
+}
+
+#[tokio::test]
+async fn r3users2_public_users_outside_the_network_need_remote_access() {
+    let t = b103().await;
+    let (status, _) = t
+        .policy(
+            &t.owner,
+            &t.bob_id,
+            serde_json::json!({ "EnableRemoteAccess": false }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _) = t
+        .policy(&t.owner, &t.ada_id, serde_json::json!({ "IsHidden": true }))
+        .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let local = r3users2_public(&t.app).await;
+    assert!(
+        local.contains_key("bob"),
+        "a local client sees bob: {local:?}"
+    );
+    assert!(!local.contains_key("ada"), "a hidden user has no tile");
+
+    let remote_app = build_router(t.state.clone()).layer(MockConnectInfo(
+        "203.0.113.5:4000".parse::<SocketAddr>().unwrap(),
+    ));
+    let remote = r3users2_public(&remote_app).await;
+    assert!(remote.contains_key("karl"), "{remote:?}");
+    assert!(
+        !remote.contains_key("bob"),
+        "a user without remote access has no tile outside the network: {remote:?}"
+    );
+    assert!(!remote.contains_key("ada"));
+}
+
+#[tokio::test]
+async fn r3users2_forgot_password_answers_alike_and_writes_only_locally() {
+    let state = test_state().await;
+    let local_app = app(state.clone());
+    assert_eq!(
+        post_startup_user(&local_app, None, "owner", "pw-owner").await,
+        StatusCode::NO_CONTENT
+    );
+    let remote_app = build_router(state.clone()).layer(MockConnectInfo(
+        "203.0.113.5:4000".parse::<SocketAddr>().unwrap(),
+    ));
+    for name in ["owner", "ghost"] {
+        let (status, body) = send(
+            &remote_app,
+            request(
+                "POST",
+                "/Users/ForgotPassword",
+                None,
+                Some(serde_json::json!({ "EnteredUsername": name })),
+            ),
+        )
+        .await;
+        // As in Jellyfin 12.4: PinCode and the file's path for every name and every client
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["Action"], "PinCode", "{name}: {body}");
+        assert!(
+            body["PinFile"]
+                .as_str()
+                .is_some_and(|f| f.contains("passwordreset-"))
+        );
+        assert!(body["PinExpirationDate"].is_string());
+    }
+    let pin_files = std::fs::read_dir(&*state.data_dir)
+        .unwrap()
+        .filter_map(Result::ok)
+        .filter(|e| {
+            e.file_name()
+                .to_string_lossy()
+                .starts_with("passwordreset-")
+        })
+        .count();
+    assert_eq!(pin_files, 0, "a remote request writes no PIN file");
+
+    // On the local network the PIN file is written under the configured data dir, single use
+    let (_, body) = send(
+        &local_app,
+        request(
+            "POST",
+            "/Users/ForgotPassword",
+            None,
+            Some(serde_json::json!({ "EnteredUsername": "owner" })),
+        ),
+    )
+    .await;
+    assert_eq!(body["Action"], "PinCode", "{body}");
+    assert!(body["PinExpirationDate"].is_string());
+    let path = std::path::PathBuf::from(body["PinFile"].as_str().unwrap());
+    assert!(path.starts_with(&*state.data_dir), "{path:?}");
+    let pin = await_reset_pin(&path).await.expect("a PIN file");
+    let redeem = |pin: String| {
+        request(
+            "POST",
+            "/Users/ForgotPassword/Pin",
+            None,
+            Some(serde_json::json!({ "Pin": pin })),
+        )
+    };
+    let (status, body) = send(&local_app, redeem(pin.clone())).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["UsersReset"][0], "owner");
+    assert!(!path.exists(), "the redeem removes the PIN file");
+    let (status, _) = send(&local_app, redeem(pin.clone())).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "a PIN is single use");
+    assert!(login(&local_app, "owner", &pin).await.is_some());
+
+    // As in Jellyfin 12.4, a PIN typed without its dashes matches too
+    let (_, body) = send(
+        &local_app,
+        request(
+            "POST",
+            "/Users/ForgotPassword",
+            None,
+            Some(serde_json::json!({ "EnteredUsername": "owner" })),
+        ),
+    )
+    .await;
+    let path = std::path::PathBuf::from(body["PinFile"].as_str().unwrap());
+    let pin = await_reset_pin(&path).await.expect("a second PIN file");
+    let typed = pin.replace('-', "").to_lowercase();
+    let (status, body) = send(&local_app, redeem(typed.clone())).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(
+        login(&local_app, "owner", &typed.to_uppercase())
+            .await
+            .is_some()
+    );
+}
+
+/// A labelled remote client: its router and the headers it sends.
+type R3users2RemoteClient = (
+    &'static str,
+    axum::Router,
+    Vec<(&'static str, &'static str)>,
+);
+
+/// The ways a client outside the local network reaches the reset routes: a public peer, a public
+/// peer claiming a local address in X-Forwarded-For, and a local peer that isn't a listed proxy
+/// passing on a public address.
+fn r3users2_remote_clients(state: &AppState) -> Vec<R3users2RemoteClient> {
+    let public = || {
+        build_router(state.clone()).layer(MockConnectInfo(
+            "203.0.113.5:4000".parse::<SocketAddr>().unwrap(),
+        ))
+    };
+    vec![
+        ("public peer", public(), vec![]),
+        (
+            "spoofed local XFF",
+            public(),
+            vec![("X-Forwarded-For", "127.0.0.1")],
+        ),
+        (
+            "unlisted proxy",
+            app(state.clone()),
+            vec![("X-Forwarded-For", "203.0.113.9")],
+        ),
+    ]
+}
+
+fn r3users2_post(uri: &str, headers: &[(&str, &str)], body: serde_json::Value) -> Request<Body> {
+    let mut b = Request::builder()
+        .method("POST")
+        .uri(uri)
+        .header("Content-Type", "application/json");
+    for (name, value) in headers {
+        b = b.header(*name, *value);
+    }
+    b.body(Body::from(body.to_string())).unwrap()
+}
+
+#[tokio::test]
+async fn r3users2_reset_routes_try_no_pin_outside_the_network() {
+    let state = test_state().await;
+    let local_app = app(state.clone());
+    assert_eq!(
+        post_startup_user(&local_app, None, "owner", "pw-owner").await,
+        StatusCode::NO_CONTENT
+    );
+    let (_, body) = send(
+        &local_app,
+        request(
+            "POST",
+            "/Users/ForgotPassword",
+            None,
+            Some(serde_json::json!({ "EnteredUsername": "owner" })),
+        ),
+    )
+    .await;
+    let path = std::path::PathBuf::from(body["PinFile"].as_str().unwrap());
+    let pin = await_reset_pin(&path).await.expect("a PIN file");
+
+    for (label, remote, headers) in r3users2_remote_clients(&state) {
+        // More wrong guesses than the attempt limit, and the real PIN too: none is tried
+        for guess in [
+            "00-00-00-00",
+            "11-11-11-11",
+            "22-22-22-22",
+            "33-33-33-33",
+            "44-44-44-44",
+            "55-55-55-55",
+            pin.as_str(),
+        ] {
+            let (status, body) = send(
+                &remote,
+                r3users2_post(
+                    "/Users/ForgotPassword/Pin",
+                    &headers,
+                    serde_json::json!({ "Pin": guess }),
+                ),
+            )
+            .await;
+            // The answer of a PIN that matches nothing
+            assert_eq!(status, StatusCode::NOT_FOUND, "{label}: {body}");
+
+            let (status, body) = send(
+                &remote,
+                r3users2_post(
+                    "/Users/ResetPassword",
+                    &headers,
+                    serde_json::json!({ "Username": "owner", "Pin": guess, "TempPassword": "x" }),
+                ),
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{label}: {body}");
+        }
+    }
+    assert!(
+        login(&local_app, "owner", "pw-owner").await.is_some(),
+        "no remote request changed the password"
+    );
+
+    // Nothing from outside spent the attempt limit or voided the reset: the PIN still works locally
+    let (status, body) = send(
+        &local_app,
+        request(
+            "POST",
+            "/Users/ForgotPassword/Pin",
+            None,
+            Some(serde_json::json!({ "Pin": pin })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["UsersReset"][0], "owner");
 }
 
 // ── G2: reset PIN (R1-01, M-17) ──
@@ -35624,6 +39575,13 @@ fn r3parental_web_user_editor() {
     b124_node_test("r3parental_user_editor.mjs");
 }
 
+// The dashboard's DLNA tab: the switch and the DLNA user, saved into the whole configuration
+// (tests/web/r3parental_dlna_admin.mjs).
+#[test]
+fn r3parental_web_dlna_admin() {
+    b124_node_test("r3parental_dlna_admin.mjs");
+}
+
 // ── B18: one scan per run, and Scan all's order ──
 // A manual scan of a library that Scan all has queued but not reached runs at once, and Scan all
 // leaves that library to it, so its ring follows one scan and one Completed comes after the 100.
@@ -40170,6 +44128,188 @@ async fn r3settings_playback_info_follows_remember_flags() {
 
     configure(serde_json::json!({})).await;
     assert_eq!(b20_only_defaults(&app, &token, item).await, b20_both(2, 4));
+}
+
+// R3 player preferences: as in Jellyfin's MediaSourceManager, a remembered subtitle is not the
+// default while the user's SubtitleMode is None; the remembered audio still is.
+#[tokio::test]
+async fn r3prefs_remembered_subtitle_skipped_when_subtitle_mode_none() {
+    let state = test_state().await;
+    let _dir = G1cDataDir(state.data_dir.to_path_buf());
+    let app = app(state.clone());
+    let (token, user) = admin_session(&state).await;
+    let item = b20_movie(&state, "R3 Prefs None", b20_full_streams()).await;
+    let body = serde_json::json!({
+        "ItemId": item, "PositionTicks": 0, "AudioStreamIndex": 2, "SubtitleStreamIndex": 4,
+    });
+    b20_report(&app, &token, "/Progress", body).await;
+    let uri = format!("/Users/{user}/Configuration");
+    let config = serde_json::json!({ "SubtitleMode": "None" });
+    let req = request("POST", &uri, Some(&token), Some(config));
+    assert!(send(&app, req).await.0.is_success());
+
+    let (audio, subtitle) = b20_only_defaults(&app, &token, item).await;
+    assert_eq!(audio, Some(serde_json::json!(2)));
+    assert_ne!(subtitle, Some(serde_json::json!(4)));
+}
+
+// R3 player preferences: POST /Items/{id}/PlaybackInfo, which Jellyfin apps call, plays the
+// remembered tracks whether or not the request names the source (they are the source's defaults,
+// as in Jellyfin), while a requested index counts only with the source's MediaSourceId.
+#[tokio::test]
+async fn r3prefs_post_playback_info_plays_remembered_and_requested_audio() {
+    let state = test_state().await;
+    let _dir = G1cDataDir(state.data_dir.to_path_buf());
+    let app = app(state.clone());
+    let (token, _) = admin_session(&state).await;
+    let streams = serde_json::json!([
+        { "Index": 0, "Codec": "h264", "CodecType": "Video" },
+        { "Index": 1, "Codec": "aac", "CodecType": "Audio", "Language": "eng", "IsDefault": true },
+        { "Index": 2, "Codec": "aac", "CodecType": "Audio", "Language": "ger" },
+        { "Index": 3, "Codec": "subrip", "CodecType": "Subtitle", "Language": "eng" },
+        { "Index": 4, "Codec": "subrip", "CodecType": "Subtitle", "Language": "ger" },
+    ]);
+    let item = b20_movie(&state, "R3 Prefs Post", streams).await;
+    let profile = serde_json::json!({
+        "DirectPlayProfiles": [{ "Container": "mkv", "Type": "Video", "VideoCodec": "h264", "AudioCodec": "aac" }],
+        "TranscodingProfiles": [{ "Container": "ts", "Type": "Video", "VideoCodec": "h264", "AudioCodec": "aac", "Protocol": "hls" }],
+        "SubtitleProfiles": [{ "Format": "srt", "Method": "External" }],
+    });
+    let post = |body: serde_json::Value| {
+        let req = request(
+            "POST",
+            &format!("/Items/{item}/PlaybackInfo"),
+            Some(&token),
+            Some(body),
+        );
+        let app = app.clone();
+        async move {
+            let (status, body) = send(&app, req).await;
+            assert!(status.is_success(), "{body}");
+            let source = &body["MediaSources"][0];
+            (
+                source["DefaultAudioStreamIndex"].clone(),
+                source["DefaultSubtitleStreamIndex"].clone(),
+            )
+        }
+    };
+    let unnamed =
+        post(serde_json::json!({ "DeviceProfile": profile, "AudioStreamIndex": 2 })).await;
+    assert_eq!(unnamed.0, serde_json::json!(1));
+    let req = request(
+        "GET",
+        &format!("/Items/{item}/PlaybackInfo"),
+        Some(&token),
+        None,
+    );
+    let source_id = send(&app, req).await.1["MediaSources"][0]["Id"].clone();
+    let named = serde_json::json!({ "DeviceProfile": profile, "AudioStreamIndex": 2, "MediaSourceId": source_id });
+    assert_eq!(post(named).await.0, serde_json::json!(2));
+
+    let body = serde_json::json!({
+        "ItemId": item, "PositionTicks": 0, "AudioStreamIndex": 2, "SubtitleStreamIndex": 4,
+    });
+    b20_report(&app, &token, "/Progress", body).await;
+    let remembered = post(serde_json::json!({ "DeviceProfile": profile })).await;
+    assert_eq!(remembered, (serde_json::json!(2), serde_json::json!(4)));
+}
+
+/// The `(DefaultAudioStreamIndex, DefaultSubtitleStreamIndex)` of POST /Items/{id}/PlaybackInfo
+/// with a device that takes H.264/AAC in MKV and `subrip` subtitles as external files, naming no
+/// MediaSourceId.
+async fn r3prefs_post_defaults(
+    app: &axum::Router,
+    token: &str,
+    item: uuid::Uuid,
+) -> (serde_json::Value, serde_json::Value) {
+    let body = serde_json::json!({ "DeviceProfile": {
+        "DirectPlayProfiles": [{ "Container": "mkv", "Type": "Video", "VideoCodec": "h264", "AudioCodec": "aac" }],
+        "SubtitleProfiles": [{ "Format": "subrip", "Method": "External" }],
+    } });
+    let req = request(
+        "POST",
+        &format!("/Items/{item}/PlaybackInfo"),
+        Some(token),
+        Some(body),
+    );
+    let (status, body) = send(app, req).await;
+    assert!(status.is_success(), "{body}");
+    let source = &body["MediaSources"][0];
+    (
+        source["DefaultAudioStreamIndex"].clone(),
+        source["DefaultSubtitleStreamIndex"].clone(),
+    )
+}
+
+// R3 player preferences: subtitles the user turned off stay off in POST PlaybackInfo when two
+// subtitles tie on Jellyfin's score and the device takes them as external files. As in Jellyfin,
+// a remembered subtitle is not scored, so the builder's tie-break can't pick one.
+#[tokio::test]
+async fn r3prefs_post_playback_info_keeps_remembered_subtitles_off_on_a_tie() {
+    let state = test_state().await;
+    let _dir = G1cDataDir(state.data_dir.to_path_buf());
+    let app = app(state.clone());
+    let (token, _) = admin_session(&state).await;
+    let streams = serde_json::json!([
+        { "Index": 0, "Codec": "h264", "CodecType": "Video" },
+        { "Index": 1, "Codec": "aac", "CodecType": "Audio", "Language": "eng", "IsDefault": true },
+        { "Index": 2, "Codec": "subrip", "CodecType": "Subtitle", "Language": "eng", "IsDefault": true },
+        { "Index": 3, "Codec": "subrip", "CodecType": "Subtitle", "Language": "eng", "IsDefault": true },
+    ]);
+    let item = b20_movie(&state, "R3 Prefs Tie", streams).await;
+    assert_eq!(
+        r3prefs_post_defaults(&app, &token, item).await.1,
+        serde_json::json!(2)
+    );
+
+    let body = serde_json::json!({
+        "ItemId": item, "PositionTicks": 0, "AudioStreamIndex": 1, "SubtitleStreamIndex": -1,
+    });
+    b20_report(&app, &token, "/Progress", body).await;
+    assert_eq!(
+        r3prefs_post_defaults(&app, &token, item).await.1,
+        serde_json::json!(-1)
+    );
+    let body = serde_json::json!({
+        "ItemId": item, "PositionTicks": 0, "AudioStreamIndex": 1, "SubtitleStreamIndex": 3,
+    });
+    b20_report(&app, &token, "/Progress", body).await;
+    assert_eq!(
+        r3prefs_post_defaults(&app, &token, item).await.1,
+        serde_json::json!(3)
+    );
+}
+
+// R3 player preferences: under SubtitleMode OnlyForced a remembered full subtitle is still the
+// default, in GET /Videos/{id}/PlaybackInfo and POST /Items/{id}/PlaybackInfo alike, as Jellyfin's
+// SetDefaultSubtitleStreamIndex skips a remembered subtitle only under None.
+#[tokio::test]
+async fn r3prefs_remembered_subtitle_kept_under_only_forced() {
+    let state = test_state().await;
+    let _dir = G1cDataDir(state.data_dir.to_path_buf());
+    let app = app(state.clone());
+    let (token, user) = admin_session(&state).await;
+    let streams = serde_json::json!([
+        { "Index": 0, "Codec": "h264", "CodecType": "Video" },
+        { "Index": 1, "Codec": "aac", "CodecType": "Audio", "Language": "eng", "IsDefault": true },
+        { "Index": 2, "Codec": "subrip", "CodecType": "Subtitle", "Language": "eng", "IsForced": true },
+        { "Index": 3, "Codec": "subrip", "CodecType": "Subtitle", "Language": "eng" },
+    ]);
+    let item = b20_movie(&state, "R3 Prefs Forced", streams).await;
+    let body = serde_json::json!({
+        "ItemId": item, "PositionTicks": 0, "AudioStreamIndex": 1, "SubtitleStreamIndex": 3,
+    });
+    b20_report(&app, &token, "/Progress", body).await;
+    let uri = format!("/Users/{user}/Configuration");
+    let config = serde_json::json!({ "SubtitleMode": "OnlyForced" });
+    let req = request("POST", &uri, Some(&token), Some(config));
+    assert!(send(&app, req).await.0.is_success());
+
+    assert_eq!(b20_only_defaults(&app, &token, item).await, b20_both(1, 3));
+    assert_eq!(
+        r3prefs_post_defaults(&app, &token, item).await.1,
+        serde_json::json!(3)
+    );
 }
 
 #[tokio::test]
@@ -45860,8 +50000,14 @@ fn j2_ids(sources: &[serde_json::Value]) -> Vec<String> {
         .collect()
 }
 
-/// Checks that `source` is as stored: every Supports flag true and no device data.
+/// Checks that `source` is as stored: every Supports flag true and no device data. Its
+/// `TranscodingSubProtocol` is Jellyfin 12.4's default, `http`: a non-null enum it always sends
+/// (MediaSourceInfo), which its SDK clients require.
 fn j2_assert_stored(source: &serde_json::Value, what: &str) {
+    assert_eq!(
+        source["TranscodingSubProtocol"], "http",
+        "{what}: TranscodingSubProtocol"
+    );
     for flag in [
         "SupportsDirectPlay",
         "SupportsDirectStream",
@@ -45871,7 +50017,6 @@ fn j2_assert_stored(source: &serde_json::Value, what: &str) {
     }
     for key in [
         "TranscodingUrl",
-        "TranscodingSubProtocol",
         "TranscodingContainer",
         "TranscodeReasons",
         "DefaultAudioStreamIndex",
@@ -48360,4 +52505,3538 @@ async fn r3admin_restart_stops_with_the_restart_exit_code() {
 #[test]
 fn r3admin_web_dashboard() {
     b124_node_test("r3admin_dashboard.mjs");
+}
+
+// ---- r3items: /Items Ids and ExcludeItemIds, /Localization/Options ----
+
+/// The names of a `/Items`-style answer, in order, and its TotalRecordCount. Panics unless 200.
+async fn r3items_names(app: &axum::Router, uri: &str, token: &str) -> (Vec<String>, i64) {
+    let (status, body) = send_authed(app, "GET", uri, token, None).await;
+    assert_eq!(status, StatusCode::OK, "{uri}: {body}");
+    let names = body["Items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|item| item["Name"].as_str().unwrap().to_string())
+        .collect();
+    (names, body["TotalRecordCount"].as_i64().unwrap())
+}
+
+/// A library of four movies, Alpha to Delta, and their ids in that order.
+async fn r3items_movies(state: &AppState) -> (uuid::Uuid, Vec<uuid::Uuid>) {
+    let lib = j6_library(state, "R3 Items").await;
+    let mut ids = Vec::new();
+    for name in ["Alpha", "Bravo", "Charlie", "Delta"] {
+        ids.push(j6_add_item(state, lib, None, name, "Movie").await);
+    }
+    // Sort names as a scan stores them, so name orders don't fall back to the random ids.
+    r3items_sql(
+        state,
+        &format!("UPDATE media_items SET sort_name = lower(name) WHERE library_id = '{lib}'"),
+    )
+    .await;
+    (lib, ids)
+}
+
+#[tokio::test]
+async fn r3items_ids_list_those_items_in_their_order() {
+    let state = test_state().await;
+    let (lib, ids) = r3items_movies(&state).await;
+    let show = j6_add_item(&state, lib, None, "Show", "Series").await;
+    let other = j6_library(&state, "R3 Items Other").await;
+    let (token, user) = admin_session(&state).await;
+    let app = app(state);
+    let (a, b, c) = (ids[0], ids[1], ids[2]);
+    // Dashed and dashless ids, an unknown one skipped, the order of Ids kept without SortBy.
+    let list = format!("{c},{},{},{b}", a.simple(), uuid::Uuid::new_v4());
+    for uri in [
+        format!("/Items?Ids={list}"),
+        format!("/Users/{user}/Items?ids={list}"),
+    ] {
+        let (names, total) = r3items_names(&app, &uri, &token).await;
+        assert_eq!(names, ["Charlie", "Alpha", "Bravo"], "{uri}");
+        assert_eq!(total, 3, "{uri}");
+    }
+    // Paging follows the order of Ids; SortBy wins over it.
+    let (names, total) = r3items_names(
+        &app,
+        &format!("/Items?Ids={list}&StartIndex=1&Limit=1"),
+        &token,
+    )
+    .await;
+    assert_eq!((names, total), (vec!["Alpha".to_string()], 3));
+    let (names, _) =
+        r3items_names(&app, &format!("/Items?Ids={list}&SortBy=SortName"), &token).await;
+    assert_eq!(names, ["Alpha", "Bravo", "Charlie"]);
+    // Other filters still apply: the types, and a ParentId the items aren't under.
+    let (names, total) = r3items_names(
+        &app,
+        &format!("/Items?Ids={a},{show}&IncludeItemTypes=Movie"),
+        &token,
+    )
+    .await;
+    assert_eq!((names, total), (vec!["Alpha".to_string()], 1));
+    let (names, total) = r3items_names(&app, &format!("/Items?Ids={show},{a}"), &token).await;
+    assert_eq!((names, total), (vec!["Show".into(), "Alpha".into()], 2));
+    let (names, total) = r3items_names(
+        &app,
+        &format!("/Items?Ids={a}&ParentId={other}&Recursive=true"),
+        &token,
+    )
+    .await;
+    assert_eq!((names.len(), total), (0, 0));
+    // Ids of no item at all: nothing, not every item.
+    let (names, total) = r3items_names(
+        &app,
+        &format!("/Items?Ids={}", uuid::Uuid::new_v4()),
+        &token,
+    )
+    .await;
+    assert_eq!((names.len(), total), (0, 0));
+}
+
+#[tokio::test]
+async fn r3items_exclude_item_ids_drops_those_items() {
+    let state = test_state().await;
+    let (lib, ids) = r3items_movies(&state).await;
+    let (token, _) = admin_session(&state).await;
+    let app = app(state);
+    let uri = format!(
+        "/Items?ParentId={lib}&Recursive=true&ExcludeItemIds={},{}",
+        ids[1].simple(),
+        ids[3]
+    );
+    let (names, total) = r3items_names(&app, &uri, &token).await;
+    assert_eq!((names, total), (vec!["Alpha".into(), "Charlie".into()], 2));
+    let uri = format!("/Items?Ids={},{}&excludeItemIds={}", ids[2], ids[0], ids[2]);
+    let (names, total) = r3items_names(&app, &uri, &token).await;
+    assert_eq!((names, total), (vec!["Alpha".to_string()], 1));
+}
+
+#[tokio::test]
+async fn r3items_ids_keep_the_callers_limits() {
+    let state = test_state().await;
+    let (_, ids) = r3items_movies(&state).await;
+    let other = j6_library(&state, "R3 Items Other").await;
+    let echo = j6_add_item(&state, other, None, "Echo", "Movie").await;
+    sqlx::query("UPDATE media_items SET official_rating = CASE name WHEN 'Bravo' THEN 'R' ELSE 'PG' END WHERE media_type = 'Movie'")
+        .execute(&state.db)
+        .await
+        .unwrap();
+    let app = app(state.clone());
+    let (admin, _) = admin_session(&state).await;
+    let kid = add_user(&state, "r3items-kid", "r3items-pass", false).await;
+    let (_, user) = send_authed(&app, "GET", &format!("/Users/{kid}"), &admin, None).await;
+    let mut policy = user["Policy"].clone();
+    policy["MaxParentalRating"] = 10.into();
+    policy["EnableAllFolders"] = false.into();
+    let movies = r3items_library_of(&state, ids[0]).await;
+    policy["EnabledFolders"] = serde_json::json!([movies]);
+    let (status, _) = send_authed(
+        &app,
+        "POST",
+        &format!("/Users/{kid}/Policy"),
+        &admin,
+        Some(&policy.to_string()),
+    )
+    .await;
+    assert!(status.is_success(), "{status}");
+    let (token, _) = login(&app, "r3items-kid", "r3items-pass").await.unwrap();
+    // Bravo is rated above the limit and Echo is in a library the user can't see.
+    let uri = format!("/Items?Ids={},{echo},{},{}", ids[2], ids[1], ids[0]);
+    let (names, total) = r3items_names(&app, &uri, &token).await;
+    assert_eq!((names, total), (vec!["Charlie".into(), "Alpha".into()], 2));
+    let (names, _) = r3items_names(&app, &uri, &admin).await;
+    assert_eq!(names, ["Charlie", "Echo", "Bravo", "Alpha"]);
+}
+
+/// Creates a collection (by query) or a playlist (by body) of `items` as `token`; its id.
+async fn r3items_container(
+    app: &axum::Router,
+    token: &str,
+    playlist: bool,
+    name: &str,
+    items: &[uuid::Uuid],
+) -> String {
+    let ids: Vec<String> = items.iter().map(uuid::Uuid::to_string).collect();
+    let (status, body) = if playlist {
+        let body = serde_json::json!({ "Name": name, "Ids": ids });
+        send_authed(app, "POST", "/Playlists", token, Some(&body.to_string())).await
+    } else {
+        let uri = format!("/Collections?Name={name}&Ids={}", ids.join(","));
+        send_authed(app, "POST", &uri, token, None).await
+    };
+    assert!(status.is_success(), "{status} {body}");
+    body["Id"].as_str().unwrap().to_string()
+}
+
+#[tokio::test]
+async fn r3items_ids_list_collections_and_playlists_with_media() {
+    let state = test_state().await;
+    let (_, ids) = r3items_movies(&state).await;
+    let (admin, _) = admin_session(&state).await;
+    add_user(&state, "r3items-other", "r3items-pass", false).await;
+    let app = app(state);
+    let (other, _) = login(&app, "r3items-other", "r3items-pass").await.unwrap();
+    let set = r3items_container(&app, &admin, false, "Set", &[ids[0], ids[1]]).await;
+    let list = r3items_container(&app, &admin, true, "List", &[ids[2]]).await;
+    let c = ids[2];
+    let uri = format!("/Items?Ids={list},{c},{}", set.replace('-', ""));
+    let (status, body) = send_authed(&app, "GET", &uri, &admin, None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let kinds: Vec<(&str, &str)> = body["Items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|i| (i["Name"].as_str().unwrap(), i["Type"].as_str().unwrap()))
+        .collect();
+    assert_eq!(
+        kinds,
+        [
+            ("List", "Playlist"),
+            ("Charlie", "Movie"),
+            ("Set", "BoxSet")
+        ]
+    );
+    assert_eq!(body["TotalRecordCount"], 3);
+    let (names, total) = r3items_names(&app, &format!("{uri}&StartIndex=1&Limit=1"), &admin).await;
+    assert_eq!((names, total), (vec!["Charlie".to_string()], 3));
+    // The types and ExcludeItemIds apply to them too.
+    let (names, total) = r3items_names(
+        &app,
+        &format!("{uri}&IncludeItemTypes=Movie,BoxSet"),
+        &admin,
+    )
+    .await;
+    assert_eq!((names, total), (vec!["Charlie".into(), "Set".into()], 2));
+    let (names, total) = r3items_names(&app, &format!("{uri}&ExcludeItemIds={set}"), &admin).await;
+    assert_eq!((names, total), (vec!["List".into(), "Charlie".into()], 2));
+    // A playlist the caller can't reach is skipped.
+    let (names, total) = r3items_names(&app, &uri, &other).await;
+    assert_eq!((names, total), (vec!["Charlie".into(), "Set".into()], 2));
+}
+
+#[tokio::test]
+async fn r3items_ids_narrow_collection_and_playlist_listings() {
+    let state = test_state().await;
+    let (_, ids) = r3items_movies(&state).await;
+    let (admin, _) = admin_session(&state).await;
+    let app = app(state);
+    let one = r3items_container(&app, &admin, false, "One", &[ids[0]]).await;
+    r3items_container(&app, &admin, false, "Two", &[ids[1]]).await;
+    let three = r3items_container(&app, &admin, false, "Three", &[ids[2]]).await;
+    // IncludeItemTypes=BoxSet lists only the collections asked for, in the order of Ids.
+    let base = "/Items?IncludeItemTypes=BoxSet&Recursive=true";
+    let (names, total) = r3items_names(&app, &format!("{base}&Ids={three},{one}"), &admin).await;
+    assert_eq!((names, total), (vec!["Three".into(), "One".into()], 2));
+    let (names, total) = r3items_names(&app, &format!("{base}&ExcludeItemIds={one}"), &admin).await;
+    assert_eq!((names, total), (vec!["Three".into(), "Two".into()], 2));
+    // A playlist as ParentId: only its entries asked for, in the order of Ids, then paged.
+    let list = r3items_container(&app, &admin, true, "List", &ids).await;
+    let (a, c, d) = (ids[0], ids[2], ids[3]);
+    let uri = format!("/Items?ParentId={list}&Ids={d},{a},{c}");
+    let (names, total) = r3items_names(&app, &uri, &admin).await;
+    assert_eq!(
+        (names, total),
+        (vec!["Delta".into(), "Alpha".into(), "Charlie".into()], 3)
+    );
+    let (names, total) = r3items_names(&app, &format!("{uri}&StartIndex=2&Limit=5"), &admin).await;
+    assert_eq!((names, total), (vec!["Charlie".to_string()], 3));
+    let uri = format!("/Items?ParentId={list}&ExcludeItemIds={a},{c}");
+    let (names, total) = r3items_names(&app, &uri, &admin).await;
+    assert_eq!((names, total), (vec!["Bravo".into(), "Delta".into()], 2));
+}
+
+/// The stored library id of an item.
+async fn r3items_library_of(state: &AppState, item: uuid::Uuid) -> String {
+    sqlx::query_scalar("SELECT library_id FROM media_items WHERE id = ?")
+        .bind(item.to_string())
+        .fetch_one(&state.db)
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn r3items_localization_options_are_jellyfins_name_value_list() {
+    let state = test_state().await;
+    let (token, _) = admin_session(&state).await;
+    let app = app(state);
+    let (status, body) = send_authed(&app, "GET", "/Localization/Options", &token, None).await;
+    assert_eq!(status, StatusCode::OK);
+    let options = body.as_array().expect("a list");
+    assert!(options.len() > 60, "{}", options.len());
+    assert!(options.iter().all(|o| o.as_object().unwrap().len() == 2
+        && o["Name"].is_string()
+        && o["Value"].is_string()));
+    assert!(options.contains(&serde_json::json!({ "Name": "English", "Value": "en-US" })));
+    assert!(options.contains(&serde_json::json!({ "Name": "Deutsch", "Value": "de" })));
+    // Cultures, countries and ratings keep Jellyfin's shapes.
+    let (_, cultures) = send_authed(&app, "GET", "/Localization/Cultures", &token, None).await;
+    let german = cultures
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["TwoLetterISOLanguageName"] == "de")
+        .unwrap();
+    assert_eq!(
+        german["ThreeLetterISOLanguageNames"],
+        serde_json::json!(["deu", "ger"])
+    );
+    assert!(german["Name"].is_string() && german["DisplayName"].is_string());
+    let (_, countries) = send_authed(&app, "GET", "/Localization/Countries", &token, None).await;
+    let us = countries
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["Name"] == "US")
+        .unwrap();
+    assert_eq!(us["TwoLetterISORegionName"], "US");
+    assert_eq!(us["ThreeLetterISORegionName"], "USA");
+    let (_, ratings) =
+        send_authed(&app, "GET", "/Localization/ParentalRatings", &token, None).await;
+    let first = &ratings.as_array().unwrap()[0];
+    assert!(
+        first["Name"].is_string() && first.get("Value").is_some(),
+        "{first}"
+    );
+}
+
+/// The items of the `/Items` filter tests, by made-up name.
+struct R3ItemsLibrary {
+    library: uuid::Uuid,
+    ids: std::collections::HashMap<&'static str, uuid::Uuid>,
+    /// People: Pat Doe (actor), Band and Guest (artists).
+    pat: uuid::Uuid,
+    band_person: uuid::Uuid,
+    guest: uuid::Uuid,
+}
+
+impl R3ItemsLibrary {
+    fn id(&self, name: &str) -> uuid::Uuid {
+        self.ids[name]
+    }
+}
+
+async fn r3items_sql(state: &AppState, sql: &str) {
+    sqlx::query(sqlx::AssertSqlSafe(sql.to_string()))
+        .execute(&state.db)
+        .await
+        .unwrap_or_else(|e| panic!("{sql}: {e}"));
+}
+
+/// Movies Alpha (HD, rated PG-13, tagged Kids, with a TMDb and an IMDb id, an overview, a
+/// subtitle, a Primary picture, studio Acme Pictures and actor Pat Doe; locked), Bravo (4K, rated
+/// R, tagged Sports and Drama, premiering in 2030) and Charlie (SD, unrated); series Show (tagged
+/// News, a TVDb id) with season 1 and its episodes 1 to 3 (the third virtual); and album Record
+/// by Band, with tracks Song One (Band) and Song Two (Guest), and a MusicArtist item Band.
+async fn r3items_library(state: &AppState) -> R3ItemsLibrary {
+    let lib = j6_library(state, "R3 Filters").await;
+    let mut ids = std::collections::HashMap::new();
+    for name in ["Alpha", "Bravo", "Charlie"] {
+        ids.insert(name, j6_add_item(state, lib, None, name, "Movie").await);
+    }
+    let show = j6_add_item(state, lib, None, "Show", "Series").await;
+    let season = j6_add_item(state, lib, Some(show), "Season 1", "Season").await;
+    ids.insert("Show", show);
+    ids.insert("Season 1", season);
+    for (n, name) in [(1, "Episode 1"), (2, "Episode 2"), (3, "Episode 3")] {
+        let id = j6_add_item(state, lib, Some(season), name, "Episode").await;
+        r3items_sql(state, &format!("UPDATE media_items SET index_number = {n}, parent_index_number = 1 WHERE id = '{id}'")).await;
+        ids.insert(name, id);
+    }
+    let band = j6_add_item(state, lib, None, "Band", "MusicArtist").await;
+    let record = j6_add_item(state, lib, Some(band), "Record", "MusicAlbum").await;
+    let one = j6_add_item(state, lib, Some(record), "Song One", "Audio").await;
+    let two = j6_add_item(state, lib, Some(record), "Song Two", "Audio").await;
+    for (name, id) in [
+        ("Band", band),
+        ("Record", record),
+        ("Song One", one),
+        ("Song Two", two),
+    ] {
+        ids.insert(name, id);
+    }
+    let (a, b, c) = (ids["Alpha"], ids["Bravo"], ids["Charlie"]);
+    let e3 = ids["Episode 3"];
+    let (pat, band_person, guest) = (
+        uuid::Uuid::new_v4(),
+        uuid::Uuid::new_v4(),
+        uuid::Uuid::new_v4(),
+    );
+    let studio = uuid::Uuid::new_v4();
+    for sql in [
+        format!(
+            "UPDATE media_items SET tmdb_id = 11, overview = 'An overview', community_rating = 8.1, premiere_date = '2001-05-01T00:00:00Z', official_rating = 'PG-13', tags = 'Kids' WHERE id = '{a}'"
+        ),
+        format!(
+            "UPDATE media_items SET community_rating = 5.0, premiere_date = '2030-01-01T00:00:00Z', official_rating = 'R', tags = 'Sports|Drama' WHERE id = '{b}'"
+        ),
+        format!(
+            "UPDATE media_items SET overview = '', premiere_date = '1990-01-01T00:00:00Z' WHERE id = '{c}'"
+        ),
+        format!("UPDATE media_items SET tags = 'News', tvdb_id = 22 WHERE id = '{show}'"),
+        format!(
+            "UPDATE media_items SET location_type = 'Virtual', is_virtual_item = 1 WHERE id = '{e3}'"
+        ),
+        format!(
+            "INSERT INTO item_metadata_extras (item_id, imdb_id, lock_data) VALUES ('{a}', 'tt0000001', 1)"
+        ),
+        format!(
+            "INSERT INTO item_images (item_id, image_type, image_index, path) VALUES ('{a}', 'Primary', 0, '/nowhere/a.jpg')"
+        ),
+        format!("INSERT INTO studios (id, name) VALUES ('{studio}', 'Acme Pictures')"),
+        format!("INSERT INTO item_studios (item_id, studio_id) VALUES ('{a}', '{studio}')"),
+        format!(
+            "INSERT INTO people (id, name) VALUES ('{pat}', 'Pat Doe'), ('{band_person}', 'Band'), ('{guest}', 'Guest')"
+        ),
+        format!(
+            "INSERT INTO item_people (item_id, person_id, type) VALUES ('{a}', '{pat}', 'Actor'), ('{one}', '{band_person}', 'Artist'), ('{record}', '{band_person}', 'AlbumArtist'), ('{two}', '{guest}', 'Artist')"
+        ),
+    ] {
+        r3items_sql(state, &sql).await;
+    }
+    // Sources: Alpha 1920x1080 with a subtitle, Bravo 3840x2160, Charlie 640x480 (on its stream).
+    for (item, width, height) in [
+        (a, "1920", "1080"),
+        (b, "3840", "2160"),
+        (c, "NULL", "NULL"),
+    ] {
+        let source = uuid::Uuid::new_v4();
+        r3items_sql(state, &format!("INSERT INTO media_sources (id, item_id, uid, path, width, height) VALUES ('{source}', '{item}', '{source}', '/nowhere/{item}.mkv', {width}, {height})")).await;
+        if item == c {
+            r3items_sql(state, &format!("INSERT INTO media_streams (id, source_id, codec_type, stream_index, width, height) VALUES ('{}', '{source}', 'Video', 0, 640, 480)", uuid::Uuid::new_v4())).await;
+        }
+        if item == a {
+            r3items_sql(state, &format!("INSERT INTO media_streams (id, source_id, codec_type, stream_index, language) VALUES ('{}', '{source}', 'Subtitle', 2, 'eng')", uuid::Uuid::new_v4())).await;
+        }
+    }
+    // Sort names as a scan stores them, so name orders don't fall back to the random ids.
+    r3items_sql(
+        state,
+        &format!("UPDATE media_items SET sort_name = lower(name) WHERE library_id = '{lib}'"),
+    )
+    .await;
+    R3ItemsLibrary {
+        library: lib,
+        ids,
+        pat,
+        band_person,
+        guest,
+    }
+}
+
+/// The sorted names that `/Items?<params>` lists, every item type unless the params name some.
+async fn r3items_found(app: &axum::Router, token: &str, params: &str) -> Vec<String> {
+    let uri = format!("/Items?Recursive=true&{params}");
+    let (mut names, total) = r3items_names(app, &uri, token).await;
+    assert_eq!(total as usize, names.len(), "{uri}");
+    names.sort();
+    names
+}
+
+/// Runs each `(params, expected names)` case and asserts its sorted names.
+async fn r3items_cases(app: &axum::Router, token: &str, cases: &[(String, &[&str])]) {
+    for (params, expected) in cases {
+        let mut expected: Vec<String> = expected.iter().map(|s| s.to_string()).collect();
+        expected.sort();
+        assert_eq!(
+            r3items_found(app, token, params).await,
+            expected,
+            "{params}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn r3items_people_and_studios_filter_the_list() {
+    let state = test_state().await;
+    let lib = r3items_library(&state).await;
+    let (token, _) = admin_session(&state).await;
+    let app = app(state);
+    let pat = lib.pat;
+    r3items_cases(
+        &app,
+        &token,
+        &[
+            (format!("PersonIds={pat}"), &["Alpha"]),
+            (format!("personIds={}", pat.simple()), &["Alpha"]),
+            ("Person=Pat%20Doe".into(), &["Alpha"]),
+            ("Person=Nobody".into(), &[]),
+            // PersonTypes keeps those credits, as in Jellyfin 12.4.
+            (format!("PersonIds={pat}&PersonTypes=Director"), &[]),
+            (format!("PersonIds={pat}&personTypes=Actor"), &["Alpha"]),
+            ("Person=Pat%20Doe&PersonTypes=Director".into(), &[]),
+            ("Studios=acme%20pictures".into(), &["Alpha"]),
+            ("Studios=Other|Acme%20Pictures".into(), &["Alpha"]),
+            ("Studios=Other".into(), &[]),
+        ],
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn r3items_artists_and_albums_filter_the_list() {
+    let state = test_state().await;
+    let lib = r3items_library(&state).await;
+    let (token, _) = admin_session(&state).await;
+    let app = app(state);
+    let (band_item, band, guest, record) =
+        (lib.id("Band"), lib.band_person, lib.guest, lib.id("Record"));
+    r3items_cases(
+        &app,
+        &token,
+        &[
+            // An artist by its MusicArtist item or its person id: the items credited and their album.
+            (format!("ArtistIds={band_item}"), &["Record", "Song One"]),
+            (
+                format!("ArtistIds={band}&IncludeItemTypes=Audio"),
+                &["Song One"],
+            ),
+            ("Artists=guest&IncludeItemTypes=Audio".into(), &["Song Two"]),
+            (format!("AlbumArtistIds={band}"), &["Record"]),
+            (
+                format!("ContributingArtistIds={guest}&IncludeItemTypes=Audio"),
+                &["Song Two"],
+            ),
+            (
+                format!("ExcludeArtistIds={band}&IncludeItemTypes=Audio"),
+                &["Song Two"],
+            ),
+            (format!("AlbumIds={record}"), &["Song One", "Song Two"]),
+            ("Albums=Record".into(), &["Song One", "Song Two"]),
+            ("Albums=Other".into(), &[]),
+        ],
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn r3items_provider_ids_text_and_locks_filter_the_list() {
+    let state = test_state().await;
+    r3items_library(&state).await;
+    let (token, _) = admin_session(&state).await;
+    let app = app(state);
+    let movies = "IncludeItemTypes=Movie";
+    r3items_cases(
+        &app,
+        &token,
+        &[
+            ("HasTmdbId=true".into(), &["Alpha"]),
+            (format!("HasTmdbId=false&{movies}"), &["Bravo", "Charlie"]),
+            ("HasImdbId=true".into(), &["Alpha"]),
+            (format!("hasImdbId=false&{movies}"), &["Bravo", "Charlie"]),
+            ("HasTvdbId=true".into(), &["Show"]),
+            (format!("HasOverview=true&{movies}"), &["Alpha"]),
+            (format!("HasOverview=false&{movies}"), &["Bravo", "Charlie"]),
+            (
+                format!("HasOfficialRating=true&{movies}"),
+                &["Alpha", "Bravo"],
+            ),
+            (format!("HasOfficialRating=false&{movies}"), &["Charlie"]),
+            ("IsLocked=true".into(), &["Alpha"]),
+            (format!("IsLocked=false&{movies}"), &["Bravo", "Charlie"]),
+            (format!("IsPlaceHolder=true&{movies}"), &[]),
+            (
+                format!("IsPlaceHolder=false&{movies}"),
+                &["Alpha", "Bravo", "Charlie"],
+            ),
+        ],
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn r3items_ratings_and_dates_filter_the_list() {
+    let state = test_state().await;
+    r3items_library(&state).await;
+    let (token, _) = admin_session(&state).await;
+    let app = app(state);
+    let movies = "IncludeItemTypes=Movie";
+    r3items_cases(
+        &app,
+        &token,
+        &[
+            ("MinCommunityRating=7".into(), &["Alpha"]),
+            ("MinCommunityRating=5".into(), &["Alpha", "Bravo"]),
+            // MinCriticRating has no effect, as in Jellyfin 12.4.
+            (
+                format!("MinCriticRating=99&{movies}"),
+                &["Alpha", "Bravo", "Charlie"],
+            ),
+            (
+                "MinPremiereDate=2000-01-01&MaxPremiereDate=2010-12-31T23:59:59Z".into(),
+                &["Alpha"],
+            ),
+            (
+                "MinPremiereDate=2020-01-01T00:00:00.000Z".into(),
+                &["Bravo"],
+            ),
+            ("MaxPremiereDate=1995-01-01".into(), &["Charlie"]),
+            (format!("IsUnaired=true&{movies}"), &["Bravo"]),
+            (format!("IsUnaired=false&{movies}"), &["Alpha", "Charlie"]),
+            // A rating range keeps the unrated items, as in Jellyfin.
+            (
+                format!("MaxOfficialRating=PG-13&{movies}"),
+                &["Alpha", "Charlie"],
+            ),
+            (
+                format!("MinOfficialRating=R&{movies}"),
+                &["Bravo", "Charlie"],
+            ),
+            (format!("HasParentalRating=false&{movies}"), &["Charlie"]),
+            (
+                format!("HasParentalRating=true&{movies}"),
+                &["Alpha", "Bravo", "Charlie"],
+            ),
+        ],
+    )
+    .await;
+    let (status, _) =
+        send_authed(&app, "GET", "/Items?MinPremiereDate=someday", &token, None).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn r3items_picture_size_streams_and_images_filter_the_list() {
+    let state = test_state().await;
+    r3items_library(&state).await;
+    let (token, _) = admin_session(&state).await;
+    let app = app(state);
+    let movies = "IncludeItemTypes=Movie";
+    r3items_cases(
+        &app,
+        &token,
+        &[
+            ("IsHD=true".into(), &["Alpha"]),
+            ("isHd=false".into(), &["Charlie"]),
+            ("Is4K=true".into(), &["Bravo"]),
+            ("IsHD=true&Is4K=true".into(), &["Alpha", "Bravo"]),
+            ("MinWidth=1000".into(), &["Alpha", "Bravo"]),
+            ("MaxWidth=2000".into(), &["Alpha", "Charlie"]),
+            ("MinHeight=2000".into(), &["Bravo"]),
+            ("MaxHeight=1080".into(), &["Alpha", "Charlie"]),
+            ("HasSubtitles=true".into(), &["Alpha"]),
+            (
+                format!("HasSubtitles=false&{movies}"),
+                &["Bravo", "Charlie"],
+            ),
+            (format!("Is3D=true&{movies}"), &[]),
+            (
+                format!("Is3D=false&{movies}"),
+                &["Alpha", "Bravo", "Charlie"],
+            ),
+            (
+                format!("VideoTypes=VideoFile&{movies}"),
+                &["Alpha", "Bravo", "Charlie"],
+            ),
+            ("VideoTypes=VideoFile&IncludeItemTypes=Audio".into(), &[]),
+            (format!("VideoTypes=Iso&{movies}"), &[]),
+            ("ImageTypes=Primary".into(), &["Alpha"]),
+            ("ImageTypes=Backdrop,Logo".into(), &[]),
+        ],
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn r3items_tags_media_types_and_flags_filter_the_list() {
+    let state = test_state().await;
+    r3items_library(&state).await;
+    let (token, _) = admin_session(&state).await;
+    let app = app(state);
+    let episodes = "IncludeItemTypes=Episode";
+    r3items_cases(
+        &app,
+        &token,
+        &[
+            // Tags are pipe-delimited and any of them matches, any case; an episode's own tags
+            // only, as Jellyfin 12.4 reads Tags.
+            ("Tags=kids".into(), &["Alpha"]),
+            ("Tags=Sports|Kids".into(), &["Alpha", "Bravo"]),
+            ("Tags=Drama".into(), &["Bravo"]),
+            (format!("Tags=News&{episodes}"), &[]),
+            ("Tags=News".into(), &["Show"]),
+            ("IsKids=true".into(), &["Alpha"]),
+            ("IsSports=true".into(), &["Bravo"]),
+            (
+                format!("IsNews=false&{episodes}"),
+                &["Episode 1", "Episode 2", "Episode 3"],
+            ),
+            (
+                "IsNews=false&IncludeItemTypes=Movie".into(),
+                &["Alpha", "Bravo", "Charlie"],
+            ),
+            // MediaTypes names media kinds.
+            (
+                "MediaTypes=Audio&IncludeItemTypes=Audio,Movie".into(),
+                &["Song One", "Song Two"],
+            ),
+            (
+                "MediaTypes=Video&IncludeItemTypes=Movie,Episode,Audio".into(),
+                &[
+                    "Alpha",
+                    "Bravo",
+                    "Charlie",
+                    "Episode 1",
+                    "Episode 2",
+                    "Episode 3",
+                ],
+            ),
+            ("MediaTypes=Book".into(), &[]),
+        ],
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn r3items_numbers_names_locations_and_adjacency_filter_the_list() {
+    let state = test_state().await;
+    let lib = r3items_library(&state).await;
+    let (token, _) = admin_session(&state).await;
+    let app = app(state);
+    let season = lib.id("Season 1");
+    let episodes = "IncludeItemTypes=Episode";
+    r3items_cases(
+        &app,
+        &token,
+        &[
+            (format!("ParentId={season}&IndexNumber=2"), &["Episode 2"]),
+            (
+                format!("ParentIndexNumber=1&{episodes}"),
+                &["Episode 1", "Episode 2", "Episode 3"],
+            ),
+            (format!("ParentIndexNumber=2&{episodes}"), &[]),
+            (
+                "NameLessThan=bravo&IncludeItemTypes=Movie".into(),
+                &["Alpha"],
+            ),
+            (format!("IsMissing=true&{episodes}"), &["Episode 3"]),
+            (
+                format!("ExcludeLocationTypes=Virtual&{episodes}"),
+                &["Episode 1", "Episode 2"],
+            ),
+            (format!("LocationTypes=Virtual&{episodes}"), &["Episode 3"]),
+            (
+                format!("LocationTypes=FileSystem&{episodes}"),
+                &["Episode 1", "Episode 2"],
+            ),
+        ],
+    )
+    .await;
+    // AdjacentTo: the item and its neighbours in the ordered list.
+    let ordered = |adjacent: uuid::Uuid| {
+        format!("/Items?ParentId={season}&SortBy=SortName&AdjacentTo={adjacent}")
+    };
+    let (names, total) = r3items_names(&app, &ordered(lib.id("Episode 2")), &token).await;
+    assert_eq!(
+        (names, total),
+        (
+            vec!["Episode 1".into(), "Episode 2".into(), "Episode 3".into()],
+            3
+        )
+    );
+    let (names, total) = r3items_names(&app, &ordered(lib.id("Episode 1")), &token).await;
+    assert_eq!(
+        (names, total),
+        (vec!["Episode 1".into(), "Episode 2".into()], 2)
+    );
+    let (names, _) = r3items_names(&app, &ordered(lib.id("Episode 3")), &token).await;
+    assert_eq!(names, ["Episode 2", "Episode 3"]);
+    // An item the list doesn't hold has no neighbours in it, as in Jellyfin 12.4.
+    let (names, total) = r3items_names(&app, &ordered(uuid::Uuid::new_v4()), &token).await;
+    assert_eq!((names.len(), total), (0, 0));
+    // With item types, a library as ParentId lists its contents recursively unless asked not to.
+    let library = lib.library;
+    let uri = format!("/Items?ParentId={library}&IncludeItemTypes=Episode&SortBy=SortName");
+    let (names, _) = r3items_names(&app, &uri, &token).await;
+    assert_eq!(names, ["Episode 1", "Episode 2", "Episode 3"]);
+    let (names, _) = r3items_names(&app, &format!("{uri}&Recursive=false"), &token).await;
+    assert!(names.is_empty(), "{names:?}");
+}
+
+#[tokio::test]
+async fn r3items_filters_keep_the_callers_parental_limit() {
+    let state = test_state().await;
+    let lib = r3items_library(&state).await;
+    let app = app(state.clone());
+    let (admin, _) = admin_session(&state).await;
+    let kid = add_user(&state, "r3items-limited", "r3items-pass", false).await;
+    let (_, user) = send_authed(&app, "GET", &format!("/Users/{kid}"), &admin, None).await;
+    let mut policy = user["Policy"].clone();
+    policy["MaxParentalRating"] = 10.into();
+    let (status, _) = send_authed(
+        &app,
+        "POST",
+        &format!("/Users/{kid}/Policy"),
+        &admin,
+        Some(&policy.to_string()),
+    )
+    .await;
+    assert!(status.is_success(), "{status}");
+    let (token, _) = login(&app, "r3items-limited", "r3items-pass")
+        .await
+        .unwrap();
+    // Pat Doe, Acme Pictures, the TMDb id and the HD picture are only on Alpha (PG-13), which
+    // the limit hides: no row and a count of 0, not the hidden item.
+    let pat = lib.pat;
+    for params in [
+        format!("PersonIds={pat}"),
+        "Studios=Acme%20Pictures".to_string(),
+        "HasTmdbId=true".to_string(),
+        "IsHD=true".to_string(),
+        "MaxOfficialRating=PG-13&IncludeItemTypes=Movie&HasOverview=true".to_string(),
+    ] {
+        assert_eq!(
+            r3items_found(&app, &token, &params).await,
+            Vec::<String>::new(),
+            "{params}"
+        );
+        assert_eq!(
+            r3items_found(&app, &admin, &params).await,
+            ["Alpha"],
+            "{params}"
+        );
+    }
+    // A hidden item as AdjacentTo: as an item the list doesn't hold, so nothing.
+    let uri = format!(
+        "/Items?Recursive=true&IncludeItemTypes=Movie&SortBy=SortName&AdjacentTo={}",
+        lib.id("Alpha")
+    );
+    let (names, total) = r3items_names(&app, &uri, &token).await;
+    assert_eq!((names.len(), total), (0, 0));
+}
+
+#[tokio::test]
+async fn r3items_camel_case_names_counts_and_last_saved() {
+    let state = test_state().await;
+    let lib = r3items_library(&state).await;
+    r3items_sql(
+        &state,
+        &format!(
+            "UPDATE media_items SET genres = 'Drama|Comedy' WHERE id = '{}'",
+            lib.id("Bravo")
+        ),
+    )
+    .await;
+    let (token, _) = admin_session(&state).await;
+    let app = app(state);
+    // The camelCase names Jellyfin's SDKs send.
+    let (names, total) = r3items_names(
+        &app,
+        "/Items?recursive=true&includeItemTypes=Movie&sortBy=SortName&limit=1",
+        &token,
+    )
+    .await;
+    assert_eq!((names, total), (vec!["Alpha".to_string()], 3));
+    r3items_cases(
+        &app,
+        &token,
+        &[
+            ("genres=Comedy".into(), &["Bravo"]),
+            ("tags=Drama".into(), &["Bravo"]),
+            ("Genres=Horror|Drama".into(), &["Bravo"]),
+        ],
+    )
+    .await;
+    // EnableTotalRecordCount=false: the count is the items returned.
+    let (names, total) = r3items_names(
+        &app,
+        "/Items?Recursive=true&IncludeItemTypes=Movie&Limit=2&enableTotalRecordCount=false",
+        &token,
+    )
+    .await;
+    assert_eq!((names.len(), total), (2, 2));
+    // Every item was added just now.
+    let movies = "IncludeItemTypes=Movie";
+    r3items_cases(
+        &app,
+        &token,
+        &[
+            (
+                format!("MinDateLastSaved=2000-01-01T00:00:00Z&{movies}"),
+                &["Alpha", "Bravo", "Charlie"],
+            ),
+            (format!("minDateLastSavedForUser=2999-01-01&{movies}"), &[]),
+        ],
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn r3items_sort_by_the_callers_favourites() {
+    let state = test_state().await;
+    let lib = r3items_library(&state).await;
+    let (token, user) = admin_session(&state).await;
+    let (other, _) = admin_session(&state).await;
+    let app = app(state);
+    let uri = format!("/Users/{user}/FavoriteItems/{}", lib.id("Charlie"));
+    let (status, _) = send_authed(&app, "POST", &uri, &token, None).await;
+    assert!(status.is_success(), "{status}");
+    let sorted = "/Items?Recursive=true&IncludeItemTypes=Movie&SortBy=IsFavoriteOrLiked,SortName&SortOrder=Descending,Ascending";
+    let (names, _) = r3items_names(&app, sorted, &token).await;
+    assert_eq!(names, ["Charlie", "Alpha", "Bravo"]);
+    // Another user's favourites don't count.
+    let (names, _) = r3items_names(&app, sorted, &other).await;
+    assert_eq!(names, ["Alpha", "Bravo", "Charlie"]);
+}
+
+#[tokio::test]
+async fn r3items_filters2_lists_stream_languages() {
+    let state = test_state().await;
+    let lib = r3items_library(&state).await;
+    // Bravo: German audio and audio without a language; Episode 1: French subtitles.
+    let (bravo, episode) = (lib.id("Bravo"), lib.id("Episode 1"));
+    let source = uuid::Uuid::new_v4();
+    for sql in [
+        format!(
+            "INSERT INTO media_sources (id, item_id, uid, path) VALUES ('{source}', '{bravo}', '{source}', '/nowhere/b2.mkv')"
+        ),
+        format!(
+            "INSERT INTO media_streams (id, source_id, codec_type, stream_index, language) VALUES ('{}', '{source}', 'Audio', 1, 'ger'), ('{}', '{source}', 'Audio', 2, NULL)",
+            uuid::Uuid::new_v4(),
+            uuid::Uuid::new_v4()
+        ),
+        format!(
+            "INSERT INTO media_sources (id, item_id, uid, path) VALUES ('e{source}', '{episode}', 'e{source}', '/nowhere/e1.mkv')"
+        ),
+        format!(
+            "INSERT INTO media_streams (id, source_id, codec_type, stream_index, language) VALUES ('{}', 'e{source}', 'Subtitle', 3, 'fre')",
+            uuid::Uuid::new_v4()
+        ),
+    ] {
+        r3items_sql(&state, &sql).await;
+    }
+    let (token, _) = admin_session(&state).await;
+    let app = app(state);
+    let filters = |types: &str| format!("/Items/Filters2?IncludeItemTypes={types}");
+    let values = |list: &serde_json::Value| -> Vec<String> {
+        list.as_array()
+            .unwrap()
+            .iter()
+            .map(|pair| pair["Value"].as_str().unwrap().to_string())
+            .collect()
+    };
+    let (status, movies) = send_authed(&app, "GET", &filters("Movie"), &token, None).await;
+    assert_eq!(status, StatusCode::OK, "{movies}");
+    assert_eq!(values(&movies["AudioLanguages"]), ["ger", "und"]);
+    assert_eq!(movies["AudioLanguages"][0]["Name"], "German (ger)");
+    assert_eq!(values(&movies["SubtitleLanguages"]), ["eng"]);
+    assert_eq!(movies["SubtitleLanguages"][0]["Name"], "English (eng)");
+    // A series' streams are its episodes'.
+    let (_, series) = send_authed(&app, "GET", &filters("Series"), &token, None).await;
+    assert_eq!(values(&series["SubtitleLanguages"]), ["fre"]);
+    assert_eq!(values(&series["AudioLanguages"]), Vec::<String>::new());
+    // Only video kinds list them, as in Jellyfin 12.4.
+    let (_, music) = send_authed(&app, "GET", &filters("Audio"), &token, None).await;
+    assert_eq!(music["AudioLanguages"], serde_json::json!([]));
+    assert_eq!(music["SubtitleLanguages"], serde_json::json!([]));
+}
+
+#[tokio::test]
+async fn r3items_item_collections_lists_those_holding_it() {
+    let state = test_state().await;
+    let lib = r3items_library(&state).await;
+    let alpha = lib.id("Alpha");
+    let app = app(state.clone());
+    let (admin, _) = admin_session(&state).await;
+    r3items_container(&app, &admin, false, "Zeta%20set", &[alpha]).await;
+    r3items_container(
+        &app,
+        &admin,
+        false,
+        "alpha%20set",
+        &[alpha, lib.id("Bravo")],
+    )
+    .await;
+    r3items_container(&app, &admin, false, "Other", &[lib.id("Charlie")]).await;
+    let uri = format!("/Items/{alpha}/Collections");
+    let (names, total) = r3items_names(&app, &uri, &admin).await;
+    assert_eq!(
+        (names, total),
+        (vec!["alpha set".into(), "Zeta set".into()], 2)
+    );
+    let (status, page) = send_authed(
+        &app,
+        "GET",
+        &format!("{uri}?startIndex=1&limit=1"),
+        &admin,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(page["Items"][0]["Name"], "Zeta set");
+    assert_eq!(page["Items"][0]["Type"], "BoxSet");
+    assert_eq!(
+        (
+            page["TotalRecordCount"].as_i64(),
+            page["StartIndex"].as_i64()
+        ),
+        (Some(2), Some(1))
+    );
+    let (names, total) = r3items_names(
+        &app,
+        &format!("/Items/{}/Collections", lib.id("Bravo")),
+        &admin,
+    )
+    .await;
+    assert_eq!((names, total), (vec!["alpha set".to_string()], 1));
+    // An item that doesn't exist is a 404.
+    let missing = format!("/Items/{}/Collections", uuid::Uuid::new_v4());
+    let (status, _) = send_authed(&app, "GET", &missing, &admin, None).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+// R3 item pages 2: download, the metadata editor's provider ids, and subtitle upload and delete.
+
+#[test]
+fn r3item2_web() {
+    b124_node_test("r3item2_web.mjs");
+}
+
+/// A library in the test's data dir with one movie whose file holds 4000 known bytes, and one
+/// series (a folder). Returns the library folder, the movie, the series and the file's bytes.
+async fn r3item2_library(
+    state: &AppState,
+) -> (std::path::PathBuf, uuid::Uuid, uuid::Uuid, Vec<u8>) {
+    let library = std::path::PathBuf::from(media_folder(state, "r3item2"));
+    std::fs::create_dir_all(library.join("Quill Harbor (2031)")).unwrap();
+    let bytes: Vec<u8> = (0..4000u32).map(|i| (i % 251) as u8).collect();
+    let file = library.join("Quill Harbor (2031)/Quill Harbor (2031).mkv");
+    std::fs::write(&file, &bytes).unwrap();
+    let lib = rustyfin_model::library::Library {
+        id: uuid::Uuid::new_v4(),
+        name: "R3 item pages".to_string(),
+        content_type: rustyfin_model::library::LibraryContentType::Movies,
+        paths: vec![library.to_str().unwrap().to_string()],
+    };
+    rustyfin_db::repo_library::create_library(&state.db, &lib)
+        .await
+        .unwrap();
+    let mut ids = Vec::new();
+    for (media_type, path) in [
+        ("Movie", file.clone()),
+        ("Series", library.join("Some Series")),
+    ] {
+        let id = uuid::Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO media_items (id, library_id, name, media_type, path) VALUES (?, ?, ?, ?, ?)",
+        )
+        .bind(id.to_string())
+        .bind(lib.id.to_string())
+        .bind("Quill Harbor")
+        .bind(media_type)
+        .bind(path.to_str().unwrap())
+        .execute(&state.db)
+        .await
+        .unwrap();
+        ids.push(id);
+    }
+    // The movie's source, for the streams an upload adds
+    let source = uuid::Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO media_sources (id, item_id, uid, container, path) VALUES (?, ?, ?, 'mkv', ?)",
+    )
+    .bind(source.to_string())
+    .bind(ids[0].to_string())
+    .bind(source.simple().to_string())
+    .bind(file.to_str().unwrap())
+    .execute(&state.db)
+    .await
+    .unwrap();
+    (library, ids[0], ids[1], bytes)
+}
+
+/// Sends a request and returns the status, the response headers and the body.
+async fn r3item2_send(
+    app: &axum::Router,
+    method: &str,
+    uri: &str,
+    token: &str,
+    body: Option<serde_json::Value>,
+) -> (StatusCode, axum::http::HeaderMap, Vec<u8>) {
+    let resp = app
+        .clone()
+        .oneshot(request(method, uri, Some(token), body))
+        .await
+        .unwrap();
+    let status = resp.status();
+    let headers = resp.headers().clone();
+    let bytes = resp
+        .into_body()
+        .collect()
+        .await
+        .unwrap()
+        .to_bytes()
+        .to_vec();
+    (status, headers, bytes)
+}
+
+fn r3item2_json(bytes: &[u8]) -> serde_json::Value {
+    serde_json::from_slice(bytes).unwrap_or(serde_json::Value::Null)
+}
+
+/// `/Items/{id}/Download`: the file with an attachment name and byte ranges for a user with
+/// EnableContentDownloading (on for a new user, as in Jellyfin), `CanDownload` on the item, 400
+/// for a folder, 404 for an unknown item, 403 once the policy is off, and the activity log entry.
+#[tokio::test]
+async fn r3item2_download_follows_the_policy() {
+    let state = test_state().await;
+    let app = app(state.clone());
+    let (owner, _, viewer, viewer_id) = g1_owner_and_viewer(&state, &app).await;
+    let (_, movie, series, bytes) = r3item2_library(&state).await;
+
+    let (_, _, user) =
+        r3item2_send(&app, "GET", &format!("/Users/{viewer_id}"), &viewer, None).await;
+    assert_eq!(
+        r3item2_json(&user)["Policy"]["EnableContentDownloading"],
+        true
+    );
+    let (_, _, item) = r3item2_send(&app, "GET", &format!("/Items/{movie}"), &viewer, None).await;
+    assert_eq!(r3item2_json(&item)["CanDownload"], true);
+    let (_, _, folder) =
+        r3item2_send(&app, "GET", &format!("/Items/{series}"), &viewer, None).await;
+    assert_eq!(r3item2_json(&folder)["CanDownload"], false);
+
+    let uri = format!("/Items/{movie}/Download");
+    let (status, headers, body) = r3item2_send(&app, "GET", &uri, &viewer, None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, bytes);
+    let disposition = headers["content-disposition"].to_str().unwrap();
+    assert!(disposition.starts_with("attachment;"), "{disposition}");
+    assert!(
+        disposition.contains("filename=\"Quill Harbor (2031).mkv\""),
+        "{disposition}"
+    );
+    let (status, range, part) = g4_get_range(&app, &uri, &viewer, "bytes=10-19").await;
+    assert_eq!(status, StatusCode::PARTIAL_CONTENT);
+    assert_eq!(range.as_deref(), Some("bytes 10-19/4000"));
+    assert_eq!(part, bytes[10..20]);
+
+    let (status, _, _) = r3item2_send(
+        &app,
+        "GET",
+        &format!("/Items/{series}/Download"),
+        &viewer,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let unknown = format!("/Items/{}/Download", uuid::Uuid::new_v4());
+    let (status, _, _) = r3item2_send(&app, "GET", &unknown, &viewer, None).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    let (_, _, log) = r3item2_send(&app, "GET", "/System/ActivityLog/Entries", &owner, None).await;
+    let log = r3item2_json(&log);
+    assert!(
+        log["Items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|entry| entry["Type"] == "UserDownloadingContent"),
+        "{log}"
+    );
+
+    // The administrator turns downloading off for the viewer
+    let (status, _, _) = r3item2_send(
+        &app,
+        "POST",
+        &format!("/Users/{viewer_id}/Policy"),
+        &owner,
+        Some(serde_json::json!({ "EnableContentDownloading": false })),
+    )
+    .await;
+    assert!(status.is_success(), "{status}");
+    let (status, _, _) = r3item2_send(&app, "GET", &uri, &viewer, None).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let (_, _, item) = r3item2_send(&app, "GET", &format!("/Items/{movie}"), &viewer, None).await;
+    assert_eq!(r3item2_json(&item)["CanDownload"], false);
+    let (_, _, user) =
+        r3item2_send(&app, "GET", &format!("/Users/{viewer_id}"), &viewer, None).await;
+    assert_eq!(
+        r3item2_json(&user)["Policy"]["EnableContentDownloading"],
+        false
+    );
+    // The owner still may
+    let (status, _, _) = r3item2_send(&app, "GET", &uri, &owner, None).await;
+    assert_eq!(status, StatusCode::OK);
+}
+
+/// The metadata editor's ProviderIds, EndDate, Studios and People save; a blank id clears it and
+/// a TMDb id that isn't a number is refused; `/Items/{id}/MetadataEditor` lists the ids to edit.
+#[tokio::test]
+async fn r3item2_editor_saves_provider_ids_and_lists_them() {
+    let server = g12_server(None, None).await;
+    let id = server.insert_movie().await;
+    let (status, body) = server
+        .send(
+            "POST",
+            &format!("/Items/{id}"),
+            Some(
+                serde_json::json!({
+                    "ProviderIds": { "Tmdb": "424242", "Imdb": "tt7654321" },
+                    "EndDate": "2032-02-03T00:00:00.0000000Z",
+                    "Studios": [{ "Name": "Lantern Works" }],
+                    "People": [{ "Name": "Pat Example", "Role": "Keeper", "Type": "Actor" }],
+                })
+                .to_string(),
+            ),
+        )
+        .await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+    let (_, text) = server.send("GET", &format!("/Items/{id}"), None).await;
+    let dto: serde_json::Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(dto["ProviderIds"]["Tmdb"], "424242", "{dto}");
+    assert_eq!(dto["ProviderIds"]["Imdb"], "tt7654321");
+    assert!(dto["EndDate"].as_str().unwrap().starts_with("2032-02-03"));
+    assert_eq!(dto["Studios"][0]["Name"], "Lantern Works");
+    assert_eq!(dto["People"][0]["Name"], "Pat Example");
+    assert_eq!(dto["People"][0]["Role"], "Keeper");
+
+    // A blank id clears it, a missing one too; another field leaves them alone
+    let (status, _) = server
+        .send(
+            "POST",
+            &format!("/Items/{id}"),
+            Some(serde_json::json!({ "ProviderIds": { "Imdb": "  " } }).to_string()),
+        )
+        .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let (_, text) = server.send("GET", &format!("/Items/{id}"), None).await;
+    let dto: serde_json::Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(dto["ProviderIds"], serde_json::json!({}), "{dto}");
+    assert_eq!(server.item(id).await.tmdb_id, None);
+
+    let (status, _) = server
+        .send(
+            "POST",
+            &format!("/Items/{id}"),
+            Some(serde_json::json!({ "ProviderIds": { "Tmdb": "abc" } }).to_string()),
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    let editor = server
+        .json(
+            "GET",
+            &format!("/Items/{id}/MetadataEditor"),
+            serde_json::Value::Null,
+        )
+        .await;
+    let keys: Vec<&str> = editor["ExternalIdInfos"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|info| info["Key"].as_str().unwrap())
+        .collect();
+    assert_eq!(keys, ["Tmdb", "Imdb"], "{editor}");
+    assert!(
+        !editor["ParentalRatingOptions"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    assert!(!editor["Cultures"].as_array().unwrap().is_empty());
+    assert!(!editor["Countries"].as_array().unwrap().is_empty());
+    assert_eq!(editor["ContentTypeOptions"], serde_json::json!([]));
+}
+
+/// Subtitle upload saves `<video>.<lang>[.forced].<ext>` beside the video (a taken name gets a
+/// counter) and adds the stream; delete removes the file and the stream; the remote search is
+/// Jellyfin's empty list (no provider) and a remote download 404s; all of them are admin-only.
+#[tokio::test]
+async fn r3item2_subtitle_upload_delete_and_search() {
+    use base64::Engine as _;
+    let state = test_state().await;
+    let app = app(state.clone());
+    let (owner, _, viewer, _) = g1_owner_and_viewer(&state, &app).await;
+    let (library, movie, series, _) = r3item2_library(&state).await;
+    let folder = library.join("Quill Harbor (2031)");
+    let srt = "1\n00:00:01,000 --> 00:00:02,000\nHello\n";
+    let upload = serde_json::json!({
+        "Language": "eng",
+        "Format": "srt",
+        "IsForced": true,
+        "IsHearingImpaired": false,
+        "Data": base64::engine::general_purpose::STANDARD.encode(srt),
+    });
+    let uri = format!("/Videos/{movie}/Subtitles");
+
+    let (status, _, _) = r3item2_send(&app, "POST", &uri, &viewer, Some(upload.clone())).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    for _ in 0..2 {
+        let (status, _, body) =
+            r3item2_send(&app, "POST", &uri, &owner, Some(upload.clone())).await;
+        assert_eq!(
+            status,
+            StatusCode::NO_CONTENT,
+            "{}",
+            String::from_utf8_lossy(&body)
+        );
+    }
+    let first = folder.join("Quill Harbor (2031).eng.forced.srt");
+    let second = folder.join("Quill Harbor (2031).eng.forced.1.srt");
+    assert_eq!(std::fs::read_to_string(&first).unwrap(), srt);
+    assert!(second.is_file());
+
+    let externals = |sources: Vec<rustyfin_model::media_source::MediaSourceResponse>| {
+        sources[0]
+            .media_streams
+            .iter()
+            .filter(|s| s.is_external)
+            .map(|s| {
+                (
+                    s.language.clone().unwrap_or_default(),
+                    s.is_forced,
+                    s.path.clone().unwrap(),
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    let streams = externals(
+        rustyfin_db::repo_media_source::get_media_sources(&state.db, &movie)
+            .await
+            .unwrap(),
+    );
+    assert_eq!(streams.len(), 2, "{streams:?}");
+    assert!(
+        streams
+            .iter()
+            .all(|(lang, forced, _)| lang == "eng" && *forced)
+    );
+
+    // Refused: a format the scan doesn't read, a language with a path in it, a folder item
+    for (body, target) in [
+        (
+            serde_json::json!({"Language": "eng", "Format": "exe", "Data": "aGk="}),
+            movie,
+        ),
+        (
+            serde_json::json!({"Language": "../x", "Format": "srt", "Data": "aGk="}),
+            movie,
+        ),
+        (
+            serde_json::json!({"Language": "eng", "Format": "srt", "Data": "not base64!"}),
+            movie,
+        ),
+        (upload.clone(), series),
+    ] {
+        let (status, _, _) = r3item2_send(
+            &app,
+            "POST",
+            &format!("/Videos/{target}/Subtitles"),
+            &owner,
+            Some(body),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    // Stream 0, the first external file, as PlaybackInfo numbers it
+    let (status, _, _) = r3item2_send(
+        &app,
+        "DELETE",
+        &format!("/Videos/{movie}/Subtitles/0"),
+        &viewer,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let (status, _, body) = r3item2_send(
+        &app,
+        "DELETE",
+        &format!("/Videos/{movie}/Subtitles/0"),
+        &owner,
+        None,
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::NO_CONTENT,
+        "{}",
+        String::from_utf8_lossy(&body)
+    );
+    let left = externals(
+        rustyfin_db::repo_media_source::get_media_sources(&state.db, &movie)
+            .await
+            .unwrap(),
+    );
+    assert_eq!(left.len(), 1, "{left:?}");
+    let gone = streams
+        .iter()
+        .find(|(_, _, path)| !left.iter().any(|(_, _, kept)| kept == path))
+        .unwrap();
+    assert!(!std::path::Path::new(&gone.2).exists());
+    let (status, _, _) = r3item2_send(
+        &app,
+        "DELETE",
+        &format!("/Videos/{movie}/Subtitles/7"),
+        &owner,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    let search = format!("/Items/{movie}/RemoteSearch/Subtitles/eng");
+    let (status, _, body) = r3item2_send(&app, "GET", &search, &owner, None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(r3item2_json(&body), serde_json::json!([]));
+    let (status, _, _) = r3item2_send(&app, "GET", &search, &viewer, None).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let (status, _, _) = r3item2_send(
+        &app,
+        "POST",
+        &format!("/Items/{movie}/RemoteSearch/Subtitles/some-id"),
+        &owner,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+/// A subtitle file of about 3 MB uploads: the JSON body (the file in base64, about 4 MB) is past
+/// the server's default request limit, which the upload route raises.
+#[tokio::test]
+async fn r3item2_subtitle_upload_takes_3_mb() {
+    use base64::Engine as _;
+    let state = test_state().await;
+    let app = app(state.clone());
+    let (owner, _, _, _) = g1_owner_and_viewer(&state, &app).await;
+    let (library, movie, _, _) = r3item2_library(&state).await;
+    let cue = "1\n00:00:01,000 --> 00:00:02,000\nA line of subtitle text that repeats\n\n";
+    let srt = cue.repeat(3 * 1024 * 1024 / cue.len() + 1);
+    assert!(srt.len() > 3 * 1024 * 1024);
+    let upload = serde_json::json!({
+        "Language": "eng",
+        "Format": "srt",
+        "Data": base64::engine::general_purpose::STANDARD.encode(&srt),
+    });
+    let (status, _, body) = r3item2_send(
+        &app,
+        "POST",
+        &format!("/Videos/{movie}/Subtitles"),
+        &owner,
+        Some(upload),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::NO_CONTENT,
+        "{}",
+        String::from_utf8_lossy(&body)
+    );
+    let saved = library.join("Quill Harbor (2031)/Quill Harbor (2031).eng.srt");
+    assert_eq!(std::fs::metadata(&saved).unwrap().len(), srt.len() as u64);
+}
+
+/// An item the caller's library access hides answers 404 on Download and on subtitle delete, as
+/// for an unknown item, also for an administrator with limits; the file stays.
+#[tokio::test]
+async fn r3item2_hidden_items_are_404_on_download_and_subtitle_delete() {
+    use base64::Engine as _;
+    let state = test_state().await;
+    let app = app(state.clone());
+    let (owner, _, viewer, viewer_id) = g1_owner_and_viewer(&state, &app).await;
+    let (library, movie, _, _) = r3item2_library(&state).await;
+    let limited_id = add_user(&state, "r3item2-limited", "limitedpass", true).await;
+    let (limited, _) = login(&app, "r3item2-limited", "limitedpass").await.unwrap();
+
+    // An external subtitle, stream 0
+    let upload = serde_json::json!({
+        "Language": "eng",
+        "Format": "srt",
+        "Data": base64::engine::general_purpose::STANDARD.encode("1\n00:00:01,000 --> 00:00:02,000\nHi\n"),
+    });
+    let (status, _, _) = r3item2_send(
+        &app,
+        "POST",
+        &format!("/Videos/{movie}/Subtitles"),
+        &owner,
+        Some(upload),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let subtitle = library.join("Quill Harbor (2031)/Quill Harbor (2031).eng.srt");
+    assert!(subtitle.is_file());
+
+    // Both users see no library
+    for user in [viewer_id.clone(), limited_id.to_string()] {
+        let (status, _, _) = r3item2_send(
+            &app,
+            "POST",
+            &format!("/Users/{user}/Policy"),
+            &owner,
+            Some(serde_json::json!({ "EnableAllFolders": false, "EnabledFolders": [] })),
+        )
+        .await;
+        assert!(status.is_success(), "{status}");
+    }
+    let (status, _, _) = r3item2_send(
+        &app,
+        "GET",
+        &format!("/Items/{movie}/Download"),
+        &viewer,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let (status, _, _) = r3item2_send(
+        &app,
+        "DELETE",
+        &format!("/Videos/{movie}/Subtitles/0"),
+        &limited,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert!(subtitle.is_file(), "a hidden item's subtitle stays");
+    // The owner, without limits, still may
+    let (status, _, _) = r3item2_send(
+        &app,
+        "GET",
+        &format!("/Items/{movie}/Download"),
+        &owner,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+}
+
+// ── Music: lyrics and instant mix ──
+
+/// A track of `library` under `parent` at `path`, with `genres` (pipe-joined, as scans store them).
+async fn r3music2_track(
+    state: &AppState,
+    library: uuid::Uuid,
+    parent: Option<uuid::Uuid>,
+    name: &str,
+    genres: &str,
+) -> uuid::Uuid {
+    let id = j6_add_item(state, library, parent, name, "Audio").await;
+    let path = state
+        .data_dir
+        .join("media")
+        .join("r3music2")
+        .join(format!("{name}.flac"));
+    sqlx::query("UPDATE media_items SET genres = ?, path = ? WHERE id = ?")
+        .bind(genres)
+        .bind(path.to_string_lossy().to_string())
+        .bind(id.to_string())
+        .execute(&state.db)
+        .await
+        .unwrap();
+    id
+}
+
+async fn r3music2_send(
+    app: &axum::Router,
+    method: &str,
+    uri: &str,
+    token: &str,
+    body: &str,
+) -> (StatusCode, serde_json::Value) {
+    let req = Request::builder()
+        .method(method)
+        .uri(uri)
+        .header("Authorization", format!("Bearer {token}"))
+        .header("Content-Type", "text/plain")
+        .body(Body::from(body.to_string()))
+        .unwrap();
+    send(app, req).await
+}
+
+/// `/Audio/{id}/Lyrics` reads a lyric file beside the track as Jellyfin's LyricDto (synced lines
+/// with their start in ticks), takes an uploaded file from an administrator only, deletes the
+/// lyric files, and answers 404 for a track with none and for an item that is not audio. A scan's
+/// lyric-file pass sets HasLyrics.
+#[tokio::test]
+async fn r3music2_lyrics_read_upload_and_delete() {
+    let state = test_state().await;
+    let library = j6_library(&state, "Music").await;
+    let synced = r3music2_track(&state, library, None, "01 Sine Song", "Ambient").await;
+    let plain = r3music2_track(&state, library, None, "02 Square Song", "Ambient").await;
+    let movie = j6_add_item(&state, library, None, "Some Movie", "Movie").await;
+    let dir = state.data_dir.join("media").join("r3music2");
+    std::fs::create_dir_all(&dir).unwrap();
+    let sidecar = dir.join("01 Sine Song.lrc");
+    std::fs::write(
+        &sidecar,
+        "[ti:Sine Song]\n[00:02.50]Second line\n[00:01.00]First line\n",
+    )
+    .unwrap();
+    let (admin, _) = admin_session(&state).await;
+    let (user, _) = j6_user_session(&state).await;
+    let pool = state.db.clone();
+    let cache = state.cache.clone();
+    let uploads = state.data_dir.join("metadata").join("lyrics");
+    let app = app(state);
+
+    let lyrics = b27_answer(&app, &format!("/Audio/{synced}/Lyrics"), &user).await;
+    assert_eq!(
+        lyrics["Lyrics"],
+        serde_json::json!([
+            {"Text": "First line", "Start": 10_000_000},
+            {"Text": "Second line", "Start": 25_000_000},
+        ]),
+        "{lyrics}"
+    );
+    assert_eq!(lyrics["Metadata"]["Title"], "Sine Song", "{lyrics}");
+    assert_eq!(lyrics["Metadata"]["IsSynced"], true, "{lyrics}");
+    for id in [plain, movie, uuid::Uuid::new_v4()] {
+        let (status, body) =
+            send_authed(&app, "GET", &format!("/Audio/{id}/Lyrics"), &user, None).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{id}: {body}");
+    }
+
+    // HasLyrics is what the scan found: nothing before its lyric-file pass.
+    let has = |body: &serde_json::Value| body["HasLyrics"].clone();
+    let item = b27_answer(&app, &format!("/Items/{synced}"), &admin).await;
+    assert_eq!(has(&item), false, "{item}");
+    rustyfin_core::lyrics::sync_sidecars(&pool, library, &rustyfin_db::repo_media::PathScope::All)
+        .await
+        .unwrap();
+    // A scan drops the cached answers when it ends; this test runs only its lyric-file pass.
+    cache.invalidate_on_scan();
+    let item = b27_answer(&app, &format!("/Items/{synced}"), &admin).await;
+    assert_eq!(has(&item), true, "{item}");
+    let list = b27_answer(
+        &app,
+        &format!("/Items?ParentId={library}&IncludeItemTypes=Audio&Recursive=true&SortBy=SortName"),
+        &admin,
+    )
+    .await;
+    let flags: Vec<_> = list["Items"].as_array().unwrap().iter().map(has).collect();
+    assert_eq!(
+        flags,
+        [serde_json::json!(true), serde_json::json!(false)],
+        "{list}"
+    );
+    let movie_item = b27_answer(&app, &format!("/Items/{movie}"), &admin).await;
+    assert!(movie_item.get("HasLyrics").is_none(), "{movie_item}");
+
+    // Uploading needs lyric management, which administrators have.
+    let upload = format!("/Audio/{plain}/Lyrics?fileName=square.txt");
+    let (status, _) = r3music2_send(&app, "POST", &upload, &user, "one\ntwo").await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let (status, _) =
+        r3music2_send(&app, "POST", &format!("/Audio/{plain}/Lyrics"), &admin, "x").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let (status, body) = r3music2_send(&app, "POST", &upload, &admin, "one\ntwo").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let expected = serde_json::json!([{"Text": "one"}, {"Text": "two"}]);
+    assert_eq!(body["Lyrics"], expected, "{body}");
+    let lyrics = b27_answer(&app, &format!("/Audio/{plain}/Lyrics"), &user).await;
+    assert_eq!(lyrics["Lyrics"], expected, "{lyrics}");
+    let item = b27_answer(&app, &format!("/Items/{plain}"), &admin).await;
+    assert_eq!(has(&item), true, "{item}");
+
+    // Deleting removes the uploaded file and the file beside the track.
+    let (status, _) =
+        r3music2_send(&app, "DELETE", &format!("/Audio/{plain}/Lyrics"), &user, "").await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    for id in [plain, synced] {
+        let (status, body) =
+            r3music2_send(&app, "DELETE", &format!("/Audio/{id}/Lyrics"), &admin, "").await;
+        assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+        let (status, body) =
+            send_authed(&app, "GET", &format!("/Audio/{id}/Lyrics"), &user, None).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{id}: {body}");
+        let item = b27_answer(&app, &format!("/Items/{id}"), &admin).await;
+        assert_eq!(has(&item), false, "{item}");
+    }
+    assert!(!sidecar.exists());
+
+    // An uploaded file goes with its item.
+    let (status, body) = r3music2_send(&app, "POST", &upload, &admin, "again").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let uploaded = uploads.join(format!("{}.txt", plain.simple()));
+    assert!(uploaded.exists());
+    let (status, body) =
+        send_authed(&app, "DELETE", &format!("/Items/{plain}"), &admin, None).await;
+    assert!(status.is_success(), "{status}: {body}");
+    assert!(!uploaded.exists());
+}
+
+/// A track that a user's parental limit hides answers 404 on `/Audio/{id}/Lyrics` and as an
+/// instant mix's seed, and stays out of another track's mix; the administrator gets both.
+#[tokio::test]
+async fn r3music2_hidden_track_has_no_lyrics_or_mix() {
+    let state = test_state().await;
+    let library = j6_library(&state, "Music").await;
+    let loud = r3music2_track(&state, library, None, "Loud Track", "Noise Pop").await;
+    let calm = r3music2_track(&state, library, None, "Calm Track", "Noise Pop").await;
+    sqlx::query("UPDATE media_items SET official_rating = 'R' WHERE id = ?")
+        .bind(loud.to_string())
+        .execute(&state.db)
+        .await
+        .unwrap();
+    let dir = state.data_dir.join("media").join("r3music2");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("Loud Track.lrc"), "[00:01.00]Loud line\n").unwrap();
+
+    let app = app(state.clone());
+    let (admin, _) = admin_session(&state).await;
+    let kid = add_user(&state, "r3m2-kid", "r3m2-pass", false).await;
+    let (_, user) = send_authed(&app, "GET", &format!("/Users/{kid}"), &admin, None).await;
+    let mut policy = user["Policy"].clone();
+    policy["MaxParentalRating"] = 10.into();
+    let (status, _) = send_authed(
+        &app,
+        "POST",
+        &format!("/Users/{kid}/Policy"),
+        &admin,
+        Some(&policy.to_string()),
+    )
+    .await;
+    assert!(status.is_success(), "{status}");
+    let (token, _) = login(&app, "r3m2-kid", "r3m2-pass").await.unwrap();
+
+    for uri in [
+        format!("/Audio/{loud}/Lyrics"),
+        format!("/Songs/{loud}/InstantMix"),
+        format!("/Items/{loud}/InstantMix"),
+    ] {
+        let (status, body) = send_authed(&app, "GET", &uri, &token, None).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{uri}: {body}");
+        b27_answer(&app, &uri, &admin).await;
+    }
+    let mix = b27_answer(&app, &format!("/Items/{calm}/InstantMix"), &token).await;
+    assert_eq!(r3music2_ids(&mix), [calm.to_string()], "{mix}");
+    let mix = b27_answer(&app, &format!("/Items/{calm}/InstantMix"), &admin).await;
+    assert_eq!(
+        r3music2_ids(&mix),
+        [calm.to_string(), loud.to_string()],
+        "{mix}"
+    );
+}
+
+/// Ids of the `Items` of an answer, in order.
+fn r3music2_ids(answer: &serde_json::Value) -> Vec<String> {
+    answer["Items"]
+        .as_array()
+        .unwrap_or_else(|| panic!("no Items in {answer}"))
+        .iter()
+        .map(|item| item["Id"].as_str().unwrap_or_default().to_string())
+        .collect()
+}
+
+fn r3music2_sorted(mut ids: Vec<String>) -> Vec<String> {
+    ids.sort();
+    ids
+}
+
+/// Jellyfin's instant mixes: tracks sharing a genre with the song (which comes first), album,
+/// artist, playlist or music genre, as a QueryResult of Audio items with StartIndex 0 and the
+/// count before Limit, on every path Jellyfin serves them; nothing for a movie, 404 for an unknown id.
+#[tokio::test]
+async fn r3music2_instant_mix_paths_and_shape() {
+    let state = test_state().await;
+    let library = j6_library(&state, "Music").await;
+    let album = j6_add_item(&state, library, None, "Wave Album", "MusicAlbum").await;
+    let sine = r3music2_track(&state, library, Some(album), "Sine", "Synth Rock").await;
+    let square = r3music2_track(&state, library, Some(album), "Square", "Synth Rock|Drone").await;
+    let saw = r3music2_track(&state, library, None, "Saw", "Cool Jazz").await;
+    let noise = r3music2_track(&state, library, None, "Noise", "Drone").await;
+    let movie = j6_add_item(&state, library, None, "Some Movie", "Movie").await;
+    let artist = r2music_link(&state, saw, "Made Up Trio", "Artist", 0).await;
+    let (admin, _) = admin_session(&state).await;
+    let (user, user_id) = j6_user_session(&state).await;
+    let app = app(state);
+    let s = |id: uuid::Uuid| id.to_string();
+
+    for path in [
+        format!("/Songs/{sine}/InstantMix"),
+        format!("/Items/{sine}/InstantMix"),
+        format!("/Users/{user_id}/Items/{sine}/InstantMix"),
+    ] {
+        let mix = b27_answer(&app, &path, &user).await;
+        let ids = r3music2_ids(&mix);
+        assert_eq!(ids[0], s(sine), "{path}: the song comes first: {mix}");
+        assert_eq!(
+            r3music2_sorted(ids[1..].to_vec()),
+            [s(square)],
+            "{path}: {mix}"
+        );
+        assert_eq!(mix["TotalRecordCount"], 2, "{path}: {mix}");
+        assert_eq!(mix["StartIndex"], 0, "{path}: {mix}");
+        for item in mix["Items"].as_array().unwrap() {
+            assert_eq!(item["Type"], "Audio", "{path}: {item}");
+            assert_eq!(item["HasLyrics"], false, "{path}: {item}");
+        }
+    }
+
+    // A song with two genres mixes the tracks of either.
+    let mix = b27_answer(&app, &format!("/Items/{square}/InstantMix"), &user).await;
+    assert_eq!(
+        r3music2_sorted(r3music2_ids(&mix)[1..].to_vec()),
+        r3music2_sorted(vec![s(sine), s(noise)]),
+        "{mix}"
+    );
+    // An album without genres of its own mixes its tracks' genres.
+    let mix = b27_answer(&app, &format!("/Albums/{album}/InstantMix"), &user).await;
+    assert_eq!(
+        r3music2_sorted(r3music2_ids(&mix)),
+        r3music2_sorted(vec![s(sine), s(square), s(noise)]),
+        "{mix}"
+    );
+    // An artist mixes the genres of the tracks credited to it, on both of Jellyfin's paths.
+    for path in [
+        format!("/Artists/{artist}/InstantMix"),
+        format!("/Artists/InstantMix?id={artist}"),
+    ] {
+        let mix = b27_answer(&app, &path, &user).await;
+        assert_eq!(r3music2_ids(&mix), [s(saw)], "{path}: {mix}");
+    }
+    // A music genre, by name and by id.
+    let jazz = rustyfin_db::repo_by_name::by_name_id(
+        rustyfin_db::repo_by_name::ByNameKind::MusicGenre,
+        "Cool Jazz",
+    );
+    for path in [
+        "/MusicGenres/Cool%20Jazz/InstantMix".to_string(),
+        format!("/MusicGenres/InstantMix?id={jazz}"),
+        format!("/Items/{jazz}/InstantMix"),
+    ] {
+        let mix = b27_answer(&app, &path, &user).await;
+        assert_eq!(r3music2_ids(&mix), [s(saw)], "{path}: {mix}");
+    }
+
+    // Limit keeps that many items; the count is of the whole mix.
+    let mix = b27_answer(&app, &format!("/Songs/{sine}/InstantMix?Limit=1"), &admin).await;
+    assert_eq!(r3music2_ids(&mix), [s(sine)], "{mix}");
+    assert_eq!(mix["TotalRecordCount"], 2, "{mix}");
+
+    // A movie has no music to mix; an unknown id is not found.
+    let mix = b27_answer(&app, &format!("/Items/{movie}/InstantMix"), &user).await;
+    assert_eq!(mix["Items"], serde_json::json!([]), "{mix}");
+    assert_eq!(mix["TotalRecordCount"], 0, "{mix}");
+    let (status, _) = send_authed(
+        &app,
+        "GET",
+        &format!("/Items/{}/InstantMix", uuid::Uuid::new_v4()),
+        &user,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[test]
+fn r3music2_web_lyrics() {
+    b124_node_test("r3music2_lyrics.mjs");
+}
+
+#[test]
+fn r3music2_web_instant_mix() {
+    b124_node_test("r3music2_instantmix.mjs");
+}
+
+#[test]
+fn r3music2_web_suggestions() {
+    b124_node_test("r3music2_suggestions.mjs");
+}
+
+// R3 cast: the Jellyfin Cast receiver signs its calls with the sender's token and its own
+// `MediaBrowser` header (Client "Chromecast", DeviceId the receiver name in base64), as the
+// jellyfin-chromecast receiver's SDK client does
+
+const R3CAST_DEVICE: &str = "TGl2aW5nIFJvb20=";
+
+/// A request as the receiver sends it: the token inside its `Authorization` header.
+fn r3cast_request(
+    method: &str,
+    uri: &str,
+    token: &str,
+    body: Option<serde_json::Value>,
+) -> Request<Body> {
+    r3cast_request_from(R3CAST_DEVICE, method, uri, token, body)
+}
+
+/// `r3cast_request` from the receiver with device id `device`.
+fn r3cast_request_from(
+    device: &str,
+    method: &str,
+    uri: &str,
+    token: &str,
+    body: Option<serde_json::Value>,
+) -> Request<Body> {
+    let auth = format!(
+        r#"MediaBrowser Client="Chromecast", Device="Living%20Room", DeviceId="{device}", Version="3.0.0", Token="{token}""#
+    );
+    let builder = Request::builder()
+        .method(method)
+        .uri(uri)
+        .header("Authorization", auth);
+    match body {
+        Some(body) => builder
+            .header("Content-Type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap(),
+        None => builder.body(Body::empty()).unwrap(),
+    }
+}
+
+// The receiver's capabilities and play reports land on a session of its own device, never on the
+// session of the web client whose token it was handed
+#[tokio::test]
+async fn r3cast_receiver_reports_are_a_session_of_their_own() {
+    let state = test_state().await;
+    let _dir = G1cDataDir(state.data_dir.to_path_buf());
+    let app = app(state.clone());
+    let (ctl, web, _) = r3s_owner(&app).await;
+    let m = g1c_insert_movies(&state, 1).await;
+    let caps = "/Sessions/Capabilities?playableMediaTypes=Video&supportedCommands=Play&supportsMediaControl=true";
+    assert_eq!(
+        r3s_post(&app, &web, caps, None).await,
+        StatusCode::NO_CONTENT
+    );
+
+    let full = serde_json::json!({
+        "PlayableMediaTypes": ["Audio", "Video"], "SupportsMediaControl": true,
+        "SupportsPersistentIdentifier": false, "DeviceProfile": { "MaxStreamingBitrate": 10_000_000 },
+    });
+    let req = r3cast_request("POST", "/Sessions/Capabilities/Full", &web, Some(full));
+    assert_eq!(send(&app, req).await.0, StatusCode::NO_CONTENT);
+    let cast = r3s_session(&app, &ctl, R3CAST_DEVICE).await;
+    assert_eq!(cast["Client"], "Chromecast");
+    assert_eq!(cast["DeviceName"], "Living Room");
+    assert_eq!(cast["ApplicationVersion"], "3.0.0");
+    assert_eq!(
+        cast["PlayableMediaTypes"],
+        serde_json::json!(["Audio", "Video"])
+    );
+    let own = r3s_session(&app, &ctl, "r3s-tgt").await;
+    assert_eq!(
+        own["PlayableMediaTypes"],
+        serde_json::json!(["Video"]),
+        "the web session keeps its own"
+    );
+    assert_ne!(own["Id"], cast["Id"]);
+
+    let start = serde_json::json!({
+        "ItemId": m[0], "PositionTicks": 50_000_000, "PlaySessionId": "r3cast-play", "CanSeek": true,
+        "PlayMethod": "DirectStream", "IsPaused": false, "AudioStreamIndex": 1, "SubtitleStreamIndex": -1,
+    });
+    let req = r3cast_request("POST", "/Sessions/Playing", &web, Some(start));
+    assert_eq!(send(&app, req).await.0, StatusCode::NO_CONTENT);
+    let cast = r3s_session(&app, &ctl, R3CAST_DEVICE).await;
+    assert_eq!(cast["NowPlayingItem"]["Id"], m[0].to_string().as_str());
+    assert_eq!(cast["PlayState"]["PositionTicks"], 50_000_000);
+    assert!(
+        r3s_session(&app, &ctl, "r3s-tgt")
+            .await
+            .get("NowPlayingItem")
+            .is_none()
+    );
+
+    let progress = serde_json::json!({ "ItemId": m[0], "PositionTicks": 70_000_000, "IsPaused": true,
+        "PlaySessionId": "r3cast-play" });
+    let req = r3cast_request("POST", "/Sessions/Playing/Progress", &web, Some(progress));
+    assert_eq!(send(&app, req).await.0, StatusCode::NO_CONTENT);
+    let ping = "/Sessions/Playing/Ping?playSessionId=r3cast-play";
+    assert_eq!(
+        send(&app, r3cast_request("POST", ping, &web, None)).await.0,
+        StatusCode::NO_CONTENT
+    );
+    let ps = r3s_session(&app, &ctl, R3CAST_DEVICE).await["PlayState"].clone();
+    assert_eq!(
+        (ps["PositionTicks"].clone(), ps["IsPaused"].clone()),
+        (70_000_000.into(), true.into())
+    );
+
+    let stop = serde_json::json!({ "ItemId": m[0], "PositionTicks": 70_000_000, "PlaySessionId": "r3cast-play" });
+    let req = r3cast_request("POST", "/Sessions/Playing/Stopped", &web, Some(stop));
+    assert_eq!(send(&app, req).await.0, StatusCode::NO_CONTENT);
+    assert!(
+        r3s_session(&app, &ctl, R3CAST_DEVICE)
+            .await
+            .get("NowPlayingItem")
+            .is_none()
+    );
+}
+
+// The receiver times GET /Playback/BitrateTest?size= to choose its bitrate: Jellyfin answers
+// that many bytes of application/octet-stream, 102400 without a size, 400 outside 1..=100000000
+#[tokio::test]
+async fn r3cast_bitrate_test_answers_the_bytes_asked_for() {
+    let state = test_state().await;
+    let (token, _) = admin_session(&state).await;
+    let app = app(state);
+    let raw = |uri: &str, token: Option<&str>| {
+        let req = request("GET", uri, token, None);
+        let app = app.clone();
+        async move {
+            let resp = app.oneshot(req).await.unwrap();
+            let status = resp.status();
+            let kind = resp
+                .headers()
+                .get("content-type")
+                .map(|v| v.to_str().unwrap().to_string());
+            let body = resp.into_body().collect().await.unwrap().to_bytes();
+            (status, kind, body.len())
+        }
+    };
+    let (status, kind, len) = raw("/Playback/BitrateTest?size=500000", Some(&token)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(kind.as_deref(), Some("application/octet-stream"));
+    assert_eq!(len, 500_000);
+    assert_eq!(raw("/Playback/BitrateTest", Some(&token)).await.2, 102_400);
+    assert_eq!(raw("/playback/bitratetest?Size=7", Some(&token)).await.2, 7);
+    for bad in ["0", "100000001", "big"] {
+        let uri = format!("/Playback/BitrateTest?size={bad}");
+        assert_eq!(
+            raw(&uri, Some(&token)).await.0,
+            StatusCode::BAD_REQUEST,
+            "size={bad}"
+        );
+    }
+    assert_eq!(
+        raw("/Playback/BitrateTest", None).await.0,
+        StatusCode::UNAUTHORIZED
+    );
+    // The largest size states its length up front; the body streams (not read here)
+    let req = request(
+        "GET",
+        "/Playback/BitrateTest?size=100000000",
+        Some(&token),
+        None,
+    );
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(resp.headers()["content-length"], "100000000");
+}
+
+/// The ids of the sessions on `device`, straight from the database.
+async fn r3cast_sessions_on(state: &AppState, device: &str) -> Vec<String> {
+    sqlx::query_scalar("SELECT id FROM sessions WHERE device_id = ?1")
+        .bind(device)
+        .fetch_all(&state.db)
+        .await
+        .unwrap()
+}
+
+// One token keeps at most four sessions for other devices: a fifth device ends the least recently
+// active of them, and a device it already has keeps its session
+#[tokio::test]
+async fn r3cast_a_token_keeps_at_most_four_receiver_sessions() {
+    let state = test_state().await;
+    let app = app(state.clone());
+    let (ctl, web, _) = r3s_owner(&app).await;
+    let caps = |device: &str| {
+        let body =
+            serde_json::json!({ "PlayableMediaTypes": ["Video"], "SupportsMediaControl": true });
+        r3cast_request_from(
+            device,
+            "POST",
+            "/Sessions/Capabilities/Full",
+            &web,
+            Some(body),
+        )
+    };
+    for device in ["cast-1", "cast-2", "cast-3", "cast-4"] {
+        assert_eq!(send(&app, caps(device)).await.0, StatusCode::NO_CONTENT);
+    }
+    // cast-3 is the least recently active; cast-1 is used again and keeps its one session
+    sqlx::query(
+        "UPDATE sessions SET last_activity = '2000-01-01 00:00:00' WHERE device_id = 'cast-3'",
+    )
+    .execute(&state.db)
+    .await
+    .unwrap();
+    let first = r3cast_sessions_on(&state, "cast-1").await;
+    assert_eq!(send(&app, caps("cast-1")).await.0, StatusCode::NO_CONTENT);
+    assert_eq!(r3cast_sessions_on(&state, "cast-1").await, first);
+
+    assert_eq!(send(&app, caps("cast-5")).await.0, StatusCode::NO_CONTENT);
+    assert!(r3cast_sessions_on(&state, "cast-3").await.is_empty());
+    for device in ["cast-1", "cast-2", "cast-4", "cast-5"] {
+        assert_eq!(
+            r3cast_sessions_on(&state, device).await.len(),
+            1,
+            "{device}"
+        );
+    }
+    // The token's own device and other tokens are not counted
+    assert!(!r3s_session(&app, &ctl, "r3s-tgt").await.is_null());
+    assert!(!r3s_session(&app, &ctl, "r3s-ctl").await.is_null());
+}
+
+// Jellyfin 12.4's session key is the client, the device and the user: two users naming one device,
+// or one user's two clients on it, get a session each, and the same three again reuse theirs
+#[tokio::test]
+async fn r3cast_sessions_are_keyed_by_client_device_and_user() {
+    let state = test_state().await;
+    let app = app(state.clone());
+    let (ctl, owner, _) = r3s_owner(&app).await;
+    add_user(&state, "guest", "guestpass", false).await;
+    let (guest, _) = r3s_login(&app, "guest", "guestpass", "r3cast-guest").await;
+    let caps = |client: &str, token: &str| {
+        let auth = format!(
+            r#"MediaBrowser Client="{client}", Device="Shared", DeviceId="r3cast-shared", Version="1", Token="{token}""#
+        );
+        Request::builder()
+            .method("POST")
+            .uri("/Sessions/Capabilities/Full")
+            .header("Authorization", auth)
+            .header("Content-Type", "application/json")
+            .body(Body::from(r#"{"PlayableMediaTypes":["Video"]}"#))
+            .unwrap()
+    };
+    let owner_of = |id: &str| {
+        let state = state.clone();
+        let id = id.to_string();
+        async move {
+            sqlx::query_scalar::<_, String>("SELECT user_id FROM sessions WHERE id = ?1")
+                .bind(id)
+                .fetch_one(&state.db)
+                .await
+                .unwrap()
+        }
+    };
+
+    assert_eq!(
+        send(&app, caps("Chromecast", &owner)).await.0,
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(
+        send(&app, caps("Chromecast", &guest)).await.0,
+        StatusCode::NO_CONTENT
+    );
+    let shared = r3cast_sessions_on(&state, "r3cast-shared").await;
+    assert_eq!(shared.len(), 2, "one session per user on the shared device");
+    let mut users = Vec::new();
+    for id in &shared {
+        users.push(owner_of(id).await);
+    }
+    users.sort();
+    users.dedup();
+    assert_eq!(
+        users.len(),
+        2,
+        "the guest didn't take over the owner's session"
+    );
+
+    // Another client of the owner on the same device id: a third session
+    assert_eq!(
+        send(&app, caps("Other Client", &owner)).await.0,
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(r3cast_sessions_on(&state, "r3cast-shared").await.len(), 3);
+    // The same client, device and user again: no new session
+    assert_eq!(
+        send(&app, caps("Chromecast", &owner)).await.0,
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(r3cast_sessions_on(&state, "r3cast-shared").await.len(), 3);
+
+    // A sign-in of one client on a device leaves the user's other clients' sessions there
+    let (_, _) = r3s_login(&app, "owner", "ownerpass", "r3s-tgt").await;
+    assert!(!r3s_session(&app, &ctl, "r3s-tgt").await.is_null());
+    let sign_in = |client: &str| {
+        Request::builder()
+            .method("POST")
+            .uri("/Users/AuthenticateByName")
+            .header("Content-Type", "application/json")
+            .header(
+                "X-Emby-Authorization",
+                format!(r#"MediaBrowser Client="{client}", Device="Box", DeviceId="r3cast-box", Version="1""#),
+            )
+            .body(Body::from(
+                serde_json::json!({ "Username": "owner", "Pw": "ownerpass" }).to_string(),
+            ))
+            .unwrap()
+    };
+    assert_eq!(send(&app, sign_in("App A")).await.0, StatusCode::OK);
+    assert_eq!(send(&app, sign_in("App B")).await.0, StatusCode::OK);
+    assert_eq!(r3cast_sessions_on(&state, "r3cast-box").await.len(), 2);
+    assert_eq!(send(&app, sign_in("App A")).await.0, StatusCode::OK);
+    assert_eq!(
+        r3cast_sessions_on(&state, "r3cast-box").await.len(),
+        2,
+        "App A keeps one"
+    );
+}
+
+// A receiver's session ends with the token it was made with: on sign-out, and on revocation
+#[tokio::test]
+async fn r3cast_receiver_sessions_end_with_their_token() {
+    let state = test_state().await;
+    let app = app(state.clone());
+    let (ctl, web, _) = r3s_owner(&app).await;
+    let req = r3cast_request(
+        "POST",
+        "/Sessions/Capabilities/Full",
+        &web,
+        Some(serde_json::json!({})),
+    );
+    assert_eq!(send(&app, req).await.0, StatusCode::NO_CONTENT);
+    assert!(!r3s_session(&app, &ctl, R3CAST_DEVICE).await.is_null());
+    let req = request("POST", "/Sessions/Logout", Some(&web), None);
+    assert_eq!(send(&app, req).await.0, StatusCode::NO_CONTENT);
+    assert!(r3cast_sessions_on(&state, R3CAST_DEVICE).await.is_empty());
+    assert!(r3s_session(&app, &ctl, R3CAST_DEVICE).await.is_null());
+
+    // A revoked token (no sign-out) takes its receiver session with it too
+    let (web, _) = r3s_login(&app, "owner", "ownerpass", "r3s-tgt").await;
+    let req = r3cast_request(
+        "POST",
+        "/Sessions/Capabilities/Full",
+        &web,
+        Some(serde_json::json!({})),
+    );
+    assert_eq!(send(&app, req).await.0, StatusCode::NO_CONTENT);
+    assert_eq!(r3cast_sessions_on(&state, R3CAST_DEVICE).await.len(), 1);
+    rustyfin_auth::revoke_token(&state.db, &web).await.unwrap();
+    assert!(r3cast_sessions_on(&state, R3CAST_DEVICE).await.is_empty());
+    // The controller's own session is untouched
+    assert!(!r3s_session(&app, &ctl, "r3s-ctl").await.is_null());
+}
+
+// The web client's Cast sender: the SDK loads only on demand, one picker lists Cast devices and
+// sessions, the hand-off carries item, position and tracks, remote controls drive the receiver,
+// and stopping resumes local playback where the receiver was
+#[test]
+fn r3cast_web_sender() {
+    b124_node_test("r3cast_web.mjs");
+}
+
+/// GET `uri` as `token` and return the status and the answer, which is an array (Latest) or a
+/// query result.
+async fn r3queues_get(
+    app: &axum::Router,
+    token: &str,
+    uri: &str,
+) -> (StatusCode, serde_json::Value) {
+    send(app, request("GET", uri, Some(token), None)).await
+}
+
+/// The ids of a Latest answer (an array) or a query result's `Items`, in order.
+fn r3queues_ids(body: &serde_json::Value) -> Vec<uuid::Uuid> {
+    body.get("Items")
+        .unwrap_or(body)
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|i| i["Id"].as_str().unwrap().parse().unwrap())
+        .collect()
+}
+
+/// Jellyfin 12.4's `TvShowsController.GetEpisodes`: `startItemId` drops the episodes before it,
+/// `adjacentTo` keeps it and its neighbours (nothing when it is not in the list), `isMissing`
+/// filters on Virtual episodes, and the count is of the filtered list.
+#[tokio::test]
+async fn r3queues_episodes_start_item_adjacent_and_missing() {
+    let state = test_state().await;
+    let app = app(state.clone());
+    let (token, user) = admin_session(&state).await;
+    let (series, [e1, e2, e3]) = g1f_insert_show(&state).await;
+    let season = b93_season_of(&state, e1).await;
+    let base = format!("/Shows/{series}/Episodes?userId={user}");
+    let stranger = uuid::Uuid::new_v4();
+    let cases = [
+        (format!("{base}&startItemId={e2}"), vec![e2, e3]),
+        (format!("{base}&StartItemId={e2}"), vec![e2, e3]),
+        (
+            format!("/Shows/{series}/Episodes?seasonId={season}&startItemId={e3}"),
+            vec![e3],
+        ),
+        (format!("{base}&startItemId={stranger}"), vec![]),
+        (format!("{base}&adjacentTo={e2}"), vec![e1, e2, e3]),
+        (format!("{base}&adjacentTo={e1}"), vec![e1, e2]),
+        (format!("{base}&adjacentTo={e3}&limit=3"), vec![e2, e3]),
+        (format!("{base}&adjacentTo={stranger}"), vec![]),
+        (
+            format!("{base}&startItemId={e2}&adjacentTo={e3}"),
+            vec![e2, e3],
+        ),
+        (format!("{base}&isMissing=false"), vec![e1, e2, e3]),
+        (format!("{base}&IsMissing=True"), vec![]),
+        (format!("{base}&startItemId={e1}&limit=2"), vec![e1, e2]),
+    ];
+    for (uri, want) in cases {
+        let (status, body) = r3queues_get(&app, &token, &uri).await;
+        assert_eq!(status, StatusCode::OK, "{uri}");
+        assert_eq!(r3queues_ids(&body), want, "{uri}");
+    }
+    // The count is of the filtered list, before paging.
+    let (_, body) = r3queues_get(&app, &token, &format!("{base}&startItemId={e2}&limit=1")).await;
+    assert_eq!(body["TotalRecordCount"], 2);
+    // sortBy=Random keeps the same episodes.
+    let (_, body) = r3queues_get(&app, &token, &format!("{base}&sortBy=Random")).await;
+    let mut ids = r3queues_ids(&body);
+    ids.sort();
+    let mut all = vec![e1, e2, e3];
+    all.sort();
+    assert_eq!(ids, all);
+    // Not a series, or a seasonId that is not a season: 404, as in Jellyfin.
+    for uri in [
+        format!("/Shows/{stranger}/Episodes"),
+        format!("/Shows/{e1}/Episodes"),
+        format!("/Shows/{series}/Episodes?seasonId={series}"),
+    ] {
+        assert_eq!(
+            r3queues_get(&app, &token, &uri).await.0,
+            StatusCode::NOT_FOUND,
+            "{uri}"
+        );
+    }
+}
+
+/// Next Up's `enableResumable=false` leaves out a series whose next episode is in progress.
+#[tokio::test]
+async fn r3queues_next_up_enable_resumable() {
+    let state = test_state().await;
+    let app = app(state.clone());
+    let (token, user) = admin_session(&state).await;
+    let (_, [e1, e2, _]) = g1f_insert_show(&state).await;
+    rustyfin_db::repo_playback::mark_played(&state.db, user, e1)
+        .await
+        .unwrap();
+    rustyfin_db::repo_playback::update_playback_position(&state.db, user, e2, 50_000_000)
+        .await
+        .unwrap();
+    for (uri, want) in [
+        ("/Shows/NextUp", vec![e2]),
+        ("/Shows/NextUp?enableResumable=true", vec![e2]),
+        ("/Shows/NextUp?enableResumable=false", vec![]),
+        ("/Shows/NextUp?EnableResumable=False", vec![]),
+    ] {
+        let (status, body) = r3queues_get(&app, &token, uri).await;
+        assert_eq!(status, StatusCode::OK, "{uri}");
+        assert_eq!(r3queues_ids(&body), want, "{uri}");
+    }
+    let (_, body) = r3queues_get(&app, &token, "/Shows/NextUp?enableTotalRecordCount=false").await;
+    assert_eq!(body["TotalRecordCount"], 0);
+    assert_eq!(r3queues_ids(&body), vec![e2]);
+}
+
+/// `nextUpDateCutoff` leaves out series whose newest play is older (not with `seriesId`), and
+/// `enableRewatching` offers the played episode after the most recently played one.
+#[tokio::test]
+async fn r3queues_next_up_date_cutoff_and_rewatching() {
+    let state = test_state().await;
+    let app = app(state.clone());
+    let (token, user) = admin_session(&state).await;
+    let (series, [e1, e2, e3]) = g1f_insert_show(&state).await;
+    let at = |d: &str| {
+        Some(
+            chrono::DateTime::parse_from_rfc3339(d)
+                .unwrap()
+                .with_timezone(&chrono::Utc),
+        )
+    };
+    rustyfin_db::repo_playback::mark_played_on(&state.db, user, e1, at("2010-05-01T00:00:00Z"))
+        .await
+        .unwrap();
+    for (uri, want) in [
+        ("/Shows/NextUp".to_string(), vec![e2]),
+        (
+            "/Shows/NextUp?nextUpDateCutoff=2010-01-01T00:00:00.000Z".to_string(),
+            vec![e2],
+        ),
+        (
+            "/Shows/NextUp?nextUpDateCutoff=2011-01-01T00:00:00Z".to_string(),
+            vec![],
+        ),
+        (
+            "/Shows/NextUp?NextUpDateCutoff=2011-01-01".to_string(),
+            vec![],
+        ),
+        (
+            format!("/Shows/NextUp?seriesId={series}&nextUpDateCutoff=2011-01-01"),
+            vec![e2],
+        ),
+    ] {
+        let (status, body) = r3queues_get(&app, &token, &uri).await;
+        assert_eq!(status, StatusCode::OK, "{uri}");
+        assert_eq!(r3queues_ids(&body), want, "{uri}");
+    }
+    assert_eq!(
+        r3queues_get(&app, &token, "/Shows/NextUp?nextUpDateCutoff=soon")
+            .await
+            .0,
+        StatusCode::BAD_REQUEST
+    );
+
+    // All watched, the first one last: nothing is next, but a rewatch goes on with episode 2.
+    rustyfin_db::repo_playback::mark_played_on(&state.db, user, e2, at("2010-03-01T00:00:00Z"))
+        .await
+        .unwrap();
+    rustyfin_db::repo_playback::mark_played_on(&state.db, user, e3, at("2010-04-01T00:00:00Z"))
+        .await
+        .unwrap();
+    for (uri, want) in [
+        ("/Shows/NextUp", vec![]),
+        ("/Shows/NextUp?enableRewatching=false", vec![]),
+        ("/Shows/NextUp?enableRewatching=true", vec![e2]),
+    ] {
+        let (status, body) = r3queues_get(&app, &token, uri).await;
+        assert_eq!(status, StatusCode::OK, "{uri}");
+        assert_eq!(r3queues_ids(&body), want, "{uri}");
+    }
+}
+
+/// Latest in a TV library (Jellyfin 12.4): new episodes of a one-season series show as the
+/// series, a single one as itself; played items are hidden while the user's
+/// `HidePlayedInLatest` is on (the default); `isPlayed`, `groupItems=false` and every
+/// `includeItemTypes` value are read.
+#[tokio::test]
+async fn r3queues_latest_group_items_and_is_played() {
+    let state = test_state().await;
+    let app = app(state.clone());
+    let (token, user) = admin_session(&state).await;
+    let (series, [e1, e2, e3]) = g1f_insert_show(&state).await;
+
+    let (status, body) = r3queues_get(&app, &token, "/Items/Latest").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(r3queues_ids(&body), vec![series]);
+
+    let (_, body) = r3queues_get(&app, &token, "/Items/Latest?groupItems=false").await;
+    let mut ids = r3queues_ids(&body);
+    ids.sort();
+    let mut all = vec![e1, e2, e3];
+    all.sort();
+    assert_eq!(ids, all);
+
+    let (_, body) = r3queues_get(
+        &app,
+        &token,
+        "/Items/Latest?includeItemTypes=Movie,Episode&GroupItems=False&limit=2",
+    )
+    .await;
+    assert_eq!(body.as_array().unwrap().len(), 2, "limit and both types");
+
+    for played in [e1, e2] {
+        rustyfin_db::repo_playback::mark_played(&state.db, user, played)
+            .await
+            .unwrap();
+    }
+    // One unplayed new episode out of three is shown as itself.
+    let (_, body) = r3queues_get(&app, &token, "/Items/Latest").await;
+    assert_eq!(
+        r3queues_ids(&body),
+        vec![e3],
+        "the played episodes are hidden"
+    );
+    let (_, body) = r3queues_get(&app, &token, &format!("/Users/{user}/Items/Latest")).await;
+    assert_eq!(r3queues_ids(&body), vec![e3], "the legacy route");
+    let (_, body) = r3queues_get(&app, &token, "/Items/Latest?isPlayed=true").await;
+    assert_eq!(r3queues_ids(&body), vec![series], "two played: the series");
+
+    // With HidePlayedInLatest off, played items count again.
+    rustyfin_db::repo_user::update_configuration(
+        &state.db,
+        user,
+        &serde_json::json!({ "HidePlayedInLatest": false }),
+    )
+    .await
+    .unwrap();
+    let (_, body) = r3queues_get(&app, &token, "/Items/Latest").await;
+    assert_eq!(r3queues_ids(&body), vec![series]);
+}
+
+/// UserViews leaves out the user's `MyMediaExcludes` unless `includeHidden=true`.
+#[tokio::test]
+async fn r3queues_user_views_include_hidden() {
+    let state = test_state().await;
+    let app = app(state.clone());
+    let (token, user) = admin_session(&state).await;
+    g1f_insert_show(&state).await;
+    let (_, body) = r3queues_get(&app, &token, "/UserViews").await;
+    let library = r3queues_ids(&body);
+    assert_eq!(library.len(), 1);
+    rustyfin_db::repo_user::update_configuration(
+        &state.db,
+        user,
+        &serde_json::json!({ "MyMediaExcludes": [library[0].simple().to_string()] }),
+    )
+    .await
+    .unwrap();
+    for (uri, want) in [
+        ("/UserViews".to_string(), vec![]),
+        ("/UserViews?includeHidden=false".to_string(), vec![]),
+        ("/UserViews?includeHidden=true".to_string(), library.clone()),
+        (
+            format!("/Users/{user}/Views?IncludeHidden=true"),
+            library.clone(),
+        ),
+        (format!("/Users/{user}/Views"), vec![]),
+    ] {
+        let (status, body) = r3queues_get(&app, &token, &uri).await;
+        assert_eq!(status, StatusCode::OK, "{uri}");
+        assert_eq!(r3queues_ids(&body), want, "{uri}");
+        assert_eq!(body["TotalRecordCount"], want.len(), "{uri}");
+    }
+}
+
+/// Resume's `excludeActiveSessions=true` leaves out what the user's sessions are playing.
+#[tokio::test]
+async fn r3queues_resume_exclude_active_sessions() {
+    let state = test_state().await;
+    let app = app(state.clone());
+    let (_, user) = admin_session(&state).await;
+    // A token with a device, so its reports have a session to play on.
+    let account = rustyfin_db::repo_user::get_user_by_id(&state.db, user)
+        .await
+        .unwrap()
+        .unwrap();
+    let device = rustyfin_auth::TokenDevice {
+        device_id: "r3q-device".to_string(),
+        device_name: "R3Q Phone".to_string(),
+        app_name: "R3Q".to_string(),
+        app_version: "1.0".to_string(),
+    };
+    let token = rustyfin_auth::create_token(&state.db, &account, &device)
+        .await
+        .unwrap();
+    let (_, [e1, e2, _]) = g1f_insert_show(&state).await;
+    // The start report first: it writes its own play state, which the positions below replace.
+    let (status, _) = send(
+        &app,
+        request(
+            "POST",
+            "/Sessions/Playing",
+            Some(&token),
+            Some(serde_json::json!({ "ItemId": e2, "PositionTicks": 50_000_000 })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    for (item, ticks) in [(e1, 40_000_000), (e2, 50_000_000)] {
+        rustyfin_db::repo_playback::update_playback_position(&state.db, user, item, ticks)
+            .await
+            .unwrap();
+    }
+    let (_, body) = r3queues_get(&app, &token, "/UserItems/Resume").await;
+    let mut ids = r3queues_ids(&body);
+    ids.sort();
+    let mut both = vec![e1, e2];
+    both.sort();
+    assert_eq!(ids, both);
+    for uri in [
+        "/UserItems/Resume?excludeActiveSessions=true".to_string(),
+        format!("/Users/{user}/Items/Resume?ExcludeActiveSessions=True"),
+    ] {
+        let (status, body) = r3queues_get(&app, &token, &uri).await;
+        assert_eq!(status, StatusCode::OK, "{uri}");
+        assert_eq!(r3queues_ids(&body), vec![e1], "{uri}");
+        assert_eq!(body["TotalRecordCount"], 1, "{uri}");
+    }
+}
+
+/// Inserts a made-up item in `library` (an episode's `parent` is its season) and returns its id.
+async fn r3queues_insert(
+    state: &AppState,
+    library: &str,
+    kind: &str,
+    parent: Option<uuid::Uuid>,
+    index: i64,
+    created: &str,
+) -> uuid::Uuid {
+    let id = uuid::Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO media_items (id, library_id, name, media_type, path, parent_id, \
+         index_number, parent_index_number, date_created) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+    )
+    .bind(id.to_string())
+    .bind(library)
+    .bind(format!("R3Q {kind} {index}"))
+    .bind(kind)
+    .bind(format!("/r3q/{id}.mkv"))
+    .bind(parent.map(|p| p.to_string()))
+    .bind(index)
+    .bind(parent.map(|_| 1))
+    .bind(created)
+    .execute(&state.db)
+    .await
+    .unwrap();
+    id
+}
+
+/// The library an item is in.
+async fn r3queues_library_of(state: &AppState, item: uuid::Uuid) -> String {
+    sqlx::query_scalar("SELECT library_id FROM media_items WHERE id = ?")
+        .bind(item.to_string())
+        .fetch_one(&state.db)
+        .await
+        .unwrap()
+}
+
+/// A made-up library of `content_type`; returns its id.
+async fn r3queues_library(
+    state: &AppState,
+    name: &str,
+    content_type: rustyfin_model::library::LibraryContentType,
+) -> String {
+    let library = rustyfin_model::library::Library {
+        id: uuid::Uuid::new_v4(),
+        name: name.to_string(),
+        content_type,
+        paths: vec![media_folder(state, name)],
+    };
+    rustyfin_db::repo_library::create_library(&state.db, &library)
+        .await
+        .unwrap();
+    library.id.to_string()
+}
+
+/// Jellyfin 12.4's TV "Latest": per series, its episodes added within 24 hours of its newest
+/// one. One gives that episode; several in one season give the season when the series has more
+/// seasons, else the series; several seasons give the series. Newest series first.
+#[tokio::test]
+async fn r3queues_latest_tv_picks_episode_season_or_series() {
+    use rustyfin_model::library::LibraryContentType;
+    let state = test_state().await;
+    let app = app(state.clone());
+    let (token, _) = admin_session(&state).await;
+    let tv = r3queues_library(&state, "r3q-tv", LibraryContentType::TvShows).await;
+    let old = "2020-01-01T00:00:00+00:00";
+    // Two seasons, two new episodes in the second: the season.
+    let two_new = r3queues_insert(&state, &tv, "Series", None, 0, old).await;
+    let s1 = r3queues_insert(&state, &tv, "Season", Some(two_new), 1, old).await;
+    let s2 = r3queues_insert(&state, &tv, "Season", Some(two_new), 2, old).await;
+    r3queues_insert(&state, &tv, "Episode", Some(s1), 1, old).await;
+    r3queues_insert(
+        &state,
+        &tv,
+        "Episode",
+        Some(s2),
+        1,
+        "2030-03-01T00:00:00+00:00",
+    )
+    .await;
+    r3queues_insert(
+        &state,
+        &tv,
+        "Episode",
+        Some(s2),
+        2,
+        "2030-03-01T05:00:00+00:00",
+    )
+    .await;
+    // One season, one new episode out of two: the episode.
+    let one_new = r3queues_insert(&state, &tv, "Series", None, 0, old).await;
+    let s = r3queues_insert(&state, &tv, "Season", Some(one_new), 1, old).await;
+    r3queues_insert(&state, &tv, "Episode", Some(s), 1, old).await;
+    let lone = r3queues_insert(
+        &state,
+        &tv,
+        "Episode",
+        Some(s),
+        2,
+        "2030-02-01T00:00:00+00:00",
+    )
+    .await;
+    // One season, two new episodes: the series.
+    let single_season = r3queues_insert(&state, &tv, "Series", None, 0, old).await;
+    let s = r3queues_insert(&state, &tv, "Season", Some(single_season), 1, old).await;
+    for n in 1..=2 {
+        r3queues_insert(
+            &state,
+            &tv,
+            "Episode",
+            Some(s),
+            n,
+            "2030-02-10T00:00:00+00:00",
+        )
+        .await;
+    }
+    // New episodes in two seasons: the series.
+    let across = r3queues_insert(&state, &tv, "Series", None, 0, old).await;
+    for n in 1..=2 {
+        let s = r3queues_insert(&state, &tv, "Season", Some(across), n, old).await;
+        r3queues_insert(
+            &state,
+            &tv,
+            "Episode",
+            Some(s),
+            1,
+            "2030-02-15T00:00:00+00:00",
+        )
+        .await;
+    }
+
+    let (status, body) = r3queues_get(&app, &token, &format!("/Items/Latest?parentId={tv}")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(r3queues_ids(&body), vec![s2, across, single_season, lone]);
+    let (_, body) = r3queues_get(
+        &app,
+        &token,
+        &format!("/Items/Latest?parentId={tv}&limit=2"),
+    )
+    .await;
+    assert_eq!(r3queues_ids(&body), vec![s2, across]);
+}
+
+/// Jellyfin 12.4's other "Latest" paths: a movie library lists its newest items, a music
+/// library its newest albums (the played filter doesn't apply), and a mixed library its newest
+/// non-episodes merged with the TV result.
+#[tokio::test]
+async fn r3queues_latest_movies_music_and_mixed() {
+    use rustyfin_model::library::LibraryContentType;
+    let state = test_state().await;
+    let app = app(state.clone());
+    let (token, user) = admin_session(&state).await;
+
+    let movies = r3queues_library(&state, "r3q-movies", LibraryContentType::Movies).await;
+    let m1 = r3queues_insert(
+        &state,
+        &movies,
+        "Movie",
+        None,
+        1,
+        "2030-01-01T00:00:00+00:00",
+    )
+    .await;
+    let m2 = r3queues_insert(
+        &state,
+        &movies,
+        "Movie",
+        None,
+        2,
+        "2030-01-02T00:00:00+00:00",
+    )
+    .await;
+    let m3 = r3queues_insert(
+        &state,
+        &movies,
+        "Movie",
+        None,
+        3,
+        "2030-01-03T00:00:00+00:00",
+    )
+    .await;
+    let uri = format!("/Items/Latest?parentId={movies}");
+    assert_eq!(
+        r3queues_ids(&r3queues_get(&app, &token, &uri).await.1),
+        vec![m3, m2, m1]
+    );
+    let uri = format!("/Items/Latest?parentId={movies}&limit=2");
+    assert_eq!(
+        r3queues_ids(&r3queues_get(&app, &token, &uri).await.1),
+        vec![m3, m2]
+    );
+
+    let music = r3queues_library(&state, "r3q-music", LibraryContentType::Music).await;
+    let older = r3queues_insert(
+        &state,
+        &music,
+        "MusicAlbum",
+        None,
+        1,
+        "2029-01-01T00:00:00+00:00",
+    )
+    .await;
+    let newer = r3queues_insert(
+        &state,
+        &music,
+        "MusicAlbum",
+        None,
+        2,
+        "2030-01-01T00:00:00+00:00",
+    )
+    .await;
+    let track = r3queues_insert(
+        &state,
+        &music,
+        "Audio",
+        Some(newer),
+        1,
+        "2030-01-01T00:00:00+00:00",
+    )
+    .await;
+    r3queues_insert(
+        &state,
+        &music,
+        "Audio",
+        Some(older),
+        1,
+        "2029-01-01T00:00:00+00:00",
+    )
+    .await;
+    rustyfin_db::repo_playback::mark_played(&state.db, user, track)
+        .await
+        .unwrap();
+    for uri in [
+        format!("/Items/Latest?parentId={music}"),
+        format!("/Items/Latest?parentId={music}&isPlayed=false"),
+    ] {
+        let (_, body) = r3queues_get(&app, &token, &uri).await;
+        assert_eq!(r3queues_ids(&body), vec![newer, older], "{uri}");
+    }
+
+    let mixed = r3queues_library(&state, "r3q-mixed", LibraryContentType::Mixed).await;
+    let film = r3queues_insert(
+        &state,
+        &mixed,
+        "Movie",
+        None,
+        1,
+        "2030-05-02T00:00:00+00:00",
+    )
+    .await;
+    let series = r3queues_insert(
+        &state,
+        &mixed,
+        "Series",
+        None,
+        0,
+        "2030-05-03T00:00:00+00:00",
+    )
+    .await;
+    let season = r3queues_insert(
+        &state,
+        &mixed,
+        "Season",
+        Some(series),
+        1,
+        "2020-01-01T00:00:00+00:00",
+    )
+    .await;
+    for n in 1..=2 {
+        r3queues_insert(
+            &state,
+            &mixed,
+            "Episode",
+            Some(season),
+            n,
+            "2030-05-01T00:00:00+00:00",
+        )
+        .await;
+    }
+    // Merged by date added: the series' own date is the newest.
+    let (_, body) = r3queues_get(&app, &token, &format!("/Items/Latest?parentId={mixed}")).await;
+    assert_eq!(r3queues_ids(&body), vec![series, film]);
+}
+
+/// `LatestItemsExcludes` leaves its libraries out of Latest without `parentId`, and only them.
+#[tokio::test]
+async fn r3queues_latest_items_excludes() {
+    let state = test_state().await;
+    let app = app(state.clone());
+    let (token, user) = admin_session(&state).await;
+    let (series, [e1, _, _]) = g1f_insert_show(&state).await;
+    let tv = r3queues_library_of(&state, e1).await;
+    let (_, body) = r3queues_get(&app, &token, "/Items/Latest").await;
+    assert_eq!(r3queues_ids(&body), vec![series]);
+    rustyfin_db::repo_user::update_configuration(
+        &state.db,
+        user,
+        &serde_json::json!({ "LatestItemsExcludes": [uuid::Uuid::new_v4().to_string()] }),
+    )
+    .await
+    .unwrap();
+    let (_, body) = r3queues_get(&app, &token, "/Items/Latest").await;
+    assert_eq!(
+        r3queues_ids(&body),
+        vec![series],
+        "another library excluded"
+    );
+    rustyfin_db::repo_user::update_configuration(
+        &state.db,
+        user,
+        &serde_json::json!({ "LatestItemsExcludes": [tv] }),
+    )
+    .await
+    .unwrap();
+    let (_, body) = r3queues_get(&app, &token, "/Items/Latest").await;
+    assert_eq!(r3queues_ids(&body), Vec::<uuid::Uuid>::new());
+    let (_, body) = r3queues_get(&app, &token, &format!("/Items/Latest?parentId={tv}")).await;
+    assert_eq!(
+        r3queues_ids(&body),
+        vec![series],
+        "a parentId reads it anyway"
+    );
+}
+
+/// An administrator asking with a restricted user's `userId` gets what that user may see.
+#[tokio::test]
+async fn r3queues_user_id_lists_follow_that_users_access() {
+    let state = test_state().await;
+    let app = app(state.clone());
+    let (token, _) = admin_session(&state).await;
+    let (series, [e1, e2, _]) = g1f_insert_show(&state).await;
+    let (status, body) = b21_new_user(&app, &token, "r3q-restricted").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let kid: uuid::Uuid = body["Id"].as_str().unwrap().parse().unwrap();
+    let uri = format!("/Users/{kid}/Policy");
+    let policy = serde_json::json!({ "EnableAllFolders": false, "EnabledFolders": [] });
+    let (status, body) = send(&app, request("POST", &uri, Some(&token), Some(policy))).await;
+    assert!(status.is_success(), "{status} {body}");
+    rustyfin_db::repo_playback::mark_played(&state.db, kid, e1)
+        .await
+        .unwrap();
+
+    let (_, body) = r3queues_get(&app, &token, "/Items/Latest").await;
+    assert_eq!(
+        r3queues_ids(&body),
+        vec![series],
+        "the administrator's own row"
+    );
+    for uri in [
+        format!("/Items/Latest?userId={kid}"),
+        format!("/Users/{kid}/Items/Latest"),
+        format!("/Shows/NextUp?userId={kid}"),
+        format!("/Shows/{series}/Episodes?userId={kid}"),
+    ] {
+        let (status, body) = r3queues_get(&app, &token, &uri).await;
+        assert_eq!(status, StatusCode::OK, "{uri}");
+        assert_eq!(r3queues_ids(&body), Vec::<uuid::Uuid>::new(), "{uri}");
+    }
+    // With the library allowed again, the same requests list it.
+    let library = r3queues_library_of(&state, e1).await;
+    let policy = serde_json::json!({ "EnableAllFolders": false, "EnabledFolders": [library] });
+    let (status, _) = send(&app, request("POST", &uri, Some(&token), Some(policy))).await;
+    assert!(status.is_success());
+    let (_, body) = r3queues_get(&app, &token, &format!("/Shows/NextUp?userId={kid}")).await;
+    assert_eq!(r3queues_ids(&body), vec![e2]);
+}
+
+/// `nextUpDateCutoff` reads the newest play, a partial one included, as Jellyfin 12.4 does.
+#[tokio::test]
+async fn r3queues_next_up_cutoff_counts_partial_plays() {
+    let state = test_state().await;
+    let app = app(state.clone());
+    let (token, user) = admin_session(&state).await;
+    let (_, [e1, e2, _]) = g1f_insert_show(&state).await;
+    let old = chrono::DateTime::parse_from_rfc3339("2010-05-01T00:00:00Z")
+        .unwrap()
+        .with_timezone(&chrono::Utc);
+    rustyfin_db::repo_playback::mark_played_on(&state.db, user, e1, Some(old))
+        .await
+        .unwrap();
+    // In progress now, so its play date is today.
+    rustyfin_db::repo_playback::update_playback_position(&state.db, user, e2, 50_000_000)
+        .await
+        .unwrap();
+    let (_, body) = r3queues_get(&app, &token, "/Shows/NextUp?nextUpDateCutoff=2020-01-01").await;
+    assert_eq!(r3queues_ids(&body), vec![e2], "the partial play is today");
+    let (_, body) = r3queues_get(&app, &token, "/Shows/NextUp?nextUpDateCutoff=2999-01-01").await;
+    assert_eq!(r3queues_ids(&body), Vec::<uuid::Uuid>::new());
+}
+
+// r3dash3: admin dashboard 3 (library options, networking, API keys, devices, branding, backups)
+
+// Every LibraryOptions field Jellyfin Web sends is stored and returned, with Jellyfin's names for
+// chapter images and trickplay and its defaults for the fields never saved.
+#[tokio::test]
+async fn r3dash3_library_options_round_trip_every_field() {
+    let state = test_state().await;
+    let app = app(state.clone());
+    let (owner, _, viewer, _) = g1_owner_and_viewer(&state, &app).await;
+    let lib = create_library_via_api(&app, &state, &owner, "R3 Dash3 Options", "Movies").await;
+    let (_, before) = send_authed(
+        &app,
+        "GET",
+        &format!("/Library/{lib}/Options"),
+        &owner,
+        None,
+    )
+    .await;
+    assert_eq!(before["SeasonZeroDisplayName"], "Specials", "{before}");
+    assert_eq!(before["EnableInternetProviders"], true, "{before}");
+    assert_eq!(before["AllowEmbeddedSubtitles"], "AllowAll", "{before}");
+    assert_eq!(before["EnableTrickplayImageExtraction"], false, "{before}");
+
+    let sent = serde_json::json!({
+        "EnableRealtimeMonitor": false,
+        "EnableChapterImageExtraction": true,
+        "PreferredMetadataLanguage": "de",
+        "MetadataCountryCode": "DE",
+        "SaveLocalMetadata": true,
+        "AutomaticRefreshIntervalDays": 90,
+        "EnableEmbeddedTitles": true,
+        "MetadataSavers": ["Nfo"],
+        "AllowEmbeddedSubtitles": "AllowText",
+        "SubtitleDownloadLanguages": ["deu"],
+        "TypeOptions": [{
+            "Type": "Movie",
+            "MetadataFetchers": ["OMDb"],
+            "MetadataFetcherOrder": ["OMDb", "TMDb"],
+            "ImageFetchers": ["TMDb"],
+            "ImageFetcherOrder": ["TMDb"],
+            "ImageOptions": [{ "Type": "Backdrop", "Limit": 3, "MinWidth": 1280 }],
+        }],
+        "PathInfos": [{ "Path": "/stale/copy" }],
+    });
+    let body = serde_json::json!({ "Id": lib, "LibraryOptions": sent }).to_string();
+    let (status, answer) = send_authed(
+        &app,
+        "POST",
+        "/Library/VirtualFolders/LibraryOptions",
+        &owner,
+        Some(&body),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{answer}");
+    let (_, saved) = send_authed(
+        &app,
+        "GET",
+        &format!("/Library/{lib}/Options"),
+        &owner,
+        None,
+    )
+    .await;
+    for (field, value) in sent.as_object().unwrap() {
+        if field == "PathInfos" {
+            continue;
+        }
+        assert_eq!(&saved[field], value, "{field}: {saved}");
+    }
+    assert_eq!(saved["EnableChapterExtraction"], true, "{saved}");
+    assert!(saved.get("PathInfos").is_none(), "{saved}");
+    let (_, folders) = send_authed(&app, "GET", "/Library/VirtualFolders", &owner, None).await;
+    let folder = folders
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|f| f["ItemId"] == lib.to_string())
+        .unwrap();
+    assert_eq!(folder["LibraryOptions"]["TypeOptions"], sent["TypeOptions"]);
+    assert_eq!(folder["LibraryOptions"]["EnableRealtimeMonitor"], false);
+
+    // Jellyfin Web posts back what it read, both names included: nothing changes
+    let body = serde_json::json!({ "Id": lib, "LibraryOptions": saved }).to_string();
+    let (status, _) = send_authed(
+        &app,
+        "POST",
+        "/Library/VirtualFolders/LibraryOptions",
+        &owner,
+        Some(&body),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let (_, again) = send_authed(
+        &app,
+        "GET",
+        &format!("/Library/{lib}/Options"),
+        &owner,
+        None,
+    )
+    .await;
+    assert_eq!(again, saved);
+
+    let (status, _) = send_authed(
+        &app,
+        "GET",
+        &format!("/Library/{lib}/Options"),
+        &viewer,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn r3dash3_available_options_are_jellyfin_shaped() {
+    let state = test_state().await;
+    let app = app(state.clone());
+    let (owner, _, viewer, _) = g1_owner_and_viewer(&state, &app).await;
+    let (status, tv) = send_authed(
+        &app,
+        "GET",
+        "/Libraries/AvailableOptions?libraryContentType=tvshows&isNewLibrary=false",
+        &owner,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{tv}");
+    assert_eq!(tv["MetadataSavers"][0]["Name"], "Nfo", "{tv}");
+    assert!(tv["SubtitleFetchers"].is_array(), "{tv}");
+    assert!(tv["LyricFetchers"].is_array(), "{tv}");
+    assert!(tv["MediaSegmentProviders"].is_array(), "{tv}");
+    let types: Vec<&str> = tv["TypeOptions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["Type"].as_str().unwrap())
+        .collect();
+    assert_eq!(types, ["Series", "Season", "Episode"]);
+    for t in tv["TypeOptions"].as_array().unwrap() {
+        assert!(t["MetadataFetchers"].is_array(), "{t}");
+        assert!(t["ImageFetchers"].is_array(), "{t}");
+        assert!(
+            t["SupportedImageTypes"]
+                .as_array()
+                .unwrap()
+                .contains(&serde_json::json!("Primary"))
+        );
+        assert!(t["DefaultImageOptions"].is_array(), "{t}");
+    }
+    let (_, movies) = send_authed(
+        &app,
+        "GET",
+        "/Libraries/AvailableOptions?libraryContentType=movies",
+        &owner,
+        None,
+    )
+    .await;
+    assert_eq!(movies["TypeOptions"][0]["Type"], "Movie", "{movies}");
+    let (status, _) = send_authed(&app, "GET", "/Libraries/AvailableOptions", &viewer, None).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+}
+
+// The named configuration `network` has Jellyfin's NetworkConfiguration shape, stores what an
+// administrator saves (unknown fields too), refuses bad values, and hides the certificate
+// password from other users.
+#[tokio::test]
+async fn r3dash3_network_configuration_round_trips() {
+    let state = test_state().await;
+    let app = app(state.clone());
+    let (owner, _, viewer, _) = g1_owner_and_viewer(&state, &app).await;
+    let uri = "/System/Configuration/network";
+    let (status, net) = send_authed(&app, "GET", uri, &owner, None).await;
+    assert_eq!(status, StatusCode::OK);
+    for field in [
+        "BaseUrl",
+        "EnableHttps",
+        "RequireHttps",
+        "CertificatePath",
+        "InternalHttpPort",
+        "InternalHttpsPort",
+        "PublicHttpPort",
+        "PublicHttpsPort",
+        "AutoDiscovery",
+        "EnableUPnP",
+        "EnableIPv4",
+        "EnableIPv6",
+        "EnableRemoteAccess",
+        "LocalNetworkSubnets",
+        "LocalNetworkAddresses",
+        "KnownProxies",
+        "IgnoreVirtualInterfaces",
+        "VirtualInterfaceNames",
+        "EnablePublishedServerUriByRequest",
+        "PublishedServerUriBySubnet",
+        "RemoteIPFilter",
+        "IsRemoteIPFilterBlacklist",
+    ] {
+        assert!(net.get(field).is_some(), "{field}: {net}");
+    }
+    assert_eq!(net["InternalHttpPort"], 8096);
+
+    let mut changed = net.clone();
+    changed["InternalHttpPort"] = serde_json::json!(8300);
+    changed["KnownProxies"] = serde_json::json!(["10.0.0.0/8"]);
+    changed["CertificatePassword"] = serde_json::json!("cert-secret");
+    changed["SomeFutureField"] = serde_json::json!(7);
+    let (status, answer) = send_authed(&app, "POST", uri, &owner, Some(&changed.to_string())).await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{answer}");
+    let (_, saved) = send_authed(&app, "GET", uri, &owner, None).await;
+    assert_eq!(saved, changed);
+    let startup = rustyfin_api::named_config::network_startup(&state.data_dir);
+    assert_eq!(startup.bind.as_deref(), Some("0.0.0.0:8300"));
+    assert_eq!(startup.known_proxies.as_deref(), Some("10.0.0.0/8"));
+
+    let (_, seen) = send_authed(&app, "GET", uri, &viewer, None).await;
+    assert_eq!(seen["CertificatePassword"], "", "{seen}");
+    assert_eq!(seen["InternalHttpPort"], 8300);
+
+    for bad in [
+        serde_json::json!({ "InternalHttpPort": 70000 }),
+        serde_json::json!({ "KnownProxies": ["not an address"] }),
+        serde_json::json!([1, 2]),
+    ] {
+        let (status, _) = send_authed(&app, "POST", uri, &owner, Some(&bad.to_string())).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{bad}");
+    }
+    let (status, _) = send_authed(&app, "POST", uri, &viewer, Some(&changed.to_string())).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let (_, kept) = send_authed(&app, "GET", uri, &owner, None).await;
+    assert_eq!(kept, changed);
+}
+
+// Branding saved through the named configuration `branding` is what the anonymous branding
+// endpoints answer.
+#[tokio::test]
+async fn r3dash3_branding_is_saved_and_served_before_sign_in() {
+    let state = test_state().await;
+    let app = app(state.clone());
+    let (owner, _, viewer, _) = g1_owner_and_viewer(&state, &app).await;
+    let body = serde_json::json!({
+        "LoginDisclaimer": "Family server",
+        "CustomCss": ".x { color: red; }",
+        "SplashscreenEnabled": true,
+    });
+    let (status, _) = send_authed(
+        &app,
+        "POST",
+        "/System/Configuration/branding",
+        &owner,
+        Some(&body.to_string()),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let (status, _) = send_authed(
+        &app,
+        "POST",
+        "/System/Configuration/branding",
+        &viewer,
+        Some(&serde_json::json!({ "CustomCss": "" }).to_string()),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+
+    let (status, config) = send(&app, request("GET", "/Branding/Configuration", None, None)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(config, body);
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/Branding/Css")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert!(
+        resp.headers()["content-type"]
+            .to_str()
+            .unwrap()
+            .starts_with("text/css")
+    );
+    let css = resp.into_body().collect().await.unwrap().to_bytes();
+    assert_eq!(&css[..], b".x { color: red; }");
+}
+
+// An API key is created once (its key in that answer only), listed by a hint, works as an
+// administrator's credentials, and stops working when revoked.
+#[tokio::test]
+async fn r3dash3_api_keys_create_list_use_revoke() {
+    let state = test_state().await;
+    let app = app(state.clone());
+    let (owner, _, viewer, _) = g1_owner_and_viewer(&state, &app).await;
+    let (status, created) =
+        send_authed(&app, "POST", "/Auth/Keys?app=Test%20App", &owner, None).await;
+    assert_eq!(status, StatusCode::OK, "{created}");
+    let key = created["AccessToken"].as_str().unwrap().to_string();
+    let id = created["Id"].as_str().unwrap().to_string();
+    assert_eq!(key.len(), 32);
+
+    let (status, list) = send_authed(&app, "GET", "/Auth/Keys", &owner, None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(list["TotalRecordCount"], 1, "{list}");
+    let item = &list["Items"][0];
+    assert_eq!(item["Id"], id.as_str());
+    assert_eq!(item["AppName"], "Test App");
+    assert_eq!(item["AccessToken"], format!("…{}", &key[28..]));
+    assert!(!list.to_string().contains(&key), "{list}");
+
+    // The key is an administrator's credentials
+    let (status, users) = send_authed(&app, "GET", "/Users", &key, None).await;
+    assert_eq!(status, StatusCode::OK, "{users}");
+    let (_, list) = send_authed(&app, "GET", "/Auth/Keys", &owner, None).await;
+    assert!(list["Items"][0]["DateLastActivity"].is_string(), "{list}");
+
+    let (status, _) = send_authed(&app, "POST", "/Auth/Keys", &owner, None).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "app is required");
+    let (status, _) = send_authed(&app, "POST", "/Auth/Keys?app=x", &viewer, None).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let (status, _) = send_authed(&app, "DELETE", &format!("/Auth/Keys/{id}"), &viewer, None).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+
+    let (status, _) = send_authed(&app, "DELETE", &format!("/Auth/Keys/{id}"), &owner, None).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let (status, _) = send_authed(&app, "GET", "/Users", &key, None).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    let (status, _) = send_authed(&app, "DELETE", &format!("/Auth/Keys/{id}"), &owner, None).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    // Jellyfin revokes by the key itself
+    let (_, created) = send_authed(&app, "POST", "/Auth/Keys?app=Other", &owner, None).await;
+    let key = created["AccessToken"].as_str().unwrap();
+    let (status, _) = send_authed(&app, "DELETE", &format!("/Auth/Keys/{key}"), &owner, None).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let (_, list) = send_authed(&app, "GET", "/Auth/Keys", &owner, None).await;
+    assert_eq!(list["TotalRecordCount"], 0, "{list}");
+}
+
+// GET /Devices answers 200 and lists the device a user signed in with; it can be renamed.
+#[tokio::test]
+async fn r3dash3_devices_lists_a_signed_in_device() {
+    let state = test_state().await;
+    let app = app(state.clone());
+    let (owner, _, _, _) = g1_owner_and_viewer(&state, &app).await;
+    let req = Request::builder()
+        .method("POST")
+        .uri("/Users/AuthenticateByName")
+        .header("Content-Type", "application/json")
+        .header(
+            "X-Emby-Authorization",
+            r#"MediaBrowser Client="Test TV", Device="Lounge", DeviceId="r3dash3-tv", Version="1.2.3""#,
+        )
+        .body(Body::from(
+            serde_json::json!({ "Username": "viewer", "Pw": "viewerpass" }).to_string(),
+        ))
+        .unwrap();
+    let (status, _) = send(&app, req).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, devices) = send_authed(&app, "GET", "/Devices", &owner, None).await;
+    assert_eq!(status, StatusCode::OK, "{devices}");
+    let tv = devices["Items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|d| d["Id"] == "r3dash3-tv")
+        .unwrap_or_else(|| panic!("{devices}"));
+    assert_eq!(tv["Name"], "Lounge");
+    assert_eq!(tv["AppName"], "Test TV");
+    assert_eq!(tv["LastUserName"], "viewer");
+
+    let (status, _) = send_authed(
+        &app,
+        "POST",
+        "/Devices/Options?id=r3dash3-tv",
+        &owner,
+        Some(r#"{"CustomName":"Kids TV"}"#),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let (_, info) = send_authed(&app, "GET", "/Devices/Info?id=r3dash3-tv", &owner, None).await;
+    assert_eq!(info["CustomName"], "Kids TV");
+    let (status, _) = send_authed(&app, "DELETE", "/Devices?id=r3dash3-tv", &owner, None).await;
+    assert!(status.is_success(), "{status}");
+    let (_, devices) = send_authed(&app, "GET", "/Devices", &owner, None).await;
+    assert!(!devices.to_string().contains("r3dash3-tv"), "{devices}");
+}
+
+// A backup is a Jellyfin-shaped manifest over one SQLite file in the data dir: created, listed,
+// downloaded, staged for a restore, and restored with its settings files at the next start.
+#[tokio::test]
+async fn r3dash3_backups_create_list_download_restore() {
+    let state = test_state().await;
+    let app = app(state.clone());
+    let (owner, _, viewer, _) = g1_owner_and_viewer(&state, &app).await;
+    std::fs::write(
+        state.data_dir.join("branding.json"),
+        r#"{"LoginDisclaimer":"then"}"#,
+    )
+    .unwrap();
+    let (status, manifest) = send_authed(
+        &app,
+        "POST",
+        "/Backup/Create",
+        &owner,
+        Some(r#"{"Metadata":true,"Trickplay":false,"Subtitles":false}"#),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{manifest}");
+    let name = manifest["Path"].as_str().unwrap().to_string();
+    assert!(
+        name.starts_with("rustyfin-backup-") && name.ends_with(".db"),
+        "{name}"
+    );
+    assert!(manifest["ServerVersion"].is_string());
+    assert!(manifest["BackupEngineVersion"].is_string());
+    assert!(manifest["DateCreated"].is_string());
+    assert_eq!(manifest["Options"]["Database"], true);
+    assert_eq!(
+        manifest["Options"]["Metadata"], false,
+        "images are not backed up"
+    );
+    assert!(state.data_dir.join("backups").join(&name).is_file());
+
+    let (_, list) = send_authed(&app, "GET", "/Backup", &owner, None).await;
+    assert_eq!(list, serde_json::json!([manifest]));
+    let (_, one) = send_authed(
+        &app,
+        "GET",
+        &format!("/Backup/Manifest?path={name}"),
+        &owner,
+        None,
+    )
+    .await;
+    assert_eq!(one, manifest);
+    for path in ["../test.db", "%2Fetc%2Fpasswd", "nope.db"] {
+        let (status, _) = send_authed(
+            &app,
+            "GET",
+            &format!("/Backup/Download?path={path}"),
+            &owner,
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{path}");
+    }
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!("/Backup/Download?path={name}"))
+                .header("Authorization", format!("Bearer {owner}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert!(
+        resp.headers()["content-disposition"]
+            .to_str()
+            .unwrap()
+            .contains(&name)
+    );
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    assert!(bytes.starts_with(b"SQLite format 3\0"));
+    let (status, _) = send_authed(&app, "GET", "/Backup", &viewer, None).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+
+    // Staged, then done at the next start against a database file in the data dir
+    std::fs::write(
+        state.data_dir.join("branding.json"),
+        r#"{"LoginDisclaimer":"now"}"#,
+    )
+    .unwrap();
+    let body = serde_json::json!({ "ArchiveFileName": name }).to_string();
+    let (status, answer) = send_authed(&app, "POST", "/Backup/Restore", &owner, Some(&body)).await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{answer}");
+    let db = state.data_dir.join("restored.db");
+    std::fs::write(&db, b"the database before the restore").unwrap();
+    let restored = rustyfin_api::backup_archive::apply_pending_restore(&state.data_dir, &db)
+        .await
+        .unwrap();
+    assert_eq!(restored.as_deref(), Some(name.as_str()));
+    assert_eq!(
+        std::fs::read_to_string(state.data_dir.join("branding.json")).unwrap(),
+        r#"{"LoginDisclaimer":"then"}"#
+    );
+    let kept: Vec<_> = std::fs::read_dir(state.data_dir.join("backups"))
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_name().to_string_lossy().starts_with("pre-restore-"))
+        .collect();
+    assert_eq!(kept.len(), 1);
+    let pool = rustyfin_db::init_db(db.to_str().unwrap()).await.unwrap();
+    let users: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM users")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(users, 2);
+    let leftover: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM sqlite_master WHERE name = 'rustyfin_backup'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(leftover, 0);
+    // Nothing staged any more
+    let again = rustyfin_api::backup_archive::apply_pending_restore(&state.data_dir, &db)
+        .await
+        .unwrap();
+    assert_eq!(again, None);
+
+    let (status, _) = send_authed(&app, "DELETE", &format!("/Backup/{name}"), &owner, None).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let (_, list) = send_authed(&app, "GET", "/Backup", &owner, None).await;
+    assert_eq!(list, serde_json::json!([]));
+    let restore = serde_json::json!({ "ArchiveFileName": "../test.db" }).to_string();
+    let (status, _) = send_authed(&app, "POST", "/Backup/Restore", &owner, Some(&restore)).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+// The dashboard's Networking, API keys, Devices, Branding and Backups tabs
+// (tests/web/r3dash3_server_admin.mjs).
+#[test]
+fn r3dash3_web_server_admin() {
+    b124_node_test("r3dash3_server_admin.mjs");
+}
+
+// The library options editor (tests/web/r3dash3_library_options.mjs).
+#[test]
+fn r3dash3_web_library_options() {
+    b124_node_test("r3dash3_library_options.mjs");
+}
+
+/// The library scan task's state and percent in `GET /ScheduledTasks`, and the library's
+/// `RefreshStatus` and `RefreshProgress` in `GET /Library/VirtualFolders`.
+async fn r3dash3_scan_views(
+    app: &axum::Router,
+    token: &str,
+    lib: uuid::Uuid,
+) -> (serde_json::Value, serde_json::Value) {
+    let (_, tasks) = send_authed(app, "GET", "/ScheduledTasks", token, None).await;
+    let task = tasks
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["Id"] == "LibraryScan")
+        .cloned()
+        .unwrap();
+    let (_, folders) = send_authed(app, "GET", "/Library/VirtualFolders", token, None).await;
+    let folder = folders
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|f| f["ItemId"] == lib.to_string())
+        .cloned()
+        .unwrap();
+    (task, folder)
+}
+
+// A library scan started outside the scheduler (a library's Scan, Scan all, the wizard) shows in
+// the dashboard as the library scan task while the library shows as refreshing, as in Jellyfin;
+// both clear when the scan ends, also when it is cancelled.
+#[tokio::test]
+async fn r3dash3_a_library_scan_shows_as_the_scan_task_and_clears() {
+    let state = test_state().await;
+    let app = app(state.clone());
+    let (owner, _, _, _) = g1_owner_and_viewer(&state, &app).await;
+    let lib = create_library_via_api(&app, &state, &owner, "Shows A", "TvShows").await;
+    // Settle any scan the library's creation started
+    rustyfin_core::scanner::wait_for_idle().await;
+    while state.task_scheduler.scans().state(lib).is_some() {
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    let (task, folder) = r3dash3_scan_views(&app, &owner, lib).await;
+    assert_eq!(task["State"], "Idle", "{task}");
+    assert_eq!(folder["RefreshStatus"], "Idle", "{folder}");
+    assert!(folder["RefreshProgress"].is_null(), "{folder}");
+
+    // A scan of the library, from outside the scheduler, at 50 %
+    let ticket = state.task_scheduler.scans().queue(lib);
+    assert!(ticket.claim());
+    ticket.start();
+    ticket.add_total(2);
+    ticket.advance(1);
+    let (task, folder) = r3dash3_scan_views(&app, &owner, lib).await;
+    assert_eq!(task["State"], "Running", "{task}");
+    assert_eq!(task["CurrentProgressPercentage"], 50.0, "{task}");
+    assert_eq!(folder["RefreshStatus"], "Active", "{folder}");
+    assert_eq!(folder["RefreshProgress"], 50.0, "{folder}");
+
+    // Its probes outlive the scan call: still listed, still Running
+    let probes = ticket.clone();
+    drop(ticket);
+    let (task, folder) = r3dash3_scan_views(&app, &owner, lib).await;
+    assert_eq!(task["State"], "Running", "{task}");
+    assert_eq!(folder["RefreshStatus"], "Active", "{folder}");
+
+    // Ended (or cancelled: the scan's future dropped with its tickets)
+    drop(probes);
+    let (task, folder) = r3dash3_scan_views(&app, &owner, lib).await;
+    assert_eq!(task["State"], "Idle", "{task}");
+    assert!(task["CurrentProgressPercentage"].is_null(), "{task}");
+    assert_eq!(folder["RefreshStatus"], "Idle", "{folder}");
+
+    let scans = state.task_scheduler.scans().clone();
+    let cancelled = tokio::spawn(async move {
+        let ticket = scans.queue(lib);
+        ticket.claim();
+        ticket.start();
+        std::future::pending::<()>().await;
+        drop(ticket);
+    });
+    while state.task_scheduler.scans().state(lib).is_none() {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(
+        r3dash3_scan_views(&app, &owner, lib).await.0["State"],
+        "Running"
+    );
+    cancelled.abort();
+    let _ = cancelled.await;
+    let (task, folder) = r3dash3_scan_views(&app, &owner, lib).await;
+    assert_eq!(task["State"], "Idle", "{task}");
+    assert_eq!(folder["RefreshStatus"], "Idle", "{folder}");
 }

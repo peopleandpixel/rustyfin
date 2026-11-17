@@ -349,14 +349,16 @@ pub(super) async fn respond(
     }
 
     let manager = state.transcode_manager.clone();
-    let (playback_id, stdout) = manager
-        .start_progressive(
+    // A hardware transcode that fails or writes nothing in time runs again in software
+    let (playback_id, stdout, first) = manager
+        .start_progressive_first(
             job.item_id,
             job.input_path,
             &job.profile,
             format,
             &job.play_session_id,
             &job.device_id,
+            FIRST_BYTES_WAIT,
         )
         .await
         .map_err(|e| match e {
@@ -364,27 +366,17 @@ pub(super) async fn respond(
             e @ (TranscodeError::TooMany(_) | TranscodeError::ShuttingDown) => {
                 ApiError::ServiceUnavailable(e.to_string())
             }
+            TranscodeError::PlaylistTimeout => {
+                ApiError::ServiceUnavailable("The transcode wrote nothing in time".into())
+            }
             e => ApiError::Internal(format!("Transcode failed: {e}")),
         })?;
     let guard = EndOnDrop {
         manager: manager.clone(),
         playback_id,
     };
-
-    let mut output = tokio_util::io::ReaderStream::with_capacity(stdout, 64 * 1024);
-    let first: Bytes = match tokio::time::timeout(FIRST_BYTES_WAIT, output.next()).await {
-        Ok(Some(Ok(bytes))) => bytes,
-        Ok(Some(Err(e))) => return Err(ApiError::Internal(format!("Transcode failed: {e}"))),
-        Ok(None) => {
-            let error = manager.progressive_failure(playback_id).await;
-            return Err(ApiError::Internal(format!("Transcode failed: {error}")));
-        }
-        Err(_) => {
-            return Err(ApiError::ServiceUnavailable(
-                "The transcode wrote nothing in time".into(),
-            ));
-        }
-    };
+    let output = tokio_util::io::ReaderStream::with_capacity(stdout, 64 * 1024);
+    let first = Bytes::from(first);
     // The guard lives as long as the body: dropping it (the end, or a client that went away)
     // kills ffmpeg
     let body = futures_util::stream::once(async move { Ok(first) })

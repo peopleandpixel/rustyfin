@@ -22,6 +22,7 @@ function sandbox({ isAdmin = false } = {}) {
         $: id => elements[id] || null,
         toast: (msg, kind) => log.push(['toast', msg, kind || 'ok']),
         itemListRow: it => `<row ${it.Id}>`,
+        canDownload: () => false,
         createCardElement: it => ({ html: `<card ${it.Id}>` }),
         playQueueAt: (items, index) => log.push(['queue', items.map(i => i.Id), index]),
         navigate: (page, id) => log.push(['navigate', page, id]),
