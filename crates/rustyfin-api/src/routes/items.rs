@@ -2528,13 +2528,14 @@ async fn get_items(
                 .await?;
         item_ids = Some(narrow_ids(item_ids, ids));
     }
-    // HasTrailer, HasSpecialFeature, HasThemeSong and HasThemeVideo: by the item's own extras, the way
-    // LocalTrailerCount and SpecialFeatureCount count them. True keeps only their owners; false leaves the
-    // owners out with the hidden items, so neither reads the ids of the whole library.
+    // HasTrailer, HasSpecialFeature, HasThemeSong and HasThemeVideo, as in Jellyfin 12.4: an item matches
+    // when it or an item inside it has that kind of extra (`owners_with_extras`). A special feature is any
+    // extra but a trailer, a theme or an `Unknown` one (`extras/`). True keeps the matches; false leaves
+    // them out with the hidden items, so neither reads the ids of the whole library.
     let mut without: Vec<String> = Vec::new();
     for (has, types) in [
         (query.has_trailer(), &["Trailer"][..]),
-        (query.has_special_feature(), SPECIAL_FEATURE_TYPES),
+        (query.has_special_feature(), &SPECIAL_FEATURE_TYPES[1..]),
         (query.has_theme_song(), &["ThemeSong"][..]),
         (query.has_theme_video(), &["ThemeVideo"][..]),
     ] {
@@ -2888,7 +2889,8 @@ async fn get_intros() -> Json<Value> {
     Json(empty_result())
 }
 
-/// The extra types that Jellyfin lists as special features (`BaseItem.DisplayExtraTypes`).
+/// The extra types that Jellyfin lists as special features (`BaseItem.DisplayExtraTypes`). `Unknown` comes
+/// first: the `HasSpecialFeature` filter takes the rest.
 const SPECIAL_FEATURE_TYPES: &[&str] = &[
     "Unknown",
     "BehindTheScenes",
