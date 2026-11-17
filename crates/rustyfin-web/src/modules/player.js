@@ -6,6 +6,8 @@ import { renderHome } from './home.js';
 import { currentDetailId, renderDetail, versionLabels } from './item.js';
 import { clearQueue, queueNeighbours, playQueueStep } from './queue.js';
 import { stopThemeSong } from './theme-media.js';
+import { setLyricsTrack, highlightLyrics } from './lyrics.js';
+import { nativeVideoPlayer, playNatively, setNativeNowPlaying } from './nativeshell.js';
 import {
     trackPrefs, defaultTracks, defaultSubtitleIndex as preferredSubtitleIndex, subtitleAppearance, saveSubtitleAppearance,
     subtitleCss, stepSubtitleOffset, qualityOptions, bitrateLabel, maxStreamingBitrate, setMaxStreamingBitrate,
@@ -613,7 +615,14 @@ function renderTrackMenus(session) {
 // queued: the play queue (queue.js) started this item; any other play ends the queue.
 // selection: the detail page's choice, { mediaSourceId, audioIndex, subtitleIndex (-1 is off), startTicks };
 // a field left out keeps the default.
+// Casting (cast.js) takes over playback: while it returns true, the receiver plays the item instead
+let playInterceptor = null;
+function setPlayInterceptor(fn) {
+    playInterceptor = fn;
+}
+
 async function playItem(itemId, streamType = 'Videos', title = '', { fromStart = false, carry = null, queued = false, selection = null } = {}) {
+    if (playInterceptor?.(itemId, streamType, title, { fromStart, selection })) return;
     const video = $('video-player');
     const modal = $('player-modal');
     if (!video || !modal) return;
@@ -630,6 +639,12 @@ async function playItem(itemId, streamType = 'Videos', title = '', { fromStart =
     if (hlsInstance) {
         hlsInstance.destroy();
         hlsInstance = null;
+    }
+
+    // In the Jellyfin Android app, a video plays in the app's player when the user chose that there
+    if (streamType === 'Videos' && nativeVideoPlayer() && await playNatively(itemId, { fromStart, selection, resumeTicks: resumePositionTicks })) {
+        if (request === playRequest) playLoading = 0;
+        return;
     }
 
     $('player-title').textContent = title || t('player.playback');
@@ -1405,6 +1420,7 @@ function playerKeyAction(e) {
 function updateNowPlaying(session, item = null) {
     const bar = $('now-playing');
     const audio = session?.streamType === 'Audio';
+    setLyricsTrack(audio ? session.itemId : null, item?.HasLyrics);
     const video = $('video-player');
     const picture = audio ? itemPicture(item) : null;
     const art = picture ? API.imageUrl(picture.id, 'Primary', { maxHeight: 512, tag: picture.tag }) : '';
@@ -1428,6 +1444,7 @@ function updateNowPlayingProgress(session) {
     if (session.streamType !== 'Audio' || $('now-playing')?.hidden) return;
     const total = session.total();
     const pos = session.position();
+    highlightLyrics(pos * 1e7);
     if (!seekDragging) $('now-playing-seek').value = total > 0 ? Math.min(100, pos / total * 100) : 0;
     $('now-playing-time').textContent = `${formatDurationSeconds(pos)} / ${formatDurationSeconds(total)}`;
 }
@@ -1645,6 +1662,7 @@ function mediaSessionMetadata(item, title) {
 }
 
 function updateMediaSession(session, item, title) {
+    setNativeNowPlaying(session, () => mediaSessionMetadata(item, title));
     if (!hasMediaSession()) return;
     bindMediaSession();
     navigator.mediaSession.metadata = new MediaMetadata(mediaSessionMetadata(item, title));
@@ -1673,6 +1691,7 @@ function updateMediaPosition(session) {
 
 // The player closed: no item, and no actions left for the OS to offer
 function clearMediaSession() {
+    setNativeNowPlaying(null);
     if (!hasMediaSession()) return;
     navigator.mediaSession.metadata = null;
     navigator.mediaSession.playbackState = 'none';
@@ -2079,10 +2098,13 @@ document.addEventListener('keydown', e => {
     }
 });
 
-// Remote control (remote.js): the playing item and where it is, and a seek to an item time in ticks
+// Remote control (remote.js, cast.js): the playing item, where it is and its tracks, and a seek to an item time in ticks
 function nowPlaying() {
     const s = activePlayback;
-    return s ? { itemId: s.itemId, streamType: s.streamType, positionTicks: Math.round(s.position() * 1e7) } : null;
+    return s ? {
+        itemId: s.itemId, streamType: s.streamType, positionTicks: Math.round(s.position() * 1e7),
+        mediaSourceId: s.mediaSourceId, audioIndex: s.audioIndex, subtitleIndex: s.subtitleIndex,
+    } : null;
 }
 
 function seekToTicks(ticks) {
@@ -2090,7 +2112,7 @@ function seekToTicks(ticks) {
 }
 
 export {
-    nowPlaying, seekToTicks,
+    nowPlaying, seekToTicks, setPlayInterceptor,
     resumePositionTicks, playWithResumeChoice, stopPlayback, seekVideo, skipTime, previewSeek, changeAudioTrack,
     changeSubtitleTrack, playItem, playerAutoHide, onPlayerClosed, playerAreaClick, closePlayer, playAdjacentEpisode,
     playUpNextNow, cancelUpNext, togglePlayPause, setVolume, toggleMute, setPlaybackRate, toggleFullscreen,

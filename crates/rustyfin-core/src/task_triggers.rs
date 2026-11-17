@@ -7,17 +7,20 @@ use rustyfin_model::scheduled_task::{DAYS_OF_WEEK, TaskTriggerInfo};
 /// Where a task stands for its triggers.
 #[derive(Debug, Clone, Copy)]
 pub struct TriggerClock {
-    /// The task's last run end, if it ran since the server started (by its triggers or by hand).
+    /// The task's last run end (by its triggers or by hand), which may be before the server
+    /// started: the last result is saved across restarts.
     pub last_end: Option<DateTime<Utc>>,
     /// Whether the task's own loop has run it since the start. Only such a run uses up a
     /// startup trigger; a run started by hand does not.
     pub loop_ran: bool,
     /// When a task that has not run yet runs for an interval or a startup trigger (the server's
-    /// start plus the task's own delay).
+    /// start plus the task's own delay). An interval that ran out while the server was down also
+    /// runs the task then, not at once.
     pub first: DateTime<Utc>,
     /// For a task whose first interval run comes one interval after this time, not at `first`.
     pub interval_from: Option<DateTime<Utc>>,
-    /// The server's start: the daily and weekly times after it count.
+    /// The server's start: the daily and weekly times after it count. As in Jellyfin, a daily or
+    /// weekly time missed while the server was down is not made up; the next one runs it.
     pub started: DateTime<Utc>,
 }
 
@@ -28,7 +31,9 @@ pub fn next_due<Tz: TimeZone>(
     triggers: &[TaskTriggerInfo],
     clock: &TriggerClock,
 ) -> Option<DateTime<Utc>> {
-    let since = clock.last_end.unwrap_or(clock.started);
+    let since = clock
+        .last_end
+        .map_or(clock.started, |end| end.max(clock.started));
     triggers
         .iter()
         .filter(|t| t.validate().is_ok())
@@ -36,7 +41,7 @@ pub fn next_due<Tz: TimeZone>(
             "IntervalTrigger" => {
                 let every = ticks(t.interval_ticks?);
                 Some(match (clock.last_end, clock.interval_from) {
-                    (Some(end), _) => end + every,
+                    (Some(end), _) => (end + every).max(clock.first),
                     (None, Some(from)) => from + every,
                     (None, None) => clock.first,
                 })
@@ -193,6 +198,34 @@ mod tests {
         assert_eq!(
             next_due(&Utc, std::slice::from_ref(&startup), &by_hand),
             Some(at("2026-11-16T10:01:00Z"))
+        );
+    }
+
+    #[test]
+    fn r3sched_an_interval_counts_from_the_saved_last_run() {
+        let t = [TaskTriggerInfo::interval(12 * HOUR)];
+        // Ran 8 hours before this start: due 4 hours after it, not at the start's delay
+        let c = clock("2026-11-16T10:00:00Z", Some("2026-11-16T02:00:00Z"));
+        assert_eq!(next_due(&Utc, &t, &c), Some(at("2026-11-16T14:00:00Z")));
+        // Ran out while the server was down: due at the task's delay after the start, not at once
+        let c = clock("2026-11-16T10:00:00Z", Some("2026-11-14T02:00:00Z"));
+        assert_eq!(next_due(&Utc, &t, &c), Some(at("2026-11-16T10:01:00Z")));
+    }
+
+    #[test]
+    fn r3sched_a_daily_time_missed_while_down_is_not_made_up() {
+        // Last ran yesterday at 03:00; the server was down at today's 03:00 and starts at 10:00.
+        // As Jellyfin, it waits for tomorrow's 03:00.
+        let c = clock("2026-11-16T10:00:00Z", Some("2026-11-15T03:20:00Z"));
+        assert_eq!(
+            next_due(&Utc, &[daily(3)], &c),
+            Some(at("2026-11-17T03:00:00Z"))
+        );
+        // A start before 03:00 still runs it at 03:00 that day
+        let c = clock("2026-11-16T01:00:00Z", Some("2026-11-15T03:20:00Z"));
+        assert_eq!(
+            next_due(&Utc, &[daily(3)], &c),
+            Some(at("2026-11-16T03:00:00Z"))
         );
     }
 

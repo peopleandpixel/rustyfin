@@ -436,8 +436,10 @@ pub(super) async fn save_item_image(
 
     rustyfin_db::repo_image::upsert_image(&state.db, &img).await?;
     // Drop the answers and the pictures that name the old one
-    state.cache.invalidate_item(&id.to_string());
-    state.image_cache.invalidate_item(&id.to_string());
+    state
+        .cache
+        .item_changed(&state.db, &state.image_cache, id)
+        .await;
     rustyfin_core::image_warmer::kick();
     Ok(())
 }

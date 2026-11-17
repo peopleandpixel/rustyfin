@@ -1,4 +1,4 @@
--- Sort names made as Jellyfin makes them ("The Matrix" sorts as "matrix").
+-- Sort names made as Jellyfin makes them ("The Meridian" sorts as "meridian").
 
 -- The sort name an admin, an NFO's <sorttitle> or a Jellyfin import forced, as written: Jellyfin's
 -- ForcedSortName. media_items.sort_name stays the sort name in use, made from it when it is set.

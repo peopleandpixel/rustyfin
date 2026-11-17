@@ -20,7 +20,7 @@ use plugin_trakt::MetadataProviderRegistrar as TraktRegistrar;
 use plugin_tvdb::MetadataProviderRegistrar as TvdbRegistrar;
 use plugin_webhook::NotificationProviderRegistrar as WebhookRegistrar;
 use rustyfin_model::media::{MediaItem, MediaType};
-use rustyfin_model::metadata::{ExternalMetadata, MetadataImage, MetadataLookups};
+use rustyfin_model::metadata::{ExternalMetadata, ImdbLookups, MetadataImage, MetadataLookups};
 use rustyfin_model::plugin::{
     NotificationPriority, Plugin, PluginConfiguration, PluginInfo, PluginStatus, PluginType,
     SubtitleResult,
@@ -220,6 +220,8 @@ pub struct MetadataProviderHandle {
     pub get_images: GetImagesFn,
     /// Lookups by id, by year and by season, when the provider offers them (TMDb)
     pub lookups: Option<Arc<dyn MetadataLookups>>,
+    /// Lookups by IMDb id (OMDb), asked after the other providers to fill what is missing
+    pub imdb_lookups: Option<Arc<dyn ImdbLookups>>,
 }
 
 /// Subtitle provider handle stored in the plugin manager.
@@ -262,11 +264,14 @@ pub async fn install_tmdb_plugin(pm: &PluginManager, client: crate::tmdb_client:
 
 /// Install the built-in OMDb plugin. It is enabled by a saved `api_key` unless a saved status says
 /// otherwise. A key saved later through the plugin's configuration enables it at once, without a
-/// restart.
-pub async fn install_omdb_plugin(pm: &PluginManager) {
+/// restart. Its answers are kept in `store`.
+pub async fn install_omdb_plugin(
+    pm: &PluginManager,
+    store: rustyfin_model::answer_store::AnswerStore,
+) {
     let plugin = Arc::new(plugin_omdb::OmdbPlugin::default());
     install_keyed_plugin(pm, plugin, "OMDb", false, None, move |p| async move {
-        plugin_omdb::register_omdb_provider(&p, pm).await
+        plugin_omdb::register_omdb_provider(&p, store, pm).await
     })
     .await;
 }
@@ -698,6 +703,7 @@ impl PluginManager {
             search_tv: Arc::new(search_tv),
             get_images: Arc::new(get_images),
             lookups: None,
+            imdb_lookups: None,
         });
         inner.metadata_providers.sort_by_key(|h| h.priority);
         tracing::info!(
@@ -1173,6 +1179,18 @@ impl PluginManager {
             handle.lookups = Some(lookups.clone());
         }
     }
+
+    /// Attaches IMDb-id lookups to the metadata provider registered as `provider_name`.
+    pub async fn register_imdb_lookups(&self, provider_name: &str, lookups: Arc<dyn ImdbLookups>) {
+        let mut inner = self.inner.write().await;
+        for handle in inner
+            .metadata_providers
+            .iter_mut()
+            .filter(|h| h.provider_name == provider_name)
+        {
+            handle.imdb_lookups = Some(lookups.clone());
+        }
+    }
 }
 
 // ── MetadataProviderRegistrar trait implementations ──
@@ -1282,6 +1300,10 @@ impl OmdbRegistrar for PluginManager {
             get_images,
         )
         .await;
+    }
+
+    async fn register_imdb_lookups(&self, provider_name: String, lookups: Arc<dyn ImdbLookups>) {
+        PluginManager::register_imdb_lookups(self, &provider_name, lookups).await;
     }
 }
 

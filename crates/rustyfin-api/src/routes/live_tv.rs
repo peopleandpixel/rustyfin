@@ -292,6 +292,13 @@ pub fn routes() -> Router<AppState> {
         .route("/LiveTv/Programs", get(get_programs))
         .route("/LiveTv/Programs/{programId}", get(get_program))
         .route("/LiveTv/LiveStream", post(start_live_stream))
+        .route("/LiveStreams/Open", post(open_live_stream))
+        .route("/LiveStreams/Close", post(close_live_stream))
+        .route(
+            "/LiveTv/Programs/Recommended",
+            get(get_recommended_programs),
+        )
+        .route("/LiveTv/Timers/Defaults", get(get_timer_defaults))
         .route("/LiveTv/VirtualChannels", get(get_virtual_channels))
         .route(
             "/LiveTv/RecommendedProgramsPtr",
@@ -922,6 +929,151 @@ async fn start_live_stream(
     // Live streaming requires a real-time transcoding pipeline.
     // For now, return an empty response – the client will fall back to direct play.
     Ok(Json(serde_json::json!({})))
+}
+
+/// Jellyfin's `LiveStreamResponse`. `MediaSource` is null because Rustyfin has no live channel
+/// source to open (tuner hosts are stored, but no stream is produced from them).
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "PascalCase")]
+struct LiveStreamResponseDto {
+    media_source: Option<serde_json::Value>,
+}
+
+/// `POST /LiveStreams/Open`. Same answer as `start_live_stream`: no stream, so clients fall back
+/// to direct play. The body (`OpenLiveStreamDto`) is accepted and ignored.
+async fn open_live_stream(_body: axum::body::Bytes) -> Json<LiveStreamResponseDto> {
+    Json(LiveStreamResponseDto { media_source: None })
+}
+
+/// `POST /LiveStreams/Close`. Nothing is tracked per live stream, so this only acknowledges.
+async fn close_live_stream() -> StatusCode {
+    StatusCode::NO_CONTENT
+}
+
+// ── Timer Defaults ──
+
+#[derive(Debug, Deserialize)]
+struct TimerDefaultsQuery {
+    #[serde(default, rename = "programId", alias = "ProgramId")]
+    program_id: Option<String>,
+}
+
+/// Jellyfin's `SeriesTimerInfoDto` as returned by `GetDefaultTimer`.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "PascalCase")]
+struct TimerDefaultsDto {
+    id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    program_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    channel_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    channel_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    overview: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    start_date: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    end_date: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    service_name: Option<String>,
+    priority: i32,
+    pre_padding_seconds: i32,
+    post_padding_seconds: i32,
+    is_pre_padding_required: bool,
+    is_post_padding_required: bool,
+    keep_until: &'static str,
+    keep_up_to: i32,
+    record_any_time: bool,
+    record_any_channel: bool,
+    record_new_only: bool,
+    skip_episodes_in_library: bool,
+    days: Vec<String>,
+    day_pattern: Option<String>,
+}
+
+/// `GET /LiveTv/Timers/Defaults?programId=`. Without a program, the defaults alone. An unknown
+/// program is a 404, as Jellyfin's ResourceNotFound.
+async fn get_timer_defaults(
+    State(state): State<AppState>,
+    Query(query): Query<TimerDefaultsQuery>,
+) -> Result<Json<TimerDefaultsDto>, ApiError> {
+    // Jellyfin's TimerManager.GetNewTimerDefaultsAsync: padding from LiveTvOptions (Rustyfin has
+    // no padding settings, so zero), any time, new episodes only, every day.
+    let mut dto = TimerDefaultsDto {
+        id: String::new(),
+        program_id: None,
+        channel_id: None,
+        channel_name: None,
+        name: None,
+        overview: None,
+        start_date: None,
+        end_date: None,
+        service_name: None,
+        priority: 0,
+        pre_padding_seconds: 0,
+        post_padding_seconds: 0,
+        is_pre_padding_required: false,
+        is_post_padding_required: false,
+        keep_until: "UntilDeleted",
+        keep_up_to: 0,
+        record_any_time: true,
+        record_any_channel: false,
+        record_new_only: true,
+        skip_episodes_in_library: false,
+        days: [
+            "Sunday",
+            "Monday",
+            "Tuesday",
+            "Wednesday",
+            "Thursday",
+            "Friday",
+            "Saturday",
+        ]
+        .map(String::from)
+        .to_vec(),
+        day_pattern: None,
+    };
+    let program_id = query
+        .program_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    if let Some(program_id) = program_id {
+        let e = rustyfin_db::repo_live_tv::get_guide_entry(&state.db_ro, program_id)
+            .await?
+            .ok_or_else(|| ApiError::NotFound("program not found".into()))?;
+        let (channel_name, service_name) =
+            match rustyfin_db::repo_live_tv::get_channel(&state.db_ro, &e.channel_id).await? {
+                Some(ch) => {
+                    let service = match ch.tuner_host_id.as_deref() {
+                        Some(host_id) => {
+                            rustyfin_db::repo_live_tv::get_tuner_host(&state.db_ro, host_id)
+                                .await?
+                                .map(|h| h.r#type)
+                        }
+                        None => None,
+                    };
+                    (Some(ch.name), service)
+                }
+                None => (None, None),
+            };
+        dto.program_id = Some(e.id);
+        dto.channel_id = Some(e.channel_id);
+        dto.channel_name = channel_name;
+        dto.name = Some(e.name);
+        dto.overview = if e.description.is_empty() {
+            None
+        } else {
+            Some(e.description)
+        };
+        dto.start_date = Some(e.start_time);
+        dto.end_date = Some(e.end_time);
+        dto.service_name = service_name;
+    }
+    Ok(Json(dto))
 }
 
 // ── Virtual Channels ──

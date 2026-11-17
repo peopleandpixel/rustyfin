@@ -56,22 +56,34 @@ pub async fn get_library_by_id(
     Ok(row.map(Into::into))
 }
 
-pub async fn delete_library(pool: &SqlitePool, id: Uuid) -> Result<(), sqlx::Error> {
-    sqlx::query(
-        "DELETE FROM music_tags_read WHERE item_id IN (SELECT id FROM media_items WHERE library_id = ?)",
-    )
-    .bind(id.to_string())
-    .execute(pool)
-    .await?;
-    sqlx::query("DELETE FROM media_items WHERE library_id = ?")
-        .bind(id.to_string())
-        .execute(pool)
+/// Deletes the library `id` and its items in one write transaction, so a failure leaves both. The
+/// rows that reference its items without an ON DELETE action (users' play state, people, studios,
+/// pinned episodes) go first, as `repo_media::delete_item_rows_in` does for one item; extras in
+/// other libraries that its items own are detached. Returns whether the library existed.
+pub async fn delete_library(pool: &SqlitePool, id: Uuid) -> Result<bool, sqlx::Error> {
+    let id = id.to_string();
+    let mut tx = crate::begin_write(pool).await?;
+    for sql in [
+        "UPDATE media_items SET owner_id = NULL WHERE library_id <> ?1 \
+         AND owner_id IN (SELECT id FROM media_items WHERE library_id = ?1)",
+        "DELETE FROM pinned_episodes WHERE \
+         series_id IN (SELECT id FROM media_items WHERE library_id = ?1) \
+         OR episode_id IN (SELECT id FROM media_items WHERE library_id = ?1) \
+         OR season_id IN (SELECT id FROM media_items WHERE library_id = ?1)",
+        "DELETE FROM user_item_data WHERE item_id IN (SELECT id FROM media_items WHERE library_id = ?1)",
+        "DELETE FROM item_people WHERE item_id IN (SELECT id FROM media_items WHERE library_id = ?1)",
+        "DELETE FROM item_studios WHERE item_id IN (SELECT id FROM media_items WHERE library_id = ?1)",
+        "DELETE FROM music_tags_read WHERE item_id IN (SELECT id FROM media_items WHERE library_id = ?1)",
+        "DELETE FROM media_items WHERE library_id = ?1",
+    ] {
+        sqlx::query(sql).bind(&id).execute(&mut *tx).await?;
+    }
+    let result = sqlx::query("DELETE FROM libraries WHERE id = ?1")
+        .bind(&id)
+        .execute(&mut *tx)
         .await?;
-    sqlx::query("DELETE FROM libraries WHERE id = ?")
-        .bind(id.to_string())
-        .execute(pool)
-        .await?;
-    Ok(())
+    tx.commit().await?;
+    Ok(result.rows_affected() > 0)
 }
 
 pub async fn update_library_paths(
