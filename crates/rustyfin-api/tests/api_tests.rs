@@ -42471,9 +42471,11 @@ async fn r3playback_universal_passes_the_hevc_limits_on() {
         "VideoCodec=h264,hevc",
         "MaxVideoBitDepth=10",
         "hevc-videobitdepth=10",
-        "hevc-profile=main%2Cmain+10",
+        // One encoding for every URL the server builds (QueryBuilder): commas stay, as in
+        // Jellyfin's comma lists, and a space is %20
+        "hevc-profile=main,main%2010",
         "hevc-level=123",
-        "hevc-rangetype=SDR%2CHDR10",
+        "hevc-rangetype=SDR,HDR10",
     ] {
         assert!(url.contains(part), "{part} in {url}");
     }
