@@ -4522,7 +4522,8 @@ mod tests {
             "ORDER BY sort_name DESC, name DESC, community_rating DESC, id DESC"
         );
         assert_eq!(
-            order_by("Album,ProductionYear", "Descending"),
+            // AirTime sorts by name in Jellyfin 12.4's OrderMapper (Album is the album's name).
+            order_by("AirTime,ProductionYear", "Descending"),
             "ORDER BY sort_name DESC, production_year DESC, id DESC"
         );
         // So a list repeated any number of times sorts as the list itself.
@@ -4537,7 +4538,7 @@ mod tests {
             "ParentIndexNumber",
             "IndexNumber",
             "Random",
-            "Album",
+            "AirTime",
         ];
         assert_eq!(
             order_by(&keys.repeat(500).join(","), "Descending"),
