@@ -5,6 +5,7 @@ use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
+use rustyfin_core::query_string::QueryBuilder;
 use rustyfin_db::repo_playback::StreamChoice;
 use rustyfin_model::auth::Claims;
 use serde::Deserialize;
@@ -1569,25 +1570,24 @@ async fn video_universal(
             (can_direct_play, can_direct_stream, can_transcode)
         };
 
-    // Build the URL based on playback method
+    // Build the URL based on playback method. Every value is percent-encoded: a `+` in a device
+    // id must reach the transcode as sent (stopping by device id compares it), and a `&` or `=` in
+    // a value must not add a parameter.
     let url = if supports_direct_play {
-        Some(format!(
-            "/Videos/{}/stream?MediaSourceId={}&Static=true",
-            id, media_sources[index].id
-        ))
+        let mut params = QueryBuilder::new();
+        params
+            .pair("MediaSourceId", &media_sources[index].id)
+            .pair("Static", "true");
+        Some(params.url(&format!("/Videos/{id}/stream")))
     } else if supports_direct_stream {
-        Some(format!(
-            "/Videos/{}/stream?MediaSourceId={}",
-            id, media_sources[index].id
-        ))
+        let mut params = QueryBuilder::new();
+        params.pair("MediaSourceId", &media_sources[index].id);
+        Some(params.url(&format!("/Videos/{id}/stream")))
     } else if supports_transcoding {
-        let mut url = format!(
-            "/Videos/{}/main.m3u8?DeviceId={}",
-            id,
-            query.device_id.unwrap_or_default()
-        );
+        let mut params = QueryBuilder::new();
+        params.pair("DeviceId", query.device_id.unwrap_or_default());
         if let Some(source) = media_sources.get(index) {
-            url.push_str(&format!("&MediaSourceId={}", source.id));
+            params.pair("MediaSourceId", &source.id);
         }
         // The transcode's VideoBitrate is in kbps; Jellyfin's MaxVideoBitrate is in bits/s. With
         // both limits the lower one wins.
@@ -1597,41 +1597,41 @@ async fn video_universal(
             media_sources.get(index).and_then(|source| source.bitrate),
         );
         if let Some(bitrate) = [max_video_kbps, streaming_kbps].into_iter().flatten().min() {
-            url.push_str(&format!("&VideoBitrate={}", bitrate));
+            params.pair("VideoBitrate", bitrate);
         }
         if let Some(bitrate) = query.max_audio_bitrate {
-            url.push_str(&format!("&AudioBitrate={}", bitrate));
+            params.pair("AudioBitrate", bitrate);
         }
         if let Some(ref codec) = query.video_codec {
-            url.push_str(&format!("&VideoCodec={}", codec));
+            params.pair("VideoCodec", codec);
         }
         if let Some(ref codec) = query.audio_codec {
-            url.push_str(&format!("&AudioCodec={}", codec));
+            params.pair("AudioCodec", codec);
         }
         if let Some(width) = query.width {
-            url.push_str(&format!("&MaxWidth={}", width));
+            params.pair("MaxWidth", width);
         }
         if let Some(height) = query.height {
-            url.push_str(&format!("&MaxHeight={}", height));
+            params.pair("MaxHeight", height);
         }
         if let Some(ticks) = query.start_time_ticks {
-            url.push_str(&format!("&StartTimeTicks={}", ticks));
+            params.pair("StartTimeTicks", ticks);
         }
         if let Some(audio) = query.audio_stream_index {
-            url.push_str(&format!("&AudioStreamIndex={}", audio));
+            params.pair("AudioStreamIndex", audio);
         }
         if let Some(subtitle) = query.subtitle_stream_index.filter(|&i| i >= 0) {
-            url.push_str(&format!("&SubtitleStreamIndex={}", subtitle));
+            params.pair("SubtitleStreamIndex", subtitle);
         }
         if needs.burn_in {
-            url.push_str("&SubtitleMethod=Encode");
+            params.pair("SubtitleMethod", "Encode");
         }
         if let Some(seg_time) = query.segment_time {
-            url.push_str(&format!("&SegmentTime={}", seg_time));
+            params.pair("SegmentTime", seg_time);
         }
         // What the client states about the video it takes, which decides a stream copy
         if let Some(depth) = query.max_video_bit_depth {
-            url.push_str(&format!("&MaxVideoBitDepth={depth}"));
+            params.pair("MaxVideoBitDepth", depth);
         }
         for (name, value) in [
             ("hevc-profile", &query.hevc_profile),
@@ -1640,13 +1640,11 @@ async fn video_universal(
             ("hevc-rangetype", &query.hevc_range_type),
         ] {
             if let Some(value) = value.as_deref().filter(|v| !v.trim().is_empty()) {
-                let encoded: String = form_urlencoded::byte_serialize(value.as_bytes()).collect();
-                url.push_str(&format!("&{name}={encoded}"));
+                params.pair(name, value);
             }
         }
-        let encoded: String = form_urlencoded::byte_serialize(play_session_id.as_bytes()).collect();
-        url.push_str(&format!("&PlaySessionId={encoded}"));
-        Some(url)
+        params.pair("PlaySessionId", &play_session_id);
+        Some(params.url(&format!("/Videos/{id}/main.m3u8")))
     } else {
         None
     };

@@ -256,6 +256,37 @@ fn request_defaults_allow_every_method() {
     assert_eq!(StreamRequest::default(), expected);
 }
 
+/// Every value is percent-encoded: a `+` in the device id survives (so stopping by device id
+/// finds the transcode), and a `&` or `=` in a value can't add a parameter.
+#[test]
+fn r3security_transcode_url_encodes_every_value() {
+    let request = StreamRequest {
+        device_id: "dev+1&Static=true".to_string(),
+        play_session_id: "ps=1 é".to_string(),
+        access_token: "tok&ApiKey=other".to_string(),
+        media_source_id: "src1".to_string(),
+        ..request()
+    };
+    let data = device_data(&h264_hi10("mp4"), &profile("chrome-linux"), &request);
+    let url = data.transcoding_url.expect("a transcoding URL");
+    let (path, params) = parts(&url);
+    assert_eq!(path, format!("/Videos/{ITEM}/master.m3u8"));
+    assert_eq!(params[0], "DeviceId=dev%2B1%26Static%3Dtrue", "{url}");
+    assert!(
+        params.contains(&"PlaySessionId=ps%3D1%20%C3%A9".to_string()),
+        "{url}"
+    );
+    assert!(
+        params.contains(&"ApiKey=tok%26ApiKey%3Dother".to_string()),
+        "{url}"
+    );
+    // One of each: nothing was injected
+    for name in ["DeviceId=", "ApiKey=", "Static="] {
+        let count = params.iter().filter(|p| p.starts_with(name)).count();
+        assert_eq!(count, usize::from(name != "Static="), "{name} in {url}");
+    }
+}
+
 #[test]
 fn chrome_transcodes_high_10_h264_to_8_bit_h264() {
     let data = device_data(&h264_hi10("mp4"), &profile("chrome-linux"), &request());

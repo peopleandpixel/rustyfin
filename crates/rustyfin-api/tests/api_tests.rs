@@ -41560,6 +41560,54 @@ async fn r3security_dlna_stream_urls_use_a_reachable_address() {
     );
 }
 
+/// Universal's transcode URL percent-encodes every value: a `+` in the device id comes back as
+/// sent (stopping the transcode by device id compares it), and a `&` or `=` in a value adds no
+/// parameter.
+#[tokio::test]
+async fn r3security_universal_url_encodes_every_value() {
+    let state = test_state().await;
+    let (token, _) = admin_session(&state).await;
+    let folder = std::path::PathBuf::from(media_folder(&state, "r3security-universal"));
+    let file = folder.join("Film.mkv");
+    std::fs::write(&file, b"film").unwrap();
+    let id = g4_insert_item(&state, "Movie", &file).await;
+    g4_insert_source(
+        &state,
+        id,
+        "mkv",
+        &file,
+        &[("Video", "hevc"), ("Audio", "ac3")],
+    )
+    .await;
+    let app = app(state);
+
+    // DeviceId "dev+1&Static=true", PlaySessionId "ps é&MaxWidth=1"
+    let uri = format!(
+        "/Videos/{id}/Universal?VideoCodecs=h264&AudioCodecs=aac&DeviceId=dev%2B1%26Static%3Dtrue\
+         &PlaySessionId=ps%20%C3%A9%26MaxWidth%3D1"
+    );
+    let (status, body) = send(&app, request("GET", &uri, Some(&token), None)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let url = body["Url"].as_str().unwrap();
+    let (path, query) = url.split_once('?').unwrap();
+    assert_eq!(path, format!("/Videos/{id}/main.m3u8"));
+    let pairs: Vec<(String, String)> = form_urlencoded::parse(query.as_bytes())
+        .into_owned()
+        .collect();
+    let values = |name: &str| -> Vec<&str> {
+        pairs
+            .iter()
+            .filter(|(key, _)| key == name)
+            .map(|(_, value)| value.as_str())
+            .collect()
+    };
+    assert_eq!(values("DeviceId"), ["dev+1&Static=true"], "{url}");
+    assert_eq!(values("PlaySessionId"), ["ps é&MaxWidth=1"], "{url}");
+    assert!(values("Static").is_empty(), "{url}");
+    assert!(values("MaxWidth").is_empty(), "{url}");
+    assert!(!query.contains(' ') && !query.contains('+'), "{url}");
+}
+
 #[tokio::test]
 async fn r3playback_subtitle_routes_refuse_files_out_of_the_library() {
     let state = test_state().await;
