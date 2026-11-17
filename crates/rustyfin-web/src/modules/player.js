@@ -1472,7 +1472,9 @@ function openFullPlayer() {
     if (modal && !modal.open) modal.showModal();
 }
 
-// The bar's ×: the music stops, the queue ends and the bar goes
+// The one way to stop local playback, music or video: the bar's ×, the OS stop key, a remote Stop and
+// every hand-off to another player (Play on, Cast). The playback stops, the queue ends, the bar goes
+// and the player closes. (Closing the player alone leaves music playing under the bar.)
 function stopNowPlaying() {
     stopPlayback();
     endNowPlaying();
@@ -1733,7 +1735,7 @@ function bindMediaSession() {
     const video = () => $('video-player');
     setMediaSessionHandler('play', () => video()?.play());
     setMediaSessionHandler('pause', () => video()?.pause());
-    setMediaSessionHandler('stop', () => (activePlayback?.streamType === 'Audio' ? stopNowPlaying() : closePlayer()));
+    setMediaSessionHandler('stop', () => stopNowPlaying());
     setMediaSessionHandler('seekbackward', d => skipTime(-(d?.seekOffset || 10)));
     setMediaSessionHandler('seekforward', d => skipTime(d?.seekOffset || 30));
     setMediaSessionHandler('seekto', d => { if (activePlayback && Number.isFinite(d?.seekTime)) seekTo(activePlayback, d.seekTime); });

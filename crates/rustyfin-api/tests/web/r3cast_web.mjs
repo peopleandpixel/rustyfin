@@ -136,7 +136,7 @@ function sandbox({ ua = CHROME, playing = null, receiverId = '6F511C87', session
         formatDurationSeconds: s => `${Math.floor(s / 60)}:${String(Math.floor(s % 60)).padStart(2, '0')}`,
         toast: log('toast'),
         nowPlaying: () => playing,
-        closePlayer: log('closePlayer'),
+        stopNowPlaying: log('stopNowPlaying'),
         playItem: log('playItem'),
         setPlayInterceptor: fn => { intercept.fn = fn; calls.push(['setPlayInterceptor', !!fn]); },
         maxStreamingBitrate: () => 8000000,
@@ -310,7 +310,7 @@ test('Casting hands the playing item over with its position and tracks', async (
     assert.equal(play.serverAddress, 'https://rf.test');
     assert.equal(play.receiverName, 'Living Room');
     assert.equal(play.maxBitrate, 8000000);
-    assert.ok(sb.calls.some(c => c[0] === 'closePlayer'), 'the local player closes');
+    assert.ok(sb.calls.some(c => c[0] === 'stopNowPlaying'), 'local playback, music too, stops');
     assert.ok(sb.calls.some(c => c[0] === 'setPlayInterceptor' && c[1] === true));
     assert.ok(sb.elements['cast-bar'], 'the cast bar shows');
     assert.ok(!sb.navCast.classList.contains('hidden'));
@@ -334,7 +334,7 @@ test('Closing Chrome\'s device chooser keeps local playback', async () => {
     sb.context.refuse = 'cancel';
     await sb.cast.castToDevice();
     assert.equal(sb.cast.isCasting(), false);
-    assert.ok(!sb.calls.some(c => c[0] === 'closePlayer' || c[0] === 'toast'));
+    assert.ok(!sb.calls.some(c => c[0] === 'stopNowPlaying' || c[0] === 'toast'));
 });
 
 test('While casting, playing an item plays it on the receiver', async () => {
