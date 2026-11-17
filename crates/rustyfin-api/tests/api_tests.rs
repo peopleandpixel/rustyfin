@@ -31333,16 +31333,17 @@ async fn r3missing_world() -> R3Missing {
         ids.insert(key, uuid::Uuid::new_v4());
     }
     // (key, name, type, parent, index, season number, premiere, virtual)
-    let rows: [(
-        &str,
-        &str,
-        &str,
-        Option<&str>,
+    type Row<'a> = (
+        &'a str,
+        &'a str,
+        &'a str,
+        Option<&'a str>,
         Option<i32>,
         Option<i32>,
         Option<String>,
         bool,
-    ); 7] = [
+    );
+    let rows: [Row; 7] = [
         ("series", "Show A", "Series", None, None, None, None, false),
         (
             "season1",
