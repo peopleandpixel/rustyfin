@@ -28,7 +28,7 @@ import {
     folderBrowserSelect, closeFolderBrowser, addLibraryPathRow, removeLibraryPathRow, initScanProgressWebSocket,
 } from './library-admin.js';
 import { openPluginConfig, openPluginPriority } from './plugins.js';
-import { savePlaybackSettings } from './playback-admin.js';
+import { savePlaybackSettings, detectHardware } from './playback-admin.js';
 import { serverPower, openLibraryEditor, removeLibraryFolder, openTriggerEditor, removeTaskTrigger } from './dashboard.js';
 import {
     openUserEditor, closeUserEditor, showUserEditorTab, addUserEditorTag, removeUserEditorTag, addUserEditorSchedule,
@@ -224,6 +224,7 @@ const clickActions = {
     'oidc-copy-callback': () => copyOidcCallbackUrl(),
     'oidc-save-settings': () => saveOidcAdminSettings(),
     'playback-save': () => savePlaybackSettings(),
+    'playback-detect-hw': el => detectHardware(el),
     'plugin-edit-config': el => openPluginConfig(el.dataset.pluginId),
     'plugin-edit-priority': el => openPluginPriority(el.dataset.pluginId),
 };

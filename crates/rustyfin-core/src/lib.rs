@@ -4,6 +4,7 @@ pub mod date_backfill;
 pub mod dlna;
 pub mod encoding;
 pub mod extras;
+pub mod hwaccel;
 pub mod image_proxy;
 pub mod image_warmer;
 pub mod jellyfin_import;

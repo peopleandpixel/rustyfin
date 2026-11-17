@@ -349,42 +349,55 @@ pub(super) async fn respond(
     }
 
     let manager = state.transcode_manager.clone();
-    let (playback_id, stdout) = manager
-        .start_progressive(
-            job.item_id,
-            job.input_path,
-            &job.profile,
-            format,
-            &job.play_session_id,
-            &job.device_id,
-        )
-        .await
-        .map_err(|e| match e {
-            TranscodeError::Stopped => ApiError::NotFound("The play session was stopped".into()),
-            e @ (TranscodeError::TooMany(_) | TranscodeError::ShuttingDown) => {
-                ApiError::ServiceUnavailable(e.to_string())
+    // A hardware transcode that writes nothing is run again in software (the file stays in
+    // software from then on, logged once): at most two tries
+    let mut tries = 0;
+    let (guard, output, first) = loop {
+        tries += 1;
+        let (playback_id, stdout) = manager
+            .start_progressive(
+                job.item_id,
+                job.input_path,
+                &job.profile,
+                format,
+                &job.play_session_id,
+                &job.device_id,
+            )
+            .await
+            .map_err(|e| match e {
+                TranscodeError::Stopped => {
+                    ApiError::NotFound("The play session was stopped".into())
+                }
+                e @ (TranscodeError::TooMany(_) | TranscodeError::ShuttingDown) => {
+                    ApiError::ServiceUnavailable(e.to_string())
+                }
+                e => ApiError::Internal(format!("Transcode failed: {e}")),
+            })?;
+        let guard = EndOnDrop {
+            manager: manager.clone(),
+            playback_id,
+        };
+        let hardware = manager.progressive_uses_hardware(playback_id);
+        let mut output = tokio_util::io::ReaderStream::with_capacity(stdout, 64 * 1024);
+        match tokio::time::timeout(FIRST_BYTES_WAIT, output.next()).await {
+            Ok(Some(Ok(bytes))) => break (guard, output, bytes),
+            Ok(Some(Err(e))) => return Err(ApiError::Internal(format!("Transcode failed: {e}"))),
+            Ok(None) => {
+                let error = manager.progressive_failure(playback_id).await;
+                if hardware && tries < 2 {
+                    manager.note_progressive_hardware_failure(job.input_path, &error.to_string());
+                    continue;
+                }
+                return Err(ApiError::Internal(format!("Transcode failed: {error}")));
             }
-            e => ApiError::Internal(format!("Transcode failed: {e}")),
-        })?;
-    let guard = EndOnDrop {
-        manager: manager.clone(),
-        playback_id,
-    };
-
-    let mut output = tokio_util::io::ReaderStream::with_capacity(stdout, 64 * 1024);
-    let first: Bytes = match tokio::time::timeout(FIRST_BYTES_WAIT, output.next()).await {
-        Ok(Some(Ok(bytes))) => bytes,
-        Ok(Some(Err(e))) => return Err(ApiError::Internal(format!("Transcode failed: {e}"))),
-        Ok(None) => {
-            let error = manager.progressive_failure(playback_id).await;
-            return Err(ApiError::Internal(format!("Transcode failed: {error}")));
-        }
-        Err(_) => {
-            return Err(ApiError::ServiceUnavailable(
-                "The transcode wrote nothing in time".into(),
-            ));
+            Err(_) => {
+                return Err(ApiError::ServiceUnavailable(
+                    "The transcode wrote nothing in time".into(),
+                ));
+            }
         }
     };
+    let first: Bytes = first;
     // The guard lives as long as the body: dropping it (the end, or a client that went away)
     // kills ffmpeg
     let body = futures_util::stream::once(async move { Ok(first) })

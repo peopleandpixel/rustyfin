@@ -17,6 +17,8 @@ const HW_TYPES = [
     ['v4l2m2m', 'Video4Linux2 (V4L2)'],
 ];
 const HW_IMPLEMENTED = ['none', 'vaapi', 'qsv', 'nvenc'];
+// Short names for the detected device line
+const HW_SHORT = { vaapi: 'VA-API', qsv: 'Intel QSV', nvenc: 'NVIDIA NVENC', videotoolbox: 'VideoToolbox' };
 const DECODE_CODECS = [
     ['h264', 'H.264'], ['hevc', 'HEVC'], ['mpeg2video', 'MPEG-2'], ['mpeg4', 'MPEG-4'],
     ['vc1', 'VC-1'], ['vp8', 'VP8'], ['vp9', 'VP9'], ['av1', 'AV1'],
@@ -31,6 +33,8 @@ const CHECKBOX = 'w-4 h-4 rounded bg-white/10 border-white/20 text-[#00a4dc]';
 
 // What the tab loaded: { encoding, config }, posted back with the form's values on save
 let loaded = null;
+// The server's hardware detection (/System/MediaEncoder/HardwareAcceleration), null when unknown
+let hardware = null;
 
 function playbackPanelHtml() {
     return '<div id="admin-playback" class="hidden jf-settings-card"></div>';
@@ -44,13 +48,47 @@ function options(values, selected, label = v => v) {
     return values.map(v => `<option value="${escapeHtml(v)}"${same(v, selected) ? ' selected' : ''}>${escapeHtml(label(v))}</option>`).join('');
 }
 
+function autoLabel(hw) {
+    const selected = hw?.Detection?.Selected;
+    return selected ? t('playback_admin.hw_auto', { name: HW_SHORT[selected.Type] || selected.Type }) : t('playback_admin.hw_auto_none');
+}
+
 function hwLabel(type, name) {
     if (!name) return t('playback_admin.hw_none');
     return HW_IMPLEMENTED.includes(type) ? name : t('playback_admin.hw_stored_only', { name });
 }
 
-// The tab's form for the stored encoding options and server configuration
-function playbackSettingsHtml(enc, cfg) {
+// "VA-API, /dev/dri/renderD128, decodes H.264, HEVC, HEVC 10-bit" for a detected device
+function hwSummary(d) {
+    const names = Object.fromEntries(DECODE_CODECS);
+    const codecs = [];
+    for (const c of d.HardwareDecodingCodecs || []) {
+        codecs.push(names[c] || c);
+        if (c === 'hevc' && d.EnableDecodingColorDepth10Hevc) codecs.push(t('playback_admin.hw_10bit', { codec: 'HEVC' }));
+        if (c === 'vp9' && d.EnableDecodingColorDepth10Vp9) codecs.push(t('playback_admin.hw_10bit', { codec: 'VP9' }));
+    }
+    const parts = [HW_SHORT[d.Type] || d.Type];
+    if (d.Device) parts.push(d.Device);
+    parts.push(t('playback_admin.hw_decodes', { codecs: codecs.join(', ') }));
+    return parts.join(', ');
+}
+
+// What the hardware detection found, as lines of text
+function hwDetectedLines(hw) {
+    const detection = hw?.Detection;
+    if (!detection) return hw?.Detecting ? [t('playback_admin.hw_detecting')] : [];
+    const lines = detection.Selected
+        ? [t('playback_admin.hw_detected', { summary: hwSummary(detection.Selected) })]
+        : [t('playback_admin.hw_none_found')];
+    for (const d of detection.Devices || []) {
+        if (!d.Usable) lines.push(t('playback_admin.hw_unusable', { device: [HW_SHORT[d.Type] || d.Type, d.Device].filter(Boolean).join(' '), error: d.Error || '' }));
+    }
+    return lines;
+}
+
+// The tab's form for the stored encoding options and server configuration. `hw` is the server's
+// hardware detection: with it, the type list starts with "Automatic" (the detected device)
+function playbackSettingsHtml(enc, cfg, hw = null) {
     const field = (name, key, input, hintKey) => `
         <div>
             <label for="pb-${name}" class="${LABEL}">${escapeHtml(t(key))}</label>
@@ -78,8 +116,13 @@ function playbackSettingsHtml(enc, cfg) {
         <h3 class="font-bold text-white text-base">${escapeHtml(t('playback_admin.transcoding'))}</h3>
 
         ${heading('playback_admin.hardware')}
-        ${select('HardwareAccelerationType', 'playback_admin.hw_type', HW_TYPES.map(([v]) => v),
-            enc.HardwareAccelerationType || 'none', v => hwLabel(v, hwNames[v]), 'playback_admin.hw_type_hint')}
+        ${select('HardwareAccelerationType', 'playback_admin.hw_type', (hw ? ['auto'] : []).concat(HW_TYPES.map(([v]) => v)),
+            hw?.Automatic ? 'auto' : (enc.HardwareAccelerationType || 'none'),
+            v => (v === 'auto' ? autoLabel(hw) : hwLabel(v, hwNames[v])), hw ? 'playback_admin.hw_auto_hint' : 'playback_admin.hw_type_hint')}
+        ${hw ? `<div class="text-xs text-white/60 space-y-1" id="pb-hw-detected">
+            ${hwDetectedLines(hw).map(line => `<p>${escapeHtml(line)}</p>`).join('')}
+            <button type="button" class="jf-btn-ghost text-xs" data-action="playback-detect-hw">${escapeHtml(t('playback_admin.hw_detect_again'))}</button>
+        </div>` : ''}
         ${text('VaapiDevice', 'playback_admin.vaapi_device', enc.VaapiDevice, 'playback_admin.vaapi_device_hint')}
         ${text('QsvDevice', 'playback_admin.qsv_device', enc.QsvDevice, 'playback_admin.qsv_device_hint')}
         <fieldset>
@@ -161,6 +204,8 @@ function readPlaybackSettings(form, enc, cfg) {
     for (const name of ['HardwareAccelerationType', 'EncoderPreset', 'DownMixStereoAlgorithm', 'TonemappingAlgorithm', 'TonemappingRange']) {
         encoding[name] = el(name).value;
     }
+    // Automatic: no type saved, so the server keeps using the detected device
+    if (encoding.HardwareAccelerationType === 'auto') encoding.HardwareAccelerationType = null;
     for (const name of ['VaapiDevice', 'QsvDevice', 'TranscodingTempPath']) {
         encoding[name] = el(name).value.trim();
     }
@@ -197,16 +242,29 @@ async function loadPlaybackAdmin() {
     const box = $('admin-playback');
     if (!box) return;
     try {
-        const [encoding, config] = await Promise.all([
+        const [encoding, config, hw] = await Promise.all([
             API.get('/System/Configuration/encoding'),
             API.getConfig(),
+            API.get('/System/MediaEncoder/HardwareAcceleration').catch(() => null),
         ]);
         loaded = { encoding, config };
+        hardware = hw;
     } catch (err) {
         box.innerHTML = `<p class="text-xs text-red-400">${escapeHtml(t('playback_admin.load_failed'))}: ${escapeHtml(err.message)}</p>`;
         return;
     }
-    box.innerHTML = playbackSettingsHtml(loaded.encoding, loaded.config);
+    box.innerHTML = playbackSettingsHtml(loaded.encoding, loaded.config, hardware);
+}
+
+// Runs the hardware detection again (a few seconds), then shows the tab with its result
+async function detectHardware(button) {
+    if (button) button.disabled = true;
+    try {
+        await API.post('/System/MediaEncoder/HardwareAcceleration/Detect', {});
+    } catch (err) {
+        toast(err.message);
+    }
+    await loadPlaybackAdmin();
 }
 
 // The form stays as typed when a save fails: the error goes into the card
@@ -245,4 +303,4 @@ async function postPlaybackSettings(values, api) {
     return null;
 }
 
-export { playbackPanelHtml, loadPlaybackAdmin, savePlaybackSettings };
+export { playbackPanelHtml, loadPlaybackAdmin, savePlaybackSettings, detectHardware };
