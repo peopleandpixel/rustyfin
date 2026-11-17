@@ -29257,6 +29257,13 @@ fn r3android_shell() {
     b124_node_test("r3android_shell.mjs");
 }
 
+// R3 web client on phones: the desktop sidebar stays hidden below lg, and the drawer opens, closes on
+// an item, Escape and navigation (tests/web/r3mobile_*.mjs)
+#[test]
+fn r3mobile_drawer() {
+    b124_node_test("r3mobile_drawer.mjs");
+}
+
 #[test]
 fn r3android_page() {
     b124_node_test("r3android_page.mjs");

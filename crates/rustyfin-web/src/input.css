@@ -73,6 +73,46 @@ body {
   }
 }
 
+/* Phones: the desktop sidebar is hidden below lg (64rem); the mobile drawer slides by a class, not a
+   Tailwind translate utility. The header keeps clear of the notch (viewport-fit=cover). */
+.jf-sidebar-desktop {
+  display: none;
+}
+@media (width >= 64rem) {
+  .jf-sidebar-desktop {
+    display: block;
+  }
+}
+
+.jf-drawer-mobile {
+  transform: translateX(-100%);
+  transition: transform 0.2s ease-out;
+  width: min(80vw, 280px);
+  padding-bottom: max(1rem, env(safe-area-inset-bottom));
+}
+.jf-drawer-mobile.is-open {
+  transform: none;
+}
+
+/* Same paddings as the header's px-3 / lg:px-6, plus the notch insets (these rules win over utilities) */
+.jf-header {
+  padding-left: max(0.75rem, env(safe-area-inset-left));
+  padding-right: max(0.75rem, env(safe-area-inset-right));
+}
+@media (width >= 64rem) {
+  .jf-header {
+    padding-left: max(1.5rem, env(safe-area-inset-left));
+    padding-right: max(1.5rem, env(safe-area-inset-right));
+  }
+}
+
+/* Touch screens get a 44px-high search field */
+@media (pointer: coarse) {
+  .jf-search {
+    min-height: 2.75rem;
+  }
+}
+
 .jf-drawer-item {
   display: flex;
   align-items: center;
@@ -1702,6 +1742,9 @@ img.jf-thumb-img {
     width: 100%;
     opacity: 0.5;
     animation: none;
+  }
+  .jf-drawer-mobile {
+    transition: none;
   }
 }
 
