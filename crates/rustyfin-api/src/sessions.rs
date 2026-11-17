@@ -1,5 +1,6 @@
-//! Sessions as Jellyfin's `SessionManager` keeps them: one per device, found from the request's
-//! token, with the play state the client reports. The session rows (who, which device, the
+//! Sessions as Jellyfin 12.4's `SessionManager` keeps them: one per client, device and user,
+//! found from the request's token (and the device its header names), with the play state the
+//! client reports. The session rows (who, which device, the
 //! capabilities, the last activity) are in the database; what is playing lives here in memory,
 //! as in Jellyfin, and is gone after a restart.
 
@@ -161,7 +162,7 @@ impl Caller {
     }
 }
 
-/// The session of the request's token: its device's session, made again when it has expired
+/// The session of the request's token: its client's session on its device, made again when it has expired
 /// (Jellyfin's `LogSessionActivity`), and marked active. `None` for the API key and for a token
 /// without a device.
 pub async fn for_token(state: &AppState, token: Option<&str>) -> Result<Option<String>, ApiError> {
@@ -202,9 +203,14 @@ pub async fn for_request(
         };
         via_token = Some(rustyfin_auth::token_hash(token));
     }
-    if let Some(id) =
-        rustyfin_db::repo_session::find_device_session(&state.db, user_id, &device.device_id)
-            .await?
+    // Jellyfin 12.4's session key: the client, the device and the user
+    if let Some(id) = rustyfin_db::repo_session::find_device_session(
+        &state.db,
+        user_id,
+        &device.device_id,
+        Some(&device.app_name),
+    )
+    .await?
     {
         rustyfin_db::repo_session::touch_session(&state.db, &id).await?;
         return Ok(Some(id));
