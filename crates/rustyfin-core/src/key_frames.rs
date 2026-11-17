@@ -1006,6 +1006,18 @@ mod tests {
             let e = stream.push(&packet(&[slice]), &mut Vec::new()).unwrap_err();
             assert!(e.starts_with(NOT_ALONE), "{what}: {e}");
         }
+        // An MMCO behind POC type 1's deltas (with the bottom field delta) is found too
+        let poc1 = Coding {
+            poc_type: 1,
+            bottom_field_poc: true,
+            ..Coding::default()
+        };
+        let mut stream = h264_stream(poc1);
+        let mmco = h264_slice(poc1, false, (1, 0), (false, 0, true));
+        let e = stream.push(&packet(&[mmco]), &mut Vec::new()).unwrap_err();
+        assert!(e.contains("marks reference frames"), "{e}");
+        let plain = h264_slice(poc1, false, (1, 0), (false, 0, false));
+        stream.push(&packet(&[plain]), &mut Vec::new()).unwrap();
     }
 
     /// A Blu-ray encode's avcC: 4-byte lengths, one High profile SPS, one PPS.
