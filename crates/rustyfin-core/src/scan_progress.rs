@@ -80,6 +80,8 @@ struct Run {
     claimed: bool,
     /// Whether a caller sends the run's Started and Completed. See `ScanTicket::announce`.
     announced: bool,
+    /// Whether Stop on the library scan task asked the run to end. See `ScanRegistry::cancel_all`.
+    cancelled: bool,
     /// The tickets that claimed the run, clones included.
     holders: usize,
     /// The tickets waiting for the run, clones included.
@@ -282,8 +284,9 @@ impl ScanRegistry {
                 runs: Vec::new(),
                 sent: (ScanStatus::Idle, 100),
             });
+        // A scan queued after a stop is a run of its own, not part of the stopped one
         let run_id = match entry.runs.last_mut() {
-            Some(newest) if newest.status == ScanStatus::Queued => {
+            Some(newest) if newest.status == ScanStatus::Queued && !newest.cancelled => {
                 newest.waiters += 1;
                 newest.id
             }
@@ -298,6 +301,7 @@ impl ScanRegistry {
                     done: 0,
                     claimed: false,
                     announced: false,
+                    cancelled: false,
                     holders: 0,
                     waiters: 1,
                     ended,
@@ -313,6 +317,32 @@ impl ScanRegistry {
             run: run_id,
             holder: AtomicBool::new(false),
         }
+    }
+
+    /// Asks every listed run to end, as Stop on the library scan task does in Jellyfin, where
+    /// every scan is a run of that task. A run's scan sees it at its next check; the run stays
+    /// listed until its tickets are dropped. Returns how many runs were asked.
+    pub fn cancel_all(&self) -> usize {
+        let mut libraries = self.inner.lock();
+        let mut asked = 0;
+        for entry in libraries.entries.values_mut() {
+            for run in &mut entry.runs {
+                if !run.cancelled {
+                    run.cancelled = true;
+                    asked += 1;
+                }
+            }
+        }
+        asked
+    }
+
+    /// Whether a listed run has been asked to end and hasn't yet.
+    pub fn any_cancelled(&self) -> bool {
+        let libraries = self.inner.lock();
+        libraries
+            .entries
+            .values()
+            .any(|entry| entry.runs.iter().any(|run| run.cancelled))
     }
 }
 
@@ -430,6 +460,18 @@ impl ScanTicket {
         if self.claim() {
             self.change(|run| run.status = ScanStatus::Active);
         }
+    }
+
+    /// Whether the run was asked to end (`ScanRegistry::cancel_all`). False for an untracked
+    /// ticket and once the run has ended.
+    pub fn is_cancelled(&self) -> bool {
+        let Some(inner) = &self.inner else {
+            return false;
+        };
+        let mut libraries = inner.lock();
+        libraries
+            .run_mut(self.library_id, self.run)
+            .is_some_and(|run| run.cancelled)
     }
 
     /// `n` more units of work.

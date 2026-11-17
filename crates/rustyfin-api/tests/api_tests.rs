@@ -39864,6 +39864,69 @@ async fn b18_manual_scan_of_a_library_scan_all_has_queued_runs_once() {
     b18_assert_one_run(&lines, "Second");
 }
 
+/// Stop on the library scan task ends a scan started from a library's Scan, as in Jellyfin, where
+/// every scan is a run of that task: the card shows Cancelling until the scan has ended, then
+/// Idle with the result Cancelled, and the ring clears.
+#[tokio::test]
+async fn r3sched_stop_ends_a_scan_started_from_the_library_route() {
+    use rustyfin_model::scheduled_task::TaskState;
+    use std::time::Duration;
+    let state = test_state().await;
+    let app = app(state.clone());
+    let (owner, _, _, _) = g1_owner_and_viewer(&state, &app).await;
+    let library = create_library_via_api(&app, &state, &owner, "R3sched One", "Movies").await;
+    b17_movies(&media_folder(&state, "r3sched one"), 2);
+    let sched = state.task_scheduler.clone();
+    let card = || async { sched.get_task("LibraryScan").await.unwrap() };
+
+    // The scan waits for the scan lock, listed (its ring shows) and claimed by the route
+    let lock = rustyfin_core::scanner::SCAN_LOCK.lock().await;
+    let uri = format!("/Library/VirtualFolders/{library}/Refresh");
+    let manual = b18_spawn_request(&app, "POST", uri, &owner);
+    for _ in 0..500 {
+        if sched.scans().state(library).is_some() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(sched.scans().state(library).is_some(), "the scan is listed");
+    assert_eq!(card().await.state, TaskState::Running);
+
+    let (status, _) = send_authed(
+        &app,
+        "DELETE",
+        "/ScheduledTasks/Running/LibraryScan",
+        &owner,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    assert_eq!(
+        card().await.state,
+        TaskState::Cancelling,
+        "until the scan ends"
+    );
+    drop(lock);
+
+    let (status, body) = manual.await.unwrap();
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["items_scanned"], 0, "the stopped scan read nothing");
+    let mut ended = card().await;
+    for _ in 0..500 {
+        if ended.last_execution_result.is_some() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        ended = card().await;
+    }
+    assert!(sched.scans().snapshot().is_empty(), "the ring is idle");
+    assert_eq!(ended.state, TaskState::Idle);
+    assert_eq!(
+        ended.last_execution_result.map(|r| r.status),
+        Some(rustyfin_model::scheduled_task::TaskCompletionStatus::Cancelled)
+    );
+}
+
 #[tokio::test]
 async fn b18_second_manual_scan_of_a_waiting_library_joins_the_first() {
     let state = test_state().await;

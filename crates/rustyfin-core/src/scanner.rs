@@ -201,6 +201,8 @@ pub async fn scan_with_metadata(
                 _ => {}
             }
         }
+        // A stop skips the lookups not started yet
+        let stop = std::sync::Arc::new(ticket.clone());
         for wave in [first, later] {
             let mut handles = Vec::new();
             for item in wave {
@@ -208,8 +210,12 @@ pub async fn scan_with_metadata(
                 let pool = pool.clone();
                 let client = http_client.clone();
                 let pm = plugin_manager.clone();
+                let stop = stop.clone();
                 let handle = tokio::spawn(async move {
                     let _perm = sem.acquire().await;
+                    if stop.is_cancelled() {
+                        return;
+                    }
                     if let Err(e) = crate::metadata::refresh_item_metadata_with(
                         &pool,
                         &client,
@@ -920,6 +926,17 @@ async fn remove_uncollected(
 }
 
 /// Flat scan for Movies, Photos, Mixed libraries
+/// Whether the scan was stopped (Stop on the library scan task) before its walk: it then ends
+/// with no change. A walk that has begun runs to its end, as its removal of missing items needs
+/// the whole walk; the metadata lookups after it stop.
+fn stopped_before_walk(library: &Library, ticket: &ScanTicket) -> bool {
+    let stopped = ticket.is_cancelled();
+    if stopped {
+        tracing::info!("the scan of library '{}' was stopped", library.name);
+    }
+    stopped
+}
+
 async fn scan_flat_library(
     pool: &SqlitePool,
     library: &Library,
@@ -928,6 +945,9 @@ async fn scan_flat_library(
 ) -> Result<(ScanChanges, Vec<Uuid>), sqlx::Error> {
     let guard = SCAN_LOCK.lock().await;
     ticket.start();
+    if stopped_before_walk(library, ticket) {
+        return Ok(Default::default());
+    }
     let filter = path_scope(scope);
     let mut count = 0u32;
     let mut existing_count = 0u32;
@@ -1371,6 +1391,9 @@ async fn scan_tv_library(
 ) -> Result<(ScanChanges, Vec<Uuid>), sqlx::Error> {
     let guard = SCAN_LOCK.lock().await;
     ticket.start();
+    if stopped_before_walk(library, ticket) {
+        return Ok(Default::default());
+    }
     let filter = path_scope(scope);
     let mut count = 0u32;
     let mut plans: Vec<(Uuid, Vec<probe::ProbeStep>)> = Vec::new();
@@ -2132,6 +2155,9 @@ async fn scan_music_library(
 ) -> Result<(ScanChanges, Vec<Uuid>), sqlx::Error> {
     let guard = SCAN_LOCK.lock().await;
     ticket.start();
+    if stopped_before_walk(library, ticket) {
+        return Ok(Default::default());
+    }
     let filter = path_scope(scope);
     let mut count = 0u32;
     let mut existing_count = 0u32;
