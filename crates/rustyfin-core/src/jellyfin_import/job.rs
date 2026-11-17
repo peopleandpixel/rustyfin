@@ -39,7 +39,9 @@ pub struct ImportStatus {
     pub result: Option<ImportReport>,
     pub error: Option<String>,
     /// The users a failed run created before it failed, each with its one-time code (H19). Empty
-    /// while running and after a completed run, whose `result` lists them.
+    /// while running and after a completed run, whose `result` lists them; left out of the JSON
+    /// when empty.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub created_users: Vec<UserRow>,
 }
 

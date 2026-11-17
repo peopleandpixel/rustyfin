@@ -46983,7 +46983,8 @@ async fn b20_import_run_creates_picked_users_with_codes() {
 
 #[tokio::test]
 async fn b20_import_run_creates_one_user_per_name() {
-    // Jellyfin users whose names differ only in case: the one created first matches the other.
+    // Jellyfin users whose names sign-in can't tell apart: the first is created, the other is
+    // skipped as ambiguous, never merged into it unconfirmed (H18).
     let mut w = b20_world().await;
     w.source.users.push(jf::JfUser::new(3, "Erin", false));
     w.source.users.push(jf::JfUser::new(4, "erin", false));
@@ -46997,10 +46998,11 @@ async fn b20_import_run_creates_one_user_per_name() {
         panic!("{report}");
     };
     let actions = (first.action.as_str(), second.action.as_str());
-    assert_eq!(actions, ("Create", "Match"), "{report}");
+    assert_eq!(actions, ("Create", "Skip"), "{report}");
+    assert_eq!(second.reason.as_deref(), Some("Ambiguous"), "{report}");
     assert!(first.code.is_some() && second.code.is_none(), "{report}");
     assert!(first.user_id.is_some(), "{report}");
-    assert_eq!(second.user_id, first.user_id, "{report}");
+    assert_eq!(second.user_id, None, "{report}");
     let erin_users: i64 =
         sqlx::query_scalar("SELECT COUNT(*) FROM users WHERE lower(name) = 'erin'")
             .fetch_one(&w.state.db)
