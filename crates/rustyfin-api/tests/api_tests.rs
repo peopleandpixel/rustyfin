@@ -49610,8 +49610,14 @@ fn j2_ids(sources: &[serde_json::Value]) -> Vec<String> {
         .collect()
 }
 
-/// Checks that `source` is as stored: every Supports flag true and no device data.
+/// Checks that `source` is as stored: every Supports flag true and no device data. Its
+/// `TranscodingSubProtocol` is Jellyfin 12.4's default, `http`: a non-null enum it always sends
+/// (MediaSourceInfo), which its SDK clients require.
 fn j2_assert_stored(source: &serde_json::Value, what: &str) {
+    assert_eq!(
+        source["TranscodingSubProtocol"], "http",
+        "{what}: TranscodingSubProtocol"
+    );
     for flag in [
         "SupportsDirectPlay",
         "SupportsDirectStream",
@@ -49621,7 +49627,6 @@ fn j2_assert_stored(source: &serde_json::Value, what: &str) {
     }
     for key in [
         "TranscodingUrl",
-        "TranscodingSubProtocol",
         "TranscodingContainer",
         "TranscodeReasons",
         "DefaultAudioStreamIndex",
