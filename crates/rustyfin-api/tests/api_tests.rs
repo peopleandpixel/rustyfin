@@ -56040,3 +56040,113 @@ async fn r3dash3_a_library_scan_shows_as_the_scan_task_and_clears() {
     assert_eq!(task["State"], "Idle", "{task}");
     assert_eq!(folder["RefreshStatus"], "Idle", "{folder}");
 }
+
+// A scan the scheduler starts over two libraries shows one percentage everywhere: the library
+// scan task (GET /ScheduledTasks, GET /ScheduledTasks/LibraryScan and the ScheduledTasksInfo
+// frames) is the mean of what /Library/VirtualFolders and the RefreshProgress frames show for each
+// library, because all of them read the scan registry. The task's result is still the scheduler's.
+#[tokio::test]
+async fn r3dash3_a_scheduled_scan_shows_one_percentage_everywhere() {
+    let state = test_state().await;
+    let app = app(state.clone());
+    let (owner, _, _, _) = g1_owner_and_viewer(&state, &app).await;
+    let first = create_library_via_api(&app, &state, &owner, "Movies A", "Movies").await;
+    let second = create_library_via_api(&app, &state, &owner, "Shows B", "TvShows").await;
+    let addr = b17_serve(&app).await;
+    let scans = state.task_scheduler.scans().clone();
+    while scans.state(first).is_some() || scans.state(second).is_some() {
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+
+    // The scheduler's scan waits for the scan lock in its first library, both libraries queued
+    let lock = rustyfin_core::scanner::SCAN_LOCK.lock().await;
+    let (status, body) = send_authed(
+        &app,
+        "POST",
+        "/ScheduledTasks/Running/LibraryScan",
+        &owner,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+    for _ in 0..500 {
+        if scans.state(first).is_some() && scans.state(second).is_some() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    let mut socket = G1cSocket::open(addr, &owner).await;
+    r3tasks_send(
+        &mut socket,
+        r#"{"MessageType":"ScheduledTasksInfoStart","Data":"0,500"}"#,
+    )
+    .await;
+
+    // Work reported on each library's run: 1 of 2 in the first, 1 of 4 in the second
+    let a = scans.queue(first);
+    a.add_total(2);
+    a.advance(1);
+    let b = scans.queue(second);
+    b.add_total(4);
+    b.advance(1);
+
+    // The RefreshProgress frames reach 50 and 25, and a ScheduledTasksInfo frame the mean
+    let (mut ring_a, mut ring_b, mut frame_task) = (None, None, None);
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while ring_a != Some(50.0) || ring_b != Some(25.0) || frame_task != Some(37.5) {
+            let frame = socket.next().await;
+            match frame["MessageType"].as_str() {
+                Some("RefreshProgress") => {
+                    let percent = frame["Data"]["Progress"]
+                        .as_str()
+                        .and_then(|p| p.parse::<f64>().ok());
+                    if frame["Data"]["ItemId"] == first.to_string() {
+                        ring_a = percent;
+                    } else if frame["Data"]["ItemId"] == second.to_string() {
+                        ring_b = percent;
+                    }
+                }
+                Some("ScheduledTasksInfo") => {
+                    frame_task = frame["Data"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .find(|t| t["Id"] == "LibraryScan")
+                        .and_then(|t| t["CurrentProgressPercentage"].as_f64());
+                }
+                _ => {}
+            }
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("frames: {ring_a:?} {ring_b:?} {frame_task:?}"));
+
+    let (task, folder_a) = r3dash3_scan_views(&app, &owner, first).await;
+    let (_, folder_b) = r3dash3_scan_views(&app, &owner, second).await;
+    let (_, one) = send_authed(&app, "GET", "/ScheduledTasks/LibraryScan", &owner, None).await;
+    assert_eq!(task["State"], "Running", "{task}");
+    assert_eq!(task["CurrentProgressPercentage"], 37.5, "{task}");
+    assert_eq!(one["CurrentProgressPercentage"], 37.5, "{one}");
+    assert_eq!(folder_a["RefreshProgress"], 50.0, "{folder_a}");
+    assert_eq!(folder_b["RefreshProgress"], 25.0, "{folder_b}");
+    let mean = (folder_a["RefreshProgress"].as_f64().unwrap()
+        + folder_b["RefreshProgress"].as_f64().unwrap())
+        / 2.0;
+    assert_eq!(task["CurrentProgressPercentage"].as_f64(), Some(mean));
+
+    // The scans run and end: the task is Idle, with the scheduler's result
+    drop(a);
+    drop(b);
+    drop(lock);
+    let mut task = serde_json::Value::Null;
+    for _ in 0..1000 {
+        task = r3dash3_scan_views(&app, &owner, first).await.0;
+        if task["State"] == "Idle" && task["LastExecutionResult"].is_object() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert_eq!(task["State"], "Idle", "{task}");
+    assert!(task["CurrentProgressPercentage"].is_null(), "{task}");
+    assert_eq!(task["LastExecutionResult"]["Status"], "Completed", "{task}");
+}

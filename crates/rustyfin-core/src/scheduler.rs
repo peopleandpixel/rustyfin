@@ -577,10 +577,13 @@ impl TaskScheduler {
 
     /// A task's info, with the percent it has reported while it is not idle.
     ///
-    /// As in Jellyfin, every library scan shows as the library scan task: while any library has a
-    /// scan listed (queued, scanning or probing), wherever it was started (a library's Scan, Scan
-    /// all, the setup wizard), an idle library scan task reads Running, at the listed scans'
-    /// average percent. The scans listed are what the web client's scan rings show.
+    /// As in Jellyfin, every library scan shows as the library scan task. Its `State` and percent
+    /// come only from the scan registry, the source of the web client's scan rings, the
+    /// `RefreshProgress` frames and `RefreshStatus`: Running while any library has a scan listed
+    /// (queued, scanning or probing), wherever it was started (the scheduler, whose run holds
+    /// tickets like any other scan, a library's Scan, Scan all, the setup wizard), at the listed
+    /// scans' average percent; Idle when none is. A stopped scheduler run reads Cancelling while
+    /// its scans are listed. `LastExecutionResult` stays the scheduler's.
     fn info_of(&self, entry: &TaskEntry) -> ScheduledTaskInfo {
         let mut info = entry.info.clone();
         info.current_progress_percentage = match info.state {
@@ -589,16 +592,10 @@ impl TaskScheduler {
                 self.progress.get(&info.id).and_then(TaskProgress::get)
             }
         };
-        if info.id == TASK_LIBRARY_SCAN && info.state == TaskState::Idle {
-            let scans = self.scans.snapshot();
-            if !scans.is_empty() {
-                let sum: f64 = scans
-                    .iter()
-                    .map(|(_, s)| f64::from(s.progress.unwrap_or(0)))
-                    .sum();
-                info.state = TaskState::Running;
-                info.current_progress_percentage = Some(sum / scans.len() as f64);
-            }
+        if info.id == TASK_LIBRARY_SCAN {
+            let (state, percent) = library_scan_state(&self.scans, &info.state);
+            info.state = state;
+            info.current_progress_percentage = percent;
         }
         info
     }
@@ -1055,11 +1052,6 @@ impl TaskScheduler {
 
         let result = match rustyfin_db::repo_library::get_all_libraries(&self.db).await {
             Ok(libraries) => {
-                let follower = follow_scans(
-                    self.scans.subscribe(),
-                    libraries.iter().map(|lib| lib.id).collect(),
-                    self.progress_of(TASK_LIBRARY_SCAN),
-                );
                 // Every library is listed as queued before the first one starts.
                 let tickets: Vec<_> = libraries
                     .iter()
@@ -1094,9 +1086,6 @@ impl TaskScheduler {
                 for ticket in runs {
                     ticket.wait_end().await;
                 }
-                // Waited for, so no late percent lands after the task ends
-                follower.abort();
-                let _ = follower.await;
                 let end = Utc::now();
                 if errors.is_empty() {
                     TaskResult {
@@ -1672,6 +1661,16 @@ impl TaskScheduler {
         );
     }
 
+    /// Whether the scheduler's own run of task `id` is going, whatever its reported state (the
+    /// library scan task reports the scan registry's).
+    async fn run_active(&self, id: &str) -> bool {
+        self.tasks
+            .read()
+            .await
+            .get(id)
+            .is_some_and(|entry| entry.info.state != TaskState::Idle)
+    }
+
     /// The running work a VACUUM would hold up: it holds the write lock throughout, so their
     /// writes would wait and then fail. `scan_lock_held`: whether `SCAN_LOCK` is held, as by the
     /// scans started outside the scheduler.
@@ -1685,7 +1684,7 @@ impl TaskScheduler {
             TASK_TRICKPLAY,
         ] {
             if let Some(task) = self.get_task(id).await
-                && task.state != TaskState::Idle
+                && (task.state != TaskState::Idle || self.run_active(id).await)
             {
                 blockers.push(task.name);
             }
@@ -1693,7 +1692,8 @@ impl TaskScheduler {
         let scan_listed = self
             .get_task(TASK_LIBRARY_SCAN)
             .await
-            .is_some_and(|task| task.state != TaskState::Idle);
+            .is_some_and(|task| task.state != TaskState::Idle)
+            || self.run_active(TASK_LIBRARY_SCAN).await;
         if !scan_listed && scan_lock_held {
             blockers.push("a library scan".to_string());
         }
@@ -1820,37 +1820,23 @@ fn no_library_on(id: &str, message: &str) -> String {
     message.to_string()
 }
 
-/// Reports the library scan task's percent from the scans' updates: the mean of each library's
-/// percent, where a library whose scan ended counts as 100. Each library's percent only rises, so
-/// the late updates of a library still probing never move the total back.
-fn follow_scans(
-    mut updates: tokio::sync::broadcast::Receiver<crate::scan_progress::ScanUpdate>,
-    libraries: Vec<uuid::Uuid>,
-    progress: TaskProgress,
-) -> tokio::task::JoinHandle<()> {
-    use crate::scan_progress::ScanStatus;
-    use tokio::sync::broadcast::error::RecvError;
-    let mut percents = vec![0u8; libraries.len()];
-    progress.report_count(0, libraries.len());
-    tokio::spawn(async move {
-        loop {
-            let update = match updates.recv().await {
-                Ok(update) => update,
-                Err(RecvError::Lagged(_)) => continue,
-                Err(RecvError::Closed) => return,
-            };
-            let Some(i) = libraries.iter().position(|id| *id == update.library_id) else {
-                continue;
-            };
-            let percent = match update.status {
-                ScanStatus::Idle => 100,
-                ScanStatus::Active | ScanStatus::Queued => update.progress,
-            };
-            percents[i] = percents[i].max(percent);
-            let sum: usize = percents.iter().map(|&p| usize::from(p)).sum();
-            progress.report(sum as f64 / percents.len() as f64);
-        }
-    })
+/// The library scan task's state and percent from the scans listed in `scans`: Idle with no
+/// percent when none is listed, else Running (Cancelling while the scheduler's run is stopping) at
+/// the mean of the listed scans' percents, each as its `RefreshProgress` frame shows it.
+fn library_scan_state(scans: &ScanRegistry, run: &TaskState) -> (TaskState, Option<f64>) {
+    let listed = scans.snapshot();
+    if listed.is_empty() {
+        return (TaskState::Idle, None);
+    }
+    let sum: f64 = listed
+        .iter()
+        .map(|(_, s)| f64::from(s.progress.unwrap_or(0)))
+        .sum();
+    let state = match run {
+        TaskState::Cancelling => TaskState::Cancelling,
+        _ => TaskState::Running,
+    };
+    (state, Some(sum / listed.len() as f64))
 }
 
 /// Remove transcode cache files older than 24 hours
@@ -2456,6 +2442,34 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// The scheduler's own run of the library scan reads only what the registry lists: not its own
+    /// reported percent, Idle while nothing is listed, Running while scans are, a stopped run's
+    /// included (stopping it does not end the scans already going).
+    #[tokio::test]
+    async fn r3dash3_the_scheduler_run_reads_the_registry_only() {
+        let (sched, dir) = r3tasks_scheduler().await;
+        sched
+            .set_task_state(TASK_LIBRARY_SCAN, TaskState::Running)
+            .await;
+        sched.progress_of(TASK_LIBRARY_SCAN).report(80.0);
+        assert_eq!(r3dash3_scan_task(&sched).await, (TaskState::Idle, None));
+        let ticket = sched.scans().queue(Uuid::new_v4());
+        ticket.add_total(10);
+        ticket.advance(3);
+        assert_eq!(
+            r3dash3_scan_task(&sched).await,
+            (TaskState::Running, Some(30.0))
+        );
+        assert!(sched.stop_task(TASK_LIBRARY_SCAN).await);
+        assert_eq!(
+            r3dash3_scan_task(&sched).await,
+            (TaskState::Running, Some(30.0))
+        );
+        drop(ticket);
+        assert_eq!(r3dash3_scan_task(&sched).await, (TaskState::Idle, None));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// A scan that is cancelled (its task aborted) or fails (panics) clears the library's listing,
     /// so neither the scan ring nor the task stays on.
     #[tokio::test]
@@ -2838,47 +2852,5 @@ mod tests {
         assert!(!sched.is_held(TASK_CHAPTER_IMAGES));
         r3tasks_settle().await;
         let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[tokio::test]
-    async fn r3tasks_scan_progress_follows_the_libraries_scans() {
-        let scans = ScanRegistry::new();
-        let (first, second) = (uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
-        let progress = TaskProgress::new();
-        let follower = follow_scans(scans.subscribe(), vec![first, second], progress.clone());
-        assert_eq!(progress.get(), Some(0.0), "a scan of libraries starts at 0");
-
-        let wait_for = |want: f64| {
-            let progress = progress.clone();
-            async move {
-                for _ in 0..200 {
-                    if progress.get() == Some(want) {
-                        return;
-                    }
-                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-                }
-                panic!("progress {:?}, want {want}", progress.get());
-            }
-        };
-        let one = scans.queue(first);
-        let two = scans.queue(second);
-        one.start();
-        one.add_total(4);
-        one.advance(2);
-        wait_for(25.0).await;
-        drop(one);
-        wait_for(50.0).await;
-        two.start();
-        two.add_total(2);
-        two.advance(1);
-        wait_for(75.0).await;
-        // A late update of a library that has ended never moves the total back.
-        let late = scans.queue(first);
-        late.start();
-        two.advance(1);
-        drop(two);
-        wait_for(100.0).await;
-        drop(late);
-        follower.abort();
     }
 }
