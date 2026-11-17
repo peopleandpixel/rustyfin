@@ -5,12 +5,18 @@
 //! with length prefixes (`avcC`, `hvcC`), into an Annex B stream that one ffmpeg decodes, a key
 //! frame after another, in the order they came.
 //!
-//! H.264 takes IDR frames only: each starts afresh. An HEVC CRA key frame (x265's open GOP) is
-//! decoded as a random access point, but its picture order count (POC) still follows the one
-//! before, and the decoder makes up the frames its reference set names. A CRA's references all
-//! precede it, so `KeyFrameStream` rewrites each CRA's POC to count up a quarter of the POC range
-//! from the last one: no frame then lands on a made-up one, and frames come out in the order they
-//! went in.
+//! An HEVC CRA key frame (x265's open GOP) is decoded as a random access point, but its picture
+//! order count (POC) still follows the one before, and the decoder makes up the frames its
+//! reference set names. A CRA's references all precede it, so `KeyFrameStream` rewrites each
+//! CRA's POC to count up a quarter of the POC range from the last one: no frame then lands on a
+//! made-up one, and frames come out in the order they went in.
+//!
+//! H.264 takes IDR frames, and the non-IDR key frames of open GOPs (as on Blu-rays) whose slices
+//! are all I slices: those refer to no other picture, so they decode alone exactly. Only the
+//! decoder's bookkeeping follows the picture before, which here isn't there: so each one's
+//! `frame_num` is rewritten to follow the last (no gap in the reference frames) and its POC to
+//! count up as HEVC's does. A key frame with a P or B slice, a field, or data partitioning is
+//! refused.
 
 use std::collections::HashMap;
 
@@ -113,6 +119,7 @@ pub(crate) struct KeyFrameStream {
     /// The parameter sets of the decoder configuration, sent before the first frame.
     header: Option<Vec<u8>>,
     hevc: HevcPoc,
+    h264: H264Count,
 }
 
 impl KeyFrameStream {
@@ -128,6 +135,7 @@ impl KeyFrameStream {
             length_size,
             header: None,
             hevc: HevcPoc::default(),
+            h264: H264Count::default(),
         };
         let mut header = Vec::new();
         for set in sets {
@@ -169,8 +177,11 @@ impl KeyFrameStream {
             }
             match self.codec {
                 Codec::H264 => match nal[0] & 0x1f {
-                    5 => pictures += 1,
-                    1..=4 => return Err(format!("{NOT_ALONE}: an H.264 frame that isn't IDR")),
+                    // Whether a non-IDR slice is an I slice is the slice header's to say
+                    1 | 5 => pictures += 1,
+                    2..=4 => {
+                        return Err(format!("{NOT_ALONE}: an H.264 frame in data partitions"));
+                    }
                     _ => {}
                 },
                 Codec::Hevc => match (nal[0] >> 1) & 0x3f {
@@ -202,7 +213,7 @@ impl KeyFrameStream {
     /// One NAL unit as it goes out: HEVC parameter sets are noted and CRA POCs rewritten.
     fn nal(&mut self, nal: Vec<u8>) -> Result<Vec<u8>, String> {
         match self.codec {
-            Codec::H264 => Ok(nal),
+            Codec::H264 => self.h264.nal(nal),
             Codec::Hevc => self.hevc.nal(nal),
         }
     }
@@ -258,6 +269,263 @@ fn hvcc(data: &[u8]) -> Option<(usize, Vec<&[u8]>)> {
         }
     }
     Some((length_size, sets))
+}
+
+/// What a slice header needs from an H.264 SPS.
+#[derive(Clone, Copy)]
+struct H264Sps {
+    frame_num_bits: u32,
+    /// `pic_order_cnt_type`: 0 sends a POC LSB in each slice header; 1 and 2 derive the POC
+    /// from `frame_num`.
+    poc_type: u32,
+    poc_lsb_bits: u32,
+    /// For `pic_order_cnt_type` 1: no POC deltas in the slice header.
+    delta_pic_order_always_zero: bool,
+    frames_only: bool,
+    separate_colour_planes: bool,
+}
+
+/// What a slice header needs from an H.264 PPS.
+#[derive(Clone, Copy)]
+struct H264Pps {
+    sps: u32,
+    /// `bottom_field_pic_order_in_frame_present_flag`: a bottom field POC delta in the header.
+    bottom_field_poc: bool,
+    redundant_pic_cnt: bool,
+}
+
+/// The H.264 parameter sets seen so far, and the `frame_num` and POC LSB the last picture was
+/// given.
+#[derive(Default)]
+struct H264Count {
+    sps: HashMap<u32, H264Sps>,
+    pps: HashMap<u32, H264Pps>,
+    frame_num: u32,
+    lsb: u32,
+}
+
+impl H264Count {
+    fn nal(&mut self, nal: Vec<u8>) -> Result<Vec<u8>, String> {
+        let kind = nal.first().copied().unwrap_or_default() & 0x1f;
+        let bad = |what: &str| format!("{NOT_ALONE}: its {what} can't be read");
+        let payload = nal.get(1..).unwrap_or_default();
+        match kind {
+            7 => {
+                let (id, sps) = parse_h264_sps(&unescape(payload)).ok_or_else(|| bad("SPS"))?;
+                self.sps.insert(id, sps);
+                Ok(nal)
+            }
+            8 => {
+                let (id, pps) = parse_h264_pps(&unescape(payload)).ok_or_else(|| bad("PPS"))?;
+                self.pps.insert(id, pps);
+                Ok(nal)
+            }
+            1 | 5 => self.slice(nal, kind == 5),
+            _ => Ok(nal),
+        }
+    }
+
+    /// Takes an IDR slice's `frame_num` and POC LSB as the count's; gives a non-IDR I slice the
+    /// next `frame_num` and a POC LSB a quarter of the range on. Refuses any other slice, a
+    /// redundant one, and one that marks reference frames itself (memory management control
+    /// operations): an MMCO 5 resets the decoder's `frame_num` and POC, and the others name
+    /// pictures by a `frame_num` difference that the rewrite changes.
+    fn slice(&mut self, nal: Vec<u8>, idr: bool) -> Result<Vec<u8>, String> {
+        let refuse = |what: &str| format!("{NOT_ALONE}: an H.264 {what}");
+        let unread = || format!("{NOT_ALONE}: its slice header can't be read");
+        if nal.first().is_some_and(|h| h >> 5 & 3 == 0) {
+            return Err(refuse("key frame no other frame refers to"));
+        }
+        let mut rbsp = unescape(nal.get(1..).unwrap_or_default());
+        let mut r = Bits::new(&rbsp);
+        let first = r.ue().ok_or_else(unread)? == 0;
+        // I (2) and SI (4), or the same that hold for every slice of the picture (7, 9)
+        let slice_type = r.ue().filter(|&t| t <= 9).ok_or_else(unread)?;
+        if !matches!(slice_type % 5, 2 | 4) {
+            return Err(refuse("key frame with a P or B slice"));
+        }
+        let pps = r
+            .ue()
+            .and_then(|id| self.pps.get(&id))
+            .copied()
+            .ok_or_else(unread)?;
+        let sps = self.sps.get(&pps.sps).copied().ok_or_else(unread)?;
+        if sps.separate_colour_planes {
+            r.skip(2).ok_or_else(unread)?;
+        }
+        let frame_num_at = r.at;
+        let frame_num = r.u(sps.frame_num_bits).ok_or_else(unread)?;
+        if !sps.frames_only && r.flag().ok_or_else(unread)? {
+            return Err(refuse("key frame coded as fields"));
+        }
+        if idr {
+            r.ue().ok_or_else(unread)?; // idr_pic_id
+        }
+        let lsb_at = r.at;
+        let lsb = if sps.poc_type == 0 {
+            Some(r.u(sps.poc_lsb_bits).ok_or_else(unread)?)
+        } else {
+            None
+        };
+        // The rest of an I slice's header up to dec_ref_pic_marking (7.3.3): POC deltas,
+        // redundant_pic_cnt; an I slice has no reference lists or weights
+        if sps.poc_type == 0 && pps.bottom_field_poc {
+            r.se().ok_or_else(unread)?;
+        }
+        if sps.poc_type == 1 && !sps.delta_pic_order_always_zero {
+            r.se().ok_or_else(unread)?;
+            if pps.bottom_field_poc {
+                r.se().ok_or_else(unread)?;
+            }
+        }
+        if pps.redundant_pic_cnt && r.ue().ok_or_else(unread)? > 0 {
+            return Err(refuse("redundant picture"));
+        }
+        // dec_ref_pic_marking, as nal_ref_idc isn't 0
+        if idr {
+            r.skip(2).ok_or_else(unread)?;
+        } else if r.flag().ok_or_else(unread)? {
+            return Err(refuse("key frame that marks reference frames itself"));
+        }
+        if idr {
+            if first {
+                self.frame_num = frame_num;
+                self.lsb = lsb.unwrap_or_default();
+            }
+            return Ok(nal);
+        }
+        if first {
+            self.frame_num = (self.frame_num + 1) % (1 << sps.frame_num_bits);
+            let range = 1u32 << sps.poc_lsb_bits;
+            self.lsb = (self.lsb + range / 4) % range;
+        }
+        set_bits(&mut rbsp, frame_num_at, sps.frame_num_bits, self.frame_num);
+        if lsb.is_some() {
+            set_bits(&mut rbsp, lsb_at, sps.poc_lsb_bits, self.lsb);
+        }
+        let mut out = nal[..1].to_vec();
+        escape(&rbsp, &mut out);
+        Ok(out)
+    }
+}
+
+/// Writes the low `n` bits of `value` into `data` from bit `at` on, most significant first.
+/// The bits are there: they were just read.
+fn set_bits(data: &mut [u8], at: usize, n: u32, value: u32) {
+    for i in 0..n {
+        let bit = (value >> (n - 1 - i)) & 1 == 1;
+        let p = at + i as usize;
+        let mask = 0x80 >> (p % 8);
+        if bit {
+            data[p / 8] |= mask;
+        } else {
+            data[p / 8] &= !mask;
+        }
+    }
+}
+
+/// The profiles whose SPS has the chroma format, bit depths and scaling matrices.
+const H264_HIGH_PROFILES: [u32; 13] =
+    [100, 110, 122, 244, 44, 83, 86, 118, 128, 138, 139, 134, 135];
+
+fn parse_h264_sps(rbsp: &[u8]) -> Option<(u32, H264Sps)> {
+    let mut r = Bits::new(rbsp);
+    let profile = r.u(8)?;
+    r.skip(16)?; // constraint flags, level
+    let id = Some(r.ue()?).filter(|&id| id <= 31)?;
+    let mut separate_colour_planes = false;
+    if H264_HIGH_PROFILES.contains(&profile) {
+        let chroma = r.ue()?;
+        if chroma == 3 {
+            separate_colour_planes = r.flag()?;
+        }
+        r.ue()?;
+        r.ue()?; // bit depths
+        r.skip(1)?;
+        if r.flag()? {
+            for i in 0..if chroma == 3 { 12 } else { 8 } {
+                if r.flag()? {
+                    skip_scaling_list(&mut r, if i < 6 { 16 } else { 64 })?;
+                }
+            }
+        }
+    }
+    // log2_max_frame_num_minus4 and log2_max_pic_order_cnt_lsb_minus4: 0 to 12
+    let frame_num_bits = Some(r.ue()?).filter(|&n| n <= 12)? + 4;
+    let poc_type = r.ue()?;
+    let mut poc_lsb_bits = 4;
+    let mut delta_pic_order_always_zero = false;
+    match poc_type {
+        0 => poc_lsb_bits = Some(r.ue()?).filter(|&n| n <= 12)? + 4,
+        1 => {
+            delta_pic_order_always_zero = r.flag()?;
+            r.se()?;
+            r.se()?;
+            for _ in 0..Some(r.ue()?).filter(|&n| n <= 255)? {
+                r.se()?;
+            }
+        }
+        2 => {}
+        _ => return None,
+    }
+    r.ue()?; // max_num_ref_frames
+    r.skip(1)?;
+    r.ue()?;
+    r.ue()?; // size in macroblocks
+    let frames_only = r.flag()?;
+    Some((
+        id,
+        H264Sps {
+            frame_num_bits,
+            poc_type,
+            poc_lsb_bits,
+            delta_pic_order_always_zero,
+            frames_only,
+            separate_colour_planes,
+        },
+    ))
+}
+
+fn skip_scaling_list(r: &mut Bits<'_>, size: usize) -> Option<()> {
+    let (mut last, mut next) = (8i64, 8i64);
+    for _ in 0..size {
+        if next != 0 {
+            next = (last + r.se()?).rem_euclid(256);
+        }
+        if next != 0 {
+            last = next;
+        }
+    }
+    Some(())
+}
+
+/// An H.264 PPS's id and what a slice header needs of it. `None` for slice groups (FMO, of the
+/// Baseline profile only), whose map isn't read.
+fn parse_h264_pps(rbsp: &[u8]) -> Option<(u32, H264Pps)> {
+    let mut r = Bits::new(rbsp);
+    let id = Some(r.ue()?).filter(|&id| id <= 255)?;
+    let sps = Some(r.ue()?).filter(|&id| id <= 31)?;
+    r.skip(1)?; // entropy_coding_mode_flag
+    let bottom_field_poc = r.flag()?;
+    if r.ue()? != 0 {
+        return None;
+    }
+    r.ue()?;
+    r.ue()?; // default reference list sizes
+    r.skip(3)?; // weighted prediction
+    r.se()?;
+    r.se()?;
+    r.se()?; // initial QPs, chroma QP offset
+    r.skip(2)?; // deblocking_filter_control_present_flag, constrained_intra_pred_flag
+    let redundant_pic_cnt = r.flag()?;
+    Some((
+        id,
+        H264Pps {
+            sps,
+            bottom_field_poc,
+            redundant_pic_cnt,
+        },
+    ))
 }
 
 /// What a slice header needs from an HEVC SPS.
@@ -343,16 +611,7 @@ impl HevcPoc {
         }
         let at = r.at;
         r.u(sps.poc_lsb_bits)?;
-        for i in 0..sps.poc_lsb_bits {
-            let bit = (self.lsb >> (sps.poc_lsb_bits - 1 - i)) & 1 == 1;
-            let p = at + i as usize;
-            let mask = 0x80 >> (p % 8);
-            if bit {
-                rbsp[p / 8] |= mask;
-            } else {
-                rbsp[p / 8] &= !mask;
-            }
-        }
+        set_bits(&mut rbsp, at, sps.poc_lsb_bits, self.lsb);
         let mut out = nal.get(..2)?.to_vec();
         escape(&rbsp, &mut out);
         Some(out)
@@ -494,6 +753,12 @@ impl<'a> Bits<'a> {
         (self.at <= self.data.len() * 8).then_some(())
     }
 
+    /// A signed Exp-Golomb number.
+    fn se(&mut self) -> Option<i64> {
+        let k = i64::from(self.ue()?);
+        Some(if k % 2 == 1 { (k + 1) / 2 } else { -(k / 2) })
+    }
+
     /// An unsigned Exp-Golomb number.
     fn ue(&mut self) -> Option<u32> {
         let mut zeros = 0;
@@ -536,6 +801,231 @@ mod tests {
         assert!(!hex_line("00000030:\u{e9}0102".as_bytes(), &mut out));
         assert_eq!(out.len(), 25);
     }
+
+    /// Writes bits, most significant first, into an RBSP with its stop bit.
+    #[derive(Default)]
+    struct BitsOut(Vec<bool>);
+
+    impl BitsOut {
+        fn u(&mut self, n: u32, v: u32) -> &mut Self {
+            self.0.extend((0..n).rev().map(|i| v >> i & 1 == 1));
+            self
+        }
+        fn ue(&mut self, v: u32) -> &mut Self {
+            let n = 32 - (v + 1).leading_zeros();
+            self.u(n - 1, 0).u(n, v + 1)
+        }
+        fn se(&mut self, v: i32) -> &mut Self {
+            let k = if v > 0 { 2 * v - 1 } else { -2 * v };
+            self.ue(k as u32)
+        }
+        /// The NAL unit: `header`, then these bits, the stop bit, padding, escaped.
+        fn nal(&mut self, header: u8) -> Vec<u8> {
+            self.0.push(true);
+            while self.0.len() % 8 != 0 {
+                self.0.push(false);
+            }
+            let rbsp: Vec<u8> = self
+                .0
+                .chunks(8)
+                .map(|b| b.iter().fold(0, |v, &bit| v << 1 | u8::from(bit)))
+                .collect();
+            let mut out = vec![header];
+            escape(&rbsp, &mut out);
+            out
+        }
+    }
+
+    /// The H.264 coding choices `h264_stream` and `h264_slice` follow.
+    #[derive(Clone, Copy, Default)]
+    struct Coding {
+        poc_type: u32,
+        fields: bool,
+        bottom_field_poc: bool,
+        redundant: bool,
+    }
+
+    /// A Baseline profile stream with 4-bit frame_num and POC LSB, as `coding` says.
+    fn h264_stream(coding: Coding) -> KeyFrameStream {
+        let mut sps = BitsOut::default();
+        sps.u(8, 66)
+            .u(8, 0)
+            .u(8, 30)
+            .ue(0)
+            .ue(0)
+            .ue(coding.poc_type);
+        match coding.poc_type {
+            0 => {
+                sps.ue(0);
+            }
+            1 => {
+                // delta_pic_order_always_zero_flag 0, offsets, one frame in the cycle
+                sps.u(1, 0).se(0).se(0).ue(1).se(2);
+            }
+            _ => {}
+        }
+        sps.ue(1)
+            .u(1, 0)
+            .ue(0)
+            .ue(0)
+            .u(1, u32::from(!coding.fields));
+        if coding.fields {
+            sps.u(1, 0);
+        }
+        sps.u(3, 0); // direct_8x8_inference, cropping, VUI
+        let mut pps = BitsOut::default();
+        pps.ue(0)
+            .ue(0)
+            .u(1, 0)
+            .u(1, u32::from(coding.bottom_field_poc));
+        pps.ue(0).ue(0).ue(0).u(3, 0).se(0).se(0).se(0).u(2, 0);
+        pps.u(1, u32::from(coding.redundant));
+        let (sps, pps) = (sps.nal(0x67), pps.nal(0x68));
+        let mut config = vec![1, 66, 0, 30, 0xff, 0xe1];
+        config.extend((sps.len() as u16).to_be_bytes());
+        config.extend(&sps);
+        config.push(1);
+        config.extend((pps.len() as u16).to_be_bytes());
+        config.extend(&pps);
+        KeyFrameStream::new(Codec::H264, &config).unwrap()
+    }
+
+    /// An all-I slice NAL unit (IDR where `idr`) with `frame_num` and POC LSB `lsb`, a field
+    /// where `field`, `redundant_pic_cnt`, and MMCO 5 where `mmco`, then a body that a rewrite
+    /// must leave as it is.
+    fn h264_slice(
+        coding: Coding,
+        idr: bool,
+        (frame_num, lsb): (u32, u32),
+        (field, redundant, mmco): (bool, u32, bool),
+    ) -> Vec<u8> {
+        let mut s = BitsOut::default();
+        s.ue(0).ue(7).ue(0).u(4, frame_num);
+        if coding.fields {
+            s.u(1, u32::from(field));
+        }
+        if idr {
+            s.ue(3);
+        }
+        if coding.poc_type == 0 {
+            s.u(4, lsb);
+            if coding.bottom_field_poc {
+                s.se(-1);
+            }
+        }
+        if coding.poc_type == 1 {
+            s.se(3);
+            if coding.bottom_field_poc {
+                s.se(1);
+            }
+        }
+        if coding.redundant {
+            s.ue(redundant);
+        }
+        if idr {
+            s.u(2, 0);
+        } else if mmco {
+            s.u(1, 1).ue(5).ue(0);
+        } else {
+            s.u(1, 0);
+        }
+        s.se(-2).u(16, 0xa50f).u(8, 0); // slice_qp_delta, then "slice data"
+        s.nal(if idr { 0x65 } else { 0x61 })
+    }
+
+    /// The slice NAL unit `push` sent last in `out`.
+    fn last_nal(out: &[u8]) -> &[u8] {
+        let at = out.windows(4).rposition(|w| w == START).unwrap();
+        &out[at + 4..]
+    }
+
+    #[test]
+    fn r3trickplay_h264_rewrite_renumbers_only_frame_num_and_poc() {
+        for coding in [
+            Coding::default(),
+            Coding {
+                bottom_field_poc: true,
+                ..Coding::default()
+            },
+            Coding {
+                poc_type: 1,
+                bottom_field_poc: true,
+                ..Coding::default()
+            },
+            Coding {
+                poc_type: 2,
+                ..Coding::default()
+            },
+            // Frames in a stream that may hold fields, and redundant_pic_cnt 0
+            Coding {
+                fields: true,
+                redundant: true,
+                ..Coding::default()
+            },
+        ] {
+            let mut stream = h264_stream(coding);
+            let mut out = Vec::new();
+            let plain = (false, 0, false);
+            let idr = h264_slice(coding, true, (0, 6), plain);
+            stream.push(&packet(&[idr.clone()]), &mut out).unwrap();
+            assert_eq!(last_nal(&out), idr, "an IDR slice goes out as it came");
+            // Whatever they held, the next key frames get frame_num 1, 2, 3 and an LSB 4 on
+            for k in 1..=3 {
+                out.clear();
+                let came = h264_slice(coding, false, (9, 13), plain);
+                stream.push(&packet(&[came]), &mut out).unwrap();
+                let lsb = (6 + 4 * k) % 16;
+                let expected = h264_slice(coding, false, (k, lsb), plain);
+                assert_eq!(last_nal(&out), expected, "key frame {k}");
+            }
+        }
+    }
+
+    #[test]
+    fn r3trickplay_h264_refuses_fields_redundant_pictures_and_mmcos() {
+        let fields = Coding {
+            fields: true,
+            redundant: true,
+            ..Coding::default()
+        };
+        for (what, slice) in [
+            (
+                "a field",
+                h264_slice(fields, false, (1, 2), (true, 0, false)),
+            ),
+            (
+                "a redundant picture",
+                h264_slice(fields, false, (1, 2), (false, 1, false)),
+            ),
+            (
+                "an MMCO",
+                h264_slice(fields, false, (1, 2), (false, 0, true)),
+            ),
+        ] {
+            let mut stream = h264_stream(fields);
+            let e = stream.push(&packet(&[slice]), &mut Vec::new()).unwrap_err();
+            assert!(e.starts_with(NOT_ALONE), "{what}: {e}");
+        }
+        // An MMCO behind POC type 1's deltas (with the bottom field delta) is found too
+        let poc1 = Coding {
+            poc_type: 1,
+            bottom_field_poc: true,
+            ..Coding::default()
+        };
+        let mut stream = h264_stream(poc1);
+        let mmco = h264_slice(poc1, false, (1, 0), (false, 0, true));
+        let e = stream.push(&packet(&[mmco]), &mut Vec::new()).unwrap_err();
+        assert!(e.contains("marks reference frames"), "{e}");
+        let plain = h264_slice(poc1, false, (1, 0), (false, 0, false));
+        stream.push(&packet(&[plain]), &mut Vec::new()).unwrap();
+    }
+
+    /// A Blu-ray encode's avcC: 4-byte lengths, one High profile SPS, one PPS.
+    const AVCC: [u8; 41] = [
+        1, 0x64, 0, 0x29, 0xff, 0xe1, 0, 0x18, 0x67, 0x64, 0, 0x29, 0xac, 0xd9, 0x40, 0x78, 0x02,
+        0x27, 0xe5, 0x84, 0, 0x06, 0x5d, 0x3c, 0x01, 0x31, 0x2d, 0x02, 0x3c, 0x60, 0xc6, 0x58,
+        0x01, 0, 0x06, 0x68, 0xe9, 0x38, 0x6c, 0xb2, 0x2c,
+    ];
 
     /// An HEVC NAL unit header of `kind` in `layer`, then `payload`.
     fn hevc_nal(kind: u8, layer: u8, payload: &[u8]) -> Vec<u8> {
@@ -614,14 +1104,18 @@ mod tests {
             }
             // Raw bytes as a packet, as a decoder configuration, and as a dump line
             let _ = hevc.push(&bytes, &mut out);
-            let mut h264 = KeyFrameStream::new(
-                Codec::H264,
-                &[
-                    1, 0x64, 0, 0x29, 0xff, 0xe1, 0, 2, 0x67, 0x64, 1, 0, 2, 0x68, 0xe9,
-                ],
-            )
-            .unwrap();
+            let mut h264 = KeyFrameStream::new(Codec::H264, &AVCC).unwrap();
             let _ = h264.push(&bytes, &mut out);
+            // H.264 slices of every kind, then cut anywhere
+            let nal = [
+                &[[0x65, 0x61, 0x41, 0x01, 0x67, 0x68][round % 6]][..],
+                &bytes,
+            ]
+            .concat();
+            let cut = &nal[..(next() as usize % (nal.len() + 1))];
+            for nal in [&nal[..], cut] {
+                let _ = h264.push(&packet(&[nal.to_vec()]), &mut out);
+            }
             let _ = KeyFrameStream::new(Codec::Hevc, &bytes);
             let _ = KeyFrameStream::new(Codec::H264, &bytes);
             let mut line = b"00000000: ".to_vec();
@@ -635,6 +1129,8 @@ mod tests {
             let rbsp: Vec<u8> = (0..len).map(|_| next() as u8).collect();
             let _ = parse_sps(&rbsp);
             let _ = parse_pps(&rbsp);
+            let _ = parse_h264_sps(&rbsp);
+            let _ = parse_h264_pps(&rbsp);
             let _ = unescape(&rbsp);
         }
         // Exp-Golomb numbers too long to be one; a CTB of 8 pixels
@@ -652,29 +1148,38 @@ mod tests {
     }
 
     #[test]
-    fn r3trickplay_h264_takes_idr_frames_only() {
-        // avcC: version 1, 4-byte lengths, one SPS (67 ..), one PPS (68 ..)
-        let config = [
-            1, 0x64, 0, 0x29, 0xff, 0xe1, 0, 2, 0x67, 0x64, 1, 0, 2, 0x68, 0xe9,
+    fn r3trickplay_h264_takes_i_frames_and_renumbers_them() {
+        // The start of the AVCC encode's first IDR slice: first_mb 0, slice_type 7 (all I),
+        // PPS 0, ...
+        let slice = [
+            0x88, 0x82, 0x00, 0x7f, 0xf2, 0x9d, 0x41, 0xdd, 0x70, 0x83, 0x19,
         ];
-        let mut stream = KeyFrameStream::new(Codec::H264, &config).unwrap();
+        let with = |header: u8| packet(&[[&[header][..], &slice].concat()]);
+        let mut stream = KeyFrameStream::new(Codec::H264, &AVCC).unwrap();
         let mut out = Vec::new();
-        stream
-            .push(&[0, 0, 0, 3, 0x65, 0x88, 0x80], &mut out)
-            .unwrap();
-        assert_eq!(
-            out,
-            [
-                0, 0, 0, 1, 0x67, 0x64, 0, 0, 0, 1, 0x68, 0xe9, 0, 0, 0, 1, 0x65, 0x88, 0x80
-            ]
-        );
-        out.clear();
-        stream.push(&[0, 0, 0, 2, 0x65, 0x88], &mut out).unwrap();
-        assert_eq!(out, [0, 0, 0, 1, 0x65, 0x88]);
-        let e = stream
-            .push(&[0, 0, 0, 2, 0x41, 0x9a], &mut out)
-            .unwrap_err();
-        assert!(e.starts_with(NOT_ALONE), "{e}");
+        // An IDR frame goes out as it came, after the parameter sets
+        stream.push(&with(0x65), &mut out).unwrap();
+        assert_eq!(&out[..5], &[0, 0, 0, 1, 0x67]);
+        assert!(out.ends_with(&[&[0, 0, 0, 1, 0x65][..], &slice].concat()));
+        // A non-IDR I frame gets the next frame_num and a POC on, so two in a row differ
+        let mut renumbered = Vec::new();
+        for _ in 0..2 {
+            out.clear();
+            stream.push(&with(0x61), &mut out).unwrap();
+            assert_eq!(&out[..5], &[0, 0, 0, 1, 0x61]);
+            renumbered.push(out[5..].to_vec());
+        }
+        assert_ne!(renumbered[0], slice);
+        assert_ne!(renumbered[0], renumbered[1]);
+        // A P slice (slice_type 5), a key frame nothing refers to, data partitions: refused
+        for refused in [
+            packet(&[vec![0x41, 0x98, 0x80]]),
+            with(0x01),
+            packet(&[vec![0x42, 0x88]]),
+        ] {
+            let e = stream.push(&refused, &mut out).unwrap_err();
+            assert!(e.starts_with(NOT_ALONE), "{e}");
+        }
         assert!(stream.push(&[0, 0, 0, 9, 0x65], &mut out).is_err());
         assert!(KeyFrameStream::new(Codec::H264, &[0, 0, 0, 1, 0x67]).is_none());
     }
