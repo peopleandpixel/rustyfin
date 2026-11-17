@@ -48328,6 +48328,7 @@ async fn r3items_localization_options_are_jellyfins_name_value_list() {
 
 /// The items of the `/Items` filter tests, by made-up name.
 struct R3ItemsLibrary {
+    library: uuid::Uuid,
     ids: std::collections::HashMap<&'static str, uuid::Uuid>,
     /// People: Pat Doe (actor), Band and Guest (artists).
     pat: uuid::Uuid,
@@ -48433,6 +48434,7 @@ async fn r3items_library(state: &AppState) -> R3ItemsLibrary {
         }
     }
     R3ItemsLibrary {
+        library: lib,
         ids,
         pat,
         band_person,
@@ -48477,8 +48479,10 @@ async fn r3items_people_and_studios_filter_the_list() {
             (format!("personIds={}", pat.simple()), &["Alpha"]),
             ("Person=Pat%20Doe".into(), &["Alpha"]),
             ("Person=Nobody".into(), &[]),
-            // PersonTypes has no effect, as in Jellyfin 10.11.
-            (format!("PersonIds={pat}&PersonTypes=Director"), &["Alpha"]),
+            // PersonTypes keeps those credits, as in Jellyfin 12.4.
+            (format!("PersonIds={pat}&PersonTypes=Director"), &[]),
+            (format!("PersonIds={pat}&personTypes=Actor"), &["Alpha"]),
+            ("Person=Pat%20Doe&PersonTypes=Director".into(), &[]),
             ("Studios=acme%20pictures".into(), &["Alpha"]),
             ("Studios=Other|Acme%20Pictures".into(), &["Alpha"]),
             ("Studios=Other".into(), &[]),
@@ -48571,7 +48575,7 @@ async fn r3items_ratings_and_dates_filter_the_list() {
         &[
             ("MinCommunityRating=7".into(), &["Alpha"]),
             ("MinCommunityRating=5".into(), &["Alpha", "Bravo"]),
-            // MinCriticRating has no effect, as in Jellyfin 10.11.
+            // MinCriticRating has no effect, as in Jellyfin 12.4.
             (
                 format!("MinCriticRating=99&{movies}"),
                 &["Alpha", "Bravo", "Charlie"],
@@ -48663,7 +48667,7 @@ async fn r3items_tags_media_types_and_flags_filter_the_list() {
         &token,
         &[
             // Tags are pipe-delimited and any of them matches, any case; an episode's own tags
-            // only, as Jellyfin 10.11 reads Tags.
+            // only, as Jellyfin 12.4 reads Tags.
             ("Tags=kids".into(), &["Alpha"]),
             ("Tags=Sports|Kids".into(), &["Alpha", "Bravo"]),
             ("Tags=Drama".into(), &["Bravo"]),
@@ -48755,8 +48759,16 @@ async fn r3items_numbers_names_locations_and_adjacency_filter_the_list() {
     );
     let (names, _) = r3items_names(&app, &ordered(lib.id("Episode 3")), &token).await;
     assert_eq!(names, ["Episode 2", "Episode 3"]);
-    let (names, _) = r3items_names(&app, &ordered(uuid::Uuid::new_v4()), &token).await;
-    assert_eq!(names, ["Episode 1"]);
+    // An item the list doesn't hold has no neighbours in it, as in Jellyfin 12.4.
+    let (names, total) = r3items_names(&app, &ordered(uuid::Uuid::new_v4()), &token).await;
+    assert_eq!((names.len(), total), (0, 0));
+    // With item types, a library as ParentId lists its contents recursively unless asked not to.
+    let library = lib.library;
+    let uri = format!("/Items?ParentId={library}&IncludeItemTypes=Episode&SortBy=SortName");
+    let (names, _) = r3items_names(&app, &uri, &token).await;
+    assert_eq!(names, ["Episode 1", "Episode 2", "Episode 3"]);
+    let (names, _) = r3items_names(&app, &format!("{uri}&Recursive=false"), &token).await;
+    assert!(names.is_empty(), "{names:?}");
 }
 
 #[tokio::test]
@@ -48802,13 +48814,13 @@ async fn r3items_filters_keep_the_callers_parental_limit() {
             "{params}"
         );
     }
-    // A hidden item as AdjacentTo: as an item the list doesn't hold.
+    // A hidden item as AdjacentTo: as an item the list doesn't hold, so nothing.
     let uri = format!(
         "/Items?Recursive=true&IncludeItemTypes=Movie&SortBy=SortName&AdjacentTo={}",
         lib.id("Alpha")
     );
     let (names, total) = r3items_names(&app, &uri, &token).await;
-    assert_eq!((names, total), (vec!["Charlie".to_string()], 1));
+    assert_eq!((names.len(), total), (0, 0));
 }
 
 #[tokio::test]

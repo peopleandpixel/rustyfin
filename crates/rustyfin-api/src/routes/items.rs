@@ -2072,7 +2072,7 @@ struct ItemsQuery {
     person_ids: Option<String>,
     #[serde(alias = "person")]
     person: Option<String>,
-    /// Accepted and, as in Jellyfin 10.11's item query, without effect.
+    /// The credit kinds `PersonIds` and `Person` keep (Actor, Director, …), as in Jellyfin 12.4.
     #[serde(alias = "personTypes")]
     person_types: Option<String>,
     #[serde(alias = "studios")]
@@ -2089,7 +2089,7 @@ struct ItemsQuery {
     albums: Option<String>,
     #[serde(alias = "minCommunityRating")]
     min_community_rating: Option<f64>,
-    /// Accepted and, as in Jellyfin 10.11's item query, without effect.
+    /// Accepted and, as in Jellyfin 12.4's item query, without effect.
     #[serde(alias = "minCriticRating")]
     min_critic_rating: Option<f64>,
     #[serde(alias = "minPremiereDate")]
@@ -2163,6 +2163,9 @@ struct ItemsQuery {
     min_date_last_saved: Option<String>,
     #[serde(alias = "minDateLastSavedForUser")]
     min_date_last_saved_for_user: Option<String>,
+    /// Jellyfin 12.4's AudioLanguages: items with an audio stream in one of these languages
+    #[serde(alias = "audioLanguages")]
+    audio_languages: Option<String>,
 }
 
 #[allow(dead_code)]
@@ -2231,7 +2234,10 @@ impl ItemsQuery {
             .or(self.name_starts_with_or_greater_lower.as_deref())
     }
     fn recursive(&self) -> bool {
-        self.recursive.or(self.recursive_lower).unwrap_or(false)
+        self.recursive_given().unwrap_or(false)
+    }
+    fn recursive_given(&self) -> Option<bool> {
+        self.recursive.or(self.recursive_lower)
     }
     fn fields(&self) -> Option<&str> {
         self.fields.as_deref().or(self.fields_lower.as_deref())
@@ -2658,6 +2664,25 @@ fn item_filter(query: &ItemsQuery) -> Result<rustyfin_db::repo_item_filter::Item
     let now = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
     Ok(rustyfin_db::repo_item_filter::ItemFilter {
         person_ids: ids(query.person_ids.as_deref()),
+        person_types: comma_list(query.person_types.as_deref()),
+        official_ratings: query
+            .official_ratings()
+            .into_iter()
+            .flat_map(|s| s.split(['|', ',']))
+            .map(str::trim)
+            .filter(|r| !r.is_empty())
+            .map(str::to_string)
+            .collect(),
+        audio_languages: comma_list(query.audio_languages.as_deref())
+            .iter()
+            .flat_map(|code| rustyfin_model::media_source::language_forms(code))
+            .collect(),
+        // Jellyfin 12.4: languages make HasSubtitles=true redundant, and HasSubtitles=false
+        // drops the languages.
+        subtitle_languages: query
+            .subtitle_languages()
+            .filter(|_| query.has_subtitles() != Some(false))
+            .unwrap_or_default(),
         person: query
             .person
             .as_deref()
@@ -2677,7 +2702,7 @@ fn item_filter(query: &ItemsQuery) -> Result<rustyfin_db::repo_item_filter::Item
         min_community_rating: query.min_community_rating,
         min_premiere_date: query_instant("MinPremiereDate", query.min_premiere_date.as_deref())?,
         max_premiere_date: query_instant("MaxPremiereDate", query.max_premiere_date.as_deref())?,
-        // Both compare the item's last save in Jellyfin 10.11; the later bound wins.
+        // Both compare the item's last save in Jellyfin 12.4; the later bound wins.
         min_date_last_saved: query_instant(
             "MinDateLastSaved",
             query.min_date_last_saved.as_deref(),
@@ -2699,7 +2724,9 @@ fn item_filter(query: &ItemsQuery) -> Result<rustyfin_db::repo_item_filter::Item
         min_height: query.min_height,
         max_width: query.max_width,
         max_height: query.max_height,
-        has_subtitles: query.has_subtitles(),
+        has_subtitles: query
+            .has_subtitles()
+            .filter(|&has| !(has && query.subtitle_languages().is_some())),
         has_overview: query.has_overview,
         has_official_rating: query.has_official_rating,
         no_parental_rating: query.has_parental_rating == Some(false)
@@ -2722,15 +2749,11 @@ fn item_filter(query: &ItemsQuery) -> Result<rustyfin_db::repo_item_filter::Item
     })
 }
 
-/// Jellyfin's `AdjacentTo` (`UserViewBuilder.FilterForAdjacency`): the item `id` of the ordered
-/// list and the ones before and after it. When the list doesn't hold it, its first item only,
-/// as Jellyfin's index of -1 gives.
+/// Jellyfin 12.4's `AdjacentTo` (`ApplyAdjacencyFilter`): the item `id` of the ordered list and
+/// the ones before and after it; nothing when the list doesn't hold it.
 fn adjacent_items(items: Vec<MediaItem>, id: Uuid) -> Vec<MediaItem> {
     let index = items.iter().position(|item| item.id == id);
-    let keep = |i: usize| match index {
-        Some(index) => i + 1 == index || i == index || i == index + 1,
-        None => i == 0,
-    };
+    let keep = |i: usize| index.is_some_and(|index| i + 1 == index || i == index || i == index + 1);
     items
         .into_iter()
         .enumerate()
@@ -2770,9 +2793,8 @@ async fn get_items(
     let years: Option<Vec<i32>> = query
         .years()
         .map(|s| s.split(',').filter_map(|y| y.trim().parse().ok()).collect());
-    let official_ratings: Option<Vec<String>> = query
-        .official_ratings()
-        .map(|s| s.split(['|', ',']).map(|r| r.trim().to_string()).collect());
+    // OfficialRatings, as SubtitleLanguages, goes to `item_filter`: Jellyfin 12.4 matches a
+    // folder by its contents too.
     // `Filters=IsPlayed,IsUnplayed,IsResumable,IsFavorite` sets the same conditions as the flags.
     let flag = |set: Option<bool>, names: &[&str]| {
         set.or(names.iter().any(|n| query.has_filter(n)).then_some(true))
@@ -2884,6 +2906,13 @@ async fn get_items(
         return listing.await.map(|r| Json(narrowed(r)).into_response());
     }
 
+    // Whether IncludeItemTypes names any type, or only MusicAlbum (for the defaults below).
+    let typed_list = media_types
+        .as_ref()
+        .is_some_and(|t| t.iter().any(|t| !t.is_empty()));
+    let albums_only = media_types
+        .as_ref()
+        .is_some_and(|t| t.len() == 1 && t[0].eq_ignore_ascii_case("MusicAlbum"));
     // If IsMovie/IsSeries is set, constrain media_type
     let constrained_media_types: Option<Vec<String>> = if let Some(true) = query.is_movie() {
         Some(vec!["\"Movie\"".to_string()])
@@ -2915,12 +2944,6 @@ async fn get_items(
         let ids = rustyfin_db::repo_media::series_ids_with_status(&state.db_ro, &statuses).await?;
         item_ids = Some(narrow_ids(item_ids, ids));
     }
-    if let Some(languages) = query.subtitle_languages() {
-        let ids =
-            rustyfin_db::repo_media::item_ids_with_subtitle_language(&state.db_ro, &languages)
-                .await?;
-        item_ids = Some(narrow_ids(item_ids, ids));
-    }
     // The other conditions join the list's own SQL, beside the parental limits and the count.
     let extra = rustyfin_db::repo_item_filter::filter_sql(&state.db_ro, &conditions).await?;
     // Ids keeps only the listed items (Jellyfin's `InternalItemsQuery.ItemIds`); ids of no item
@@ -2948,6 +2971,31 @@ async fn get_items(
         (0, by_id.requested.len() as i64)
     };
 
+    // Jellyfin 12.4: with item types, a library as ParentId lists its contents recursively unless
+    // the client chose; an artist's albums come newest first unless an order is asked for.
+    let recursive = match query.recursive_given() {
+        Some(recursive) => recursive,
+        None => match parent_id {
+            Some(id) if typed_list => {
+                rustyfin_db::repo_library::get_library_by_id(&state.db_ro, id)
+                    .await?
+                    .is_some()
+            }
+            _ => false,
+        },
+    };
+    let (sort_by, sort_order) = if query.sort_by().is_none_or(|s| s.trim().is_empty())
+        && (!conditions.artist_ids.is_empty() || !conditions.artist_names.is_empty())
+        && albums_only
+    {
+        (
+            Some("ProductionYear,SortName"),
+            Some("Descending,Ascending"),
+        )
+    } else {
+        (query.sort_by(), query.sort_order())
+    };
+
     let (mut items, mut total) = rustyfin_db::repo_media::get_items_filtered(
         &state.db_ro,
         parent_id,
@@ -2959,15 +3007,15 @@ async fn get_items(
         query.search_term(),
         query.name_starts_with(),
         query.name_starts_with_or_greater(),
-        query.sort_by(),
-        query.sort_order(),
+        sort_by,
+        sort_order,
         fetch_start,
         fetch_limit,
-        query.recursive(),
+        recursive,
         is_favorite,
         is_unplayed,
         is_played,
-        official_ratings.as_deref(),
+        None,
         tags.as_deref(),
         media_types_filter.as_deref(),
         query.start_date(),

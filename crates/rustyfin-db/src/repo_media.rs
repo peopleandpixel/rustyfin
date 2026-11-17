@@ -836,10 +836,11 @@ enum SortKey {
     PlayCount,
     /// When the caller last played the item (bound user id)
     DatePlayed,
-    /// When the caller last played one of a series' episodes (bound user id)
+    /// When the caller last played one of a series' played episodes (bound user id), as in
+    /// Jellyfin 12.4
     SeriesDatePlayed,
-    /// Whether the caller marked the item a favourite (bound user id); NULL without user data,
-    /// as Jellyfin's
+    /// Whether the caller marked the item a favourite (bound user id); false without user data,
+    /// as in Jellyfin 12.4
     IsFavoriteOrLiked,
     /// Whether the caller played the item, or not (bound user id); NULL without user data
     IsPlayed,
@@ -848,8 +849,8 @@ enum SortKey {
     IsFolder,
     /// The item's critic rating (`item_metadata_extras`)
     CriticRating,
-    /// The first artist, album artist or studio credited, folded to lowercase as Jellyfin's
-    /// `CleanValue`; a track takes its album's album artist when it has none of its own
+    /// The first by name of the artists, album artists or studios credited, folded to lowercase
+    /// as Jellyfin 12.4's `CleanValue`; a track takes its album's album artist when it has none
     Artist,
     AlbumArtist,
     Studio,
@@ -922,8 +923,8 @@ impl SortKey {
                 ")"
             ),
             SortKey::IsFavoriteOrLiked => concat!(
-                "(SELECT ud.is_favorite FROM user_item_data ud ",
-                "WHERE ud.item_id = media_items.id AND ud.user_id = ?)"
+                "COALESCE((SELECT ud.is_favorite FROM user_item_data ud ",
+                "WHERE ud.item_id = media_items.id AND ud.user_id = ?), 0)"
             ),
             SortKey::IsPlayed => concat!(
                 "(SELECT ud.played FROM user_item_data ud ",
@@ -942,22 +943,19 @@ impl SortKey {
                 "WHERE e.item_id = media_items.id)"
             ),
             SortKey::Artist => concat!(
-                "(SELECT lower(p.name) FROM item_people ip JOIN people p ON p.id = ip.person_id ",
-                "WHERE ip.item_id = media_items.id AND ip.type = 'Artist' ",
-                "ORDER BY ip.sort_order IS NULL, ip.sort_order, ip.rowid LIMIT 1)"
+                "(SELECT MIN(lower(p.name)) FROM item_people ip JOIN people p ON p.id = ip.person_id ",
+                "WHERE ip.item_id = media_items.id AND ip.type = 'Artist')"
             ),
             SortKey::AlbumArtist => concat!(
-                "COALESCE((SELECT lower(p.name) FROM item_people ip JOIN people p ON p.id = ip.person_id ",
-                "WHERE ip.item_id = media_items.id AND ip.type = 'AlbumArtist' ",
-                "ORDER BY ip.sort_order IS NULL, ip.sort_order, ip.rowid LIMIT 1), ",
-                "(SELECT lower(p.name) FROM item_people ip JOIN people p ON p.id = ip.person_id ",
+                "COALESCE((SELECT MIN(lower(p.name)) FROM item_people ip JOIN people p ON p.id = ip.person_id ",
+                "WHERE ip.item_id = media_items.id AND ip.type = 'AlbumArtist'), ",
+                "(SELECT MIN(lower(p.name)) FROM item_people ip JOIN people p ON p.id = ip.person_id ",
                 "WHERE ip.item_id = media_items.parent_id AND ip.type = 'AlbumArtist' ",
-                "AND media_items.media_type = 'Audio' ",
-                "ORDER BY ip.sort_order IS NULL, ip.sort_order, ip.rowid LIMIT 1))"
+                "AND media_items.media_type = 'Audio'))"
             ),
             SortKey::Studio => concat!(
-                "(SELECT lower(st.name) FROM item_studios s JOIN studios st ON st.id = s.studio_id ",
-                "WHERE s.item_id = media_items.id ORDER BY s.rowid LIMIT 1)"
+                "(SELECT MIN(lower(st.name)) FROM item_studios s JOIN studios st ON st.id = s.studio_id ",
+                "WHERE s.item_id = media_items.id)"
             ),
             SortKey::Album => concat!(
                 "(SELECT p.name FROM media_items p WHERE p.id = media_items.parent_id ",
@@ -988,7 +986,7 @@ impl SortKey {
                 "WHERE ud.item_id = media_items.id AND ud.user_id = ?)"
             ),
             SortKey::SeriesDatePlayed => concat!(
-                "(SELECT MAX(ud.last_played_date) FROM user_item_data ud WHERE ud.user_id = ? ",
+                "(SELECT MAX(ud.last_played_date) FROM user_item_data ud WHERE ud.user_id = ? AND ud.played = 1 ",
                 "AND ud.item_id IN (SELECT c.id FROM media_items c WHERE c.parent_id = media_items.id ",
                 "UNION ALL SELECT g.id FROM media_items c JOIN media_items g ON g.parent_id = c.id ",
                 "WHERE c.parent_id = media_items.id))"
@@ -1689,8 +1687,8 @@ pub async fn get_items_filtered(
         }};
     }
 
-    // AdjacentTo (Jellyfin's `FilterForAdjacency`): the item's place in the ordered list, then
-    // only it and its neighbours; the first item alone when the list doesn't hold it.
+    // AdjacentTo (Jellyfin 12.4's `ApplyAdjacencyFilter`): the item's place in the ordered list,
+    // then only it and its neighbours; nothing when the list doesn't hold it.
     let (mut start_index, mut limit) = (start_index, limit);
     if let Some(id) = adjacent_to {
         let terms = parse_sort(sort_by_str, sort_order_str);
@@ -1718,7 +1716,7 @@ pub async fn get_items_filtered(
         (start_index, limit) = match position {
             Some(0) => (0, 2),
             Some(n) => (n - 1, 3),
-            None => (0, 1),
+            None => (0, 0),
         };
     }
 
@@ -4641,7 +4639,7 @@ mod tests {
                 "UPDATE media_items SET official_rating = 'R' WHERE id = 's'".to_string(),
                 "UPDATE media_items SET official_rating = 'PG' WHERE id = 'm1'".to_string(),
                 "INSERT INTO people (id, name) VALUES ('pa', 'Aaron'), ('pb', 'Beta'), ('pc', 'Alpha'), ('pz', 'Zed')".to_string(),
-                "INSERT INTO item_people (item_id, person_id, type) VALUES ('r1', 'pz', 'AlbumArtist'), ('t1', 'pb', 'Artist'), ('t2', 'pc', 'Artist'), ('t3', 'pa', 'AlbumArtist')".to_string(),
+                "INSERT INTO item_people (item_id, person_id, type) VALUES ('r1', 'pz', 'AlbumArtist'), ('t1', 'pb', 'Artist'), ('t1', 'pc', 'Artist'), ('t2', 'pc', 'Artist'), ('t3', 'pa', 'AlbumArtist')".to_string(),
             ],
         );
         for sql in sql {
@@ -4652,7 +4650,8 @@ mod tests {
         }
         let movies = ["Movie"];
         let cases: Vec<(&[&str], &str, &str, &[&str])> = vec![
-            // The caller's user data: none sorts first, as NULL does in Jellyfin's.
+            // The caller's user data: none is not a favourite, as in Jellyfin 12.4, and sorts
+            // first as NULL for played.
             (
                 &movies,
                 "IsFavoriteOrLiked",
@@ -4663,7 +4662,7 @@ mod tests {
                 &movies,
                 "IsFavoriteOrLiked,SortName",
                 "Descending,Ascending",
-                &["Bravo", "Charlie", "Alpha"],
+                &["Bravo", "Alpha", "Charlie"],
             ),
             (
                 &movies,
@@ -4713,7 +4712,8 @@ mod tests {
                 &["Audio"],
                 "Artist",
                 "Ascending",
-                &["Song Three", "Song Two", "Song One"],
+                // The first by name: Song One's Alpha, before its Beta.
+                &["Song Three", "Song One", "Song Two"],
             ),
             (
                 &["Audio"],

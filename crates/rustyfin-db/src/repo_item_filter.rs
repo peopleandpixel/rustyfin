@@ -27,6 +27,14 @@ pub struct ItemFilter {
     pub person_ids: Vec<String>,
     /// Items crediting a person of exactly this name (`Person`).
     pub person: Option<String>,
+    /// With `person_ids` or `person`: only credits of these kinds (Actor, Director, …), any case.
+    pub person_types: Vec<String>,
+    /// Items, or folders holding an item, with exactly one of these ratings (`OfficialRatings`).
+    pub official_ratings: Vec<String>,
+    /// Items, or folders holding an item, with an audio or a subtitle stream in one of these
+    /// languages (`AudioLanguages`, `SubtitleLanguages`); `und` also matches a stream without one.
+    pub audio_languages: Vec<String>,
+    pub subtitle_languages: Vec<String>,
     /// Items of a studio with one of these names, any case (`Studios`).
     pub studios: Vec<String>,
     /// Artists (as `MusicArtist` item or person ids) and artist names: items credited to one
@@ -133,6 +141,9 @@ impl ItemFilter {
             && self.index_number.is_none()
             && self.parent_index_number.is_none()
             && self.image_types.is_empty()
+            && self.official_ratings.is_empty()
+            && self.audio_languages.is_empty()
+            && self.subtitle_languages.is_empty()
     }
 }
 
@@ -167,6 +178,58 @@ impl FilterSql {
     fn int(&mut self, value: i64) {
         self.sql.push('?');
         self.binds.push(Bound::Int(value));
+    }
+
+    /// ` AND (<cond>)` on the item or any of its descendants, as Jellyfin 12.4's
+    /// `WhereItemOrDescendantMatches` (` AND NOT` for `WhereNeitherItemNorDescendantMatches`):
+    /// `cond` gives the condition on a table alias, and `binds` are its values, bound for each use.
+    fn item_or_descendant(&mut self, cond: impl Fn(&str) -> String, binds: &[Bound], wanted: bool) {
+        self.push(if wanted { " AND (" } else { " AND NOT (" });
+        self.push(&cond("media_items"));
+        self.binds.extend(binds.iter().cloned());
+        // The ancestors of every matching item, walked up once for the whole query.
+        self.push(
+            " OR id IN (WITH RECURSIVE up(id) AS (SELECT x.parent_id FROM media_items x \
+             WHERE x.parent_id IS NOT NULL AND ",
+        );
+        self.push(&cond("x"));
+        self.binds.extend(binds.iter().cloned());
+        self.push(
+            " UNION SELECT m.parent_id FROM media_items m JOIN up ON m.id = up.id \
+             WHERE m.parent_id IS NOT NULL) SELECT id FROM up))",
+        );
+    }
+
+    /// Items, or folders holding one, with a `kind` stream (`audio`, `subtitle`) in one of
+    /// `languages` (lowercase), `und` also matching a stream without a language.
+    fn stream_languages(&mut self, kind: &'static str, languages: &[String]) {
+        let languages: Vec<String> = languages.iter().map(|l| l.to_lowercase()).collect();
+        let und = languages.iter().any(|l| l == "und");
+        let binds = [
+            Bound::Text(serde_json::Value::from(languages).to_string()),
+            Bound::Int(und.into()),
+        ];
+        self.item_or_descendant(
+            |a| {
+                format!(
+                    "EXISTS (SELECT 1 FROM media_streams st JOIN media_sources ms ON ms.id = st.source_id \
+                     WHERE ms.item_id = {a}.id AND lower(st.codec_type) = '{kind}' \
+                     AND (lower(st.language) IN (SELECT value FROM json_each(?)) \
+                     OR (? AND COALESCE(st.language, '') = '')))"
+                )
+            },
+            &binds,
+            true,
+        );
+    }
+
+    /// ` AND lower(ip.type) IN (…)` for a credit query over `item_people ip`, when `types` names
+    /// any (Jellyfin 12.4 applies `PersonTypes` to `PersonIds` and `Person`).
+    fn person_types(&mut self, types: &[String]) {
+        if !types.is_empty() {
+            self.push(" AND lower(ip.type) IN ");
+            self.list(types.iter().map(|t| t.to_lowercase()));
+        }
     }
 
     /// `(SELECT value FROM json_each(?))`, with `values` bound as one JSON array.
@@ -297,7 +360,9 @@ pub async fn filter_sql(
              WHERE p.name IN (SELECT name FROM people WHERE id IN ",
         );
         q.list(f.person_ids.iter().cloned());
-        q.push("))");
+        q.push(")");
+        q.person_types(&f.person_types);
+        q.push(")");
     }
     if let Some(person) = &f.person {
         q.push(
@@ -305,7 +370,24 @@ pub async fn filter_sql(
              WHERE p.name = ",
         );
         q.text(person.clone());
+        q.person_types(&f.person_types);
         q.push(")");
+    }
+    if !f.official_ratings.is_empty() {
+        let ratings = [Bound::Text(
+            serde_json::Value::from(f.official_ratings.clone()).to_string(),
+        )];
+        q.item_or_descendant(
+            |a| format!("{a}.official_rating IN (SELECT value FROM json_each(?))"),
+            &ratings,
+            true,
+        );
+    }
+    if !f.audio_languages.is_empty() {
+        q.stream_languages("audio", &f.audio_languages);
+    }
+    if !f.subtitle_languages.is_empty() {
+        q.stream_languages("subtitle", &f.subtitle_languages);
     }
     if !f.studios.is_empty() {
         q.push(
@@ -411,13 +493,26 @@ pub async fn filter_sql(
     if f.is_3d == Some(true) || f.is_placeholder == Some(true) {
         q.push(" AND 0");
     }
-    q.flag(
-        "EXISTS (SELECT 1 FROM media_streams st JOIN media_sources ms ON ms.id = st.source_id \
-         WHERE ms.item_id = media_items.id AND lower(st.codec_type) = 'subtitle')",
-        f.has_subtitles,
-    );
+    if let Some(wanted) = f.has_subtitles {
+        q.item_or_descendant(
+            |a| {
+                format!(
+                    "EXISTS (SELECT 1 FROM media_streams st JOIN media_sources ms ON ms.id = st.source_id \
+                     WHERE ms.item_id = {a}.id AND lower(st.codec_type) = 'subtitle')"
+                )
+            },
+            &[],
+            wanted,
+        );
+    }
     q.flag("COALESCE(overview, '') != ''", f.has_overview);
-    q.flag("COALESCE(official_rating, '') != ''", f.has_official_rating);
+    if let Some(wanted) = f.has_official_rating {
+        q.item_or_descendant(
+            |a| format!("COALESCE({a}.official_rating, '') != ''"),
+            &[],
+            wanted,
+        );
+    }
     if f.no_parental_rating || f.min_rating.is_some() || f.max_rating.is_some() {
         let excluded = excluded_ratings(pool, f).await?;
         if !excluded.is_empty() {
@@ -439,11 +534,15 @@ pub async fn filter_sql(
             .video_types
             .iter()
             .any(|t| t.eq_ignore_ascii_case("VideoFile"));
-        q.push(if video_file {
-            " AND media_type IN ('Movie', 'Episode', 'Video')"
+        if video_file {
+            q.item_or_descendant(
+                |a| format!("{a}.media_type IN ('Movie', 'Episode', 'Video')"),
+                &[],
+                true,
+            );
         } else {
-            " AND 0"
-        });
+            q.push(" AND 0");
+        }
     }
     if let Some(name) = &f.name_less_than {
         q.push(" AND lower(COALESCE(sort_name, name)) < ");
@@ -551,6 +650,10 @@ mod tests {
                 "INSERT INTO item_people (item_id, person_id, type) VALUES ('a', 'pat2', 'Actor'), ('t1', 'pband', 'Artist'), ('r', 'pband', 'AlbumArtist'), ('t2', 'guest', 'Artist')",
                 "INSERT INTO media_sources (id, item_id, uid, path, width, height) VALUES ('sa', 'a', 'sa', '/x/a', 1920, 1080), ('sb', 'b', 'sb', '/x/b', 3840, 2160), ('sc', 'c', 'sc', '/x/c', NULL, NULL)",
                 "INSERT INTO media_streams (id, source_id, codec_type, stream_index, width, height) VALUES ('vc', 'sc', 'Video', 0, 640, 480), ('sub', 'sa', 'Subtitle', 2, NULL, NULL)",
+                // Episode 1: German subtitles and English audio; Alpha: audio without a language.
+                "INSERT INTO media_sources (id, item_id, uid, path) VALUES ('se1', 'e1', 'se1', '/x/e1')",
+                "INSERT INTO media_streams (id, source_id, codec_type, stream_index, language) VALUES ('e1s', 'se1', 'Subtitle', 2, 'ger'), ('e1a', 'se1', 'Audio', 1, 'eng'), ('aa', 'sa', 'Audio', 1, NULL)",
+                "UPDATE media_items SET official_rating = 'TV-14' WHERE id = 'e2'",
             ]
             .map(str::to_string),
         );
@@ -772,7 +875,59 @@ mod tests {
                     has_subtitles: Some(true),
                     ..Default::default()
                 },
+                // A folder counts when an item under it has one, as in Jellyfin 12.4.
+                &["a", "e1", "n", "s"],
+            ),
+            (
+                ItemFilter {
+                    subtitle_languages: list(&["GER"]),
+                    ..Default::default()
+                },
+                &["e1", "n", "s"],
+            ),
+            (
+                ItemFilter {
+                    audio_languages: list(&["eng"]),
+                    ..Default::default()
+                },
+                &["e1", "n", "s"],
+            ),
+            (
+                ItemFilter {
+                    audio_languages: list(&["und"]),
+                    ..Default::default()
+                },
                 &["a"],
+            ),
+            (
+                ItemFilter {
+                    official_ratings: list(&["TV-14"]),
+                    ..Default::default()
+                },
+                &["e2", "n", "s"],
+            ),
+            (
+                ItemFilter {
+                    video_types: list(&["VideoFile"]),
+                    ..Default::default()
+                },
+                &["a", "b", "c", "e1", "e2", "e3", "n", "s"],
+            ),
+            (
+                ItemFilter {
+                    person_ids: list(&["pat"]),
+                    person_types: list(&["actor"]),
+                    ..Default::default()
+                },
+                &["a"],
+            ),
+            (
+                ItemFilter {
+                    person: Some("Pat".into()),
+                    person_types: list(&["Director"]),
+                    ..Default::default()
+                },
+                &[],
             ),
             (
                 ItemFilter {
@@ -786,7 +941,7 @@ mod tests {
                     has_official_rating: Some(true),
                     ..Default::default()
                 },
-                &["a", "b", "s"],
+                &["a", "b", "e2", "n", "s"],
             ),
             (
                 ItemFilter {
@@ -912,7 +1067,7 @@ mod tests {
         assert!(shows(found(&pool, ranged(None, Some("PG-13"), false)).await).is_empty());
         assert_eq!(
             shows(found(&pool, ranged(Some("TV-MA"), None, false)).await),
-            list(&["e1", "e2", "e3", "n", "s"])
+            list(&["e1", "e3", "n", "s"])
         );
         assert!(shows(found(&pool, ranged(None, None, true)).await).is_empty());
         // Last saved: added, or refreshed by a metadata provider, whichever is later.
