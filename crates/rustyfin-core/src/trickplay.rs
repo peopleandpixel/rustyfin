@@ -974,7 +974,11 @@ impl Feed {
             .map_err(|e| format!("{}: {e}", mkv_index::INDEX_FAILED))?;
         let read = |target: f64| {
             let (index, file) = (index.clone(), file.clone());
-            tokio::task::spawn_blocking(move || index.frame(&file, index.pick(target)))
+            tokio::task::spawn_blocking(move || match index.pick(target) {
+                Some(cue) => index.frame(&file, cue),
+                // Before the first cue or past the last, ffmpeg doesn't seek by the index
+                None => Err(format!("{} at {target:.3} s", mkv_index::INDEX_FAILED)),
+            })
         };
         let mut targets = targets.iter();
         let mut next = targets.next().map(|&t| read(t));
@@ -2047,16 +2051,65 @@ mod tests {
             "keyint=20:min-keyint=20:scenecut=0:log-level=error",
         ];
         let mut checked = 0;
-        for (encoder, params) in [("libx264", &x264), ("libx265", &x265)] {
+        for (encoder, params, audio) in [
+            ("libx264", &x264, false),
+            ("libx265", &x265, false),
+            // Audio interleaved, and clusters cut every 0.7 s, so key frames sit inside them
+            ("libx264", &x264, true),
+        ] {
             if !have_encoder(encoder) {
                 eprintln!("SKIPPED {test} for {encoder}: ffmpeg can't encode with it");
                 continue;
             }
-            let clip = timed_clip(&dir, encoder, params, &[], "index.mkv");
+            let clip = if audio {
+                let clip = dir.join(format!("{encoder}-audio.mkv"));
+                let status = std::process::Command::new("ffmpeg")
+                    .args(["-nostdin", "-loglevel", "error", "-y", "-f", "lavfi", "-i"])
+                    .arg("nullsrc=size=320x180:rate=10:duration=95,geq=lum='16+N/5':cb=128:cr=128")
+                    .args(["-f", "lavfi", "-i", "sine=frequency=440:duration=95"])
+                    .args(["-c:v", encoder, "-pix_fmt", "yuv420p"])
+                    .args(params)
+                    .args(["-c:a", "pcm_s16le", "-cluster_time_limit", "700"])
+                    .args(["-cluster_size_limit", "20000"])
+                    .arg(&clip)
+                    .status()
+                    .unwrap();
+                assert!(status.success());
+                clip
+            } else {
+                timed_clip(&dir, encoder, params, &[], "index.mkv")
+            };
             let clip = clip.to_string_lossy();
             let probed = probe(&clip, &Cancel::new()).await.unwrap().unwrap();
             let index = probed.raw.as_ref().unwrap().index.clone();
             let index = index.expect("ffmpeg writes cues with the block's position");
+            if audio {
+                assert!(
+                    index.key_frames_inside_clusters() > 0,
+                    "some key frames don't start their cluster"
+                );
+            }
+            // The index's packets, read with and without the blocks' positions, are the ones
+            // ffprobe prints, for every thumbnail the index covers
+            let targets: Vec<f64> = (0..probed.count())
+                .map(|k| probed.start + f64::from(k) * 10.0 + 5.0 - 1e-3)
+                .collect();
+            let printed = probe_packets(&clip, &targets);
+            let file = std::fs::File::open(&*clip).unwrap();
+            for index in [index.clone(), Arc::new(index.without_positions())] {
+                let mut compared = 0;
+                for (target, printed) in targets.iter().zip(&printed) {
+                    if let Some(cue) = index.pick(*target) {
+                        assert_eq!(&index.frame(&file, cue).unwrap(), printed, "{target}");
+                        compared += 1;
+                    }
+                }
+                assert!(
+                    compared + 1 >= targets.len(),
+                    "{compared} of {}",
+                    targets.len()
+                );
+            }
             // Through the index; through ffprobe; through an index without the blocks'
             // positions, which reads each cluster from its start; and through an index whose
             // clusters are all in the wrong place, which falls back to ffprobe
@@ -2095,6 +2148,28 @@ mod tests {
         if checked == 0 {
             eprintln!("SKIPPED {test}: no H.264 or HEVC encoder, so this test checked nothing");
         }
+    }
+
+    /// The packets ffprobe prints for a seek to each of `targets` in `clip` (`-show_data`).
+    fn probe_packets(clip: &str, targets: &[f64]) -> Vec<Vec<u8>> {
+        let intervals: Vec<String> = targets.iter().map(|t| format!("{t:.6}%+#1")).collect();
+        let out = std::process::Command::new("ffprobe")
+            .args(["-v", "error", "-select_streams", "V:0", "-read_intervals"])
+            .arg(intervals.join(","))
+            .args(["-show_data", "-show_entries", "packet=flags,data"])
+            .args(["-of", "default=noprint_wrappers=1", clip])
+            .output()
+            .unwrap();
+        let mut packets: Vec<Vec<u8>> = Vec::new();
+        for line in out.stdout.split(|&b| b == b'\n') {
+            if line.starts_with(b"flags=") {
+                packets.push(Vec::new());
+            } else if let Some(packet) = packets.last_mut() {
+                key_frames::hex_line(line, packet);
+            }
+        }
+        assert_eq!(packets.len(), targets.len());
+        packets
     }
 
     #[tokio::test]
