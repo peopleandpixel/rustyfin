@@ -290,7 +290,11 @@ function handleHash() {
 }
 
 // --- Bootstrap & Lifecycle ---
-window.addEventListener('hashchange', handleHash);
+// navigate() has already drawn the page whose hash it set, so the hashchange that follows is skipped;
+// any other hash (Back/Forward, a typed or linked one) is routed. A page used to draw twice per click.
+window.addEventListener('hashchange', () => {
+    if (window.location.hash.slice(1) !== navigatedHash) handleHash();
+});
 
 document.addEventListener('DOMContentLoaded', async () => {
     // Every way of closing the player goes through here, so the session is stopped and its position reported once

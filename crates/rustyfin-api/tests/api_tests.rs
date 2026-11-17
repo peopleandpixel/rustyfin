@@ -29269,6 +29269,12 @@ fn r3mobile_touch() {
     b124_node_test("r3mobile_touch.mjs");
 }
 
+// In-app navigation draws the page once, not again on the hashchange it causes (tests/web/r3mobile_navigate_once.mjs)
+#[test]
+fn r3mobile_navigate_once() {
+    b124_node_test("r3mobile_navigate_once.mjs");
+}
+
 #[test]
 fn r3android_page() {
     b124_node_test("r3android_page.mjs");
