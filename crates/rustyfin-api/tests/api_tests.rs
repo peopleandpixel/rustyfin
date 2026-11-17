@@ -2601,6 +2601,153 @@ async fn r3transcoding_encoding_options_round_trip_and_reach_the_transcoder() {
     );
 }
 
+// ── r3hwaccel: the detected device decodes while the administrator hasn't chosen ──
+
+#[tokio::test]
+async fn r3hwaccel_detected_device_shapes_the_encoding_options_until_one_is_chosen() {
+    use rustyfin_core::encoding::HardwareAccelerationType;
+    use rustyfin_core::hwaccel::{DetectedDevice, HardwareDetection};
+    let (state, app, admin, (bob, _), _path) = r2admin_world().await;
+    let device = DetectedDevice {
+        accel: HardwareAccelerationType::Vaapi,
+        device: "/dev/dri/renderD128".into(),
+        usable: true,
+        error: None,
+        hardware_decoding_codecs: vec!["h264".into(), "hevc".into(), "av1".into()],
+        enable_decoding_color_depth_10_hevc: true,
+        enable_decoding_color_depth_10_vp9: false,
+    };
+    let unusable = DetectedDevice {
+        device: "/dev/dri/renderD129".into(),
+        usable: false,
+        error: Some("permission denied".into()),
+        hardware_decoding_codecs: vec![],
+        enable_decoding_color_depth_10_hevc: false,
+        ..device.clone()
+    };
+    state.transcode_manager.set_hardware_detection(
+        &state.data_dir,
+        HardwareDetection {
+            devices: vec![device.clone(), unusable],
+            selected: Some(device),
+            detected_at: chrono::Utc::now(),
+        },
+    );
+    let hw = "/System/MediaEncoder/HardwareAcceleration";
+
+    // The detection, for administrators only
+    let (status, _) = send_authed(&app, "GET", hw, &bob, None).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let (status, found) = send_authed(&app, "GET", hw, &admin, None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(found["Automatic"], true, "{found}");
+    assert_eq!(found["Detecting"], false, "{found}");
+    let selected = &found["Detection"]["Selected"];
+    assert_eq!(selected["Type"], "vaapi", "{found}");
+    assert_eq!(selected["Device"], "/dev/dri/renderD128", "{found}");
+    assert_eq!(
+        selected["HardwareDecodingCodecs"],
+        serde_json::json!(["h264", "hevc", "av1"])
+    );
+    assert_eq!(selected["EnableDecodingColorDepth10Hevc"], true);
+    assert_eq!(selected["EnableDecodingColorDepth10Vp9"], false);
+    let devices = found["Detection"]["Devices"].as_array().unwrap();
+    assert_eq!(devices.len(), 2);
+    assert_eq!(devices[1]["Usable"], false);
+    assert_eq!(devices[1]["Error"], "permission denied");
+    assert!(found["Detection"]["DetectedAt"].is_string());
+
+    // Never set: the encoding options are the detected device's, in Jellyfin's fields
+    let (_, mut encoding) =
+        send_authed(&app, "GET", "/System/Configuration/encoding", &admin, None).await;
+    assert_eq!(encoding["HardwareAccelerationType"], "vaapi", "{encoding}");
+    assert_eq!(encoding["VaapiDevice"], "/dev/dri/renderD128");
+    assert_eq!(
+        encoding["HardwareDecodingCodecs"],
+        serde_json::json!(["h264", "hevc", "av1"])
+    );
+    assert_eq!(encoding["EnableDecodingColorDepth10Hevc"], true);
+    assert_eq!(encoding["EnableDecodingColorDepth10Vp9"], false);
+    let settings = state.transcode_manager.encoding_settings();
+    assert_eq!(
+        settings.hardware_acceleration,
+        HardwareAccelerationType::Vaapi
+    );
+    assert_eq!(settings.hardware_decoding_codecs, ["h264", "hevc", "av1"]);
+
+    let post = |body: serde_json::Value| {
+        let app = app.clone();
+        let admin = admin.clone();
+        async move {
+            let (status, _) = send_authed(
+                &app,
+                "POST",
+                "/System/Configuration/encoding",
+                &admin,
+                Some(&body.to_string()),
+            )
+            .await;
+            assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+        }
+    };
+    let stored = || {
+        let text = std::fs::read_to_string(state.data_dir.join("encoding.json")).unwrap();
+        serde_json::from_str::<serde_json::Value>(&text).unwrap()
+    };
+
+    // Saving the page with "Automatic" (a null type) and another change stays automatic
+    encoding["HardwareAccelerationType"] = serde_json::Value::Null;
+    encoding["H264Crf"] = serde_json::json!(20);
+    post(encoding.clone()).await;
+    assert!(
+        stored().get("HardwareAccelerationType").is_none(),
+        "{}",
+        stored()
+    );
+    let settings = state.transcode_manager.encoding_settings();
+    assert_eq!(
+        settings.hardware_acceleration,
+        HardwareAccelerationType::Vaapi
+    );
+    assert_eq!(settings.h264_crf, 20);
+
+    // A named type is stored as the administrator's choice, the detected one included
+    encoding["HardwareAccelerationType"] = serde_json::json!("vaapi");
+    post(encoding.clone()).await;
+    assert_eq!(stored()["HardwareAccelerationType"], "vaapi");
+    let (_, found) = send_authed(&app, "GET", hw, &admin, None).await;
+    assert_eq!(found["Automatic"], false, "{found}");
+
+    // An explicit none wins over the detection
+    encoding["HardwareAccelerationType"] = serde_json::json!("none");
+    post(encoding.clone()).await;
+    assert_eq!(stored()["HardwareAccelerationType"], "none");
+    assert_eq!(
+        state
+            .transcode_manager
+            .encoding_settings()
+            .hardware_acceleration,
+        HardwareAccelerationType::None
+    );
+    let (_, found) = send_authed(&app, "GET", hw, &admin, None).await;
+    assert_eq!(found["Automatic"], false, "{found}");
+    let (_, now) = send_authed(&app, "GET", "/System/Configuration/encoding", &admin, None).await;
+    assert_eq!(now["HardwareAccelerationType"], "none", "{now}");
+
+    // A null type goes back to the detected device
+    encoding["HardwareAccelerationType"] = serde_json::Value::Null;
+    post(encoding).await;
+    assert_eq!(
+        state
+            .transcode_manager
+            .encoding_settings()
+            .hardware_acceleration,
+        HardwareAccelerationType::Vaapi
+    );
+    let (_, found) = send_authed(&app, "GET", hw, &admin, None).await;
+    assert_eq!(found["Automatic"], true, "{found}");
+}
+
 #[tokio::test]
 async fn r2admin_configuration_keys_match_without_case_and_stay_bounded() {
     // With the provider plugins installed, so a TMDb key can be saved.
