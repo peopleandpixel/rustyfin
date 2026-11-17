@@ -63,6 +63,34 @@ function searchSection(key, items) {
 // Answers of a search that was overtaken meanwhile are dropped
 let searchSeq = 0;
 
+// What an empty search shows, as Jellyfin Web's search suggestions: favourite or liked movies,
+// shows and artists first, then random ones, as a list of names
+const SUGGESTIONS_URL = '/Items?SortBy=IsFavoriteOrLiked%2CRandom&IncludeItemTypes=Movie%2CSeries%2CMusicArtist&Limit=20'
+    + '&Recursive=true&ImageTypeLimit=0&EnableImages=false&EnableTotalRecordCount=false';
+
+function suggestionsHtml(items) {
+    return `
+    <div class="jf-page">
+        <h2 class="text-lg lg:text-xl font-bold tracking-tight text-white mb-4">${t('search.suggestions')}</h2>
+        <ul class="flex flex-col items-start gap-2" data-search-suggestions>
+            ${items.map(item => `<li><button type="button" class="text-[#00a4dc] hover:text-[#38bdf8] font-medium" data-action="navigate" data-page="detail" data-id="${escapeHtml(item.Id)}">${escapeHtml(item.Name || '')}</button></li>`).join('')}
+        </ul>
+    </div>`;
+}
+
+// An empty search shows the suggestions; with none (or when they fail) the page stays blank
+async function renderSearchSuggestions(seq, page) {
+    page.innerHTML = '';
+    let items = [];
+    try {
+        items = (await API.get(SUGGESTIONS_URL)).Items || [];
+    } catch (e) {
+        console.warn('Search suggestions failed', e);
+    }
+    if (seq !== searchSeq || !items.length) return;
+    page.innerHTML = suggestionsHtml(items);
+}
+
 // --- Search Page Renderer ---
 async function renderSearch(term) {
     const seq = ++searchSeq;
@@ -72,9 +100,9 @@ async function renderSearch(term) {
     const showNoResults = () => {
         page.innerHTML = `<div class="text-center py-24 text-white/40 jf-page"><p class="text-lg">${t('search.no_results', { term: escapeHtml(term) })}</p></div>`;
     };
-    // A blank term never reaches the server: /Search/Hints answers 400 to it.
+    // A blank term never reaches the server (/Search/Hints answers 400 to it): it shows suggestions
     if (!term) {
-        showNoResults();
+        renderSearchSuggestions(seq, page);
         return;
     }
     if (!page.querySelector('[data-search-section]')) {
@@ -109,15 +137,15 @@ async function renderSearch(term) {
 
 let searchTimeout = null;
 
-// Shows the results for a term; on the search page already, in place, without a history entry per term
+// Shows the results for a term; on the search page already, in place, without a history entry per
+// term, and an emptied box there shows the suggestions again
 function showSearch(value) {
     const term = (value || '').trim();
-    if (!term) return;
     const encoded = encodeURIComponent(term);
     if (currentPage === 'search') {
-        history.replaceState(null, '', `#search/${encoded}`);
+        history.replaceState(null, '', term ? `#search/${encoded}` : '#search');
         renderSearch(encoded);
-    } else {
+    } else if (term) {
         navigate('search', encoded);
     }
 }
@@ -134,5 +162,9 @@ function doSearch(term) {
 }
 
 $('search-input')?.addEventListener('input', e => searchAsYouType(e.target.value));
+// Going to the empty search box opens the search page on its suggestions, as Jellyfin Web's search button does
+$('search-input')?.addEventListener('focus', e => {
+    if (!e.target.value.trim() && currentPage !== 'search') navigate('search', '');
+});
 
 export { renderSearch, doSearch };

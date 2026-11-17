@@ -50,8 +50,8 @@ pub struct MediaSourceResponse {
     /// Media state: "Missing", "SubtitlesOutOfSync"
     #[serde(skip_serializing_if = "Option::is_none")]
     pub media_state: Option<String>,
-    /// Array of media streams (video, audio, subtitle tracks)
-    #[serde(default)]
+    /// Array of media streams (video, audio, subtitle tracks), each sent with its DisplayTitle
+    #[serde(default, serialize_with = "serialize_streams")]
     pub media_streams: Vec<MediaStream>,
     /// Whether direct play is supported
     #[serde(default)]
@@ -322,6 +322,132 @@ impl MediaStream {
         })
     }
 
+    /// Jellyfin's DisplayTitle (MediaStream.DisplayTitle), in English: for video the resolution,
+    /// codec and range; for audio the language, codec, layout and Default and External; for a
+    /// subtitle the language, Default, Forced, codec and External. A stream's own title comes
+    /// first, followed by what it doesn't already say. `None` for other kinds of stream.
+    pub fn display_title(&self) -> Option<String> {
+        let kind = self
+            .r#type
+            .clone()
+            .or_else(|| Self::stream_type(&self.codec_type, self.codec.as_deref()))?;
+        let codec = self
+            .codec
+            .as_deref()
+            .map(jellyfin_codec)
+            .filter(|c| !c.is_empty());
+        let language = self.language.as_deref().filter(|l| !l.is_empty());
+        let language_text =
+            |code: &str| first_to_upper(&language_name(code).unwrap_or_else(|| code.to_string()));
+        let title = self.title.as_deref();
+        let mut attributes = Vec::new();
+        match kind.as_str() {
+            "Audio" => {
+                let special = |code: &str| {
+                    ["mis", "mul", "und", "zxx"]
+                        .iter()
+                        .any(|s| s.eq_ignore_ascii_case(code))
+                };
+                if let Some(code) = language.filter(|code| !special(code)) {
+                    attributes.push(language_text(code));
+                }
+                match self
+                    .profile
+                    .as_deref()
+                    .filter(|p| !p.is_empty() && !p.eq_ignore_ascii_case("lc"))
+                {
+                    Some(profile) => attributes.push(profile.to_string()),
+                    None => attributes.extend(codec.map(audio_codec_name)),
+                }
+                match self.channel_layout.as_deref().filter(|l| !l.is_empty()) {
+                    Some(layout) => attributes.push(first_to_upper(layout)),
+                    None => attributes.extend(self.channels.map(|ch| format!("{ch} ch"))),
+                }
+                if self.is_default {
+                    attributes.push("Default".to_string());
+                }
+                if self.is_external {
+                    attributes.push("External".to_string());
+                }
+                Some(titled(title, attributes, " - "))
+            }
+            "Video" => {
+                attributes.extend(self.resolution_text().map(str::to_string));
+                attributes.extend(codec.map(str::to_uppercase));
+                match self.dovi_title() {
+                    Some(dovi) => attributes.push(dovi),
+                    None => {
+                        attributes.extend(self.video_range().map(|(range, _)| range.to_string()))
+                    }
+                }
+                Some(titled(title, attributes, " "))
+            }
+            "Subtitle" => {
+                attributes.push(language.map_or_else(|| "Und".to_string(), language_text));
+                if self.is_default {
+                    attributes.push("Default".to_string());
+                }
+                if self.is_forced {
+                    attributes.push("Forced".to_string());
+                }
+                attributes.extend(codec.map(str::to_uppercase));
+                if self.is_external {
+                    attributes.push("External".to_string());
+                }
+                Some(titled(title, attributes, " - "))
+            }
+            _ => None,
+        }
+    }
+
+    /// Jellyfin's resolution label of a video stream (MediaStream.GetResolutionText): the first
+    /// size class whose width and height both hold the stream's.
+    fn resolution_text(&self) -> Option<&'static str> {
+        let (width, height) = (self.width?, self.height?);
+        const CLASSES: [(u32, u32, &str, &str); 12] = [
+            (256, 144, "144p", "144i"),
+            (426, 240, "240p", "240i"),
+            (640, 360, "360p", "360i"),
+            (682, 384, "384p", "384i"),
+            (720, 404, "404p", "404i"),
+            (854, 480, "480p", "480i"),
+            (960, 544, "540p", "540i"),
+            (1024, 576, "576p", "576i"),
+            (1280, 962, "720p", "720i"),
+            (2560, 1440, "1080p", "1080i"),
+            (4096, 3072, "4K", "4K"),
+            (8192, 6144, "8K", "8K"),
+        ];
+        CLASSES
+            .iter()
+            .find(|(w, h, _, _)| width <= *w && height <= *h)
+            .map(|(_, _, p, i)| if self.is_interlaced { *i } else { *p })
+    }
+
+    /// Jellyfin's VideoDoViTitle: "Dolby Vision Profile 8.1 (HDR10)" for a Dolby Vision record
+    /// with RPU and base layer of profile 4, 5, 7, 8, 9 or 10.
+    fn dovi_title(&self) -> Option<String> {
+        let dv = &self.dovi;
+        let profile = dv
+            .dv_profile
+            .filter(|p| matches!(p, 4 | 5 | 7 | 8 | 9 | 10))?;
+        if dv.rpu_present_flag != Some(1) || dv.bl_present_flag != Some(1) {
+            return None;
+        }
+        let compat = dv.dv_bl_signal_compatibility_id.unwrap_or(0);
+        let mut title = format!("Dolby Vision Profile {profile}");
+        if compat > 0 {
+            title.push_str(&format!(".{compat}"));
+        }
+        title.push_str(match compat {
+            1 | 6 => " (HDR10)",
+            2 => " (SDR)",
+            4 => " (HLG)",
+            _ => "",
+        });
+        Some(title)
+    }
+
     /// Sets `video_range` and `video_range_type` from the stream (`video_range`).
     pub fn fill_video_range(&mut self) {
         let range = self.video_range();
@@ -554,6 +680,142 @@ fn deserialize_frame_rate<'de, D: serde::Deserializer<'de>>(
     )
 }
 
+/// Media streams that serialize as Jellyfin sends them, each with its `DisplayTitle`, for a
+/// hand-written `Serialize` (see `serialize_streams`).
+pub struct TitledStreams<'a>(pub &'a [MediaStream]);
+
+impl Serialize for TitledStreams<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serialize_streams(self.0, serializer)
+    }
+}
+
+/// Media sources that serialize with their `Name`, for a hand-written `Serialize` (see
+/// `serialize_named_source`).
+pub struct NamedSources<'a>(pub &'a [MediaSourceResponse]);
+
+impl Serialize for NamedSources<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serialize_named_sources(self.0, serializer)
+    }
+}
+
+/// Media streams as Jellyfin sends them: each with its `DisplayTitle`.
+pub fn serialize_streams<S: serde::Serializer>(
+    streams: &[MediaStream],
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    #[derive(Serialize)]
+    #[serde(rename_all = "PascalCase")]
+    struct Titled<'a> {
+        #[serde(flatten)]
+        stream: &'a MediaStream,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        display_title: Option<String>,
+    }
+    serializer.collect_seq(streams.iter().map(|stream| Titled {
+        stream,
+        display_title: stream.display_title(),
+    }))
+}
+
+/// A media source as Jellyfin sends it: with its `Name`, the file's name without its extension
+/// (MediaSourceManager's GetMediaSourceName for a file).
+pub fn serialize_named_source<S: serde::Serializer>(
+    source: &MediaSourceResponse,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    #[derive(Serialize)]
+    #[serde(rename_all = "PascalCase")]
+    struct Named<'a> {
+        #[serde(flatten)]
+        source: &'a MediaSourceResponse,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        name: Option<&'a str>,
+    }
+    let name = std::path::Path::new(&source.path)
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .filter(|stem| !stem.is_empty());
+    Named { source, name }.serialize(serializer)
+}
+
+/// A list of media sources, each with its `Name` (`serialize_named_source`).
+pub fn serialize_named_sources<S: serde::Serializer>(
+    sources: &[MediaSourceResponse],
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    struct One<'a>(&'a MediaSourceResponse);
+    impl Serialize for One<'_> {
+        fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+            serialize_named_source(self.0, serializer)
+        }
+    }
+    serializer.collect_seq(sources.iter().map(One))
+}
+
+/// ISO 639-2 codes with their English names (code, other code, two-letter code, name).
+const LANGUAGE_NAMES: &str = include_str!("../../rustyfin-api/data/iso639-2.txt");
+
+/// The English name of a language code (three letters, two letters, or a tag such as "en-US"),
+/// as .NET's CultureInfo names a neutral culture: "Spanish" for "Spanish; Castilian".
+fn language_name(code: &str) -> Option<String> {
+    let base = code.split(['-', '_']).next().unwrap_or(code);
+    LANGUAGE_NAMES.lines().find_map(|line| {
+        let mut parts = line.split('|');
+        let (b, t, two, name) = (parts.next()?, parts.next()?, parts.next()?, parts.next()?);
+        [b, t, two]
+            .iter()
+            .any(|c| !c.is_empty() && c.eq_ignore_ascii_case(base))
+            .then(|| {
+                let name = name.split(';').next().unwrap_or(name);
+                let name = name.split(" (").next().unwrap_or(name);
+                name.strip_prefix("Modern ")
+                    .unwrap_or(name)
+                    .trim()
+                    .to_string()
+            })
+    })
+}
+
+/// Jellyfin's name for an audio codec in a DisplayTitle (AudioCodec.GetFriendlyName).
+fn audio_codec_name(codec: &str) -> String {
+    match codec.to_ascii_lowercase().as_str() {
+        "ac3" => "Dolby Digital".to_string(),
+        "eac3" => "Dolby Digital+".to_string(),
+        "dca" => "DTS".to_string(),
+        _ => codec.to_uppercase(),
+    }
+}
+
+/// The first letter in upper case (Jellyfin's StringHelper.FirstToUpper).
+fn first_to_upper(text: &str) -> String {
+    let mut chars = text.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().chain(chars).collect(),
+        None => String::new(),
+    }
+}
+
+/// The title, then each attribute it doesn't already hold, joined by `sep`; the attributes
+/// alone without a title.
+fn titled(title: Option<&str>, attributes: Vec<String>, sep: &str) -> String {
+    match title.filter(|t| !t.is_empty()) {
+        Some(title) => {
+            let lower = title.to_lowercase();
+            let mut out = title.to_string();
+            for tag in attributes {
+                if !lower.contains(&tag.to_lowercase()) {
+                    out.push_str(" - ");
+                    out.push_str(&tag);
+                }
+            }
+            out
+        }
+        None => attributes.join(sep),
+    }
+}
+
 fn serialize_jellyfin_codec<S: serde::Serializer>(
     codec: &Option<String>,
     serializer: S,
@@ -776,5 +1038,100 @@ mod tests {
         assert_eq!(kind("video", "hevc").as_deref(), Some("Video"));
         assert_eq!(kind("video", "mjpeg").as_deref(), Some("EmbeddedImage"));
         assert_eq!(kind("attachment", "ttf"), None);
+    }
+
+    #[test]
+    fn r3parental_display_titles_follow_jellyfin() {
+        let stream = |kind: &str, codec: &str| MediaStream {
+            codec_type: kind.to_string(),
+            codec: Some(codec.to_string()),
+            ..Default::default()
+        };
+        let video = MediaStream {
+            width: Some(3840),
+            height: Some(1600),
+            ..stream("video", "hevc")
+        };
+        assert_eq!(video.display_title().as_deref(), Some("4K HEVC SDR"));
+        let interlaced = MediaStream {
+            width: Some(720),
+            height: Some(576),
+            is_interlaced: true,
+            title: Some("Main 576i".to_string()),
+            ..stream("video", "mpeg2video")
+        };
+        assert_eq!(
+            interlaced.display_title().as_deref(),
+            Some("Main 576i - MPEG2VIDEO - SDR")
+        );
+        let audio = MediaStream {
+            language: Some("spa".to_string()),
+            channels: Some(2),
+            is_external: true,
+            ..stream("audio", "eac3")
+        };
+        assert_eq!(
+            audio.display_title().as_deref(),
+            Some("Spanish - Dolby Digital+ - 2 ch - External")
+        );
+        let unknown = MediaStream {
+            language: Some("und".to_string()),
+            profile: Some("LC".to_string()),
+            channel_layout: Some("stereo".to_string()),
+            is_default: true,
+            ..stream("audio", "aac")
+        };
+        assert_eq!(
+            unknown.display_title().as_deref(),
+            Some("AAC - Stereo - Default")
+        );
+        let subtitle = MediaStream {
+            language: Some("gre".to_string()),
+            is_default: true,
+            ..stream("subtitle", "hdmv_pgs_subtitle")
+        };
+        assert_eq!(
+            subtitle.display_title().as_deref(),
+            Some("Greek - Default - PGSSUB")
+        );
+        assert_eq!(
+            stream("subtitle", "ass").display_title().as_deref(),
+            Some("Und - ASS")
+        );
+        assert_eq!(stream("data", "bin_data").display_title(), None);
+
+        // Serialized with DisplayTitle, and a source with the file's name.
+        let value = serde_json::to_value(crate::media::MediaItem {
+            media_streams: vec![video.clone()],
+            media_sources: vec![MediaSourceResponse {
+                id: "s".into(),
+                uid: "u".into(),
+                container: Some("mkv".into()),
+                protocol: "File".into(),
+                path: "/films/A Made Up Film (2001)/A Made Up Film.mkv".into(),
+                r#type: "Default".into(),
+                run_time_ticks: None,
+                size: None,
+                bitrate: None,
+                video_bitrate: None,
+                audio_bitrate: None,
+                width: None,
+                height: None,
+                aspect_ratio: None,
+                is_remote: false,
+                media_state: None,
+                media_streams: vec![video],
+                supports_transcoding: true,
+                supports_direct_stream: true,
+                supports_direct_play: true,
+            }],
+            ..crate::media::MediaItem::default_dto_fields()
+        })
+        .unwrap();
+        assert_eq!(value["MediaStreams"][0]["DisplayTitle"], "4K HEVC SDR");
+        let source = &value["MediaSources"][0];
+        assert_eq!(source["Name"], "A Made Up Film", "{source}");
+        assert_eq!(source["Container"], "mkv");
+        assert_eq!(source["MediaStreams"][0]["DisplayTitle"], "4K HEVC SDR");
     }
 }

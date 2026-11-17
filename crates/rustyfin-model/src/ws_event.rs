@@ -53,6 +53,12 @@ pub enum WsEvent {
         #[serde(flatten)]
         data: serde_json::Value,
     },
+    /// A user's data changed on some items (Jellyfin's `UserDataChangeInfo`: `UserId` and
+    /// `UserDataList`). Sent only to that user's sockets.
+    UserDataChanged {
+        #[serde(rename = "Data")]
+        data: serde_json::Value,
+    },
     /// System time sync
     TimeSync {
         #[serde(rename = "Data")]

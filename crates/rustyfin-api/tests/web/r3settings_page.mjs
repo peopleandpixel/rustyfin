@@ -31,6 +31,7 @@ function sandbox({ config = {}, prefs = {}, post } = {}) {
         },
         uiLocale: () => 'en-GB',
         escapeHtml: s => String(s),
+        icon: name => `<svg data-icon="${name}"></svg>`,
         $: () => null,
         toast: (msg, kind) => log.push(['toast', msg, kind || 'info']),
         showOidcLinkResult() {},
@@ -89,7 +90,9 @@ test('a userSettings value saves into the usersettings CustomPrefs, keeping the 
 
     await box.fns.changeUserPref(select('', { pref: 'maxStreamingBitrate' }));
     [, , body] = box.posts().at(-1);
-    assert.deepEqual(body.CustomPrefs, { homesection0: 'resume' });
+    // Removed with a null, as the server merges CustomPrefs key by key
+    assert.deepEqual(body.CustomPrefs, { homesection0: 'resume', maxStreamingBitrate: null });
+    assert.equal(box.fns.userSetting('maxStreamingBitrate'), null);
 
     await box.fns.changeUserPref(toggle(false, { pref: 'enableBackdrops' }));
     assert.equal(box.fns.userSetting('enableBackdrops'), 'false');

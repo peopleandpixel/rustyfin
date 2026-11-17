@@ -135,7 +135,8 @@ vm.runInContext([
         'function libraryScrollSpeed(', 'function blurhashAverage(', 'function stopLibraryLoad(',
         'function libraryRowsAhead(', 'function blurhashTint(', 'function librarySize(', 'function libraryHasHash(',
         'function libraryFlyingLimit(', 'function libraryShape(', 'function libraryCardOptions(',
-        'function libraryPlaceholder(', 'function libraryPictureTag('].map(fn),
+        'function libraryPlaceholder(', 'function libraryPictureTag(', 'function libraryCard(',
+        'function libraryList('].map(fn),
     // Stand-ins for what the tests drive by hand
     'function scheduleLibraryUpdate() { calls.scheduled++; }',
     'function scheduleRailUpdate() {}',
@@ -144,6 +145,7 @@ vm.runInContext([
     'function loadLibraryIndex(gen) { calls.index = (calls.index || 0) + 1; }',
     'var libraryIndexRefresh = null, railAnchor = null, libraryQuery = {}, container = null;',
     'var librarySeq = 0, libraryTotalSeq = 0;',
+    'var libraries = [];',
     'function $(id) { return id === "lib-grid-container" ? container : null; }',
     'function libraryGridTop() { return 0; }',
     'function toast() {} function t(k) { return k; }',

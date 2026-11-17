@@ -334,6 +334,10 @@ const API = {
     },
 
     // OpenID Connect. Start and Link answer with the provider's AuthorizationUrl.
+    // The sign-in page's user tiles, and Jellyfin's forgot-password steps (the PIN is never kept or logged)
+    publicUsers() { return this.get('/Users/Public'); },
+    forgotPassword(name) { return this.post('/Users/ForgotPassword', { EnteredUsername: name }); },
+    redeemResetPin(pin) { return this.post('/Users/ForgotPassword/Pin', { Pin: pin }); },
     oidcInfo() { return this.get('/Auth/Oidc/Info'); },
     oidcStart() { return this.post('/Auth/Oidc/Start'); },
     oidcLink() { return this.post('/Auth/Oidc/Link'); },
@@ -364,11 +368,17 @@ const API = {
     setupJellyfinPreview(sourcePath) { return this.post('/Startup/JellyfinImport/Preview', { SourcePath: sourcePath }); },
 
     // Libraries
-    getLibraries() {
+    // includeHidden: also the libraries the user hid from My Media (Jellyfin's includeHidden)
+    getLibraries({ includeHidden = false } = {}) {
         if (this.isAdmin) return this.get('/Library/VirtualFolders');
         // /Library/VirtualFolders is for administrators; other users get the same libraries from their views.
+        return this.getUserViews({ includeHidden });
+    },
+    // The user's libraries as the server lists them for My Media: in their order (OrderedViews),
+    // without those hidden from My Media (MyMediaExcludes) unless includeHidden
+    getUserViews({ includeHidden = false } = {}) {
         const types = { movies: 'Movies', tvshows: 'TvShows', music: 'Music', homevideos: 'Photos' };
-        return this.get('/UserViews').then(views => (views.Items || []).map(v => ({
+        return this.get(includeHidden ? '/UserViews?IncludeHidden=true' : '/UserViews').then(views => (views.Items || []).map(v => ({
             id: v.Id,
             name: v.Name,
             content_type: types[v.CollectionType] || 'Mixed',
@@ -486,6 +496,17 @@ const API = {
         if (!res.ok) throw await this._requestError('POST', path, res);
     },
     updateItem(id, fields) { return this.post(`/Items/${id}`, fields); },
+    // The metadata editor's choices (provider ids, ratings), as Jellyfin's MetadataEditorInfo
+    getMetadataEditor(id) { return this.get(`/Items/${id}/MetadataEditor`); },
+    getCultures() { return this.get('/Localization/Cultures'); },
+    // Subtitle files beside a video: upload (Jellyfin's UploadSubtitleDto, Data in base64) and delete
+    uploadSubtitle(id, body) { return this.post(`/Videos/${id}/Subtitles`, body); },
+    deleteSubtitle(id, index) { return this.del(`/Videos/${id}/Subtitles/${index}`); },
+    // The item's own file, as Jellyfin's getItemDownloadUrl: a plain link, so the token rides in the query
+    downloadUrl(id) {
+        const q = this.token ? `?api_key=${encodeURIComponent(this.token)}` : '';
+        return `${this.base}/Items/${encodeURIComponent(id)}/Download${q}`;
+    },
 
     // User Items
     getUserItems(params = {}) {

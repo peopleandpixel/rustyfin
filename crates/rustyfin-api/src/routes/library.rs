@@ -51,6 +51,166 @@ pub fn setup_routes() -> Router<AppState> {
             "/Library/VirtualFolders/LibraryOptions",
             post(update_virtual_folder_options),
         )
+        .route("/Libraries/AvailableOptions", get(get_available_options))
+}
+
+/// Jellyfin 10.11's `LibraryOptions` defaults, for the fields no client has saved yet.
+fn jellyfin_option_defaults() -> Value {
+    json!({
+        "Enabled": true,
+        "EnablePhotos": true,
+        "EnableLUFSScan": true,
+        "SaveLocalMetadata": false,
+        "EnableInternetProviders": true,
+        "EnableAutomaticSeriesGrouping": false,
+        "EnableEmbeddedTitles": false,
+        "EnableEmbeddedExtrasTitles": false,
+        "EnableEmbeddedEpisodeInfos": false,
+        "AutomaticRefreshIntervalDays": 0,
+        "PreferredMetadataLanguage": null,
+        "MetadataCountryCode": null,
+        "SeasonZeroDisplayName": "Specials",
+        "MetadataSavers": null,
+        "DisabledLocalMetadataReaders": [],
+        "LocalMetadataReaderOrder": null,
+        "DisabledSubtitleFetchers": [],
+        "SubtitleFetcherOrder": [],
+        "DisabledMediaSegmentProviders": [],
+        "MediaSegmentProviderOrder": [],
+        "SkipSubtitlesIfEmbeddedSubtitlesPresent": false,
+        "SkipSubtitlesIfAudioTrackMatches": false,
+        "SubtitleDownloadLanguages": null,
+        "RequirePerfectSubtitleMatch": true,
+        "SaveSubtitlesWithMedia": true,
+        "SaveLyricsWithMedia": false,
+        "SaveTrickplayWithMedia": false,
+        "DisabledLyricFetchers": [],
+        "LyricFetcherOrder": [],
+        "PreferNonstandardArtistsTag": false,
+        "UseCustomTagDelimiters": false,
+        "CustomTagDelimiters": ["/", "|", ";", "\\"],
+        "DelimiterWhitelist": [],
+        "AutomaticallyAddToCollection": false,
+        "AllowEmbeddedSubtitles": "AllowAll",
+        "TypeOptions": [],
+    })
+}
+
+/// A library's options as clients read them: Rustyfin's fields, Jellyfin's names for chapter
+/// images and trickplay, every other field a client saved, and Jellyfin's defaults for the rest.
+pub(crate) fn options_json(options: &LibraryOptions) -> Value {
+    let mut json = serde_json::to_value(options).unwrap_or_else(|_| json!({}));
+    if let Some(obj) = json.as_object_mut() {
+        obj.insert(
+            "EnableChapterImageExtraction".into(),
+            json!(options.enable_chapter_extraction),
+        );
+        obj.insert(
+            "EnableTrickplayImageExtraction".into(),
+            json!(options.enable_trickplay),
+        );
+        if let Value::Object(defaults) = jellyfin_option_defaults() {
+            for (field, value) in defaults {
+                obj.entry(field).or_insert(value);
+            }
+        }
+    }
+    json
+}
+
+/// The item types of a library's content, as Jellyfin's `TypeOptions` name them.
+fn library_item_types(content_type: &str) -> &'static [&'static str] {
+    match content_type.to_ascii_lowercase().as_str() {
+        "movies" => &["Movie"],
+        "tvshows" => &["Series", "Season", "Episode"],
+        "music" => &["MusicArtist", "MusicAlbum", "Audio"],
+        "musicvideos" => &["MusicVideo"],
+        "homevideos" | "photos" => &["Video", "Photo"],
+        "books" => &["Book", "AudioBook"],
+        _ => &["Movie", "Series", "Season", "Episode", "Video"],
+    }
+}
+
+/// The image types an item type can have, and Jellyfin's default limits for the ones fetched.
+fn type_images(item_type: &str) -> (Vec<&'static str>, Value) {
+    match item_type {
+        "Movie" | "Series" => (
+            vec![
+                "Primary", "Art", "Backdrop", "Banner", "Disc", "Logo", "Thumb",
+            ],
+            json!([
+                { "Type": "Primary", "Limit": 1, "MinWidth": 0 },
+                { "Type": "Backdrop", "Limit": 1, "MinWidth": 1280 },
+                { "Type": "Logo", "Limit": 1, "MinWidth": 0 },
+                { "Type": "Thumb", "Limit": 1, "MinWidth": 0 },
+            ]),
+        ),
+        "Season" => (
+            vec!["Primary", "Backdrop", "Banner", "Thumb"],
+            json!([{ "Type": "Primary", "Limit": 1, "MinWidth": 0 }]),
+        ),
+        "Episode" => (
+            vec!["Primary"],
+            json!([{ "Type": "Primary", "Limit": 1, "MinWidth": 0 }]),
+        ),
+        _ => (
+            vec!["Primary", "Backdrop"],
+            json!([{ "Type": "Primary", "Limit": 1, "MinWidth": 0 }]),
+        ),
+    }
+}
+
+/// GET /Libraries/AvailableOptions - Jellyfin's `LibraryOptionsResultDto`: the metadata savers,
+/// readers, subtitle fetchers and, per item type of `libraryContentType`, the metadata and image
+/// fetchers this server has (its active metadata provider plugins, in priority order).
+async fn get_available_options(
+    State(state): State<AppState>,
+    Query(params): Query<Vec<(String, String)>>,
+) -> Result<Json<Value>, ApiError> {
+    let content_type = crate::query::first_value(&params, "libraryContentType").unwrap_or("");
+    let plugins = state.plugin_manager.list_plugins().await;
+    let plugin_name = |id: &str, fallback: &str| {
+        plugins
+            .iter()
+            .find(|p| p.id == id)
+            .map(|p| p.name.clone())
+            .unwrap_or_else(|| fallback.to_string())
+    };
+    let fetchers: Vec<Value> = state
+        .plugin_manager
+        .metadata_providers()
+        .await
+        .iter()
+        .map(|h| json!({ "Name": plugin_name(&h.plugin_id, &h.provider_name), "DefaultEnabled": true }))
+        .collect();
+    let subtitle_fetchers: Vec<Value> = state
+        .plugin_manager
+        .subtitle_providers()
+        .await
+        .iter()
+        .map(|h| json!({ "Name": plugin_name(&h.plugin_id, &h.plugin_id), "DefaultEnabled": true }))
+        .collect();
+    let type_options: Vec<Value> = library_item_types(content_type)
+        .iter()
+        .map(|item_type| {
+            let (supported, defaults) = type_images(item_type);
+            json!({
+                "Type": item_type,
+                "MetadataFetchers": fetchers,
+                "ImageFetchers": fetchers,
+                "SupportedImageTypes": supported,
+                "DefaultImageOptions": defaults,
+            })
+        })
+        .collect();
+    Ok(Json(json!({
+        "MetadataSavers": [{ "Name": "Nfo", "DefaultEnabled": false }],
+        "MetadataReaders": [{ "Name": "Nfo", "DefaultEnabled": true }],
+        "SubtitleFetchers": subtitle_fetchers,
+        "LyricFetchers": [],
+        "MediaSegmentProviders": [],
+        "TypeOptions": type_options,
+    })))
 }
 
 /// Administrator-only library refresh routes. `routes::build_router` wraps them in `require_admin`.
@@ -139,21 +299,48 @@ async fn get_user_views(
     State(state): State<AppState>,
     Extension(claims): Extension<Claims>,
     Path(user_id): Path<Uuid>,
+    Query(params): Query<Vec<(String, String)>>,
 ) -> Result<Json<Value>, ApiError> {
     // An administrator may look at another user's views; anyone else gets their own.
     let user = if claims.is_admin { user_id } else { claims.sub };
-    Ok(Json(views_for(&state, user).await?))
+    let include_hidden = crate::query::bool_param(&params, "includeHidden")?.unwrap_or(false);
+    Ok(Json(views_for(&state, user, include_hidden).await?))
 }
 
 async fn get_user_views_no_user(
     State(state): State<AppState>,
     Extension(claims): Extension<Claims>,
+    Query(params): Query<Vec<(String, String)>>,
 ) -> Result<Json<Value>, ApiError> {
-    Ok(Json(views_for(&state, claims.sub).await?))
+    let include_hidden = crate::query::bool_param(&params, "includeHidden")?.unwrap_or(false);
+    Ok(Json(views_for(&state, claims.sub, include_hidden).await?))
 }
 
-/// Every library as a view (cached for all users), less those `user`'s library access leaves out.
-async fn views_for(state: &AppState, user: Uuid) -> Result<Value, ApiError> {
+/// Orders `views` by the user's `OrderedViews`, as Jellyfin's `UserViewManager`: the libraries it
+/// names first, in its order, then the others in their own order. Ids match with or without
+/// dashes, in any case.
+fn order_views(views: &mut Value, config: &Value) {
+    let key = |id: &str| id.replace('-', "").to_lowercase();
+    let order: Vec<String> = config["OrderedViews"]
+        .as_array()
+        .map(|ids| ids.iter().filter_map(Value::as_str).map(key).collect())
+        .unwrap_or_default();
+    if order.is_empty() {
+        return;
+    }
+    if let Some(items) = views.get_mut("Items").and_then(Value::as_array_mut) {
+        // A stable sort keeps the libraries `OrderedViews` doesn't name in their own order.
+        items.sort_by_key(|view| {
+            let id = key(view["Id"].as_str().unwrap_or(""));
+            order.iter().position(|o| *o == id).unwrap_or(usize::MAX)
+        });
+    }
+}
+
+/// Every library as a view (cached for all users), in the user's `OrderedViews` order, less those
+/// `user`'s library access leaves out and, unless `include_hidden` (Jellyfin's `includeHidden`),
+/// those in the user's `MyMediaExcludes`.
+async fn views_for(state: &AppState, user: Uuid, include_hidden: bool) -> Result<Value, ApiError> {
     let mut views = match state.cache.library_views.get("views") {
         Some(cached) => cached,
         None => {
@@ -166,6 +353,12 @@ async fn views_for(state: &AppState, user: Uuid) -> Result<Value, ApiError> {
             views
         }
     };
+    // In the user's order (OrderedViews)
+    let config = rustyfin_db::repo_user::get_user_by_id(&state.db_ro, user)
+        .await?
+        .map(|u| rustyfin_model::user::jellyfin_configuration(&u.configuration))
+        .unwrap_or_default();
+    order_views(&mut views, &config);
     let policy = crate::parental::user_policy(state, user).await?;
     if policy.enabled_folders().is_some()
         && let Some(items) = views.get_mut("Items").and_then(Value::as_array_mut)
@@ -173,6 +366,30 @@ async fn views_for(state: &AppState, user: Uuid) -> Result<Value, ApiError> {
         items.retain(|v| v["Id"].as_str().is_some_and(|id| policy.allows_folder(id)));
         let count = items.len();
         views["TotalRecordCount"] = count.into();
+    }
+    if !include_hidden {
+        let config = rustyfin_db::repo_user::get_user_by_id(&state.db_ro, user)
+            .await?
+            .map(|u| rustyfin_model::user::jellyfin_configuration(&u.configuration))
+            .unwrap_or_default();
+        let excluded: Vec<Uuid> = config["MyMediaExcludes"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|id| id.as_str().and_then(|id| Uuid::parse_str(id).ok()))
+            .collect();
+        if !excluded.is_empty()
+            && let Some(items) = views.get_mut("Items").and_then(Value::as_array_mut)
+        {
+            items.retain(|v| {
+                v["Id"]
+                    .as_str()
+                    .and_then(|id| Uuid::parse_str(id).ok())
+                    .is_none_or(|id| !excluded.contains(&id))
+            });
+            let count = items.len();
+            views["TotalRecordCount"] = count.into();
+        }
     }
     Ok(views)
 }
@@ -184,7 +401,7 @@ async fn views_for(state: &AppState, user: Uuid) -> Result<Value, ApiError> {
 struct LibraryWithOptions {
     #[serde(flatten)]
     library: Library,
-    library_options: LibraryOptions,
+    library_options: Value,
     item_id: Uuid,
     collection_type: Option<&'static str>,
     locations: Vec<String>,
@@ -201,7 +418,7 @@ impl LibraryWithOptions {
             locations: library.paths.clone(),
             refresh_status: "Idle",
             library,
-            library_options,
+            library_options: options_json(&library_options),
         }
     }
 }
@@ -319,8 +536,13 @@ async fn remove_library(
     Path(id): Path<Uuid>,
 ) -> Result<Json<Value>, ApiError> {
     let covers = rustyfin_core::local_images::embedded_cover_paths(&state.db, id).await;
-    rustyfin_db::repo_library::delete_library(&state.db, id).await?;
+    let lyrics = rustyfin_core::lyrics::uploads_in_library(&state.db, id).await;
+    // Jellyfin answers 404 for a library it doesn't have
+    if !rustyfin_db::repo_library::delete_library(&state.db, id).await? {
+        return Err(ApiError::NotFound("library not found".into()));
+    }
     rustyfin_core::local_images::remove_orphaned_covers(&state.db, &covers).await;
+    rustyfin_core::lyrics::remove_orphaned_uploads(&state.db, &lyrics).await;
     state.cache.invalidate_library_lists();
     crate::routes::streaming::forget_library_roots(&state);
     state.task_scheduler.watcher().libraries_changed();
@@ -596,9 +818,9 @@ async fn refresh_all(State(state): State<AppState>) -> Result<Json<Value>, ApiEr
 async fn get_library_options(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
-) -> Result<Json<LibraryOptions>, ApiError> {
+) -> Result<Json<Value>, ApiError> {
     // An unreadable row reads as the defaults (and is logged), so it can be saved over
-    Ok(Json(stored_options(&state, id).await))
+    Ok(Json(options_json(&stored_options(&state, id).await)))
 }
 
 /// POST /Library/{id}/Options — Update library options.

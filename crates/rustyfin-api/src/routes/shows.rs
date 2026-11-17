@@ -3,12 +3,14 @@ use axum::extract::{Path, State};
 use axum::routing::get;
 use axum::{Extension, Json, Router};
 use rustyfin_model::auth::Claims;
-use rustyfin_model::media::{MediaItem, MediaType, QueryResult};
+use rustyfin_model::media::{LocationType, MediaItem, MediaType, QueryResult};
 use serde::Deserialize;
 use uuid::Uuid;
 
 use crate::error::ApiError;
 use crate::parental::HiddenItems;
+use crate::query::{bool_param, first_value, parent_param, uuid_param};
+use crate::routes::activity::parse_min_date;
 use crate::routes::items::enrich_items;
 use crate::routes::playback::query_user;
 use crate::state::AppState;
@@ -19,6 +21,14 @@ pub fn routes() -> Router<AppState> {
         .route("/Shows/Upcoming", get(upcoming))
         .route("/Shows/{seriesId}/Seasons", get(get_seasons))
         .route("/Shows/{seriesId}/Episodes", get(get_episodes))
+}
+
+/// Keeps the episodes of the library `parent_id` names (all when `None`), as a library's own
+/// Next Up and Upcoming rows ask with `ParentId`
+fn in_library(episodes: &mut Vec<MediaItem>, parent_id: Option<Uuid>) {
+    if let Some(library) = parent_id {
+        episodes.retain(|e| e.library_id == library);
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -37,24 +47,46 @@ struct NextUpQuery {
     limit: Option<i64>,
 }
 
+/// `GET /Shows/NextUp`, with Jellyfin's `enableResumable` (default true), `enableRewatching`
+/// (default false), `nextUpDateCutoff` and `enableTotalRecordCount` (default true).
+/// `disableFirstEpisode` is obsolete in Jellyfin 10.11 and ignored there too.
 async fn next_up(
     State(state): State<AppState>,
     Query(q): Query<NextUpQuery>,
+    Query(params): Query<Vec<(String, String)>>,
     Extension(claims): Extension<Claims>,
 ) -> Result<Json<QueryResult>, ApiError> {
     let user_id = query_user(&state, &claims, q.user_id).await?;
     let series_id = q.series_id;
     let start_index = q.start_index.unwrap_or(0) as usize;
     let limit = q.limit.unwrap_or(20) as usize;
+    let date_cutoff = first_value(&params, "nextUpDateCutoff")
+        .map(|d| {
+            parse_min_date(d)
+                .map(|d| d.and_utc())
+                .ok_or_else(|| ApiError::BadRequest("nextUpDateCutoff must be a date".into()))
+        })
+        .transpose()?;
+    let options = rustyfin_db::repo_media::NextUpOptions {
+        date_cutoff,
+        enable_resumable: bool_param(&params, "enableResumable")?.unwrap_or(true),
+        enable_rewatching: bool_param(&params, "enableRewatching")?.unwrap_or(false),
+    };
+    let count_total = bool_param(&params, "enableTotalRecordCount")?.unwrap_or(true);
 
     // One episode per series: its next unplayed episode (see get_next_up)
     let mut episodes =
-        rustyfin_db::repo_media::get_next_up(&state.db_ro, user_id, series_id).await?;
-    HiddenItems::for_caller(&state, &claims)
+        rustyfin_db::repo_media::get_next_up(&state.db_ro, user_id, series_id, &options).await?;
+    hidden_for(&state, &claims, user_id)
         .await?
         .retain(&mut episodes);
+    in_library(&mut episodes, q.parent_id);
 
-    let total = episodes.len() as i64;
+    let total = if count_total {
+        episodes.len() as i64
+    } else {
+        0
+    };
     let end = start_index.saturating_add(limit).min(episodes.len());
     let mut items: Vec<MediaItem> = if start_index < episodes.len() {
         episodes[start_index..end].to_vec()
@@ -101,14 +133,29 @@ async fn upcoming(
     HiddenItems::for_caller(&state, &claims)
         .await?
         .retain(&mut episodes);
+    in_library(&mut episodes, q.parent_id);
 
     let total = episodes.len() as i64;
     let end = start_index.saturating_add(limit).min(episodes.len());
-    let items: Vec<MediaItem> = if start_index < episodes.len() {
+    let mut items: Vec<MediaItem> = if start_index < episodes.len() {
         episodes[start_index..end].to_vec()
     } else {
         Vec::new()
     };
+
+    // Enrich the page as Next Up does, so its cards get their series and pictures
+    let tmdb = state.tmdb.api(None);
+    enrich_items(
+        &state.db_ro,
+        &state.server_id,
+        user_id,
+        &mut items,
+        &state.http_client,
+        tmdb.as_ref(),
+        &state.data_dir,
+        true,
+    )
+    .await;
 
     Ok(Json(QueryResult {
         items,
@@ -186,13 +233,35 @@ struct EpisodesQuery {
     limit: Option<i64>,
 }
 
+/// `GET /Shows/{seriesId}/Episodes`, filtered as Jellyfin's `TvShowsController.GetEpisodes` does:
+/// `isMissing`, then `startItemId` (drop the episodes before it), then `adjacentTo` (it and its
+/// neighbours), then `sortBy=Random`, then paging. The count is of the filtered list.
 async fn get_episodes(
     State(state): State<AppState>,
     Path(series_id): Path<Uuid>,
     Query(q): Query<EpisodesQuery>,
+    Query(params): Query<Vec<(String, String)>>,
     Extension(claims): Extension<Claims>,
 ) -> Result<Json<QueryResult>, ApiError> {
     let user_id = query_user(&state, &claims, q.user_id).await?;
+    let is_missing = bool_param(&params, "isMissing")?;
+    let start_item = uuid_param(&params, "startItemId")?;
+    let adjacent_to = parent_param(&params, "adjacentTo")?;
+    let random = first_value(&params, "sortBy").is_some_and(|s| s.eq_ignore_ascii_case("Random"));
+
+    // Jellyfin answers 404 for a seasonId that is not a season, or (without one) a series id
+    // that is not a series.
+    let (wanted, kind) = match q.season_id {
+        Some(season_id) => (season_id, MediaType::Season),
+        None => (series_id, MediaType::Series),
+    };
+    let found = rustyfin_db::repo_media::get_item_by_id(&state.db_ro, wanted).await?;
+    if !found.is_some_and(|item| item.media_type == kind) {
+        return Err(ApiError::NotFound(format!(
+            "No {kind:?} exists with Id {wanted}"
+        )));
+    }
+
     // Single-query fetch: get all episodes for the series using a subquery
     let mut episodes: Vec<MediaItem> = if let Some(season_id) = q.season_id {
         // If season_id is specified, fetch children of that season directly
@@ -205,9 +274,27 @@ async fn get_episodes(
         // Use single-query subquery to fetch all episodes for the series
         rustyfin_db::repo_media::get_episodes_for_series(&state.db_ro, series_id, q.season).await?
     };
-    HiddenItems::for_caller(&state, &claims)
+    hidden_for(&state, &claims, user_id)
         .await?
         .retain(&mut episodes);
+
+    if let Some(missing) = is_missing {
+        // Jellyfin's IsMissingEpisode: a Virtual episode.
+        episodes.retain(|e| (e.location_type == LocationType::Virtual) == missing);
+    }
+    if let Some(start_item) = start_item {
+        let from = episodes
+            .iter()
+            .position(|e| e.id == start_item)
+            .unwrap_or(episodes.len());
+        episodes.drain(..from);
+    }
+    if let Some(adjacent_to) = adjacent_to {
+        episodes = adjacent(episodes, adjacent_to);
+    }
+    if random {
+        rustyfin_db::repo_media::shuffle(&mut episodes);
+    }
 
     let total = episodes.len() as i64;
     let start = q.start_index.unwrap_or(0).max(0) as usize;
@@ -247,4 +334,34 @@ async fn get_episodes(
         total_record_count: total,
         start_index: start as i64,
     }))
+}
+
+/// The items hidden from the user a route answers for: `user` (an administrator's `userId`), else
+/// the caller.
+async fn hidden_for(
+    state: &AppState,
+    claims: &Claims,
+    user: Option<Uuid>,
+) -> Result<HiddenItems, ApiError> {
+    match user {
+        Some(user) => HiddenItems::for_user(state, user).await,
+        None => HiddenItems::for_caller(state, claims).await,
+    }
+}
+
+/// Jellyfin's `UserViewBuilder.FilterForAdjacency`: the episode `id` and the ones just before
+/// and after it. When `id` is not in the list Jellyfin's index is -1, which leaves only the
+/// first episode.
+fn adjacent(episodes: Vec<MediaItem>, id: Uuid) -> Vec<MediaItem> {
+    let index = episodes.iter().position(|e| e.id == id);
+    let keep = |i: usize| match index {
+        Some(at) => i + 1 >= at && i <= at + 1,
+        None => i == 0,
+    };
+    episodes
+        .into_iter()
+        .enumerate()
+        .filter(|(i, _)| keep(*i))
+        .map(|(_, e)| e)
+        .collect()
 }

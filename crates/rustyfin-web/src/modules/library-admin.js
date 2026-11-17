@@ -5,6 +5,7 @@ import { renderHome } from './home.js';
 import { currentLibraryId, currentLibraryRoute, renderLibrary, libraryRefreshInPlace } from './library.js';
 import { currentDetailId, renderDetail } from './item.js';
 import { renderAdmin, refreshTasks } from './admin.js';
+import { renderLibraryOptionsEditor, readLibraryOptionsEditor, closeLibraryOptionsEditor } from './library-options.js';
 // Library id -> { percent, queued } while it scans (percent 0 = not known yet, so its ring spins; queued = waiting its turn). Absent when not scanning.
 let scanStatuses = {};
 
@@ -142,8 +143,9 @@ function readLibraryImageOptions(form) {
     return Object.fromEntries(LIBRARY_IMAGE_OPTIONS.map(([option]) => [option, !!form.elements[option]?.checked]));
 }
 
-// Opens the options dialog of an existing library, with its saved image options.
-async function openLibraryOptions(id, name) {
+// Opens the options dialog of an existing library, with its saved image options and the editor of
+// its other options (library-options.js).
+async function openLibraryOptions(id, name, collectionType) {
     const dlg = $('library-options-modal');
     const form = $('library-options-form');
     if (!dlg || !form) return;
@@ -157,6 +159,7 @@ async function openLibraryOptions(id, name) {
     form.elements.libraryId.value = id;
     $('library-options-title').textContent = t('library.options_title', { name });
     $('library-options-images').innerHTML = libraryImageOptionsHtml('lib-opt', options);
+    await renderLibraryOptionsEditor($('library-options-more'), options, collectionType);
     if (typeof dlg.showModal === 'function') {
         try { dlg.showModal(); } catch { dlg.setAttribute('open', ''); }
     } else {
@@ -165,6 +168,7 @@ async function openLibraryOptions(id, name) {
 }
 
 function closeLibraryOptions() {
+    closeLibraryOptionsEditor();
     const dlg = $('library-options-modal');
     if (!dlg) return;
     if (typeof dlg.close === 'function') {
@@ -183,7 +187,7 @@ async function submitLibraryOptions(e) {
     if (submitBtn) submitBtn.disabled = true;
     try {
         const options = await API.getLibraryOptions(id);
-        await API.saveLibraryOptions(id, { ...options, ...readLibraryImageOptions(form) });
+        await API.saveLibraryOptions(id, { ...options, ...readLibraryOptionsEditor(form), ...readLibraryImageOptions(form) });
     } catch (err) {
         toast(t('library.options_save_failed', { message: err.message }), 'error');
         return;

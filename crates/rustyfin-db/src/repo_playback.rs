@@ -47,11 +47,14 @@ pub async fn get_user_item_data(
 
 /// For each Series or Season in `folder_ids`, counts its episodes and the ones `user_id` has not
 /// played, as `(episodes, unplayed)`. A season's episodes are its children; a series' episodes
-/// are those of its seasons, specials included. Folders with no episodes have no entry.
+/// are those of its seasons, specials included. Only the episodes that pass `visible` (a
+/// `repo_parental::filter_json` filter) count; `None` counts them all. Folders with no episodes
+/// have no entry.
 pub async fn get_unplayed_counts(
     pool: &SqlitePool,
     user_id: Uuid,
     folder_ids: &[Uuid],
+    visible: Option<&str>,
 ) -> Result<HashMap<String, (i64, i64)>, sqlx::Error> {
     if folder_ids.is_empty() {
         return Ok(HashMap::new());
@@ -63,18 +66,26 @@ pub async fn get_unplayed_counts(
         .map(|i| format!("?{}", i))
         .collect();
     let placeholder_str = placeholders.join(",");
+    // The filter comes after the folder ids.
+    let shown = crate::repo_parental::visible_sql(
+        "e.id",
+        "e.library_id",
+        &format!("?{}", folder_ids.len() + 2),
+    );
     let sql = format!(
         "SELECT ef.folder_id, COUNT(*), SUM(CASE WHEN ud.played = 1 THEN 0 ELSE 1 END) \
          FROM ( \
              SELECT e.id AS episode_id, p.id AS folder_id \
              FROM media_items e JOIN media_items p ON p.id = e.parent_id \
              WHERE e.media_type = 'Episode' AND p.media_type = 'Season' AND p.id IN ({ph}) \
+               AND {shown} \
              UNION ALL \
              SELECT e.id, g.id \
              FROM media_items e \
              JOIN media_items p ON p.id = e.parent_id AND p.media_type = 'Season' \
              JOIN media_items g ON g.id = p.parent_id \
              WHERE e.media_type = 'Episode' AND g.media_type = 'Series' AND g.id IN ({ph}) \
+               AND {shown} \
          ) ef \
          LEFT JOIN user_item_data ud ON ud.item_id = ef.episode_id AND ud.user_id = ?1 \
          GROUP BY ef.folder_id",
@@ -86,6 +97,7 @@ pub async fn get_unplayed_counts(
     for id in folder_ids {
         query = query.bind(id.to_string());
     }
+    query = query.bind(visible);
     let rows = query.fetch_all(pool).await?;
 
     Ok(rows

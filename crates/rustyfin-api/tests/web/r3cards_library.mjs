@@ -42,6 +42,7 @@ function sandbox() {
          ${slice('const LIBRARY_PLACEHOLDER = ', ';\n')}
          ${slice('function libraryViewCustom(')}
          ${slice('const LIBRARY_FILTER_PARAMS = ', ';\n')}
+         ${slice('const LIBRARY_CUSTOM_KEYS = ', ';\n')}
          ${slice('const LIBRARY_PREFS_CLIENT = ', ';\n')}
          ${slice('function librarySort(')}
          ${slice('function libraryFilterQuery(')}
@@ -50,13 +51,14 @@ function sandbox() {
          ${slice('function libraryPrefsId(')}
          ${slice('function libraryListQuery(')}
          ${slice('function libraryViewMenu(')}
+         ${slice('function libraryTabs(')}
          ${slice('function libraryTabBar(')}
          ${slice('function libraryShape(')}
          ${slice('function libraryCardOptions(')}
          ${slice('function libraryGridClass(')}
          ${slice('function libraryPlaceholder(')}
          ${slice('function libraryPictureTag(')}
-         var currentLibraryTab = '', currentLibraryGenre = null;
+         var currentLibraryTab = '', currentLibraryGenre = null, currentLibraryScope = null;
          var libraryPrefs = libraryPrefsFromDisplay(null);
          this.fns = { librarySorts, libraryList, libraryPrefsFromDisplay, libraryPrefsToDisplay, libraryPrefsId,
              libraryListQuery, libraryViewMenu, libraryTabBar, libraryShape, libraryCardOptions, libraryGridClass,
@@ -105,7 +107,10 @@ test('view settings save under Jellyfin names, and the defaults save nothing', (
     const { fns } = sandbox();
     const base = fns.libraryPrefsFromDisplay(null);
     assert.deepEqual(plain(base.view), { layout: 'poster', size: 'medium' });
-    assert.deepEqual(plain(fns.libraryPrefsToDisplay('films', base).CustomPrefs), {});
+    // The server merges CustomPrefs key by key, so every key the list writes is sent, unset ones as null
+    const KEYS = ['Filters', 'SeriesStatus', 'Genres', 'OfficialRatings', 'Years', 'ViewMode', 'ImageType', 'CardSize'];
+    const cleared = Object.fromEntries(KEYS.map(k => [k, null]));
+    assert.deepEqual(plain(fns.libraryPrefsToDisplay('films', base).CustomPrefs), cleared);
     const cases = [
         [{ layout: 'thumb', size: 'small' }, { ImageType: 'Thumb', CardSize: 'small' }],
         [{ layout: 'banner', size: 'medium' }, { ImageType: 'Banner' }],
@@ -114,7 +119,7 @@ test('view settings save under Jellyfin names, and the defaults save nothing', (
     for (const [view, custom] of cases) {
         const prefs = { ...base, filters: { ...base.filters, Genres: ['Drama'] }, view };
         const body = plain(fns.libraryPrefsToDisplay('films', prefs));
-        assert.deepEqual(body.CustomPrefs, { Genres: 'Drama', ...custom });
+        assert.deepEqual(body.CustomPrefs, { ...cleared, Genres: 'Drama', ...custom });
         assert.deepEqual(plain(fns.libraryPrefsFromDisplay(body)), plain(prefs));
     }
     const odd = fns.libraryPrefsFromDisplay({ CustomPrefs: { ImageType: 'Logo', CardSize: 'huge' } });
@@ -172,10 +177,12 @@ test('the view menu and the tab bars', () => {
     assert.match(menu, /name="lib-size" value="large" checked/);
     assert.equal((menu.match(/name="lib-layout"/g) || []).length, 4);
     const tv = fns.libraryTabBar('shows', 'TvShows', 'episodes');
-    assert.deepEqual([...tv.matchAll(/data-id="([^"]+)"/g)].map(m => m[1]), ['shows', 'shows/episodes', 'shows/genres']);
+    assert.deepEqual([...tv.matchAll(/data-id="([^"]+)"/g)].map(m => m[1]),
+        ['shows', 'shows/suggestions', 'shows/upcoming', 'shows/genres', 'shows/studios', 'shows/episodes']);
     assert.match(tv, /aria-selected="true" data-action="navigate" data-page="library" data-id="shows\/episodes"/);
     const films = fns.libraryTabBar('films', 'Movies', 'main');
-    assert.deepEqual([...films.matchAll(/data-id="([^"]+)"/g)].map(m => m[1]), ['films', 'films/collections', 'films/genres']);
+    assert.deepEqual([...films.matchAll(/data-id="([^"]+)"/g)].map(m => m[1]),
+        ['films', 'films/suggestions', 'films/favorites', 'films/collections', 'films/genres']);
     assert.match(films, /library.tab_movies/);
 });
 

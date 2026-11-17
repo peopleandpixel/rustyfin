@@ -1,8 +1,10 @@
 mod activity;
 mod additional;
+mod additional_parts;
 mod auth;
 mod backup;
 mod branding;
+mod client_log;
 mod collections;
 mod configuration;
 mod devices;
@@ -12,12 +14,15 @@ mod dlna_streaming;
 mod dynamic_hls;
 mod encoding_manager;
 mod images;
+mod instant_mix;
+mod item_download;
 pub(crate) mod items;
 mod jellyfin_import;
 pub(crate) mod library;
 mod library_monitor;
 mod live_tv;
 mod localization;
+mod lyrics;
 mod media_segments;
 mod metadata_admin;
 mod oidc;
@@ -33,6 +38,7 @@ mod shows;
 mod startup;
 mod streaming;
 mod subtitle;
+mod suggestions;
 mod sync_play;
 mod system;
 mod transcode;
@@ -125,6 +131,7 @@ pub fn build_router(state: AppState) -> Router {
         .merge(library::routes())
         .merge(items::routes())
         .merge(images::routes())
+        .merge(item_download::routes())
         .merge(quick_connect::routes())
         .merge(
             streaming::routes()
@@ -160,6 +167,11 @@ pub fn build_router(state: AppState) -> Router {
         .merge(shows::routes())
         .merge(live_tv::routes())
         .merge(additional::routes())
+        .merge(instant_mix::routes())
+        .merge(lyrics::routes())
+        .merge(additional_parts::routes())
+        .merge(suggestions::routes())
+        .merge(client_log::routes())
         .merge(media_segments::routes())
         .merge(trickplay::routes())
         .merge(
