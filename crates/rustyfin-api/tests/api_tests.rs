@@ -74,6 +74,7 @@ async fn test_state() -> AppState {
         shutdown_tx: Arc::new(shutdown_tx),
         bind_addr: Arc::new("0.0.0.0:8096".to_string()),
         published_url: None,
+        published_subnets: Default::default(),
         api_key: Some(Arc::new("test-api-key".to_string())),
         quick_connect: Arc::new(RwLock::new(HashMap::new())),
         transcode_manager,
@@ -41683,7 +41684,25 @@ async fn r3security_dlna_stream_urls_use_a_reachable_address() {
     assert!(!xml.contains("0.0.0.0"), "{xml}");
 
     state.published_url = Some(Arc::new("https://media.example/jf/".to_string()));
-    let (_, xml) = browse(app(state)).await;
+    let (_, xml) = browse(app(state.clone())).await;
+    assert!(
+        xml.contains(&format!("https://media.example/jf{path}")),
+        "{xml}"
+    );
+
+    // PublishedServerUriBySubnet: a renderer in 10.0.0.0/8 gets the LAN URL, one elsewhere on
+    // the local network the `all=` URL
+    state.published_subnets = Arc::new(rustyfin_core::net_addr::PublishedUrls::parse([
+        "10.0.0.0/8=http://lan",
+    ]));
+    let from = |ip: [u8; 4]| {
+        build_router(state.clone()).layer(MockConnectInfo(SocketAddr::from((ip, 40000))))
+    };
+    let (status, xml) = browse(from([10, 1, 2, 3])).await;
+    assert_eq!(status, StatusCode::OK, "{xml}");
+    assert!(xml.contains(&format!("http://lan{path}")), "{xml}");
+    assert!(!xml.contains("media.example"), "{xml}");
+    let (_, xml) = browse(from([192, 168, 1, 4])).await;
     assert!(
         xml.contains(&format!("https://media.example/jf{path}")),
         "{xml}"

@@ -20,6 +20,9 @@ pub struct UdpDiscoveryConfig {
     pub bind_ip: Ipv4Addr,
     /// Optional published URL for remote access (e.g. "http://myserver.com:8096")
     pub endpoint_address: Option<String>,
+    /// `PublishedServerUriBySubnet`'s entries by subnet: for a client they match, they come
+    /// before `endpoint_address` in the reply's `Address`
+    pub published_subnets: crate::net_addr::PublishedUrls,
 }
 
 /// Response sent to clients during UDP discovery: Jellyfin's ServerDiscoveryInfo, with its
@@ -121,7 +124,9 @@ fn handle_discovery_request(
     // interface toward it (never 0.0.0.0, which no client can connect to)
     let response = DiscoveryResponse {
         address: crate::net_addr::smart_api_url(
-            config.endpoint_address.as_deref(),
+            config
+                .published_subnets
+                .for_peer(src.ip(), config.endpoint_address.as_deref()),
             config.bind_ip.into(),
             config.http_port,
             src.ip(),
@@ -178,6 +183,7 @@ mod tests {
             http_port: 8096,
             bind_ip: Ipv4Addr::LOCALHOST,
             endpoint_address: None,
+            published_subnets: Default::default(),
         };
         let sock = TokioUdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
             .await
@@ -226,6 +232,7 @@ mod tests {
                 http_port: 8096,
                 bind_ip: Ipv4Addr::UNSPECIFIED,
                 endpoint_address: published.map(str::to_string),
+                published_subnets: Default::default(),
             };
             let sock = TokioUdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
                 .await

@@ -9,6 +9,7 @@ rustyfin-db = { workspace = true }
 rustyfin-auth = { workspace = true }
 sqlx = { workspace = true }
 uuid = { workspace = true }
+ipnet = "2"
 chrono = { workspace = true }
 tracing = { workspace = true }
 thiserror = { workspace = true }

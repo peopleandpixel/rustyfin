@@ -76,6 +76,7 @@ async fn description(State(state): State<AppState>) -> Response {
         http_port: parse_port(&state.bind_addr),
         bind_ip: std::net::Ipv4Addr::UNSPECIFIED,
         published_url: state.published_url.as_deref().cloned(),
+        published_subnets: (*state.published_subnets).clone(),
     };
     let xml = dlna::device_description_xml(&config);
     xml_response(xml)
@@ -375,7 +376,8 @@ fn extract_xml_value(xml: &str, tag: &str) -> Option<String> {
 }
 
 /// The base of the stream URLs a renderer at `peer` gets, as Jellyfin's `GetSmartApiUrl`: the
-/// published server URL, else the address the server is bound to, else (bound to every
+/// `PublishedServerUriBySubnet` entry for `peer`'s subnet (or `internal`/`external`), else the
+/// published server URL (`all=`), else the address the server is bound to, else (bound to every
 /// interface) the address of the interface toward `peer`. Never `0.0.0.0`.
 fn stream_base_url(state: &AppState, peer: SocketAddr) -> String {
     let bind_ip = state
@@ -384,7 +386,10 @@ fn stream_base_url(state: &AppState, peer: SocketAddr) -> String {
         .map(|addr| addr.ip())
         .unwrap_or(std::net::Ipv4Addr::UNSPECIFIED.into());
     rustyfin_core::net_addr::smart_api_url(
-        state.published_url.as_deref().map(String::as_str),
+        state.published_subnets.for_peer(
+            peer.ip(),
+            state.published_url.as_deref().map(String::as_str),
+        ),
         bind_ip,
         parse_port(&state.bind_addr),
         peer.ip(),

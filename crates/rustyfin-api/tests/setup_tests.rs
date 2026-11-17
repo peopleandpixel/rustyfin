@@ -64,6 +64,7 @@ async fn test_state() -> (AppState, DataDir) {
         shutdown_tx: Arc::new(shutdown_tx),
         bind_addr: Arc::new("0.0.0.0:8096".to_string()),
         published_url: None,
+        published_subnets: Default::default(),
         api_key: Some(Arc::new(API_KEY.to_string())),
         quick_connect: Arc::new(RwLock::new(HashMap::new())),
         transcode_manager,

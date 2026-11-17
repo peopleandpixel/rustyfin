@@ -3480,6 +3480,7 @@ dependencies = [
  "fast_image_resize",
  "image",
  "inotify",
+ "ipnet",
  "jpeg-decoder",
  "kamadak-exif",
  "libc",

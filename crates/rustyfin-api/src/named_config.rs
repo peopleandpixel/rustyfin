@@ -5,7 +5,8 @@
 //! Of the network settings, the server applies at its next start, when the matching environment
 //! variable is unset: `LocalNetworkAddresses` and `InternalHttpPort` (the bind address,
 //! `RUSTYFIN_BIND`), `KnownProxies` (`RUSTYFIN_KNOWN_PROXIES`) and the `all=` entry of
-//! `PublishedServerUriBySubnet` (`RUSTYFIN_PUBLISHED_URL`). The others are stored only. The
+//! `PublishedServerUriBySubnet` (`RUSTYFIN_PUBLISHED_URL`), with its entries by subnet,
+//! `internal` and `external` for the addresses DLNA and discovery give. The others are stored only. The
 //! branding settings apply at once.
 
 use std::net::IpAddr;
@@ -251,6 +252,8 @@ pub struct NetworkStartup {
     pub known_proxies: Option<String>,
     /// The URL of `PublishedServerUriBySubnet`'s `all=` entry
     pub published_url: Option<String>,
+    /// Its other entries: by subnet, `internal` and `external`
+    pub published_subnets: rustyfin_core::net_addr::PublishedUrls,
 }
 
 /// Reads the network settings the server applies at its start. Only fields the file itself holds
@@ -277,7 +280,10 @@ pub fn network_startup(data_dir: &Path) -> NetworkStartup {
     });
     let proxies = strings(&saved, "KnownProxies");
     let known_proxies = (!proxies.is_empty()).then(|| proxies.join(","));
-    let published_url = strings(&saved, "PublishedServerUriBySubnet")
+    let published_entries = strings(&saved, "PublishedServerUriBySubnet");
+    let published_subnets =
+        rustyfin_core::net_addr::PublishedUrls::parse(published_entries.iter().copied());
+    let published_url = published_entries
         .into_iter()
         .filter_map(|e| e.split_once('='))
         .find(|(subnet, _)| subnet.trim().eq_ignore_ascii_case("all"))
@@ -287,6 +293,7 @@ pub fn network_startup(data_dir: &Path) -> NetworkStartup {
         bind,
         known_proxies,
         published_url,
+        published_subnets,
     }
 }
 
@@ -336,6 +343,15 @@ mod tests {
         assert_eq!(s.bind.as_deref(), Some("[::1]:8300"));
         assert_eq!(s.known_proxies.as_deref(), Some("10.0.0.0/8,192.168.1.2"));
         assert_eq!(s.published_url.as_deref(), Some("https://media.example"));
+        // The subnet entry is kept for the clients it matches, before `all=`
+        let all = s.published_url.as_deref();
+        let lan: IpAddr = "10.4.5.6".parse().unwrap();
+        let public: IpAddr = "198.51.100.1".parse().unwrap();
+        assert_eq!(s.published_subnets.for_peer(lan, all), Some("http://lan"));
+        assert_eq!(
+            s.published_subnets.for_peer(public, all),
+            Some("https://media.example")
+        );
         std::fs::write(dir.join("network.json"), r#"{"InternalHttpPort":9000}"#).unwrap();
         assert_eq!(network_startup(&dir).bind.as_deref(), Some("0.0.0.0:9000"));
         std::fs::remove_dir_all(&dir).ok();

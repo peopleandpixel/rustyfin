@@ -27,6 +27,9 @@ pub struct DlnaConfig {
     pub bind_ip: Ipv4Addr,
     /// The published server URL, which the SSDP `LOCATION` uses when it is set
     pub published_url: Option<String>,
+    /// `PublishedServerUriBySubnet`'s entries by subnet: for a client they match, they come
+    /// before `published_url`
+    pub published_subnets: crate::net_addr::PublishedUrls,
 }
 
 impl DlnaConfig {
@@ -34,7 +37,8 @@ impl DlnaConfig {
     /// at the address of the interface toward `peer` (`net_addr::smart_api_url`).
     fn location(&self, peer: IpAddr) -> String {
         let base = crate::net_addr::smart_api_url(
-            self.published_url.as_deref(),
+            self.published_subnets
+                .for_peer(peer, self.published_url.as_deref()),
             self.bind_ip.into(),
             self.http_port,
             peer,
@@ -404,6 +408,7 @@ mod tests {
             http_port: 8096,
             bind_ip: Ipv4Addr::LOCALHOST,
             published_url: None,
+            published_subnets: Default::default(),
         }
     }
 
@@ -587,6 +592,7 @@ mod tests {
             http_port: 8096,
             bind_ip: Ipv4Addr::LOCALHOST,
             published_url: None,
+            published_subnets: Default::default(),
         };
         let xml = device_description_xml(&config);
         let model_number = format!("<modelNumber>{}</modelNumber>", env!("CARGO_PKG_VERSION"));
