@@ -819,14 +819,11 @@ async function playItem(itemId, streamType = 'Videos', title = '', { fromStart =
     updatePipButton(session);
     updateMediaSession(session, item, $('player-title').textContent);
 
-    // Periodic progress reporting
+    // Progress reports as Jellyfin Web sends them: every 10 s while the item is open, paused too
+    // (they keep the server from stopping a paused session and its transcode), and on pause and
+    // unpause, each with IsPaused
     if (playerReportInterval) clearInterval(playerReportInterval);
-    playerReportInterval = setInterval(() => {
-        if (!video.paused && !video.ended) {
-            const ticks = Math.round(session.position() * 1e7);
-            API.reportProgress(itemId, ticks, false, session.reportFields()).catch(() => {});
-        }
-    }, 8000);
+    playerReportInterval = setInterval(() => reportSessionProgress(session), PROGRESS_REPORT_MS);
 
     // Video events for custom UI
     // A text track added during the playback (captions that hls.js finds in the stream) stays off
@@ -840,9 +837,18 @@ async function playItem(itemId, streamType = 'Videos', title = '', { fromStart =
         updateMediaPosition(session);
     };
 
-    video.onplay = () => { updatePlayIcon(true); setMediaPlaybackState('playing'); };
+    video.onplay = () => {
+        updatePlayIcon(true);
+        setMediaPlaybackState('playing');
+        if (session.reportedPaused) reportSessionProgress(session);
+    };
     video.onplaying = () => { session.failed = false; };
-    video.onpause = () => { updatePlayIcon(false); setMediaPlaybackState('paused'); };
+    video.onpause = () => {
+        updatePlayIcon(false);
+        setMediaPlaybackState('paused');
+        // The pause at the end of the item is the Stopped report's
+        if (!video.ended) reportSessionProgress(session);
+    };
     video.onvolumechange = () => {
         updateVolumeIcon();
         const slider = $('player-vol');
@@ -1253,6 +1259,18 @@ function hideUpNext() {
     if (status) status.textContent = '';
 }
 
+const PROGRESS_REPORT_MS = 10000;
+
+// One progress report of `session` while it is the active playback, with IsPaused from the
+// player; nothing after the item ended (the Stopped report follows)
+function reportSessionProgress(session) {
+    const video = $('video-player');
+    if (activePlayback !== session || !video || video.ended) return;
+    session.reportedPaused = video.paused;
+    const ticks = Math.round(session.position() * 1e7);
+    API.reportProgress(session.itemId, ticks, video.paused, session.reportFields()).catch(() => {});
+}
+
 function togglePlayPause() {
     const v = $('video-player');
     if (!v) return;
@@ -1454,7 +1472,9 @@ function openFullPlayer() {
     if (modal && !modal.open) modal.showModal();
 }
 
-// The bar's ×: the music stops, the queue ends and the bar goes
+// The one way to stop local playback, music or video: the bar's ×, the OS stop key, a remote Stop and
+// every hand-off to another player (Play on, Cast). The playback stops, the queue ends, the bar goes
+// and the player closes. (Closing the player alone leaves music playing under the bar.)
 function stopNowPlaying() {
     stopPlayback();
     endNowPlaying();
@@ -1715,7 +1735,7 @@ function bindMediaSession() {
     const video = () => $('video-player');
     setMediaSessionHandler('play', () => video()?.play());
     setMediaSessionHandler('pause', () => video()?.pause());
-    setMediaSessionHandler('stop', () => (activePlayback?.streamType === 'Audio' ? stopNowPlaying() : closePlayer()));
+    setMediaSessionHandler('stop', () => stopNowPlaying());
     setMediaSessionHandler('seekbackward', d => skipTime(-(d?.seekOffset || 10)));
     setMediaSessionHandler('seekforward', d => skipTime(d?.seekOffset || 30));
     setMediaSessionHandler('seekto', d => { if (activePlayback && Number.isFinite(d?.seekTime)) seekTo(activePlayback, d.seekTime); });

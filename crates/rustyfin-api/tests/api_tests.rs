@@ -29310,6 +29310,18 @@ fn r3prefs_player() {
     b124_node_test("r3prefs_player.mjs");
 }
 
+// The web player reports progress every 10 s, paused too, and on pause and unpause with IsPaused
+#[test]
+fn r3prefs_progress() {
+    b124_node_test("r3prefs_progress.mjs");
+}
+
+// Every stop and hand-off path (remote Stop, Play on, Cast, the OS stop key) stops local music and video
+#[test]
+fn r3prefs_stop() {
+    b124_node_test("r3prefs_stop.mjs");
+}
+
 // The album page's Play queues every track in disc and track order; a track plays the album from it
 #[test]
 fn r3player_album() {

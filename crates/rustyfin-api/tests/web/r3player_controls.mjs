@@ -317,7 +317,7 @@ test('the Media Session shows the item and binds Jellyfin Web\'s actions; previo
         'function episodeNumberLabel(', 'function itemPicture(', 'function itemArtist('], {
         navigator: { mediaSession },
         MediaMetadata: class { constructor(m) { Object.assign(this, m); } },
-        closePlayer: () => calls.push('close'),
+        stopNowPlaying: () => calls.push('close'),
         skipTime: d => calls.push(['skip', d]),
         seekTo: (s, to) => calls.push(['seek', to]),
     }, `${decl('hasMediaSession')} ${decl('ARTWORK_SIZES')} ${decl('MEDIA_SESSION_ACTIONS')}`);

@@ -68,7 +68,7 @@ function sandbox({ playing = { itemId: 'i1', streamType: 'Videos', positionTicks
         nowPlaying: () => playing,
         seekToTicks: log('seekToTicks'),
         playItem: log('playItem'),
-        closePlayer: log('closePlayer'),
+        stopNowPlaying: log('stopNowPlaying'),
         togglePlayPause: log('togglePlayPause'),
         setVolume: log('setVolume'),
         toggleMute: () => { elements['video-player'].muted = !elements['video-player'].muted; calls.push(['toggleMute']); },
@@ -124,7 +124,7 @@ test('Playstate commands drive the player', () => {
     send(sb, 'Playstate', { Command: 'Seek', SeekPositionTicks: 300000000 });
     assert.deepEqual(sb.calls.filter(c => c[0] !== 'addEventListener'), [
         ['pause'], ['play'], ['togglePlayPause'], ['playAdjacentEpisode', 1], ['playAdjacentEpisode', -1],
-        ['skipTime', -10], ['skipTime', 30], ['closePlayer'], ['seekToTicks', 300000000],
+        ['skipTime', -10], ['skipTime', 30], ['stopNowPlaying'], ['seekToTicks', 300000000],
     ]);
 });
 
@@ -235,9 +235,9 @@ test('the Sessions tab follows the socket and stops when left', () => {
     assert.deepEqual(sb.socket.sent.at(-1), { MessageType: 'SessionsStop' });
 });
 
-test('Play on hands the playing item over at its position and closes the player', async () => {
+test('Play on hands the playing item over at its position and stops local playback, music too', async () => {
     const sb = sandbox();
     await sb.sessions.playOnSession('s9');
     assert.deepEqual(plain(sb.posts), [['/Sessions/s9/Playing?playCommand=PlayNow&itemIds=i1&startPositionTicks=1234', null]]);
-    assert.ok(sb.calls.some(c => c[0] === 'closePlayer'));
+    assert.ok(sb.calls.some(c => c[0] === 'stopNowPlaying'));
 });
