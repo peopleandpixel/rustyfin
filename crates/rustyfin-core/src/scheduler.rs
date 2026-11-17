@@ -581,8 +581,8 @@ impl TaskScheduler {
     /// come only from the scan registry, the source of the web client's scan rings, the
     /// `RefreshProgress` frames and `RefreshStatus`: Running while any library has a scan listed
     /// (queued, scanning or probing), wherever it was started (the scheduler, whose run holds
-    /// tickets like any other scan, a library's Scan, Scan all, the setup wizard), at the listed
-    /// scans' average percent; Idle when none is. A stopped scheduler run reads Cancelling while
+    /// tickets like any other scan, a library's Scan, Scan all, the setup wizard), at the batch's
+    /// percent (`library_scan_state`); Idle when none is. A stopped scheduler run reads Cancelling while
     /// its scans are listed. `LastExecutionResult` stays the scheduler's.
     fn info_of(&self, entry: &TaskEntry) -> ScheduledTaskInfo {
         let mut info = entry.info.clone();
@@ -1820,23 +1820,19 @@ fn no_library_on(id: &str, message: &str) -> String {
     message.to_string()
 }
 
-/// The library scan task's state and percent from the scans listed in `scans`: Idle with no
-/// percent when none is listed, else Running (Cancelling while the scheduler's run is stopping) at
-/// the mean of the listed scans' percents, each as its `RefreshProgress` frame shows it.
+/// The library scan task's state and percent from the scan registry: Idle with no percent when no
+/// scan is listed, else Running (Cancelling while the scheduler's run is stopping) at the batch's
+/// percent, the mean of each library's `RefreshProgress` percent, a finished one at 100 until the
+/// batch ends, so the percent never drops as libraries finish.
 fn library_scan_state(scans: &ScanRegistry, run: &TaskState) -> (TaskState, Option<f64>) {
-    let listed = scans.snapshot();
-    if listed.is_empty() {
+    let Some(percent) = scans.batch_progress() else {
         return (TaskState::Idle, None);
-    }
-    let sum: f64 = listed
-        .iter()
-        .map(|(_, s)| f64::from(s.progress.unwrap_or(0)))
-        .sum();
+    };
     let state = match run {
         TaskState::Cancelling => TaskState::Cancelling,
         _ => TaskState::Running,
     };
-    (state, Some(sum / listed.len() as f64))
+    (state, Some(percent))
 }
 
 /// Remove transcode cache files older than 24 hours
