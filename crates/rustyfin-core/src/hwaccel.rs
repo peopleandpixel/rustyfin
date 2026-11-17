@@ -126,6 +126,9 @@ pub trait Prober {
     fn open(&self, candidate: &Candidate) -> impl Future<Output = Result<(), String>> + Send;
     /// Whether the device decodes `clip`.
     fn decodes(&self, candidate: &Candidate, clip: Clip) -> impl Future<Output = bool> + Send;
+    /// Ok when the device encodes H.264 with the type's encoder (selecting a device also turns
+    /// hardware encoding on); else why not.
+    fn encodes(&self, candidate: &Candidate) -> impl Future<Output = Result<(), String>> + Send;
 }
 
 /// Probes every candidate, then picks the best usable one (`select`).
@@ -169,6 +172,9 @@ pub async fn detect_with(prober: &impl Prober, candidates: &[Candidate]) -> Hard
         found.usable = !found.hardware_decoding_codecs.is_empty();
         if !found.usable {
             found.error = Some("it opened but decoded none of the test clips".to_string());
+        } else if let Err(e) = prober.encodes(candidate).await {
+            found.usable = false;
+            found.error = Some(format!("it decodes but can't encode H.264: {e}"));
         }
         devices.push(found);
     }
@@ -330,22 +336,14 @@ fn same_value(a: &Value, b: &Value) -> bool {
     }
 }
 
-/// A save (`body`) that leaves the type automatic: one without a type (null or empty), or,
-/// while the type is automatic, one that sends the automatic type back unchanged. Its automatic
-/// fields that carry the automatic value are left out, so a save of another field on the page
-/// doesn't pin today's detection (or today's `none`). A changed value is kept: it is the
-/// administrator's choice. A save that names another type is stored as it came.
-pub fn keep_automatic(
-    body: &mut Map<String, Value>,
-    saved: Option<&Map<String, Value>>,
-    detection: Option<&HardwareDetection>,
-) {
+/// A save (`body`) that leaves the type automatic: one without a type (null or empty; the
+/// dashboard's "Automatic" sends null). Its automatic fields that carry the automatic value are
+/// left out, so they follow the detection; a changed value is kept as the administrator's
+/// choice. A save that names any type, `none` included, is stored as it came: a `none` posted
+/// while detection hasn't finished (or found nothing) must not turn into hardware later.
+pub fn keep_automatic(body: &mut Map<String, Value>, detection: Option<&HardwareDetection>) {
     let automatic = automatic_values(detection.and_then(|d| d.selected.as_ref()));
-    let posted = saved_field(body, "HardwareAccelerationType");
-    let stays = unset(posted)
-        || (type_is_automatic(saved)
-            && posted.is_some_and(|t| same_value(t, &automatic["HardwareAccelerationType"])));
-    if !stays {
+    if !unset(saved_field(body, "HardwareAccelerationType")) {
         return;
     }
     body.retain(|key, value| {
@@ -584,6 +582,36 @@ impl Prober for FfmpegProber {
         ]);
         run(&self.ffmpeg, &args).await.is_ok()
     }
+
+    async fn encodes(&self, candidate: &Candidate) -> Result<(), String> {
+        let accel = candidate.accel.transcoder_accel();
+        // A type the transcoder doesn't drive never encodes on the device
+        let Some(encoder) = encoding::hardware_encoder(accel, "h264") else {
+            return Ok(());
+        };
+        // A few generated frames, taken to the device as a transcode takes them
+        let mut args = Self::device_args(candidate, false);
+        args.extend(strings(&[
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc2=s=256x144:r=10:d=0.3",
+            "-vf",
+        ]));
+        args.push(crate::transcode::hw_encoder_upload(accel).to_string());
+        args.extend(strings(&["-c:v", encoder, "-f", "null", "-"]));
+        run(&self.ffmpeg, &args).await
+    }
+}
+
+/// Removes the probe's work folder when dropped, so a detection that is cancelled (its request
+/// gone) leaves nothing behind.
+struct RemoveOnDrop(PathBuf);
+
+impl Drop for RemoveOnDrop {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
 }
 
 /// The reasons already logged, so a device that can't be used is explained once per run of the
@@ -600,10 +628,10 @@ pub async fn detect(ffmpeg: &Path, work_dir: &Path) -> HardwareDetection {
     let detection = if candidates.is_empty() {
         detect_with(&NoDevices, &[]).await
     } else {
+        let _cleanup = RemoveOnDrop(work_dir.to_path_buf());
         let prober = FfmpegProber::new(ffmpeg, work_dir).await;
         detect_with(&prober, &candidates).await
     };
-    let _ = tokio::fs::remove_dir_all(work_dir).await;
     for device in &detection.devices {
         let Some(error) = &device.error else { continue };
         let key = format!("{}|{}|{error}", device.accel.name(), device.device);
@@ -650,6 +678,9 @@ impl Prober for NoDevices {
     async fn decodes(&self, _: &Candidate, _: Clip) -> bool {
         false
     }
+    async fn encodes(&self, _: &Candidate) -> Result<(), String> {
+        Err("no device".to_string())
+    }
 }
 
 /// The encoding options in effect for `data_dir`'s saved options and `detection`.
@@ -691,6 +722,56 @@ mod tests {
                 .get(&format!("{}{}", c.accel.name(), c.device))
                 .is_some_and(|clips| clips.contains(&clip))
         }
+        async fn encodes(&self, _: &Candidate) -> Result<(), String> {
+            Ok(())
+        }
+    }
+
+    /// `Fake`, but the devices of `fails` (type and device, as `decodes` keys them) can't encode.
+    struct NoEncode(Fake, Vec<&'static str>);
+
+    impl Prober for NoEncode {
+        async fn open(&self, c: &Candidate) -> Result<(), String> {
+            self.0.open(c).await
+        }
+        async fn decodes(&self, c: &Candidate, clip: Clip) -> bool {
+            self.0.decodes(c, clip).await
+        }
+        async fn encodes(&self, c: &Candidate) -> Result<(), String> {
+            let key = format!("{}{}", c.accel.name(), c.device);
+            if self.1.contains(&key.as_str()) {
+                Err("Function not implemented".into())
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn hwaccel_detection_drops_a_device_that_cannot_encode() {
+        use HardwareAccelerationType::*;
+        let all = vec![Clip::H264, Clip::Hevc, Clip::Av1];
+        let fake = Fake {
+            opens: [("/a".to_string(), Ok(())), ("/b".to_string(), Ok(()))].into(),
+            decodes: [
+                ("vaapi/a".to_string(), all.clone()),
+                ("vaapi/b".to_string(), vec![Clip::H264]),
+            ]
+            .into(),
+        };
+        let prober = NoEncode(fake, vec!["vaapi/a"]);
+        let d = detect_with(&prober, &[cand(Vaapi, "/a"), cand(Vaapi, "/b")]).await;
+        assert!(!d.devices[0].usable);
+        assert!(
+            d.devices[0]
+                .error
+                .as_deref()
+                .is_some_and(|e| e.contains("can't encode H.264")),
+            "{:?}",
+            d.devices[0]
+        );
+        // The one that decodes less but encodes is selected
+        assert_eq!(d.selected.unwrap().device, "/b");
     }
 
     fn cand(accel: HardwareAccelerationType, device: &str) -> Candidate {
@@ -855,46 +936,45 @@ mod tests {
     #[test]
     fn hwaccel_a_save_of_the_automatic_values_stays_automatic() {
         let det = detection(HardwareAccelerationType::Vaapi);
-        // The page sends back what it read, with another field changed
+        // The page sends back what it read with "Automatic" (a null type) and another change
         let read = effective_options(
             encoding::default_options("ffmpeg", Path::new("/t")),
             None,
             Some(&det),
         );
         let mut body = read.clone();
+        body.insert("HardwareAccelerationType".into(), Value::Null);
         body.insert("H264Crf".into(), json!(20));
-        keep_automatic(&mut body, None, Some(&det));
+        keep_automatic(&mut body, Some(&det));
         assert!(type_is_automatic(Some(&body)));
         for field in AUTOMATIC_FIELDS {
             assert!(!body.contains_key(field), "{field} kept");
         }
         assert_eq!(body["H264Crf"], json!(20));
 
-        // A changed type is the administrator's choice, none included
+        // Any named type is the administrator's choice, the detected one included
         let mut body = read.clone();
-        body.insert("HardwareAccelerationType".into(), json!("none"));
-        keep_automatic(&mut body, None, Some(&det));
-        assert_eq!(body["HardwareAccelerationType"], json!("none"));
-        assert!(!type_is_automatic(Some(&body)));
-
-        // Nothing detected: the defaults sent back stay automatic too
-        let mut body = encoding::default_options("ffmpeg", Path::new("/t"));
-        keep_automatic(&mut body, None, None);
-        assert!(type_is_automatic(Some(&body)));
-
-        // Once chosen, a save is stored as it came
-        let saved = json!({ "HardwareAccelerationType": "vaapi" });
-        let mut body = read.clone();
-        keep_automatic(&mut body, saved.as_object(), Some(&det));
+        keep_automatic(&mut body, Some(&det));
         assert_eq!(body["HardwareAccelerationType"], json!("vaapi"));
         assert!(body.contains_key("HardwareDecodingCodecs"));
 
+        // None while detection hasn't finished, or found nothing, stays none: a later
+        // detection must not turn the hardware on
+        for detected in [None, Some(&det)] {
+            let mut body = encoding::default_options("ffmpeg", Path::new("/t"));
+            assert_eq!(body["HardwareAccelerationType"], json!("none"));
+            keep_automatic(&mut body, detected);
+            assert_eq!(body["HardwareAccelerationType"], json!("none"));
+            assert!(!type_is_automatic(Some(&body)));
+            let s = settings(Some(Value::Object(body)), Some(&det));
+            assert_eq!(s.hardware_acceleration, HardwareAccelerationType::None);
+        }
+
         // Back to automatic (a null type) from a choice: a changed codec list stays chosen
-        let saved = json!({ "HardwareAccelerationType": "none" });
         let mut body = read;
         body.insert("HardwareAccelerationType".into(), Value::Null);
         body.insert("HardwareDecodingCodecs".into(), json!(["h264"]));
-        keep_automatic(&mut body, saved.as_object(), Some(&det));
+        keep_automatic(&mut body, Some(&det));
         assert!(type_is_automatic(Some(&body)));
         assert!(!body.contains_key("VaapiDevice"));
         assert_eq!(body["HardwareDecodingCodecs"], json!(["h264"]));

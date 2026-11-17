@@ -2695,7 +2695,8 @@ async fn r3hwaccel_detected_device_shapes_the_encoding_options_until_one_is_chos
         serde_json::from_str::<serde_json::Value>(&text).unwrap()
     };
 
-    // Saving the page with another change keeps the type automatic
+    // Saving the page with "Automatic" (a null type) and another change stays automatic
+    encoding["HardwareAccelerationType"] = serde_json::Value::Null;
     encoding["H264Crf"] = serde_json::json!(20);
     post(encoding.clone()).await;
     assert!(
@@ -2709,6 +2710,13 @@ async fn r3hwaccel_detected_device_shapes_the_encoding_options_until_one_is_chos
         HardwareAccelerationType::Vaapi
     );
     assert_eq!(settings.h264_crf, 20);
+
+    // A named type is stored as the administrator's choice, the detected one included
+    encoding["HardwareAccelerationType"] = serde_json::json!("vaapi");
+    post(encoding.clone()).await;
+    assert_eq!(stored()["HardwareAccelerationType"], "vaapi");
+    let (_, found) = send_authed(&app, "GET", hw, &admin, None).await;
+    assert_eq!(found["Automatic"], false, "{found}");
 
     // An explicit none wins over the detection
     encoding["HardwareAccelerationType"] = serde_json::json!("none");
