@@ -36,6 +36,7 @@ pub mod repo_sync_play;
 pub mod repo_token;
 pub mod repo_trickplay;
 pub mod repo_user;
+pub mod repo_virtual;
 pub mod writer;
 
 pub use writer::{WriteTx, begin_write};

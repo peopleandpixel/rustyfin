@@ -76,6 +76,24 @@ pub struct SeasonMetadata {
     pub episodes: Vec<(i32, ExternalMetadata)>,
 }
 
+/// A series' current season list, as the provider's series details give it: what the missing
+/// episode task asks for once a run, to learn of new seasons and episodes.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct SeriesSeasons {
+    /// The series' status now ("Returning Series", "Ended", ...)
+    pub status: Option<String>,
+    pub seasons: Vec<SeasonSummary>,
+}
+
+/// One season in a series' season list.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct SeasonSummary {
+    pub number: i32,
+    pub name: Option<String>,
+    /// How many episodes the provider lists in it now
+    pub episode_count: Option<i32>,
+}
+
 /// A lookup that got no final answer (a timeout, a 5xx, a rate limit, no API key), so it is worth
 /// asking again later. `Ok(None)` is a final "not there" (a 404).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -99,6 +117,18 @@ pub trait MetadataLookups: Send + Sync {
     fn series_by_id(&self, id: i64) -> LookupFuture<'_, ExternalMetadata>;
     fn search_series(&self, name: &str, year: Option<i32>) -> LookupFuture<'_, ExternalMetadata>;
     fn season(&self, series_id: i64, season_number: i32) -> LookupFuture<'_, SeasonMetadata>;
+    /// A series' season list, asked of the provider even when an answer is cached (the new
+    /// answer replaces it): the missing-episode task asks it once a run for each series that has
+    /// not ended. A provider without one answers with none.
+    fn series_seasons_fresh(&self, id: i64) -> LookupFuture<'_, SeriesSeasons> {
+        let _ = id;
+        Box::pin(async { Ok(None) })
+    }
+    /// `season`, asked of the provider even when an answer is cached: for a season whose episode
+    /// count has changed since the cached answer.
+    fn season_fresh(&self, series_id: i64, season_number: i32) -> LookupFuture<'_, SeasonMetadata> {
+        self.season(series_id, season_number)
+    }
     /// Every match of a name search, for an admin's Identify (`series` picks the TV search).
     /// A provider without a list search answers with none.
     fn search_all(
