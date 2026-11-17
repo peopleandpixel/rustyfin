@@ -132,6 +132,7 @@ class FakeExternalPlayerPlugin {
     }
     async play(options) {
         this._currentTime = options.playerStartPositionTicks / 10000 || 0;
+        record('ExtPlayer.url', options.url);
         const playOptions = options.item.playOptions;
         playOptions.ids = options.item ? [options.item.Id] : [];
         window.ExternalPlayer.initPlayer(JSON.stringify(playOptions));
@@ -196,6 +197,7 @@ test('the app: credentials, plugins, menu and Back', async () => {
             selectServer: () => window.NativeInterface.openServerSelection(),
             getPlugins: () => Object.keys(plugins),
             AppHost: {
+                deviceId: () => 'device-a',
                 init: nativeCall('AppHost.init'),
                 supports: command => native.features.includes(command.toLowerCase()),
                 exit: () => window.NativeInterface.exitApp(),
@@ -289,6 +291,9 @@ test('an external player: the page reports the start and the stop', async () => 
     assert.equal(await app.playNatively('item-a', { resumeTicks: () => 2e9 }), true);
     assert.deepEqual(JSON.parse(take('ExternalPlayer.initPlayer')[0][0]).ids, ['item-a']);
     assert.equal(take('API.reportPlaying')[0][1], 2e9);
+    // The direct stream Jellyfin's web client gives an external player: version, device and token
+    assert.equal(take('ExtPlayer.url')[0][0],
+        'http://127.0.0.1:8250/Videos/item-a/stream?Static=true&mediaSourceId=item-a&deviceId=device-a&ApiKey=token-a');
     // The app calls these when VLC or mpv returns at 10 minutes
     window.ExtPlayer.notifyTimeUpdate(600000);
     await window.ExtPlayer.notifyEnded();
@@ -302,6 +307,19 @@ test('an external player: the page reports the start and the stop', async () => 
     window.ExtPlayer.notifyTimeUpdate();
     await window.ExtPlayer.notifyEnded();
     assert.equal(take('API.reportStopped')[0][1], 6e10);
+
+    // The detail page's version and tracks reach the stream, with the version's container
+    reset();
+    const get = API.get;
+    API.get = async path => ({ ...(await get(path)), MediaSources: [{ Id: 'v1080', Container: 'mkv' }, { Id: 'v720', Container: 'mp4,m4v' }] });
+    await app.playNatively('item-a', { selection: { mediaSourceId: 'v720', audioIndex: 2, subtitleIndex: 3 } });
+    API.get = get;
+    assert.equal(take('ExtPlayer.url')[0][0],
+        'http://127.0.0.1:8250/Videos/item-a/stream.mp4?Static=true&mediaSourceId=v720&deviceId=device-a&AudioStreamIndex=2&SubtitleStreamIndex=3&ApiKey=token-a');
+    const playOptions = JSON.parse(take('ExternalPlayer.initPlayer')[0][0]);
+    assert.deepEqual([playOptions.mediaSourceId, playOptions.audioStreamIndex, playOptions.subtitleStreamIndex], ['v720', 2, 3]);
+    window.ExtPlayer.notifyCanceled?.();
+    await window.ExtPlayer.notifyEnded();
 });
 
 test("the web player drives the app's notification, and its buttons drive the web player", async () => {
@@ -364,7 +382,8 @@ test('downloads go to the app by item id', async () => {
     assert.equal(app.canDownload({ CanDownload: false }), false);
     assert.equal(app.downloadItems([{ Id: 'item-a', Name: 'Movie A' }]), true);
     assert.deepEqual(take('downloadFiles')[0][0], [{
-        itemId: 'item-a', serverId: 'server-a', title: 'Movie A', filename: 'Movie A', url: 'http://127.0.0.1:8250/Items/item-a/Download',
+        itemId: 'item-a', serverId: 'server-a', title: 'Movie A', filename: 'Movie A',
+        url: 'http://127.0.0.1:8250/Items/item-a/Download?api_key=token-a',
     }]);
 
     // A download link in the page (the item page's) goes to the app instead of the WebView

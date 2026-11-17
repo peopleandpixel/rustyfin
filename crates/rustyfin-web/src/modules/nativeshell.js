@@ -189,7 +189,7 @@ async function playNatively(itemId, { fromStart = false, selection = null, resum
 async function playExternal(player, item, options) {
     external = { itemId: item.Id, mediaSourceId: options.mediaSourceId || item.Id, runtimeTicks: item.RunTimeTicks || 0 };
     await player.play({
-        url: `${API.base}/Videos/${item.Id}/stream?static=true`,
+        url: externalStreamUrl(item, options),
         item: { ...item, playOptions: options },
         playerStartPositionTicks: options.startPositionTicks || 0,
     });
@@ -197,6 +197,21 @@ async function playExternal(player, item, options) {
         MediaSourceId: external.mediaSourceId, PlayMethod: 'DirectPlay', CanSeek: true, IsPaused: false,
     }).catch(e => console.warn('Could not report the start:', e));
     return true;
+}
+
+// The direct stream Jellyfin 12.4's web client hands an external player: the chosen version, the device and the
+// token, plus the chosen tracks. The app resolves its own stream from playOptions; this is the page's answer.
+function externalStreamUrl(item, options) {
+    const source = item.MediaSources?.find(s => s.Id === options.mediaSourceId) || item.MediaSources?.[0];
+    const container = source?.Container || item.Container;
+    const query = new URLSearchParams({ Static: 'true', mediaSourceId: external.mediaSourceId });
+    const deviceId = shell?.AppHost.deviceId?.();
+    if (deviceId) query.set('deviceId', deviceId);
+    if (options.audioStreamIndex != null) query.set('AudioStreamIndex', options.audioStreamIndex);
+    if (options.subtitleStreamIndex != null) query.set('SubtitleStreamIndex', options.subtitleStreamIndex);
+    query.set('ApiKey', API.token || '');
+    const path = container ? `stream.${container.split(',')[0]}` : 'stream';
+    return `${API.base}/Videos/${encodeURIComponent(item.Id)}/${path}?${query}`;
 }
 
 // currentTime() is the position in ms; the plugin clears it right after this event
@@ -275,7 +290,8 @@ function downloadItems(items) {
     if (!shell?.AppHost.supports('filedownload')) return false;
     shell.downloadFiles(items.map(item => ({
         itemId: item.Id, serverId, title: item.Name || '', filename: item.Name || item.Id,
-        url: `${API.base}/Items/${item.Id}/Download`,
+        // As Jellyfin's web client gives it: the token in the URL, so the file downloads on its own
+        url: `${API.base}/Items/${encodeURIComponent(item.Id)}/Download?api_key=${encodeURIComponent(API.token || '')}`,
     })));
     return true;
 }
