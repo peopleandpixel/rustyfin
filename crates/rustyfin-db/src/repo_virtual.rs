@@ -155,8 +155,9 @@ pub async fn mark_virtual(pool: &SqlitePool, ids: &[Uuid]) -> Result<(), sqlx::E
     Ok(())
 }
 
-/// Turns virtual items into real ones: a file has arrived for each. Their date added becomes
-/// `now`, as a new item's would be, so the episode shows in Latest. Returns how many changed.
+/// Turns virtual items into real ones: a file has arrived for each (the upsert that stored the
+/// file's path has already cleared the flag). Their date added becomes `now`, as a new item's
+/// would be, so the episode shows in Latest. Returns how many changed.
 pub async fn materialize(
     pool: &SqlitePool,
     ids: &[Uuid],
@@ -165,8 +166,7 @@ pub async fn materialize(
     let mut changed = 0;
     for id in ids {
         changed += sqlx::query(
-            "UPDATE media_items SET is_virtual_item = 0, date_created = ?2
-             WHERE id = ?1 AND is_virtual_item = 1",
+            "UPDATE media_items SET is_virtual_item = 0, date_created = ?2 WHERE id = ?1",
         )
         .bind(id.to_string())
         .bind(now.to_rfc3339())
@@ -284,8 +284,9 @@ pub async fn delete_virtual_in(
     id: Uuid,
 ) -> Result<bool, sqlx::Error> {
     let id = id.to_string();
+    // A row with a path is a file's, whatever its flag says: never deleted here
     let is_virtual: Option<i64> =
-        sqlx::query_scalar("SELECT is_virtual_item FROM media_items WHERE id = ?1")
+        sqlx::query_scalar("SELECT is_virtual_item FROM media_items WHERE id = ?1 AND path = ''")
             .bind(&id)
             .fetch_optional(&mut *conn)
             .await?;
@@ -306,14 +307,14 @@ pub async fn delete_virtual_children_in(
     id: &str,
 ) -> Result<bool, sqlx::Error> {
     let children: Vec<String> = sqlx::query_scalar(
-        "SELECT id FROM media_items WHERE parent_id = ?1 AND is_virtual_item = 1",
+        "SELECT id FROM media_items WHERE parent_id = ?1 AND is_virtual_item = 1 AND path = ''",
     )
     .bind(id)
     .fetch_all(&mut *conn)
     .await?;
     for child in children {
         let grandchildren: Vec<String> = sqlx::query_scalar(
-            "SELECT id FROM media_items WHERE parent_id = ?1 AND is_virtual_item = 1",
+            "SELECT id FROM media_items WHERE parent_id = ?1 AND is_virtual_item = 1 AND path = ''",
         )
         .bind(&child)
         .fetch_all(&mut *conn)

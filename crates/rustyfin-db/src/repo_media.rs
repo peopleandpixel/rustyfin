@@ -54,7 +54,8 @@ pub async fn upsert_media_item(pool: &SqlitePool, item: &MediaItem) -> Result<()
           original_language = excluded.original_language, tagline = excluded.tagline, \
           production_countries = excluded.production_countries, budget = excluded.budget, \
           revenue = excluded.revenue, homepage = excluded.homepage, end_date = excluded.end_date, \
-          vote_count = excluded.vote_count, popularity = excluded.popularity",
+          vote_count = excluded.vote_count, popularity = excluded.popularity, \
+          is_virtual_item = CASE WHEN excluded.path <> '' THEN 0 ELSE media_items.is_virtual_item END",
     )
     .bind(&id)
     .bind(&item.name)
@@ -498,7 +499,9 @@ pub async fn batch_upsert_media_items(
               production_countries = excluded.production_countries, budget = excluded.budget, \
               revenue = excluded.revenue, homepage = excluded.homepage, \
               end_date = excluded.end_date, vote_count = excluded.vote_count, \
-              popularity = excluded.popularity",
+              popularity = excluded.popularity, \
+              is_virtual_item = CASE WHEN excluded.path <> '' THEN 0 \
+                                     ELSE media_items.is_virtual_item END",
         )
         .bind(&id)
         .bind(&item.name)
@@ -1182,6 +1185,8 @@ fn build_filtered_query(
     )
 }
 
+/// The count and data SQL of `get_items_filtered_virtual`.
+#[allow(clippy::too_many_arguments)]
 fn build_filtered_query_virtual(
     recursive: bool,
     media_types: Option<&[String]>,
