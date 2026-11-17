@@ -165,6 +165,41 @@ pub async fn items_missing_trickplay(
         .collect())
 }
 
+/// For the trickplay task's progress, in one query over the libraries `library_ids`: how many
+/// videos `items_missing_trickplay` would take if none had a tile set, and how many of those
+/// already have one at `width` or a recorded `failure_kind` failure.
+pub async fn trickplay_progress(
+    pool: &SqlitePool,
+    library_ids: &[String],
+    width: u32,
+    failure_kind: &str,
+) -> Result<(u64, u64), sqlx::Error> {
+    if library_ids.is_empty() {
+        return Ok((0, 0));
+    }
+    let libs = (3..library_ids.len() + 3)
+        .map(|i| format!("?{i}"))
+        .collect::<Vec<_>>()
+        .join(",");
+    let sql = format!(
+        "SELECT COUNT(*), COALESCE(SUM(
+             EXISTS (SELECT 1 FROM trickplay_infos t WHERE t.item_id = m.id AND t.width = ?1)
+             OR EXISTS (SELECT 1 FROM video_image_failures f
+                        WHERE f.item_id = m.id AND f.kind = ?2)), 0)
+         FROM media_items m
+         WHERE m.library_id IN ({libs}) AND m.media_type IN ('Movie', 'Episode')
+           AND m.path IS NOT NULL AND m.path != '' AND m.runtime_ticks > 0"
+    );
+    let mut query = sqlx::query_as::<_, (i64, i64)>(sqlx::AssertSqlSafe(sql))
+        .bind(i64::from(width))
+        .bind(failure_kind);
+    for id in library_ids {
+        query = query.bind(id);
+    }
+    let (total, done) = query.fetch_one(pool).await?;
+    Ok((total.max(0) as u64, done.max(0) as u64))
+}
+
 /// The file version (size, modified seconds) an item's last `kind` image job failed on, if any.
 pub async fn get_failure(
     pool: &SqlitePool,
@@ -336,6 +371,62 @@ mod tests {
 
         delete_trickplay(&pool, item).await.unwrap();
         assert!(get_trickplay(&pool, item).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn r3trickplay_progress_counts_finished_and_failed_videos() {
+        let pool = test_pool().await;
+        let (made, failed, todo) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        let mut libs = Vec::new();
+        for item in [made, failed, todo] {
+            insert_test_item(&pool, item).await;
+            sqlx::query("UPDATE media_items SET runtime_ticks = 600000000 WHERE id = ?1")
+                .bind(item.to_string())
+                .execute(&pool)
+                .await
+                .unwrap();
+            libs.push(library_of(&pool, item).await);
+        }
+        // Not a video the task takes: no runtime
+        let other = Uuid::new_v4();
+        insert_test_item(&pool, other).await;
+        libs.push(library_of(&pool, other).await);
+
+        assert_eq!(
+            trickplay_progress(&pool, &libs, 320, "trickplay")
+                .await
+                .unwrap(),
+            (3, 0)
+        );
+        save_trickplay(&pool, made, &make_trickplay(320))
+            .await
+            .unwrap();
+        record_failure(&pool, failed, "trickplay", (1, 2))
+            .await
+            .unwrap();
+        // A tile set at another width, or another kind of failure, isn't done
+        save_trickplay(&pool, todo, &make_trickplay(160))
+            .await
+            .unwrap();
+        record_failure(&pool, todo, "other", (1, 2)).await.unwrap();
+        assert_eq!(
+            trickplay_progress(&pool, &libs, 320, "trickplay")
+                .await
+                .unwrap(),
+            (3, 2)
+        );
+        assert_eq!(
+            trickplay_progress(&pool, &libs[..1], 320, "trickplay")
+                .await
+                .unwrap(),
+            (1, 1)
+        );
+        assert_eq!(
+            trickplay_progress(&pool, &[], 320, "trickplay")
+                .await
+                .unwrap(),
+            (0, 0)
+        );
     }
 
     #[tokio::test]

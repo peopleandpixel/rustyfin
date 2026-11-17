@@ -23,6 +23,8 @@ use uuid::Uuid;
 
 use rustyfin_model::trickplay::TrickplayInfo;
 
+use crate::key_frames::{self, Codec, KeyFrameStream};
+
 /// Thumbnail width, in pixels.
 pub const WIDTH: u32 = 320;
 /// Milliseconds between thumbnails.
@@ -397,6 +399,49 @@ struct Probe {
     last_pos: f64,
     /// A Matroska or MP4 file: its index lets ffmpeg seek straight to a key frame.
     indexed: bool,
+    /// Where the video's key frames can be read as a raw stream (`key_frames`): H.264 or HEVC,
+    /// and not rotated, as a raw stream can't say so.
+    raw: Option<RawVideo>,
+}
+
+/// What a raw stream of a video's key frames needs from its container.
+#[derive(Clone, Debug)]
+struct RawVideo {
+    codec: Codec,
+    /// The decoder configuration (`avcC`, `hvcC`).
+    config: Vec<u8>,
+    /// The container's sample aspect ratio, as `n/d`, which the raw stream may not carry.
+    sar: Option<String>,
+    /// The container's cropping (Matroska PixelCrop, MP4 `clap`), in pixels from the top,
+    /// bottom, left and right, which ffmpeg applies to the file but can't see in a raw stream.
+    crop: Option<[u64; 4]>,
+}
+
+impl RawVideo {
+    /// The filters that give a raw stream's frames what the container would have: its
+    /// cropping, as ffmpeg's own applies it, then its aspect ratio. Each ends with a comma.
+    fn container_filters(&self) -> String {
+        let mut filters = String::new();
+        if let Some([top, bottom, left, right]) = self.crop {
+            filters.push_str(&format!(
+                "crop=w=iw-{left}-{right}:h=ih-{top}-{bottom}:x={left}:y={top},"
+            ));
+        }
+        if let Some(sar) = &self.sar {
+            filters.push_str(&format!("setsar={sar},"));
+        }
+        filters
+    }
+}
+
+/// How seek mode reads a tile's key frames.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Seeking {
+    /// One ffprobe opening the file once and seeking to each key frame, its packets piped to one
+    /// ffmpeg as a raw stream.
+    Raw,
+    /// One ffmpeg through the concat demuxer, opening the file again for each key frame.
+    Concat,
 }
 
 /// How many tiles of a video `seek_tiles` makes at once, 2 above 1080p. Not from the CPU count:
@@ -434,19 +479,41 @@ impl Probe {
         }
     }
 
-    /// Whether seeking to each thumbnail's key frame reads at most a third of what reading the
-    /// whole file does. Each seek reopens the file, so it reads the header, the index (at the
-    /// end, after the media), and about a second of media around the key frame.
-    fn seek_pays(&self) -> bool {
+    /// How seek mode reads this video, where seeking to each thumbnail's key frame reads at most
+    /// a third of what reading the whole file does; `None` where it doesn't. Each opening of the
+    /// file reads its header and its index (at the end, after the media, in some MP4 files),
+    /// and each seek about a second of media around the key frame. `Raw` opens the file once per
+    /// tile, `Concat` once per thumbnail.
+    fn seeking(&self) -> Option<Seeking> {
+        #[cfg(test)]
+        if tests::SEEK_PAYS.get() {
+            return Some(if self.raw.is_some() {
+                Seeking::Raw
+            } else {
+                Seeking::Concat
+            });
+        }
+        [Seeking::Raw, Seeking::Concat]
+            .into_iter()
+            .find(|&how| self.seek_pays(how))
+    }
+
+    fn seek_pays(&self, how: Seeking) -> bool {
         let count = self.count();
         if !self.indexed || count == 0 || self.duration <= 0.0 || self.size <= 0.0 {
             return false;
         }
+        let openings = match how {
+            Seeking::Raw if self.raw.is_none() => return false,
+            Seeking::Raw => count.div_ceil(TILE_SIDE * TILE_SIDE),
+            Seeking::Concat => count,
+        };
         let rate = self.size / self.duration;
         let after_last_key = (self.duration - (self.last_key - self.start)).max(0.0) * rate;
         let index = (self.size - self.last_pos - after_last_key).max(0.0);
-        let per_seek = self.first_pos + index + SEEK_SLACK + rate;
-        self.size / f64::from(count) >= 3.0 * per_seek
+        let read =
+            f64::from(openings) * (self.first_pos + index) + f64::from(count) * (SEEK_SLACK + rate);
+        self.size >= 3.0 * read
     }
 
     /// The decoder threads for reading this video whole: at most 2 above 1080p, as each frame
@@ -473,9 +540,11 @@ async fn probe(path: &str, cancel: &Cancel) -> Result<Option<Probe>, String> {
             "-select_streams",
             // The first video that isn't cover art, as ffmpeg's 0:V:0
             "V:0",
+            "-show_data",
             "-show_entries",
-            "format=start_time,duration,size,format_name:stream=avg_frame_rate,width,height:\
-             packet=pts_time,pos",
+            "format=start_time,duration,size,format_name:stream=codec_name,avg_frame_rate,\
+             width,height,sample_aspect_ratio,extradata:stream_side_data=rotation,crop_top,\
+             crop_bottom,crop_left,crop_right:packet=pts_time,pos",
             // The first packet, and the last key frame, which a seek past the end lands on
             "-read_intervals",
             "%+#1,99999999%+#1",
@@ -514,6 +583,35 @@ async fn probe(path: &str, cancel: &Cancel) -> Result<Option<Probe>, String> {
         .and_then(|(n, d)| Some(d.parse::<f64>().ok()? / n.parse::<f64>().ok()?))
         .filter(|f| f.is_finite() && *f > 0.0);
     let format_name = format["format_name"].as_str().unwrap_or_default();
+    let side_data = stream["side_data_list"].as_array();
+    let rotated = side_data.is_some_and(|list| {
+        list.iter()
+            .any(|d| d["rotation"].as_i64().is_some_and(|r| r % 360 != 0))
+    });
+    let crop = side_data
+        .and_then(|list| list.iter().find(|d| d.get("crop_top").is_some()))
+        .map(|d| {
+            ["crop_top", "crop_bottom", "crop_left", "crop_right"]
+                .map(|side| d[side].as_u64().unwrap_or_default())
+        })
+        .filter(|crop| crop.iter().any(|&px| px > 0));
+    let sar = stream["sample_aspect_ratio"]
+        .as_str()
+        .and_then(|r| r.split_once(':'))
+        .and_then(|(n, d)| Some((n.parse::<u32>().ok()?, d.parse::<u32>().ok()?)))
+        .filter(|&(n, d)| n > 0 && d > 0)
+        .map(|(n, d)| format!("{n}/{d}"));
+    let raw = stream["codec_name"]
+        .as_str()
+        .and_then(Codec::from_name)
+        .filter(|_| !rotated)
+        .map(|codec| RawVideo {
+            codec,
+            config: key_frames::hex_dump(stream["extradata"].as_str().unwrap_or_default()),
+            sar,
+            crop,
+        })
+        .filter(|raw| KeyFrameStream::new(raw.codec, &raw.config).is_some());
     let probe = (|| {
         Some(Probe {
             start: num(&format["start_time"])?,
@@ -526,23 +624,24 @@ async fn probe(path: &str, cancel: &Cancel) -> Result<Option<Probe>, String> {
             last_key: num(&last["pts_time"])?,
             last_pos: num(&last["pos"])?,
             indexed: format_name.contains("matroska") || format_name.contains("mp4"),
+            raw,
         })
     })();
     Ok(probe)
 }
 
-/// Makes the tile images of `path` in `tiles` by seeking: per tile image, one ffprobe run finds
-/// each of its thumbnails' key frames, and one ffmpeg run reads and decodes just those, through
-/// the concat demuxer. The key frame of a thumbnail is the last one before the middle of its
-/// interval, as the unthinned streaming pass's fps filter picked (the thinned pass takes the
-/// first key frame of the interval instead; both are within half an interval). Tiles run
-/// `SEEK_TILES_AT_ONCE` at once, and `seek_tile_slots` over all videos. They are made in `work`
-/// and moved into `tiles` once all are right. Returns the thumbnail count. Fails where the
-/// decoder doesn't hand out exactly one frame per key frame in order (open-GOP HEVC can't
-/// decode its key frames alone that way).
+/// Makes the tile images of `path` in `tiles` by seeking to each thumbnail's key frame, a tile
+/// image at a time (`seek_tile`), read as `how` says. The key frame of a thumbnail is the last
+/// one before the middle of its interval, as the unthinned streaming pass's fps filter picked
+/// (the thinned pass takes the first key frame of the interval instead; both are within half an
+/// interval). Tiles run `SEEK_TILES_AT_ONCE` at once, and `seek_tile_slots` over all videos. They
+/// are made in `work` and moved into `tiles` once all are right. Returns the thumbnail count.
+/// Fails where the decoder doesn't hand out exactly one frame per key frame in order, and with
+/// `key_frames::NOT_ALONE` where `Raw` meets a key frame it can't decode alone.
 async fn seek_tiles(
     path: &str,
     probe: &Probe,
+    how: Seeking,
     work: &Path,
     tiles: &Path,
     cancel: &Cancel,
@@ -575,8 +674,18 @@ async fn seek_tiles(
                 cancel.clone(),
             );
             let start = probe.start;
+            let raw = match how {
+                Seeking::Raw => probe.raw.clone(),
+                Seeking::Concat => None,
+            };
             running.spawn(async move {
-                seek_tile(&path, start, next, slots, &work, &tiles, &cancel).await
+                let tile = Tile {
+                    path: &path,
+                    index: next,
+                    work: &work,
+                    tiles: &tiles,
+                };
+                seek_tile(tile, start, slots, raw, &cancel).await
             });
             next += 1;
         }
@@ -602,14 +711,23 @@ async fn seek_tiles(
     Ok(count)
 }
 
-/// Makes tile image `tile` of the thumbnails `slots` for `seek_tiles`.
+/// A tile image that `seek_tile` makes: of video `path`, number `index`, in folder `tiles`,
+/// with `work` for lists.
+struct Tile<'a> {
+    path: &'a str,
+    index: u32,
+    work: &'a Path,
+    tiles: &'a Path,
+}
+
+/// Makes tile image `tile` of the thumbnails `slots` for `seek_tiles`, of a video whose time
+/// line starts at `start`: from a raw stream of its key frames where `raw` holds the video's
+/// codec and decoder configuration, else through the concat demuxer.
 async fn seek_tile(
-    path: &str,
+    tile: Tile<'_>,
     start: f64,
-    tile: u32,
     slots: std::ops::Range<u32>,
-    work: &Path,
-    tiles: &Path,
+    raw: Option<RawVideo>,
     cancel: &Cancel,
 ) -> Result<(), String> {
     let _slot = tokio::select! {
@@ -628,73 +746,24 @@ async fn seek_tile(
             )
         })
         .collect();
-    let keys = run_ffprobe(
-        &[
-            "-probesize",
-            PROBE_BYTES,
-            "-analyzeduration",
-            "0",
-            "-select_streams",
-            // The first video that isn't cover art, as ffmpeg's 0:V:0
-            "V:0",
-            "-read_intervals",
-            &intervals.join(","),
-            "-show_entries",
-            "packet=pts_time",
-            "-of",
-            "csv=p=0",
-            path,
-        ],
-        cancel,
-    )
-    .await?;
-    let keys: Vec<f64> = keys
-        .lines()
-        .map(|l| l.trim().trim_end_matches(',').parse::<f64>())
-        .collect::<Result<_, _>>()
-        .map_err(|e| format!("ffprobe gave a key frame without a time: {e}"))?;
-    if keys.len() != slots.len() {
-        return Err(format!(
-            "ffprobe found {} of {} key frames",
-            keys.len(),
-            slots.len()
-        ));
+    let intervals = intervals.join(",");
+    match raw {
+        Some(raw) => raw_tile(&tile, &intervals, slots.len(), &raw, cancel).await,
+        None => concat_tile(&tile, &intervals, slots.len(), cancel).await,
     }
-    // Each entry reads one key frame: in at its time (a microsecond on, past ffprobe's rounding),
-    // out a millisecond later. Laid out an interval apart, so their order shows in the times.
-    // Each opens the file again; the probing it does there is cut short (`PROBE_BYTES`).
-    let quoted = path.replace('\'', "'\\''");
-    let mut list = String::from("ffconcat version 1.0\n");
-    for key in &keys {
-        list.push_str(&format!(
-            "file '{quoted}'\noption probesize {PROBE_BYTES}\noption analyzeduration 0\n\
-             inpoint {:.6}\noutpoint {:.6}\nduration {interval}\n",
-            key + 1e-6,
-            key + 1e-3
-        ));
-    }
-    let list_path = work.join(format!("seek-{tile}.ffconcat"));
-    fs::write(&list_path, list)
-        .await
-        .map_err(|e| format!("could not write {}: {e}", list_path.display()))?;
-    let frames = work.join(format!("seek-{tile}.crc"));
-    let output = tiles.join(format!("{tile}.jpg"));
-    let graph =
-        format!("[0:V:0]scale={WIDTH}:-2,split[t][n];[t]tile={TILE_SIDE}x{TILE_SIDE}[tiles]");
-    run_ffmpeg(
-        &[
-            "-threads",
-            "1",
-            "-skip_frame",
-            "nokey",
-            "-skip_loop_filter",
-            "all",
-            "-safe",
-            "0",
-            "-f",
-            "concat",
-            "-i",
-            &list_path.to_string_lossy(),
+}
+
+/// The ffmpeg arguments that decode one input into tile image `tile`, and list each frame
+/// it decoded in `frames` (framecrc), after the input arguments `input`. Frames go through the
+/// filters `first` (`RawVideo::container_filters`) before they are scaled.
+fn tile_args(input: Vec<String>, first: &str, tile: &Tile<'_>, frames: &Path) -> Vec<String> {
+    let output = tile.tiles.join(format!("{}.jpg", tile.index));
+    let graph = format!(
+        "[0:V:0]{first}scale={WIDTH}:-2,split[t][n];[t]tile={TILE_SIDE}x{TILE_SIDE}[tiles]"
+    );
+    let mut args = input;
+    args.extend(
+        [
             "-filter_complex_threads",
             "1",
             "-filter_complex",
@@ -717,22 +786,290 @@ async fn seek_tile(
             "-f",
             "framecrc",
             &frames.to_string_lossy(),
+        ]
+        .map(String::from),
+    );
+    args
+}
+
+/// The presentation times of the frames ffmpeg listed in `frames` (framecrc).
+async fn frame_times(frames: &Path) -> Result<Vec<i64>, String> {
+    // framecrc lines: stream, dts, pts, duration, size, checksum
+    let listed = fs::read_to_string(frames)
+        .await
+        .map_err(|e| format!("could not read {}: {e}", frames.display()))?;
+    Ok(listed
+        .lines()
+        .filter(|l| !l.starts_with('#'))
+        .filter_map(|l| l.split(',').nth(2)?.trim().parse().ok())
+        .collect())
+}
+
+/// `seek_tile` from a raw stream: one ffprobe opens the file once, seeks to each of the
+/// `wanted` key frames (`intervals`) and prints its packet, which a `KeyFrameStream` turns into
+/// the input of one ffmpeg. The order is the stream's own (see `key_frames`), so this checks
+/// that each key frame gave one frame, and that the decoder met no error: ffmpeg conceals a
+/// damaged slice and still hands out a frame, so a decode error stops it (`-xerror`) and any
+/// error it prints fails the tile (`pipe_key_frames`).
+async fn raw_tile(
+    tile: &Tile<'_>,
+    intervals: &str,
+    wanted: usize,
+    raw: &RawVideo,
+    cancel: &Cancel,
+) -> Result<(), String> {
+    let stream = KeyFrameStream::new(raw.codec, &raw.config)
+        .ok_or("the decoder configuration can't be read")?;
+    let frames = tile.work.join(format!("seek-{}.crc", tile.index));
+    let input = [
+        "-xerror",
+        "-threads",
+        "1",
+        "-skip_loop_filter",
+        "all",
+        "-f",
+        raw.codec.format(),
+        "-i",
+        "pipe:0",
+    ]
+    .map(String::from)
+    .to_vec();
+    let ffmpeg_args = tile_args(input, &raw.container_filters(), tile, &frames);
+    let probe_args = [
+        "-probesize",
+        PROBE_BYTES,
+        "-analyzeduration",
+        "0",
+        "-select_streams",
+        // The first video that isn't cover art, as ffmpeg's 0:V:0
+        "V:0",
+        "-read_intervals",
+        intervals,
+        "-show_data",
+        "-show_entries",
+        "packet=flags,data",
+        "-of",
+        "default=noprint_wrappers=1",
+        tile.path,
+    ];
+    let fed = pipe_key_frames(&probe_args, &ffmpeg_args, stream, cancel).await?;
+    if fed != wanted {
+        return Err(format!("ffprobe found {fed} of {wanted} key frames"));
+    }
+    let times = frame_times(&frames).await?;
+    if times.len() != wanted {
+        return Err(format!(
+            "the decoder gave {} frames, not {wanted}, for tile {}",
+            times.len(),
+            tile.index
+        ));
+    }
+    Ok(())
+}
+
+/// Runs ffprobe with `probe_args`, which prints key frame packets (`-show_data`), and ffmpeg
+/// with `ffmpeg_args`, which reads them from its input as `stream` turns them out. Both run as
+/// `run_tool` runs one, and fail as it does; ffmpeg fails too where it printed an error, as
+/// it runs at the error log level. Returns how many packets went through.
+async fn pipe_key_frames(
+    probe_args: &[&str],
+    ffmpeg_args: &[String],
+    mut stream: KeyFrameStream,
+    cancel: &Cancel,
+) -> Result<usize, String> {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+    let command = |program: &str| {
+        let mut cmd = Command::new(program);
+        cmd.args(["-hide_banner", "-loglevel", "error"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+        crate::media_reads::lower_priority(&mut cmd);
+        cmd
+    };
+    let mut probe = command("ffprobe");
+    probe.args(probe_args).stdin(Stdio::null());
+    let mut ffmpeg = command("ffmpeg");
+    ffmpeg
+        .args(["-nostdin", "-y"])
+        .args(ffmpeg_args)
+        .stdin(Stdio::piped());
+    let mut probe = probe
+        .spawn()
+        .map_err(|e| format!("ffprobe could not start: {e}"))?;
+    let mut ffmpeg = ffmpeg
+        .spawn()
+        .map_err(|e| format!("ffmpeg could not start: {e}"))?;
+    let (Some(packets), Some(mut input)) = (probe.stdout.take(), ffmpeg.stdin.take()) else {
+        return Err("ffprobe or ffmpeg has no pipe".to_string());
+    };
+    let feed = async move {
+        let mut lines = BufReader::with_capacity(1 << 16, packets);
+        // One buffer for every line: a 4K key frame takes thousands
+        let mut line = Vec::with_capacity(128);
+        let (mut packet, mut key, mut fed) = (Vec::new(), false, 0);
+        let mut out = Vec::new();
+        let mut send = async |packet: &mut Vec<u8>, key: bool| -> Result<(), String> {
+            if !key {
+                return Err("ffprobe landed on a frame that isn't a key frame".to_string());
+            }
+            out.clear();
+            stream.push(packet, &mut out)?;
+            packet.clear();
+            input
+                .write_all(&out)
+                .await
+                .map_err(|e| format!("ffmpeg stopped reading the key frames: {e}"))
+        };
+        // Each packet: flags=K__, then data=, its hex dump and an empty line
+        loop {
+            line.clear();
+            let read = lines
+                .read_until(b'\n', &mut line)
+                .await
+                .map_err(|e| e.to_string())?;
+            if read == 0 {
+                break;
+            }
+            let text = line.trim_ascii_end();
+            if let Some(flags) = text.strip_prefix(b"flags=") {
+                if fed > 0 {
+                    send(&mut packet, key).await?;
+                }
+                key = flags.starts_with(b"K");
+                fed += 1;
+            } else if !text.is_empty()
+                && text != b"data="
+                && !key_frames::hex_line(text, &mut packet)
+            {
+                return Err(format!(
+                    "ffprobe printed {:?}",
+                    String::from_utf8_lossy(text)
+                ));
+            }
+        }
+        if fed > 0 {
+            send(&mut packet, key).await?;
+        }
+        drop(send);
+        // ffmpeg's input ends here
+        drop(input);
+        Ok(fed)
+    };
+    let done =
+        |program: &'static str, output: std::io::Result<std::process::Output>, quiet: bool| {
+            let output = output.map_err(|e| format!("{program} failed: {e}"))?;
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            if !output.status.success() {
+                Err(format!("{program} failed: {}", stderr.trim()))
+            } else if quiet && !stderr.trim().is_empty() {
+                Err(format!("{program} met an error: {}", stderr.trim()))
+            } else {
+                Ok(())
+            }
+        };
+    let both = async {
+        // The first to fail drops the others, which kills ffprobe and ffmpeg (kill_on_drop)
+        tokio::try_join!(
+            feed,
+            async { done("ffprobe", probe.wait_with_output().await, false) },
+            async { done("ffmpeg", ffmpeg.wait_with_output().await, true) },
+        )
+    };
+    tokio::select! {
+        out = tokio::time::timeout(FFMPEG_TIMEOUT, both) => match out {
+            Ok(out) => out.map(|(fed, (), ())| fed),
+            Err(_) => Err("ffprobe and ffmpeg took too long and were stopped".to_string()),
+        },
+        _ = cancel.cancelled() => Err("cancelled".to_string()),
+    }
+}
+
+/// `seek_tile` through the concat demuxer: one ffprobe run finds each of the `wanted` key
+/// frames (`intervals`), and one ffmpeg run reads and decodes just those, opening the file
+/// again for each. Fails where the decoder doesn't hand out exactly one frame per key frame in
+/// order (open-GOP HEVC can't decode its key frames alone that way).
+async fn concat_tile(
+    tile: &Tile<'_>,
+    intervals: &str,
+    wanted: usize,
+    cancel: &Cancel,
+) -> Result<(), String> {
+    let (path, index) = (tile.path, tile.index);
+    let interval = f64::from(INTERVAL_MS) / 1000.0;
+    let keys = run_ffprobe(
+        &[
+            "-probesize",
+            PROBE_BYTES,
+            "-analyzeduration",
+            "0",
+            "-select_streams",
+            // The first video that isn't cover art, as ffmpeg's 0:V:0
+            "V:0",
+            "-read_intervals",
+            intervals,
+            "-show_entries",
+            "packet=pts_time",
+            "-of",
+            "csv=p=0",
+            path,
         ],
         cancel,
     )
     .await?;
-    // framecrc lines: stream, dts, pts, duration, size, checksum
-    let listed = fs::read_to_string(&frames)
-        .await
-        .map_err(|e| format!("could not read {}: {e}", frames.display()))?;
-    let times: Vec<i64> = listed
+    let keys: Vec<f64> = keys
         .lines()
-        .filter(|l| !l.starts_with('#'))
-        .filter_map(|l| l.split(',').nth(2)?.trim().parse().ok())
-        .collect();
+        .map(|l| l.trim().trim_end_matches(',').parse::<f64>())
+        .collect::<Result<_, _>>()
+        .map_err(|e| format!("ffprobe gave a key frame without a time: {e}"))?;
+    if keys.len() != wanted {
+        return Err(format!(
+            "ffprobe found {} of {wanted} key frames",
+            keys.len()
+        ));
+    }
+    // Each entry reads one key frame: in at its time (a microsecond on, past ffprobe's rounding),
+    // out a millisecond later. Laid out an interval apart, so their order shows in the times.
+    // Each opens the file again; the probing it does there is cut short (`PROBE_BYTES`).
+    let quoted = path.replace('\'', "'\\''");
+    let mut list = String::from("ffconcat version 1.0\n");
+    for key in &keys {
+        list.push_str(&format!(
+            "file '{quoted}'\noption probesize {PROBE_BYTES}\noption analyzeduration 0\n\
+             inpoint {:.6}\noutpoint {:.6}\nduration {interval}\n",
+            key + 1e-6,
+            key + 1e-3
+        ));
+    }
+    let list_path = tile.work.join(format!("seek-{index}.ffconcat"));
+    fs::write(&list_path, list)
+        .await
+        .map_err(|e| format!("could not write {}: {e}", list_path.display()))?;
+    let frames = tile.work.join(format!("seek-{index}.crc"));
+    let input = [
+        "-threads",
+        "1",
+        "-skip_frame",
+        "nokey",
+        "-skip_loop_filter",
+        "all",
+        "-safe",
+        "0",
+        "-f",
+        "concat",
+        "-i",
+        &list_path.to_string_lossy(),
+    ]
+    .map(String::from)
+    .to_vec();
+    let args = tile_args(input, "", tile, &frames);
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    run_ffmpeg(&args, cancel).await?;
+    let times = frame_times(&frames).await?;
     if times.len() != keys.len() || times.windows(2).any(|w| w[0] >= w[1]) {
         return Err(format!(
-            "the decoder gave {} frames, not {} in order, for tile {tile}",
+            "the decoder gave {} frames, not {} in order, for tile {index}",
             times.len(),
             keys.len()
         ));
@@ -745,9 +1082,9 @@ async fn seek_tile(
 enum Reading {
     /// Seek to each thumbnail's key frame where that reads much less than the whole file.
     Auto,
-    /// Seek, failing where seeking can't make the thumbnails.
+    /// Seek as given, failing where that can't make the thumbnails.
     #[cfg(test)]
-    Seek,
+    Seek(Seeking),
     /// Read the whole file.
     #[cfg(test)]
     Stream,
@@ -755,8 +1092,10 @@ enum Reading {
 
 /// Makes the tile images of `path` in `tiles`, using `work` for lists, and returns the set's
 /// info. A video in a container with an index (Matroska, MP4) that seeking reads much less of is
-/// read a key frame at a time (`seek_tiles`); others, and any that seeking fails on, are read
-/// whole (`tile_run`). Both make the same thumbnails.
+/// read a key frame at a time (`seek_tiles`), from a raw stream where its codec allows, else
+/// through the concat demuxer, and through that too where a key frame doesn't decode alone in
+/// a raw stream. Others, and any that seeking fails on, are read whole (`tile_run`). All make
+/// the same thumbnails.
 ///
 /// Seeking holds an `image_job`. Reading whole first takes a network read
 /// (`media_reads::whole_file_read`, for a file on a network share), then an `image_job`: the
@@ -772,29 +1111,41 @@ async fn make_tiles(
 ) -> Result<TrickplayInfo, String> {
     let probed = probe(path, cancel).await?;
     let mut count = 0;
-    let seek = match reading {
-        Reading::Auto => probed.as_ref().filter(|p| p.seek_pays()),
+    let seek = probed.as_ref().and_then(|p| match reading {
+        Reading::Auto => Some((p, p.seeking()?)),
         #[cfg(test)]
-        Reading::Seek => probed.as_ref().filter(|p| p.indexed),
+        Reading::Seek(how) => {
+            (p.indexed && (how == Seeking::Concat || p.raw.is_some())).then_some((p, how))
+        }
         #[cfg(test)]
         Reading::Stream => None,
-    };
-    if let Some(p) = seek {
+    });
+    if let Some((p, how)) = seek {
         let Some(_job) = image_job(cancel).await else {
             return Err("cancelled".to_string());
         };
-        match seek_tiles(path, p, work, tiles, cancel).await {
+        let mut result = seek_tiles(path, p, how, work, tiles, cancel).await;
+        if let Err(e) = &result
+            && how == Seeking::Raw
+            && e.starts_with(key_frames::NOT_ALONE)
+            && reading == Reading::Auto
+            && p.seek_pays(Seeking::Concat)
+        {
+            info!(path, error = %e, "trickplay seeks through the concat demuxer instead");
+            result = seek_tiles(path, p, Seeking::Concat, work, tiles, cancel).await;
+        }
+        match result {
             Ok(n) => count = n,
             Err(e) if cancel.is_cancelled() => return Err(e),
             #[cfg(test)]
-            Err(e) if reading == Reading::Seek => return Err(e),
+            Err(e) if reading != Reading::Auto => return Err(e),
             Err(e) => {
                 info!(path, error = %e, "seeking can't make the trickplay tiles; reading all")
             }
         }
     }
     #[cfg(test)]
-    if reading == Reading::Seek && seek.is_none() {
+    if matches!(reading, Reading::Seek(_)) && seek.is_none() {
         return Err("the video can't be seeked".to_string());
     }
     if count == 0 {
@@ -957,13 +1308,16 @@ pub async fn generate_for_libraries_with_progress(
     // Videos this run won't try (again): failed now, or before on the same file
     let mut failed: Vec<Uuid> = Vec::new();
     let mut made = 0u32;
-    let total =
-        rustyfin_db::repo_trickplay::items_missing_trickplay(pool, library_ids, WIDTH, &[], -1)
+    // Every video the task covers, and those already done: with a tile set, or a failure on
+    // record. A video with a failure is counted done here, so it isn't counted again when it
+    // is skipped or tried again. The bar so starts where the last run left it.
+    let (total, done) =
+        rustyfin_db::repo_trickplay::trickplay_progress(pool, library_ids, WIDTH, FAILURE_KIND)
             .await
-            .map_err(|e| format!("could not list videos: {e}"))?
-            .len();
-    let mut done = 0usize;
-    progress.report_count(0, total);
+            .map_err(|e| format!("could not count videos: {e}"))?;
+    let total = usize::try_from(total).unwrap_or(usize::MAX);
+    let mut done = usize::try_from(done).unwrap_or(usize::MAX).min(total);
+    progress.report_count(done, total);
     let db = |e: sqlx::Error| format!("could not record a failure: {e}");
     let mut queue = std::collections::VecDeque::new();
     // Up to `image_jobs` videos at once; each task's id maps to its video, path and file version
@@ -980,7 +1334,7 @@ pub async fn generate_for_libraries_with_progress(
                     // failures
                     let skip: Vec<Uuid> = failed
                         .iter()
-                        .chain(started.values().map(|(id, _, _)| id))
+                        .chain(started.values().map(|(id, _, _, _)| id))
                         .copied()
                         .collect();
                     queue.extend(
@@ -999,11 +1353,11 @@ pub async fn generate_for_libraries_with_progress(
                     return Ok(None);
                 };
                 let version = file_version(&path).await;
-                let known = get_failure(pool, item_id, FAILURE_KIND).await.map_err(db)?;
-                Ok::<_, String>(Some((item_id, path, version, known == Some(version))))
+                let failure = get_failure(pool, item_id, FAILURE_KIND).await.map_err(db)?;
+                Ok::<_, String>(Some((item_id, path, version, failure)))
             }
             .await;
-            let (item_id, path, version, known) = match next {
+            let (item_id, path, version, failure) = match next {
                 Ok(Some(next)) => next,
                 Ok(None) => break,
                 Err(e) => {
@@ -1011,12 +1365,12 @@ pub async fn generate_for_libraries_with_progress(
                     break;
                 }
             };
-            if known {
+            // Counted done at the start
+            if failure == Some(version) {
                 failed.push(item_id);
-                done += 1;
-                progress.report_count(done.min(total), total);
                 continue;
             }
+            let counted = failure.is_some();
             let (pool, data_dir, cancel, file) = (
                 pool.clone(),
                 data_dir.to_path_buf(),
@@ -1025,7 +1379,7 @@ pub async fn generate_for_libraries_with_progress(
             );
             let task = running
                 .spawn(async move { generate(&pool, &data_dir, item_id, &file, &cancel).await });
-            started.insert(task.id(), (item_id, path, version));
+            started.insert(task.id(), (item_id, path, version, counted));
         }
         let Some(joined) = running.join_next_with_id().await else {
             break;
@@ -1034,12 +1388,14 @@ pub async fn generate_for_libraries_with_progress(
             Ok((task, result)) => (result, task),
             Err(e) => (Err(format!("the tile task failed: {e}")), e.id()),
         };
-        let Some((item_id, path, version)) = started.remove(&task) else {
+        let Some((item_id, path, version, counted)) = started.remove(&task) else {
             continue;
         };
         // Videos added during the run can take it past the total counted at the start
-        done += 1;
-        progress.report_count(done.min(total), total);
+        if !counted {
+            done += 1;
+            progress.report_count(done.min(total), total);
+        }
         let recorded = async {
             match result {
                 Ok(set) => {
@@ -1093,6 +1449,12 @@ pub async fn generate_for_libraries_with_progress(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    thread_local! {
+        /// Set by a test: seeking pays for every video (`Probe::seeking`), so `Reading::Auto`
+        /// seeks a small clip.
+        pub(super) static SEEK_PAYS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
 
     fn have_ffmpeg(test: &str) -> bool {
         let here = std::process::Command::new("ffmpeg")
@@ -1232,6 +1594,11 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("r3trickplay-seek-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let x264 = ["-x264-params", "keyint=20:min-keyint=20:scenecut=0"];
+        // Key frames that aren't IDR frames, as on Blu-rays
+        let x264_open = [
+            "-x264-params",
+            "keyint=20:min-keyint=20:scenecut=0:open-gop=1",
+        ];
         // x265 makes open GOPs by default: key frames that need the frames before them in order
         let x265 = [
             "-x265-params",
@@ -1242,6 +1609,7 @@ mod tests {
             ("libx264", &x264, "seek.mkv"),
             ("libx264", &x264, "seek.mp4"),
             ("libx265", &x265, "seek.mkv"),
+            ("libx265", &x265, "seek.mp4"),
         ] {
             if !have_encoder(encoder) {
                 eprintln!("SKIPPED {test} for {encoder}: ffmpeg can't encode with it");
@@ -1250,7 +1618,11 @@ mod tests {
             let clip = timed_clip(&dir, encoder, params, &[], name);
             let clip = clip.to_string_lossy();
             let mut made = Vec::new();
-            for reading in [Reading::Stream, Reading::Seek] {
+            for reading in [
+                Reading::Stream,
+                Reading::Seek(Seeking::Raw),
+                Reading::Seek(Seeking::Concat),
+            ] {
                 let work = dir.join(format!("work-{encoder}-{name}-{reading:?}"));
                 let tiles = work.join("tiles");
                 std::fs::create_dir_all(&tiles).unwrap();
@@ -1268,23 +1640,37 @@ mod tests {
                 made.push(info.map(|count| (count, thumbnail_times(&tiles, count))));
             }
             let old = made[0].as_ref().unwrap();
-            match &made[1] {
-                Ok(new) => {
-                    assert_eq!(old.0, new.0, "{encoder} {name}: the same count");
-                    for (k, (a, b)) in old.1.iter().zip(&new.1).enumerate() {
-                        assert!(
-                            (a - b).abs() <= 1.0,
-                            "{encoder} {name}: thumbnail {k} {a} {b}"
-                        );
+            for (how, new) in ["raw", "concat"].iter().zip(&made[1..]) {
+                match new {
+                    Ok(new) => {
+                        assert_eq!(old.0, new.0, "{encoder} {name} {how}: the same count");
+                        for (k, (a, b)) in old.1.iter().zip(&new.1).enumerate() {
+                            assert!(
+                                (a - b).abs() <= 1.0,
+                                "{encoder} {name} {how}: thumbnail {k} {a} {b}"
+                            );
+                        }
                     }
-                }
-                // Only where the key frames can't be decoded alone; never wrong frames
-                Err(e) => {
-                    assert_eq!(encoder, "libx265", "{name}: {e}");
-                    assert!(e.contains("not 9 in order"), "{e}");
+                    // The concat demuxer fails on open-GOP HEVC; never with wrong frames
+                    Err(e) if *how == "concat" && encoder == "libx265" => {
+                        assert!(e.contains("not 9 in order"), "{e}");
+                    }
+                    Err(e) => panic!("{encoder} {name} {how}: {e}"),
                 }
             }
             checked += 1;
+        }
+        if have_encoder("libx264") {
+            // A raw stream refuses H.264 key frames that aren't IDR frames
+            let clip = timed_clip(&dir, "libx264", &x264_open, &[], "open.mkv");
+            let work = dir.join("work-open");
+            let tiles = work.join("tiles");
+            std::fs::create_dir_all(&tiles).unwrap();
+            let raw = Reading::Seek(Seeking::Raw);
+            let e = make_tiles(&clip.to_string_lossy(), &work, &tiles, raw, &Cancel::new())
+                .await
+                .unwrap_err();
+            assert!(e.starts_with(key_frames::NOT_ALONE), "{e}");
         }
         let _ = std::fs::remove_dir_all(&dir);
         if checked == 0 {
@@ -1316,9 +1702,10 @@ mod tests {
             .collect()
     }
 
-    /// A clip at `rate` fps for `seconds`, H.264 with a key frame every `keyint` frames, whose
-    /// left half's brightness is 16 + t / 5.5 and right half's 16 + (t mod 10) × 20, so each
-    /// frame of it looks different. `filter` is added to the source, `options` to the output.
+    /// A clip at `rate` fps for `seconds`, H.264 (or HEVC, for a name starting with `hevc`, in
+    /// x265's open GOPs) with a key frame every `keyint` frames, whose left half's brightness is
+    /// 16 + t / 5.5 and right half's 16 + (t mod 10) × 20, so each frame of it looks different.
+    /// `filter` is added to the source, `options` to the output.
     fn marked_clip(
         dir: &Path,
         name: &str,
@@ -1330,7 +1717,17 @@ mod tests {
             "nullsrc=size=320x180:rate={rate}:duration={seconds},\
              geq=lum='if(lt(X,W/2),16+T/5.5,16+mod(T,10)*20)':cb=128:cr=128{filter}"
         );
-        let params = format!("keyint={keyint}:min-keyint={keyint}:scenecut=0");
+        let x = if name.starts_with("hevc") {
+            "x265"
+        } else {
+            "x264"
+        };
+        let params = format!("keyint={keyint}:min-keyint={keyint}:scenecut=0:log-level=error");
+        let params = if x == "x264" {
+            params.replace(":log-level=error", "")
+        } else {
+            params
+        };
         let clip = dir.join(name);
         let status = std::process::Command::new("ffmpeg")
             .args([
@@ -1345,10 +1742,10 @@ mod tests {
             ])
             .args([
                 "-c:v",
-                "libx264",
+                &format!("lib{x}"),
                 "-pix_fmt",
                 "yuv420p",
-                "-x264-params",
+                &format!("-{x}-params"),
                 &params,
             ])
             .args(options)
@@ -1364,6 +1761,197 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn r3trickplay_a_damaged_raw_stream_falls_back() {
+        let test = "r3trickplay_a_damaged_raw_stream_falls_back";
+        if !have_ffmpeg(test) {
+            return;
+        }
+        if !have_encoder("libx264") {
+            eprintln!("SKIPPED {test}: ffmpeg can't encode H.264, so this test checked nothing");
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("r3trickplay-damage-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let x264 = ["-x264-params", "keyint=20:min-keyint=20:scenecut=0"];
+        let clip = timed_clip(&dir, "libx264", &x264, &[], "damaged.mkv");
+        let clip = clip.to_string_lossy();
+        let run = |name: &str| {
+            let work = dir.join(name);
+            let tiles = work.join("tiles");
+            std::fs::create_dir_all(&tiles).unwrap();
+            (work, tiles)
+        };
+        // Every key frame's slice is scrambled on its way to ffmpeg, which still hands out a
+        // frame for each
+        key_frames::DAMAGE.set(true);
+        SEEK_PAYS.set(true);
+        let (work, tiles) = run("raw");
+        let raw = make_tiles(
+            &clip,
+            &work,
+            &tiles,
+            Reading::Seek(Seeking::Raw),
+            &Cancel::new(),
+        )
+        .await
+        .unwrap_err();
+        assert!(raw.contains("ffmpeg"), "{raw}");
+        // So the video is read whole, and its tiles are the streaming pass's
+        let (work, auto) = run("auto");
+        let info = make_tiles(&clip, &work, &auto, Reading::Auto, &Cancel::new())
+            .await
+            .unwrap();
+        key_frames::DAMAGE.set(false);
+        SEEK_PAYS.set(false);
+        let (work, streamed) = run("stream");
+        let count = tile_run(&clip, &work, &streamed, true, 1, &Cancel::new())
+            .await
+            .unwrap();
+        assert_eq!(info.thumbnail_count, count);
+        assert_eq!(
+            std::fs::read(auto.join("0.jpg")).unwrap(),
+            std::fs::read(streamed.join("0.jpg")).unwrap()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A Matroska EBML number at `at`: its value (with the length marker kept, as for an
+    /// element id, when `marker`) and its length in bytes.
+    fn ebml_number(data: &[u8], at: usize, marker: bool) -> (u64, usize) {
+        let len = data[at].leading_zeros() as usize + 1;
+        let first = if marker {
+            u64::from(data[at])
+        } else {
+            u64::from(data[at]) & (0xff >> len)
+        };
+        let value = data[at + 1..at + len]
+            .iter()
+            .fold(first, |v, b| v << 8 | u64::from(*b));
+        (value, len)
+    }
+
+    /// The elements between `start` and `end`: id, offset, id and size length, body size.
+    fn ebml_children(data: &[u8], start: usize, end: usize) -> Vec<(u64, usize, usize, usize)> {
+        let mut out = Vec::new();
+        let mut at = start;
+        while at < end {
+            let (id, id_len) = ebml_number(data, at, true);
+            let (size, size_len) = ebml_number(data, at + id_len, false);
+            out.push((id, at, id_len + size_len, size as usize));
+            at += id_len + size_len + size as usize;
+        }
+        out
+    }
+
+    /// Writes a copy of the ffmpeg-made Matroska file `from` to `to` with PixelCrop top,
+    /// bottom, left and right `crop` on its video track, which ffmpeg can't write. The 16 bytes
+    /// come out of the Void element ffmpeg leaves before Info and Tracks, so the clusters and
+    /// the index keep their offsets; the SeekHead entries of Info and Tracks move with them.
+    fn with_pixel_crop(from: &Path, to: &Path, crop: [u8; 4]) {
+        let mut d = std::fs::read(from).unwrap();
+        let ids = [0x54BB_u16, 0x54AA, 0x54CC, 0x54DD];
+        let added: Vec<u8> = ids
+            .iter()
+            .zip(crop)
+            .flat_map(|(id, px)| [(id >> 8) as u8, *id as u8, 0x81, px])
+            .collect();
+        let n = added.len();
+        let find = |d: &[u8], el: (u64, usize, usize, usize), id: u64| {
+            ebml_children(d, el.1 + el.2, el.1 + el.2 + el.3)
+                .into_iter()
+                .find(|c| c.0 == id)
+                .unwrap()
+        };
+        let segment = ebml_children(&d, 0, d.len())
+            .into_iter()
+            .find(|c| c.0 == 0x1853_8067)
+            .unwrap();
+        let void = find(&d, segment, 0xEC);
+        let tracks = find(&d, segment, 0x1654_AE6B);
+        let seek_head = find(&d, segment, 0x114D_9B74);
+        let entry = find(&d, tracks, 0xAE);
+        let video = find(&d, entry, 0xE0);
+        assert!(void.1 < tracks.1 && void.3 >= n);
+        let set_size =
+            |d: &mut [u8], (id, at, head, size): (u64, usize, usize, usize), to: usize| {
+                let id_len = ebml_number(d, at, true).1;
+                let size_len = head - id_len;
+                assert_eq!(ebml_number(d, at, true).0, id);
+                let raw = (1u64 << (7 * size_len)) | (to as u64);
+                let bytes = raw.to_be_bytes();
+                d[at + id_len..at + head].copy_from_slice(&bytes[8 - size_len..]);
+                assert!(to + n >= size);
+            };
+        let video_end = video.1 + video.2 + video.3;
+        d.splice(video_end..video_end, added);
+        for el in [video, entry, tracks] {
+            set_size(&mut d, el, el.3 + n);
+        }
+        set_size(&mut d, void, void.3 - n);
+        let void_end = void.1 + void.2 + void.3;
+        d.drain(void_end - n..void_end);
+        // Seek entries: SeekID then SeekPosition, relative to the segment's body
+        for seek in ebml_children(
+            &d,
+            seek_head.1 + seek_head.2,
+            seek_head.1 + seek_head.2 + seek_head.3,
+        ) {
+            let fields = ebml_children(&d, seek.1 + seek.2, seek.1 + seek.2 + seek.3);
+            let value = |f: &(u64, usize, usize, usize)| {
+                d[f.1 + f.2..f.1 + f.2 + f.3]
+                    .iter()
+                    .fold(0u64, |v, b| v << 8 | u64::from(*b))
+            };
+            let target = fields.iter().find(|f| f.0 == 0x53AB).map(value);
+            let pos = fields.iter().find(|f| f.0 == 0x53AC).copied();
+            if let (Some(0x1549_A966 | 0x1654_AE6B), Some(pos)) = (target, pos) {
+                let moved = value(&pos) - n as u64;
+                let bytes = moved.to_be_bytes();
+                d[pos.1 + pos.2..pos.1 + pos.2 + pos.3].copy_from_slice(&bytes[8 - pos.3..]);
+            }
+        }
+        std::fs::write(to, d).unwrap();
+    }
+
+    #[tokio::test]
+    async fn r3trickplay_raw_tiles_keep_the_containers_cropping() {
+        let test = "r3trickplay_raw_tiles_keep_the_containers_cropping";
+        if !have_ffmpeg(test) {
+            return;
+        }
+        if !have_encoder("libx264") {
+            eprintln!("SKIPPED {test}: ffmpeg can't encode H.264, so this test checked nothing");
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("r3trickplay-crop-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let x264 = ["-x264-params", "keyint=20:min-keyint=20:scenecut=0"];
+        let plain = timed_clip(&dir, "libx264", &x264, &[], "plain.mkv");
+        // Odd sizes, which a 4:2:0 crop has to round the same way ffmpeg's own does
+        let cropped = dir.join("cropped.mkv");
+        with_pixel_crop(&plain, &cropped, [21, 9, 31, 40]);
+        let cropped = cropped.to_string_lossy();
+        let mut made = Vec::new();
+        for how in [Seeking::Raw, Seeking::Concat] {
+            let work = dir.join(format!("work-{how:?}"));
+            let tiles = work.join("tiles");
+            std::fs::create_dir_all(&tiles).unwrap();
+            let info = make_tiles(&cropped, &work, &tiles, Reading::Seek(how), &Cancel::new())
+                .await
+                .unwrap();
+            made.push((info, std::fs::read(tiles.join("0.jpg")).unwrap()));
+        }
+        // ffmpeg crops the file to 249 x 150, which scales to 320 x 194, not 320 x 180
+        assert_eq!((made[0].0.width, made[0].0.height), (320, 194));
+        assert_eq!(made[0].0, made[1].0);
+        assert!(
+            made[0].1 == made[1].1,
+            "the raw stream's tile is the concat demuxer's"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
     async fn r3trickplay_seeking_handles_many_tiles_late_starts_and_vfr() {
         let test = "r3trickplay_seeking_handles_many_tiles_late_starts_and_vfr";
         if !have_ffmpeg(test) {
@@ -1375,7 +1963,7 @@ mod tests {
         }
         let dir = std::env::temp_dir().join(format!("r3trickplay-seek2-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
-        let clips = [
+        let mut clips = vec![
             // 1,105 s at 1 fps: 111 thumbnails, so a full tile and one with 11
             marked_clip(&dir, "long.mkv", (1, 1105, 2), "", &[]),
             // Starts at 1,000 s, as a recording cut from a broadcast does
@@ -1395,11 +1983,23 @@ mod tests {
                 &["-fps_mode", "vfr"],
             ),
         ];
+        if have_encoder("libx265") {
+            // Open-GOP HEVC whose chosen CRA key frames are 250 frames apart: in a raw stream,
+            // each one's picture order count would be 6 below the last's, on a frame the last
+            // one's references made up, but for the rewrite (`key_frames`)
+            clips.push(marked_clip(&dir, "hevc-open.mkv", (25, 120, 50), "", &[]));
+        } else {
+            eprintln!("SKIPPED {test} for HEVC: ffmpeg can't encode with libx265");
+        }
         for clip in &clips {
             let name = clip.file_name().unwrap().to_string_lossy().into_owned();
             let clip = clip.to_string_lossy();
+            let mut readings = vec![Reading::Stream, Reading::Seek(Seeking::Raw)];
+            if !name.starts_with("hevc") {
+                readings.push(Reading::Seek(Seeking::Concat));
+            }
             let mut made = Vec::new();
-            for reading in [Reading::Stream, Reading::Seek] {
+            for reading in readings {
                 let work = dir.join(format!("work-{name}-{reading:?}"));
                 let tiles = work.join("tiles");
                 std::fs::create_dir_all(&tiles).unwrap();
@@ -1418,17 +2018,19 @@ mod tests {
                 };
                 made.push((count, thumbnail_marks(&tiles, count)));
             }
-            assert_eq!(made[0].0, made[1].0, "{name}: the same count");
-            for (k, (a, b)) in made[0].1.iter().zip(&made[1].1).enumerate() {
-                // A frame 2 s on is 40 levels brighter on the right; 10 s on, 1.8 on the left
-                assert!(
-                    (a.0 - b.0).abs() <= 1.2 && (a.1 - b.1).abs() <= 8.0,
-                    "{name}: thumbnail {k} differs: {a:?} {b:?}"
-                );
+            for (how, new) in made.iter().enumerate().skip(1) {
+                assert_eq!(made[0].0, new.0, "{name} {how}: the same count");
+                for (k, (a, b)) in made[0].1.iter().zip(&new.1).enumerate() {
+                    // A frame 2 s on is 40 levels brighter on the right; 10 s on, 1.8 on the left
+                    assert!(
+                        (a.0 - b.0).abs() <= 1.2 && (a.1 - b.1).abs() <= 8.0,
+                        "{name} {how}: thumbnail {k} differs: {a:?} {b:?}"
+                    );
+                }
             }
         }
         assert_eq!(
-            thumbnail_marks(&dir.join("work-long.mkv-Seek/tiles"), 111).len(),
+            thumbnail_marks(&dir.join("work-long.mkv-Seek(Raw)/tiles"), 111).len(),
             111
         );
         let _ = std::fs::remove_dir_all(&dir);
@@ -1526,6 +2128,155 @@ mod tests {
             .expect("the sweep runs once the job ends")
             .unwrap()
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn r3trickplay_progress_resumes_where_the_last_run_left_it() {
+        use rustyfin_db::repo_trickplay::{record_failure, save_trickplay};
+        use rustyfin_model::library::{Library, LibraryContentType};
+
+        let dir = std::env::temp_dir().join(format!("r3trickplay-progress-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let pool = rustyfin_db::init_db(dir.join("db.sqlite").to_str().unwrap())
+            .await
+            .unwrap();
+        let lib = Library {
+            id: Uuid::new_v4(),
+            name: "Films".to_string(),
+            content_type: LibraryContentType::Movies,
+            paths: vec![dir.to_string_lossy().into_owned()],
+        };
+        rustyfin_db::repo_library::create_library(&pool, &lib)
+            .await
+            .unwrap();
+        // Two made, one failed on the file as it is, one failed on an older file, one to do;
+        // none of the files is there, so the last two fail
+        let items: Vec<Uuid> = (0..5).map(|_| Uuid::new_v4()).collect();
+        for (k, id) in items.iter().enumerate() {
+            sqlx::query(
+                "INSERT INTO media_items (id, name, media_type, path, library_id, runtime_ticks)
+                 VALUES (?1, ?2, 'Movie', ?3, ?4, 600000000)",
+            )
+            .bind(id.to_string())
+            .bind(format!("Film {k}"))
+            .bind(
+                dir.join(format!("missing-{k}.mkv"))
+                    .to_string_lossy()
+                    .into_owned(),
+            )
+            .bind(lib.id.to_string())
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        let set = TrickplayInfo {
+            width: WIDTH,
+            height: 180,
+            tile_width: TILE_SIDE,
+            tile_height: TILE_SIDE,
+            thumbnail_count: 10,
+            interval: INTERVAL_MS,
+            bandwidth: 1,
+        };
+        save_trickplay(&pool, items[0], &set).await.unwrap();
+        save_trickplay(&pool, items[1], &set).await.unwrap();
+        record_failure(&pool, items[2], FAILURE_KIND, (0, 0))
+            .await
+            .unwrap();
+        record_failure(&pool, items[3], FAILURE_KIND, (1, 2))
+            .await
+            .unwrap();
+        let libs = [lib.id.to_string()];
+        let data = dir.join("data");
+
+        // A run stopped before any video starts still shows the 4 of 5 done
+        let progress = crate::task_progress::TaskProgress::new();
+        let cancel = Cancel::new();
+        cancel.cancel();
+        generate_for_libraries_with_progress(&pool, &data, &libs, &cancel, &progress)
+            .await
+            .unwrap();
+        assert_eq!(progress.get(), Some(80.0));
+
+        // A whole run ends at 100%: the older failure, counted done already, isn't counted again
+        let progress = crate::task_progress::TaskProgress::new();
+        let made =
+            generate_for_libraries_with_progress(&pool, &data, &libs, &Cancel::new(), &progress)
+                .await
+                .unwrap();
+        assert_eq!(made, 0);
+        assert_eq!(progress.get(), Some(100.0));
+        // And the next run starts there
+        let progress = crate::task_progress::TaskProgress::new();
+        generate_for_libraries_with_progress(&pool, &data, &libs, &cancel, &progress)
+            .await
+            .unwrap();
+        assert_eq!(progress.get(), Some(100.0));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn r3trickplay_a_failed_save_is_not_the_videos_failure() {
+        let test = "r3trickplay_a_failed_save_is_not_the_videos_failure";
+        if !have_ffmpeg(test) {
+            return;
+        }
+        use rustyfin_model::library::{Library, LibraryContentType};
+
+        let dir = std::env::temp_dir().join(format!("r3trickplay-save-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let clip = marked_clip(&dir, "clip.mkv", (10, 25, 20), "", &[]);
+        let pool = rustyfin_db::init_db(dir.join("db.sqlite").to_str().unwrap())
+            .await
+            .unwrap();
+        let lib = Library {
+            id: Uuid::new_v4(),
+            name: "Films".to_string(),
+            content_type: LibraryContentType::Movies,
+            paths: vec![dir.to_string_lossy().into_owned()],
+        };
+        rustyfin_db::repo_library::create_library(&pool, &lib)
+            .await
+            .unwrap();
+        let item = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO media_items (id, name, media_type, path, library_id, runtime_ticks)
+             VALUES (?1, 'Film', 'Movie', ?2, ?3, 250000000)",
+        )
+        .bind(item.to_string())
+        .bind(clip.to_string_lossy().into_owned())
+        .bind(lib.id.to_string())
+        .execute(&pool)
+        .await
+        .unwrap();
+        // The tiles are made, but the database won't take them, as when its pool timed out
+        sqlx::query(
+            "CREATE TRIGGER no_saves BEFORE INSERT ON trickplay_infos
+             BEGIN SELECT RAISE(ABORT, 'the database is down'); END",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let libs = [lib.id.to_string()];
+        let made = generate_for_libraries(&pool, &dir.join("data"), &libs, &Cancel::new())
+            .await
+            .unwrap();
+        assert_eq!(made, 0);
+        let failure = rustyfin_db::repo_trickplay::get_failure(&pool, item, FAILURE_KIND)
+            .await
+            .unwrap();
+        assert_eq!(failure, None, "a database error isn't the video's failure");
+
+        // So the next run, with the database back, makes the set
+        sqlx::query("DROP TRIGGER no_saves")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let made = generate_for_libraries(&pool, &dir.join("data"), &libs, &Cancel::new())
+            .await
+            .unwrap();
+        assert_eq!(made, 1);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
