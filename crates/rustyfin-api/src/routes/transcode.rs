@@ -1201,7 +1201,7 @@ mod tests {
         }
     }
 
-    /// Ghost Stories' streams: 1440x1080 H.264; FLAC Japanese (default) and English at 1 and 2;
+    /// Moth Stories' streams: 1440x1080 H.264; FLAC Japanese (default) and English at 1 and 2;
     /// PGS at 3, 4 and 5; SubRip at 6 (default), 7 and 8.
     fn anime() -> SourceInfo {
         SourceInfo {

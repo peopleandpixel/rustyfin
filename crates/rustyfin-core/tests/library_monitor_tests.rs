@@ -575,7 +575,7 @@ async fn a_report_of_the_library_path_turns_its_pending_units_into_one_full_scan
     ]);
     assert_eq!(queue.pending(), expected);
     assert!(
-        queue.report(&root(&films).join("Alien (1979)")).await,
+        queue.report(&root(&films).join("Alderlune (1979)")).await,
         "a report that the pending full scan takes in"
     );
     assert_eq!(queue.pending(), expected);
@@ -877,7 +877,7 @@ async fn the_default_runner_rescans_the_reported_folder() {
     scanner::scan_library(&fx.pool, &lib).await.unwrap();
     scanner::wait_for_idle().await;
     touch(&films, "Ronin (1998)/Ronin (1998).mkv");
-    touch(&films, "Alien (1979)/Alien (1979).mkv");
+    touch(&films, "Alderlune (1979)/Alderlune (1979).mkv");
 
     let queue = ChangeQueue::new(fx.pool.clone());
     queue.set_delay(Duration::ZERO);
@@ -949,13 +949,13 @@ async fn a_path_reported_in_another_case_rescans_the_folder_by_its_name_on_disk(
         .library("b18 casefold films", LibraryContentType::Movies, &["films"])
         .await;
     let films = root(&lib);
-    touch(&films, "The Matrix (1999)/The Matrix (1999).mkv");
+    touch(&films, "The Meridian (1999)/The Meridian (1999).mkv");
     scanner::scan_library(&fx.pool, &lib).await.unwrap();
     scanner::wait_for_idle().await;
     let before = stored_movies(&fx, &lib).await;
     assert_eq!(before.len(), 1, "{before:?}");
-    let on_disk = ScanScope::Folder(films.join("The Matrix (1999)"));
-    let reported = films.join("the matrix (1999)/The Matrix (1999).mkv");
+    let on_disk = ScanScope::Folder(films.join("The Meridian (1999)"));
+    let reported = films.join("the meridian (1999)/The Meridian (1999).mkv");
 
     let monitor = ChangeQueue::new(fx.pool.clone());
     monitor.set_delay(Duration::ZERO);
@@ -987,7 +987,7 @@ async fn a_path_reported_in_another_case_rescans_the_folder_by_its_name_on_disk(
     let rec = Arc::new(Recorder::default());
     let recorded = queue(&fx, &rec, Duration::ZERO);
     assert!(recorded.report(&reported).await);
-    assert!(recorded.report(&films.join("THE MATRIX (1999)")).await);
+    assert!(recorded.report(&films.join("THE MERIDIAN (1999)")).await);
     let calls = rec.wait_for(2).await;
     for call in calls {
         assert_eq!((call.library, call.scope), (lib.id, on_disk.clone()));

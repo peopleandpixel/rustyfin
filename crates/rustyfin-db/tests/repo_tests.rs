@@ -905,9 +905,9 @@ async fn r1play_versions_list_the_items_own_file_first() {
     )
     .bind(item_id.to_string())
     .bind(lib.id.to_string())
-    .bind("Alien")
+    .bind("Alderlune")
     .bind("Movie")
-    .bind("/media/Alien 1080p.mp4")
+    .bind("/media/Alderlune 1080p.mp4")
     .execute(&pool)
     .await
     .unwrap();
@@ -949,10 +949,10 @@ async fn r1play_versions_list_the_items_own_file_first() {
     };
     // Stored in the "wrong" order: the narrowest, the widest, then the item's own file
     for s in [
-        source("/media/Alien 720p.mkv", 1280, &["video", "audio"]),
-        source("/media/Alien 2160p.mkv", 3840, &["video", "audio"]),
+        source("/media/Alderlune 720p.mkv", 1280, &["video", "audio"]),
+        source("/media/Alderlune 2160p.mkv", 3840, &["video", "audio"]),
         source(
-            "/media/Alien 1080p.mp4",
+            "/media/Alderlune 1080p.mp4",
             1920,
             &["video", "audio", "subtitle", "attachment"],
         ),
@@ -962,9 +962,9 @@ async fn r1play_versions_list_the_items_own_file_first() {
             .unwrap();
     }
     let want = [
-        "/media/Alien 1080p.mp4",
-        "/media/Alien 2160p.mkv",
-        "/media/Alien 720p.mkv",
+        "/media/Alderlune 1080p.mp4",
+        "/media/Alderlune 2160p.mkv",
+        "/media/Alderlune 720p.mkv",
     ];
     let paths = |sources: &[rustyfin_model::media_source::MediaSourceResponse]| {
         sources.iter().map(|s| s.path.clone()).collect::<Vec<_>>()
@@ -1154,14 +1154,14 @@ async fn test_filtered_query_with_name_starts_with() {
         .unwrap();
 
     let items_data = [
-        (Uuid::new_v4(), "Alien", "Alien"),
+        (Uuid::new_v4(), "Alderlune", "Alderlune"),
         (Uuid::new_v4(), "Avatar", "Avatar"),
-        (Uuid::new_v4(), "Blade Runner", "Blade Runner"),
-        (Uuid::new_v4(), "The Matrix", "Matrix, The"),
+        (Uuid::new_v4(), "Brass Lantern", "Brass Lantern"),
+        (Uuid::new_v4(), "The Meridian", "Meridian, The"),
         (
             Uuid::new_v4(),
-            "2001: A Space Odyssey",
-            "2001: A Space Odyssey",
+            "2001: A Copper Orbit",
+            "2001: A Copper Orbit",
         ),
     ];
 
@@ -1220,7 +1220,7 @@ async fn test_filtered_query_with_name_starts_with() {
     assert_eq!(total_a, 2);
     assert_eq!(items_a.len(), 2);
 
-    // Filter by 'M' (matches "The Matrix" via sort_name)
+    // Filter by 'M' (matches "The Meridian" via sort_name)
     let (items_m, total_m) = rustyfin_db::repo_media::get_items_filtered(
         &pool,
         None,
@@ -1258,9 +1258,9 @@ async fn test_filtered_query_with_name_starts_with() {
     .unwrap();
 
     assert_eq!(total_m, 1);
-    assert_eq!(items_m[0].name, "The Matrix");
+    assert_eq!(items_m[0].name, "The Meridian");
 
-    // Filter by '#' (matches numbers / symbols like "2001: A Space Odyssey")
+    // Filter by '#' (matches numbers / symbols like "2001: A Copper Orbit")
     let (items_hash, total_hash) = rustyfin_db::repo_media::get_items_filtered(
         &pool,
         None,
@@ -1298,7 +1298,7 @@ async fn test_filtered_query_with_name_starts_with() {
     .unwrap();
 
     assert_eq!(total_hash, 1);
-    assert_eq!(items_hash[0].name, "2001: A Space Odyssey");
+    assert_eq!(items_hash[0].name, "2001: A Copper Orbit");
 }
 
 // ── J5: genres, studios, years ──
@@ -1680,7 +1680,7 @@ async fn j5_years_are_positive_production_years_and_studios_come_from_item_studi
     let shows = j5_library(pool, "J5 Shows", LibraryContentType::TvShows).await;
     let up = j5_item(pool, films, None, "Up", "Movie", "", Some(2009)).await;
     let coco = j5_item(pool, films, None, "Coco", "Movie", "", Some(2017)).await;
-    j5_item(pool, films, None, "Matrix", "Movie", "", Some(1999)).await;
+    j5_item(pool, films, None, "Meridian", "Movie", "", Some(1999)).await;
     j5_item(pool, films, None, "Beowulf", "Movie", "", Some(800)).await;
     j5_item(pool, films, None, "Undated", "Movie", "", None).await;
     j5_item(pool, films, None, "Zero", "Movie", "", Some(0)).await;
@@ -2602,8 +2602,8 @@ async fn r3sortname_an_edit_during_a_refresh_keeps_its_sort_name() {
     rustyfin_db::repo_library::create_library(&db.pool, &lib)
         .await
         .unwrap();
-    let mut item = make_movie(lib.id, "Matrix");
-    item.sort_name = Some("matrix".to_string());
+    let mut item = make_movie(lib.id, "Meridian");
+    item.sort_name = Some("meridian".to_string());
     rustyfin_db::repo_media::upsert_media_item(&db.pool, &item)
         .await
         .unwrap();
@@ -2620,15 +2620,15 @@ async fn r3sortname_an_edit_during_a_refresh_keeps_its_sort_name() {
     // The refresh reads the item and finds a new title
     let read = get(item.id).await;
     let mut refreshed = read.clone();
-    refreshed.name = "The Matrix".to_string();
-    refreshed.sort_name = Some("matrix".to_string());
+    refreshed.name = "The Meridian".to_string();
+    refreshed.sort_name = Some("meridian".to_string());
     refreshed.overview = Some("A hacker learns the truth.".to_string());
 
     // Meanwhile the editor forces a sort name, as POST /Items/{id} saves it
     let edit_read = get(item.id).await;
     let mut edited = edit_read.clone();
-    edited.sort_name = Some("matrix, the 0000000001".to_string());
-    rustyfin_db::repo_media::set_forced_sort_name(&db.pool, item.id, Some("Matrix, The 1"))
+    edited.sort_name = Some("meridian, the 0000000001".to_string());
+    rustyfin_db::repo_media::set_forced_sort_name(&db.pool, item.id, Some("Meridian, The 1"))
         .await
         .unwrap();
     let written = rustyfin_db::repo_media::save_refresh_changes(&db.pool, &edit_read, &edited)
@@ -2641,8 +2641,8 @@ async fn r3sortname_an_edit_during_a_refresh_keeps_its_sort_name() {
         .unwrap();
     assert_eq!(written, ["overview"]);
     let after = get(item.id).await;
-    assert_eq!(after.name, "Matrix");
-    assert_eq!(after.sort_name.as_deref(), Some("matrix, the 0000000001"));
+    assert_eq!(after.name, "Meridian");
+    assert_eq!(after.sort_name.as_deref(), Some("meridian, the 0000000001"));
     assert_eq!(
         after.overview.as_deref(),
         Some("A hacker learns the truth.")
@@ -2652,17 +2652,17 @@ async fn r3sortname_an_edit_during_a_refresh_keeps_its_sort_name() {
     // does not undo the new name
     let read = get(item.id).await;
     let mut refreshed = read.clone();
-    refreshed.name = "The Matrix".to_string();
+    refreshed.name = "The Meridian".to_string();
     rustyfin_db::repo_media::save_refresh_changes(&db.pool, &read, &refreshed)
         .await
         .unwrap();
     let mut stale_edit = read.clone();
-    stale_edit.sort_name = Some("matrix".to_string());
+    stale_edit.sort_name = Some("meridian".to_string());
     let written = rustyfin_db::repo_media::save_refresh_changes(&db.pool, &read, &stale_edit)
         .await
         .unwrap();
     assert!(written.is_empty());
-    assert_eq!(get(item.id).await.name, "The Matrix");
+    assert_eq!(get(item.id).await.name, "The Meridian");
 }
 
 // ── B20: one-time setup codes ──
@@ -2886,9 +2886,9 @@ async fn b32_both_upserts_and_the_item_reads_keep_a_season_virtual() {
         .unwrap();
     let series = MediaItem {
         id: Uuid::new_v4(),
-        name: "One Night".to_string(),
+        name: "Owl Hollow".to_string(),
         media_type: MediaType::Series,
-        path: "/media/tv/One Night (2023)".to_string(),
+        path: "/media/tv/Owl Hollow (2023)".to_string(),
         library_id: lib.id,
         ..MediaItem::default_dto_fields()
     };

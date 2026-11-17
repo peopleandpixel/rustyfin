@@ -679,7 +679,7 @@ pub fn downmix_filter(algorithm: &str, channels: u32) -> Option<&'static str> {
 }
 
 /// The audio filters of a downmix of `source_channels` to `output_channels`: the algorithm's
-/// matrix, then the volume boost, as Jellyfin adds them when it downmixes to stereo. Empty when
+/// matrix and then the volume boost, as Jellyfin adds them when it downmixes to stereo. Empty when
 /// there is no downmix to stereo.
 pub fn downmix_filters(
     settings: &EncodingSettings,

@@ -5903,7 +5903,7 @@ async fn b152_a_card_index_has_only_what_a_card_shows() {
     );
 }
 
-// R3 sort names: "The Matrix" sorts and files under M, as in Jellyfin
+// R3 sort names: "The Meridian" sorts and files under M, as in Jellyfin
 
 #[tokio::test]
 async fn r3sortname_items_sort_and_filter_by_jellyfins_sort_name() {
@@ -5920,7 +5920,14 @@ async fn r3sortname_items_sort_and_filter_by_jellyfins_sort_name() {
         .unwrap();
     // Stored as before 094: the lowercased name
     let mut ids = HashMap::new();
-    for name in ["Nemo", "The Matrix", "Lion", "28 Days", "Zodiac", "Theory"] {
+    for name in [
+        "Nemo",
+        "The Meridian",
+        "Lion",
+        "28 Days",
+        "Zodiac",
+        "Theory",
+    ] {
         let id = uuid::Uuid::new_v4();
         sqlx::query(
             "INSERT INTO media_items (id, library_id, name, sort_name, media_type, path) \
@@ -5969,20 +5976,27 @@ async fn r3sortname_items_sort_and_filter_by_jellyfins_sort_name() {
     let body = list(String::new()).await;
     assert_eq!(
         names(&body),
-        ["28 Days", "Lion", "The Matrix", "Nemo", "Theory", "Zodiac"]
+        [
+            "28 Days",
+            "Lion",
+            "The Meridian",
+            "Nemo",
+            "Theory",
+            "Zodiac"
+        ]
     );
-    let matrix = body["Items"]
+    let meridian = body["Items"]
         .as_array()
         .unwrap()
         .iter()
-        .find(|item| item["Name"] == "The Matrix")
+        .find(|item| item["Name"] == "The Meridian")
         .unwrap();
-    assert_eq!(matrix["SortName"], "matrix");
+    assert_eq!(meridian["SortName"], "meridian");
     // The letters go by the sort name only, as in Jellyfin; '#' holds what starts with no letter,
     // and Z holds Zodiac
     assert_eq!(
         names(&list("&NameStartsWith=M".into()).await),
-        ["The Matrix"]
+        ["The Meridian"]
     );
     assert_eq!(names(&list("&NameStartsWith=T".into()).await), ["Theory"]);
     assert_eq!(
@@ -5997,14 +6011,14 @@ async fn r3sortname_items_sort_and_filter_by_jellyfins_sort_name() {
 
     // The editor's forced sort name is returned as written and sorts the item; clearing it
     // brings the automatic one back
-    let matrix_id = ids["The Matrix"];
+    let meridian_id = ids["The Meridian"];
     let save = |body: serde_json::Value| {
         let (app, admin) = (app.clone(), admin.clone());
         async move {
             let (status, text) = send_authed(
                 &app,
                 "POST",
-                &format!("/Items/{matrix_id}"),
+                &format!("/Items/{meridian_id}"),
                 &admin,
                 Some(&body.to_string()),
             )
@@ -6012,33 +6026,33 @@ async fn r3sortname_items_sort_and_filter_by_jellyfins_sort_name() {
             assert_eq!(status, StatusCode::NO_CONTENT, "{text}");
         }
     };
-    save(serde_json::json!({"ForcedSortName": "Zzz Matrix"})).await;
+    save(serde_json::json!({"ForcedSortName": "Zzz Meridian"})).await;
     let (status, item) =
-        send_authed(&app, "GET", &format!("/Items/{matrix_id}"), &admin, None).await;
+        send_authed(&app, "GET", &format!("/Items/{meridian_id}"), &admin, None).await;
     assert_eq!(status, StatusCode::OK, "{item}");
-    assert_eq!(item["ForcedSortName"], "Zzz Matrix");
-    assert_eq!(item["SortName"], "zzz matrix");
+    assert_eq!(item["ForcedSortName"], "Zzz Meridian");
+    assert_eq!(item["SortName"], "zzz meridian");
     assert_eq!(
         names(&list(String::new()).await).last().unwrap(),
-        "The Matrix"
+        "The Meridian"
     );
     // A rescan's save keeps it
-    let mut rescanned = rustyfin_db::repo_media::get_item_by_id(&state.db, matrix_id)
+    let mut rescanned = rustyfin_db::repo_media::get_item_by_id(&state.db, meridian_id)
         .await
         .unwrap()
         .unwrap();
-    rescanned.sort_name = Some("matrix".to_string());
+    rescanned.sort_name = Some("meridian".to_string());
     rustyfin_db::repo_media::upsert_media_item(&state.db, &rescanned)
         .await
         .unwrap();
     assert_eq!(
         names(&list(String::new()).await).last().unwrap(),
-        "The Matrix"
+        "The Meridian"
     );
     save(serde_json::json!({"ForcedSortName": ""})).await;
-    let (_, item) = send_authed(&app, "GET", &format!("/Items/{matrix_id}"), &admin, None).await;
+    let (_, item) = send_authed(&app, "GET", &format!("/Items/{meridian_id}"), &admin, None).await;
     assert!(item["ForcedSortName"].is_null(), "{item}");
-    assert_eq!(item["SortName"], "matrix");
+    assert_eq!(item["SortName"], "meridian");
 }
 
 /// The sort lists round-trip through /System/Configuration, and saving other ones makes the
@@ -6898,7 +6912,7 @@ async fn b30_p6_terms_the_index_cannot_parse_still_find_by_name() {
     let state = test_state().await;
     let (token, lib) = b27_seed(&state).await;
     b27_add_item(&state, lib, "Star Trek: Discovery", "Series").await;
-    b27_add_item(&state, lib, "Mr. Robot", "Series").await;
+    b27_add_item(&state, lib, "Mr. Lantern", "Series").await;
     let app = app(state);
 
     // The index reads "Trek:" as a column and rejects "Mr.", so these go by name.
@@ -6907,7 +6921,7 @@ async fn b30_p6_terms_the_index_cannot_parse_still_find_by_name() {
             "Star%20Trek%3A%20Discovery",
             "Star Trek: Discovery (Series)",
         ),
-        ("Mr.%20Robot", "Mr. Robot (Series)"),
+        ("Mr.%20Lantern", "Mr. Lantern (Series)"),
     ] {
         let search = format!("/Search?Term={term}&IncludeItemTypes=Series");
         assert_eq!(b27_found(&app, &search, &token).await, [found]);
@@ -8299,7 +8313,7 @@ async fn j6_hints_survive_odd_terms() {
     let state = test_state().await;
     let lib = j6_seed(&state).await;
     j6_add_item(&state, lib.library, None, "Amélie", "Movie").await;
-    j6_add_item(&state, lib.library, None, "東京物語", "Movie").await;
+    j6_add_item(&state, lib.library, None, "東京灯台", "Movie").await;
     let app = app(state);
 
     // A term that cleans to nothing finds nothing, as in SqlSearchProvider.
@@ -8339,7 +8353,7 @@ async fn j6_hints_survive_odd_terms() {
             &lib.token
         )
         .await,
-        ["東京物語 (Movie)"]
+        ["東京灯台 (Movie)"]
     );
 }
 
@@ -35053,9 +35067,9 @@ async fn b23_comma_lists_apply_in_order_on_both_item_lists() {
 #[tokio::test]
 async fn b23_toolbar_sorts_reverse_exactly_and_page_stably() {
     let state = test_state().await;
-    let dune = |name, year| B23Item {
+    let drift = |name, year| B23Item {
         name,
-        sort_name: "dune",
+        sort_name: "drift",
         media_type: "Movie",
         year,
         added: "2021-03-01T10:00:00+00:00",
@@ -35063,10 +35077,10 @@ async fn b23_toolbar_sorts_reverse_exactly_and_page_stably() {
     };
     let mut items = b23_movies();
     items.extend([
-        dune("Dune", Some(2021)),
-        dune("Dune", Some(2021)),
-        dune("DUNE", None),
-        dune("Dune", Some(1984)),
+        drift("Drift", Some(2021)),
+        drift("Drift", Some(2021)),
+        drift("DRIFT", None),
+        drift("Drift", Some(1984)),
     ]);
     let movies = rustyfin_model::library::LibraryContentType::Movies;
     let (token, _, ids) = b23_library(&state, movies, &items).await;
