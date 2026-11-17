@@ -12,7 +12,7 @@
 //! at the files in that part, the folders in it and the folders above it, and deletes only folders
 //! in that part.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use rustyfin_db::repo_media::PathScope;
@@ -52,16 +52,43 @@ pub struct FolderPlan {
 /// Plans the folders of a library with these `roots`, from its `files` (id, path, parent folder's
 /// path today) and its stored `folders` (id, path, parent folder's path today). Only a folder that
 /// `deletable` accepts is deleted when no file needs it; any other is left as it is.
+///
+/// As Jellyfin 12.4 resolves a mixed library (`MovieResolver.FindMovie`), a folder that holds one
+/// movie (an id in `movies`) and nothing else, here or below, is that movie rather than a folder:
+/// it gets no Folder item, and the movie is listed in the folder above.
 pub fn plan_folders(
     roots: &[PathBuf],
     files: &[(String, PathBuf, Option<PathBuf>)],
     folders: &[(String, PathBuf, Option<PathBuf>)],
+    movies: &HashSet<String>,
     deletable: impl Fn(&Path) -> bool,
 ) -> FolderPlan {
+    // The folders that stand for their movie: each holds exactly one item, a movie, and no file
+    // is below it
+    let mut direct: HashMap<PathBuf, (usize, bool)> = HashMap::new();
+    let mut deeper: HashSet<PathBuf> = HashSet::new();
+    for (id, path, _) in files {
+        let Some(holder) = holding_folder(roots, path) else {
+            continue;
+        };
+        let entry = direct.entry(holder.clone()).or_insert((0, true));
+        entry.0 += 1;
+        entry.1 &= movies.contains(id);
+        let mut dir = holding_folder(roots, &holder);
+        while let Some(folder) = dir {
+            dir = holding_folder(roots, &folder);
+            deeper.insert(folder);
+        }
+    }
+    let movie_folder = |dir: &PathBuf| direct.get(dir) == Some(&(1, true)) && !deeper.contains(dir);
+
     let mut wanted: BTreeSet<PathBuf> = BTreeSet::new();
     let mut plan = FolderPlan::default();
     for (id, path, parent) in files {
-        let holder = holding_folder(roots, path);
+        let mut holder = holding_folder(roots, path);
+        if holder.as_ref().is_some_and(movie_folder) {
+            holder = holder.and_then(|dir| holding_folder(roots, &dir));
+        }
         let mut dir = holder.clone();
         while let Some(folder) = dir {
             dir = holding_folder(roots, &folder);
@@ -100,12 +127,13 @@ pub fn plan_folders(
 type Row = (String, PathBuf, Option<PathBuf>);
 
 /// The library's files and folders that a pass over `scope` reads, in one query: the items in
-/// scope, and the folders above it. Each is (id, path, path of the item it points at).
+/// scope, and the folders above it. Each is (id, path, path of the item it points at). The ids of
+/// the files that are movies come third.
 async fn rows(
     pool: &SqlitePool,
     library: &Library,
     scope: &PathScope,
-) -> Result<(Vec<Row>, Vec<Row>), sqlx::Error> {
+) -> Result<(Vec<Row>, Vec<Row>, HashSet<String>), sqlx::Error> {
     let types = crate::scan_sync::scanned_types(&library.content_type);
     let rows: Vec<(String, String, String, Option<String>)> =
         sqlx::query_as(sqlx::AssertSqlSafe(format!(
@@ -120,8 +148,11 @@ async fn rows(
         .bind(scope.param())
         .fetch_all(pool)
         .await?;
-    let (mut files, mut folders) = (Vec::new(), Vec::new());
+    let (mut files, mut folders, mut movies) = (Vec::new(), Vec::new(), HashSet::new());
     for (id, path, kind, parent) in rows {
+        if kind == "Movie" {
+            movies.insert(id.clone());
+        }
         let row = (id, PathBuf::from(path), parent.map(PathBuf::from));
         if kind == "Folder" {
             folders.push(row);
@@ -129,7 +160,7 @@ async fn rows(
             files.push(row);
         }
     }
-    Ok((files, folders))
+    Ok((files, folders, movies))
 }
 
 /// A folder's id: a UUID v5 of its path, in the namespace of its library's id
@@ -152,9 +183,9 @@ pub async fn sync_folders(
         .iter()
         .map(|p| PathBuf::from(p.trim_end_matches('/')))
         .collect();
-    let (files, folders) = rows(pool, library, scope).await?;
+    let (files, folders, movies) = rows(pool, library, scope).await?;
     // The files directly in a library path have no folder: a pass over them deletes none
-    let plan = plan_folders(&roots, &files, &folders, |path| match scope {
+    let plan = plan_folders(&roots, &files, &folders, &movies, |path| match scope {
         PathScope::All => true,
         PathScope::Under(_) => scope.contains(&path.to_string_lossy()),
         PathScope::DirectlyIn(_) => false,
@@ -235,7 +266,7 @@ mod tests {
             file("c", "/lib/Trips/y.mp4", None),
             file("d", "/more/Family/z.jpg", None),
         ];
-        let plan = plan_folders(&roots, &files, &[], |_| true);
+        let plan = plan_folders(&roots, &files, &[], &HashSet::new(), |_| true);
         assert_eq!(
             plan.add,
             [p("/lib/Trips"), p("/lib/Trips/2024"), p("/more/Family")]
@@ -265,7 +296,7 @@ mod tests {
             file("f3", "/lib/Old", None),
             file("f4", "/lib/Old/Deeper", Some("/lib/Old")),
         ];
-        let plan = plan_folders(&roots, &files, &folders, |_| true);
+        let plan = plan_folders(&roots, &files, &folders, &HashSet::new(), |_| true);
         assert!(plan.add.is_empty());
         assert_eq!(
             plan.move_to,
@@ -283,9 +314,45 @@ mod tests {
             &[p("/lib")],
             &[file("a", "/elsewhere/x/y.jpg", None)],
             &[],
+            &HashSet::new(),
             |_| true,
         );
         assert_eq!(plan, FolderPlan::default());
+    }
+
+    #[test]
+    fn a_folder_holding_one_movie_is_that_movie() {
+        // As Jellyfin 12.4 resolves a mixed library: Film/ holds one movie and is the movie;
+        // Two/ holds two movies, and Mixed/ a movie and a photo, so both are folders; Old/ held
+        // nothing but its movie, so its stored Folder goes
+        let roots = [p("/lib")];
+        let files = [
+            file("m1", "/lib/Film (2001)/Film (2001).mkv", None),
+            file("m2", "/lib/Two/a.mkv", None),
+            file("m3", "/lib/Two/b.mkv", None),
+            file("m4", "/lib/Mixed/c.mkv", None),
+            file("p1", "/lib/Mixed/d.jpg", None),
+            file("m5", "/lib/Old/e.mkv", Some("/lib/Old")),
+            file("m6", "/lib/Shelf/Inner (2003)/f.mkv", None),
+        ];
+        let folders = [file("f1", "/lib/Old", None)];
+        let movies: HashSet<String> = ["m1", "m2", "m3", "m4", "m5", "m6"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let plan = plan_folders(&roots, &files, &folders, &movies, |_| true);
+        assert_eq!(plan.add, [p("/lib/Mixed"), p("/lib/Shelf"), p("/lib/Two")]);
+        assert_eq!(plan.delete, ["f1"]);
+        let moved: HashMap<String, Option<PathBuf>> = plan.move_to.into_iter().collect();
+        assert_eq!(moved.get("m1"), None, "stays at the top");
+        assert_eq!(moved["m5"], None, "moves up to the top");
+        assert_eq!(moved["m2"], Some(p("/lib/Two")));
+        assert_eq!(moved["m4"], Some(p("/lib/Mixed")));
+        assert_eq!(
+            moved["m6"],
+            Some(p("/lib/Shelf")),
+            "its own folder stands for it"
+        );
     }
 
     #[test]
@@ -296,7 +363,7 @@ mod tests {
             file("f2", "/lib/Trips/2024", Some("/lib/Trips")),
         ];
         let scope = PathScope::Under("/lib/Trips/2024".to_string());
-        let plan = plan_folders(&[p("/lib")], &[], &folders, |path| {
+        let plan = plan_folders(&[p("/lib")], &[], &folders, &HashSet::new(), |path| {
             scope.contains(&path.to_string_lossy())
         });
         assert_eq!(plan.delete, ["f2"]);
