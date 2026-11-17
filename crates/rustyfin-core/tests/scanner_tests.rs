@@ -4435,15 +4435,22 @@ async fn r1scan_metadata_refresh_upgrades_identified_items_by_id() {
             .map(|r| r.end_time_utc);
         assert!(sched.start_task(TASK_METADATA_REFRESH).await);
         let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+        let mut started = tokio::time::Instant::now();
         loop {
-            let ended = sched
-                .get_task(TASK_METADATA_REFRESH)
-                .await
-                .unwrap()
-                .last_execution_result
-                .map(|r| r.end_time_utc);
+            let task = sched.get_task(TASK_METADATA_REFRESH).await.unwrap();
+            let ended = task.last_execution_result.map(|r| r.end_time_utc);
             if ended.is_some() && ended != before {
                 break;
+            }
+            // The previous run records its result before it lets go of the task, so a start
+            // right after it can be skipped as "running already": still idle a second later with
+            // no new result means it was, and it is started again
+
+            if task.state == rustyfin_model::scheduled_task::TaskState::Idle
+                && started.elapsed() > Duration::from_secs(1)
+            {
+                assert!(sched.start_task(TASK_METADATA_REFRESH).await);
+                started = tokio::time::Instant::now();
             }
             assert!(
                 tokio::time::Instant::now() < deadline,
