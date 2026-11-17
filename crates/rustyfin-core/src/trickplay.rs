@@ -844,7 +844,7 @@ struct Vaapi {
     codecs: Vec<String>,
     hevc_10bit: bool,
     failures: std::sync::atomic::AtomicUsize,
-    /// The variables that give the driver its cache folder (`driver_env`).
+    /// The variables that give the driver its cache folder (`hwaccel::ffmpeg_env`).
     env: Vec<(&'static str, PathBuf)>,
 }
 
@@ -870,7 +870,7 @@ impl TileDecoding {
                 codecs: settings.hardware_decoding_codecs,
                 hevc_10bit: settings.enable_decoding_color_depth_10_hevc,
                 failures: Default::default(),
-                env: crate::driver_env::vars(data_dir),
+                env: crate::hwaccel::ffmpeg_env(data_dir).to_vec(),
             })),
         }
     }
