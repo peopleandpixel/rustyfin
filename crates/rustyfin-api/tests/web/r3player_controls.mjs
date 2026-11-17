@@ -41,6 +41,7 @@ function sandbox(heads, globals = {}, prelude = '') {
         t: (key, opts) => (opts ? `${key}|${JSON.stringify(opts)}` : key),
         $: id => (elements[id] ||= element()),
         formatDurationSeconds: s => `${Math.floor(s / 60)}:${String(Math.floor(s % 60)).padStart(2, '0')}`,
+        setNativeNowPlaying: () => {},
         setTimeout: fn => { timers.push(fn); return timers.length; },
         clearTimeout: () => {},
         API: { base: 'http://srv', token: 'tok', imageUrl: (id, type, o) => `/Items/${id}/Images/${type}?maxHeight=${o.maxHeight}&tag=${o.tag}` },

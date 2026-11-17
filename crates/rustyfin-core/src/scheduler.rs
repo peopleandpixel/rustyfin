@@ -28,6 +28,8 @@ pub const TASK_CHAPTER_IMAGES: &str = "RefreshChapterImages";
 /// Jellyfin's key for its trickplay task.
 pub const TASK_TRICKPLAY: &str = "RefreshTrickplayImages";
 pub const TASK_CLEAN_ACTIVITY_LOG: &str = "CleanActivityLog";
+/// Jellyfin's key for its TMDb upcoming and missing episodes task.
+pub const TASK_MISSING_EPISODES: &str = crate::missing_episodes::TASK_KEY;
 
 /// Jellyfin's default `ActivityLogRetentionDays`.
 const DEFAULT_ACTIVITY_LOG_RETENTION_DAYS: u32 = 30;
@@ -102,6 +104,9 @@ pub struct TaskScheduler {
     /// of the state as it is once the lock is taken, so the last save is never an older state.
     saving_triggers: Arc<tokio::sync::Mutex<()>>,
     saving_results: Arc<tokio::sync::Mutex<()>>,
+    /// The tasks an admin stopped. A library scan's end doesn't start them again; their next
+    /// trigger or a start by hand does, as a cancelled task in Jellyfin waits for its trigger.
+    held: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
 }
 
 /// A task's claim on running, from `TaskScheduler::claim` until it is dropped.
@@ -439,6 +444,28 @@ impl TaskScheduler {
             },
         );
 
+        // Jellyfin 12.4's TMDb upcoming and missing episodes task
+        tasks.insert(
+            TASK_MISSING_EPISODES.to_string(),
+            TaskEntry {
+                info: ScheduledTaskInfo {
+                    id: TASK_MISSING_EPISODES.to_string(),
+                    key: TASK_MISSING_EPISODES.to_string(),
+                    is_hidden: false,
+                    name: crate::missing_episodes::TASK_NAME.to_string(),
+                    description: crate::missing_episodes::TASK_DESCRIPTION.to_string(),
+                    category: "Library".to_string(),
+                    state: TaskState::Idle,
+                    current_progress_percentage: None,
+                    // MissingEpisodeRefreshIntervalDays' default
+                    triggers: vec![TaskTriggerInfo::interval(
+                        crate::missing_episodes::DEFAULT_INTERVAL_DAYS as u64 * TICKS_24H,
+                    )],
+                    last_execution_result: None,
+                },
+            },
+        );
+
         let progress = tasks
             .keys()
             .map(|id| (id.clone(), TaskProgress::new()))
@@ -476,6 +503,7 @@ impl TaskScheduler {
             running: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
             saving_triggers: Arc::default(),
             saving_results: Arc::default(),
+            held: Arc::default(),
         }
     }
 
@@ -596,8 +624,30 @@ impl TaskScheduler {
         Ok(true)
     }
 
+    /// Whether an admin stopped task `id` since its triggers or a start by hand last ran it.
+    fn is_held(&self, id: &str) -> bool {
+        self.held
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(id)
+    }
+
+    /// Lets a scan's end start task `id` again.
+    fn release(&self, id: &str) {
+        self.held
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(id);
+    }
+
     /// Start a task manually (returns true if task exists)
     pub async fn start_task(&self, id: &str) -> bool {
+        self.release(id);
+        self.start_run(id).await
+    }
+
+    /// Starts a run of task `id` in the background; false for an unknown task.
+    async fn start_run(&self, id: &str) -> bool {
         let tasks = self.tasks.read().await;
         if tasks.contains_key(id) {
             drop(tasks);
@@ -632,6 +682,10 @@ impl TaskScheduler {
                     let sched = self.clone();
                     tokio::spawn(async move { sched.run_clean_activity_log().await });
                 }
+                TASK_MISSING_EPISODES => {
+                    let sched = self.clone();
+                    tokio::spawn(async move { sched.run_missing_episodes().await });
+                }
                 _ => {}
             }
             true
@@ -640,8 +694,21 @@ impl TaskScheduler {
         }
     }
 
-    /// Stop a running task (sets state to Idle)
+    /// Stops a running task at an admin's request. A library scan's end then doesn't start it
+    /// again until its triggers or a start by hand run it.
     pub async fn stop_task(&self, id: &str) -> bool {
+        let stopped = self.stop_run(id).await;
+        if stopped {
+            self.held
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(id.to_string());
+        }
+        stopped
+    }
+
+    /// Stops a running task (an image task winds down as Cancelling, the others go Idle).
+    async fn stop_run(&self, id: &str) -> bool {
         // An image task stops between videos and kills the ffmpeg it runs; it shows Cancelling,
         // as in Jellyfin, until it has wound down. The run is looked up and marked under the
         // tasks lock, as its start and end change them, so a run that has just ended stays Idle.
@@ -763,6 +830,63 @@ impl TaskScheduler {
 
     /// Deletes the activity log entries older than the retention age. A retention of 0 keeps
     /// every entry.
+    /// Creates and prunes the virtual (unaired and missing) episodes, as the TMDb plugin's
+    /// settings say (Jellyfin 12.4's TmdbRefreshUpcomingEpisodes).
+    async fn run_missing_episodes(&self) {
+        use crate::missing_episodes::{Settings, Source, TMDB_PLUGIN_ID};
+        let Some(_claim) = self.claim(TASK_MISSING_EPISODES) else {
+            return skipped(TASK_MISSING_EPISODES);
+        };
+        self.set_task_state(TASK_MISSING_EPISODES, TaskState::Running)
+            .await;
+        let start = Utc::now();
+        let progress = self.progress_of(TASK_MISSING_EPISODES);
+        let config = self.plugin_manager.get_configuration(TMDB_PLUGIN_ID).await;
+        let settings = Settings::from_config(config.as_ref().map(|c| &c.values));
+        let providers = self.plugin_manager.metadata_providers().await;
+        let source = providers
+            .iter()
+            .find(|p| p.plugin_id == TMDB_PLUGIN_ID)
+            .and_then(|p| {
+                Some(Source {
+                    lookups: p.lookups.as_deref()?,
+                    provider_name: &p.provider_name,
+                })
+            });
+        let report = |share: f64| progress.report(share);
+        let outcome = crate::missing_episodes::run(
+            &self.db,
+            source,
+            &settings,
+            Utc::now().date_naive(),
+            &report,
+        )
+        .await;
+        let (status, error_message) = match outcome {
+            Ok(outcome) => {
+                tracing::info!(
+                    "upcoming and missing episodes: {} series, {} created, {} updated, {} removed, {} failed",
+                    outcome.series,
+                    outcome.created,
+                    outcome.updated,
+                    outcome.pruned,
+                    outcome.failed
+                );
+                (TaskCompletionStatus::Completed, None)
+            }
+            Err(e) => (TaskCompletionStatus::Failed, Some(e)),
+        };
+        let result = TaskResult {
+            status,
+            error_message,
+            start_time_utc: start.to_rfc3339(),
+            end_time_utc: Utc::now().to_rfc3339(),
+        };
+        self.set_task_result(TASK_MISSING_EPISODES, result).await;
+        self.set_task_state(TASK_MISSING_EPISODES, TaskState::Idle)
+            .await;
+    }
+
     async fn run_clean_activity_log(&self) {
         let Some(_claim) = self.claim(TASK_CLEAN_ACTIVITY_LOG) else {
             return skipped(TASK_CLEAN_ACTIVITY_LOG);
@@ -855,7 +979,7 @@ impl TaskScheduler {
             done = &mut run => done,
             _ = tokio::time::sleep(limit) => {
                 tracing::info!(task = id, ?limit, "the task ran past its MaxRuntimeTicks; stopping it");
-                self.stop_task(id).await;
+                self.stop_run(id).await;
                 run.await
             }
         }
@@ -891,6 +1015,7 @@ impl TaskScheduler {
                 if !sched.wait_for_trigger(id, clock, &mut rx).await {
                     break;
                 }
+                sched.release(id);
                 while !sched.run_limited(id, run(sched.clone())).await {
                     tokio::select! {
                         _ = tokio::time::sleep(VACUUM_RETRY) => {}
@@ -1109,16 +1234,21 @@ impl TaskScheduler {
     }
 
     /// After a scan of library `library_id` ends, starts the chapter image and trickplay tasks
-    /// that the library asks to run during scans.
+    /// that the library asks to run during scans, unless an admin stopped them since their last
+    /// run by trigger or by hand: a scan of several libraries would otherwise start a stopped
+    /// task again as each library ends.
     async fn after_scan(&self, library_id: uuid::Uuid) {
         let options = rustyfin_db::repo_library::get_library_options(&self.db, library_id)
             .await
             .unwrap_or_default();
-        if options.enable_chapter_extraction && options.extract_chapter_images_during_library_scan {
-            self.start_task(TASK_CHAPTER_IMAGES).await;
-        }
-        if options.enable_trickplay && options.extract_trickplay_images_during_library_scan {
-            self.start_task(TASK_TRICKPLAY).await;
+        let chapters =
+            options.enable_chapter_extraction && options.extract_chapter_images_during_library_scan;
+        let trickplay =
+            options.enable_trickplay && options.extract_trickplay_images_during_library_scan;
+        for (id, wanted) in [(TASK_CHAPTER_IMAGES, chapters), (TASK_TRICKPLAY, trickplay)] {
+            if wanted && !self.is_held(id) {
+                self.start_run(id).await;
+            }
         }
     }
 
@@ -2487,6 +2617,79 @@ mod tests {
             message.as_deref(),
             Some("Made the trickplay images of 0 videos")
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn r3sched_a_stopped_task_waits_for_its_trigger_not_the_next_scan() {
+        let (sched, dir) = r3tasks_scheduler().await;
+        let library = rustyfin_model::library::Library {
+            id: uuid::Uuid::new_v4(),
+            name: "Library A".to_string(),
+            content_type: rustyfin_model::library::LibraryContentType::Movies,
+            paths: vec![dir.join("a").to_string_lossy().to_string()],
+        };
+        rustyfin_db::repo_library::create_library(&sched.db, &library)
+            .await
+            .unwrap();
+        let options = rustyfin_model::library::LibraryOptions {
+            enable_trickplay: true,
+            extract_trickplay_images_during_library_scan: true,
+            ..Default::default()
+        };
+        rustyfin_db::repo_library::set_library_options(&sched.db, library.id, &options)
+            .await
+            .unwrap();
+        let ran = |sched: TaskScheduler| async move {
+            sched
+                .get_task(TASK_TRICKPLAY)
+                .await
+                .unwrap()
+                .last_execution_result
+                .is_some()
+        };
+        let wait_for_run = |sched: TaskScheduler| async move {
+            for _ in 0..500 {
+                if ran(sched.clone()).await {
+                    return true;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            false
+        };
+
+        // An admin stops a running trickplay run
+        let _run = sched.begin_image_run(TASK_TRICKPLAY).await.unwrap();
+        assert!(sched.stop_task(TASK_TRICKPLAY).await);
+        sched.end_image_run(TASK_TRICKPLAY).await;
+        // The next library's scan ends: the task stays idle
+        sched.after_scan(library.id).await;
+        r3tasks_settle().await;
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert!(
+            !ran(sched.clone()).await,
+            "a scan started the stopped task again"
+        );
+        assert_eq!(
+            sched.get_task(TASK_TRICKPLAY).await.unwrap().state,
+            TaskState::Idle
+        );
+
+        // Once its trigger or a start by hand runs it, a scan's end starts it again
+        sched.release(TASK_TRICKPLAY);
+        sched.after_scan(library.id).await;
+        assert!(wait_for_run(sched.clone()).await, "a scan's end starts it");
+        // A stop by MaxRuntimeTicks doesn't hold it
+        let _run = sched.begin_image_run(TASK_CHAPTER_IMAGES).await.unwrap();
+        assert!(sched.stop_run(TASK_CHAPTER_IMAGES).await);
+        assert!(!sched.is_held(TASK_CHAPTER_IMAGES));
+        // A start by hand releases a stopped task
+        assert!(sched.stop_task(TASK_CHAPTER_IMAGES).await);
+        assert!(sched.is_held(TASK_CHAPTER_IMAGES));
+        sched.end_image_run(TASK_CHAPTER_IMAGES).await;
+        assert!(sched.start_task(TASK_CHAPTER_IMAGES).await);
+        assert!(!sched.is_held(TASK_CHAPTER_IMAGES));
+        r3tasks_settle().await;
         let _ = std::fs::remove_dir_all(&dir);
     }
 

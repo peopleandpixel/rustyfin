@@ -34,13 +34,15 @@ pub async fn delete_item(pool: &SqlitePool, id: &str) -> Result<bool, sqlx::Erro
 }
 
 /// Deletes the item `id` on `conn`, which the caller holds in a write transaction, so that the
-/// caller can merge other rows into the item first. Otherwise as [`delete_item`].
+/// caller can merge other rows into the item first. Its virtual items go with it; it is refused
+/// only while real children remain. Otherwise as [`delete_item`].
 pub async fn delete_item_in(conn: &mut SqliteConnection, id: &str) -> Result<bool, sqlx::Error> {
-    let children: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM media_items WHERE parent_id = ?1")
-        .bind(id)
-        .fetch_one(&mut *conn)
-        .await?;
-    if children > 0 {
+    if !rustyfin_db::repo_virtual::delete_virtual_children_in(conn, id).await? {
+        let children: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM media_items WHERE parent_id = ?1")
+                .bind(id)
+                .fetch_one(&mut *conn)
+                .await?;
         tracing::warn!("not removing item {id}: it has {children} child items");
         return Ok(false);
     }
@@ -150,6 +152,8 @@ pub async fn remove_not_collected(
     let containers: &[&str] = match library.content_type {
         LibraryContentType::TvShows => &["Season", "Series"],
         LibraryContentType::Music => &["MusicAlbum", "MusicArtist"],
+        // A photo or mixed library's folders (scan_folders.rs), which a folder pass deletes too
+        LibraryContentType::Photos | LibraryContentType::Mixed => &["Folder"],
         _ => &[],
     };
     if !matches!(scope, PathScope::All) {
@@ -162,8 +166,9 @@ pub async fn remove_not_collected(
         for &media_type in containers {
             let ids: Vec<String> = sqlx::query_scalar(
                 "SELECT id FROM media_items AS m
-                 WHERE m.library_id = ?1 AND m.media_type = ?2
-                   AND NOT EXISTS (SELECT 1 FROM media_items AS c WHERE c.parent_id = m.id)",
+                 WHERE m.library_id = ?1 AND m.media_type = ?2 AND m.is_virtual_item = 0
+                   AND NOT EXISTS (SELECT 1 FROM media_items AS c
+                                   WHERE c.parent_id = m.id AND c.is_virtual_item = 0)",
             )
             .bind(library_id.as_str())
             .bind(media_type)
@@ -198,8 +203,9 @@ async fn remove_empty_containers_in_scope(
     for &media_type in containers {
         let ids: Vec<String> = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
             "SELECT m.id FROM media_items AS m
-             WHERE m.library_id = ?1 AND m.media_type = ?2 AND {}
-               AND NOT EXISTS (SELECT 1 FROM media_items AS c WHERE c.parent_id = m.id)",
+             WHERE m.library_id = ?1 AND m.media_type = ?2 AND m.is_virtual_item = 0 AND {}
+               AND NOT EXISTS (SELECT 1 FROM media_items AS c
+                               WHERE c.parent_id = m.id AND c.is_virtual_item = 0)",
             scope.sql("m.path", 3)
         )))
         .bind(library_id)
@@ -218,8 +224,9 @@ async fn remove_empty_containers_in_scope(
             // The row is read again: an earlier deletion in this pass may have removed it already.
             let row: Option<(String, Option<String>)> = sqlx::query_as(
                 "SELECT m.media_type, m.parent_id FROM media_items AS m
-                 WHERE m.id = ?1
-                   AND NOT EXISTS (SELECT 1 FROM media_items AS c WHERE c.parent_id = m.id)",
+                 WHERE m.id = ?1 AND m.is_virtual_item = 0
+                   AND NOT EXISTS (SELECT 1 FROM media_items AS c
+                                   WHERE c.parent_id = m.id AND c.is_virtual_item = 0)",
             )
             .bind(id.as_str())
             .fetch_optional(pool)
@@ -242,7 +249,7 @@ async fn remove_empty_containers_in_scope(
 }
 
 /// The media types that a scan of a library with this content type collects.
-fn scanned_types(content_type: &LibraryContentType) -> &'static [&'static str] {
+pub(crate) fn scanned_types(content_type: &LibraryContentType) -> &'static [&'static str] {
     match content_type {
         LibraryContentType::Movies => &["Movie"],
         LibraryContentType::Photos => &["Photo", "Video"],

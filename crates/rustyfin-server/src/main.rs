@@ -235,6 +235,16 @@ async fn main() {
     transcode_manager.set_encoding_settings(encoding);
     // Start periodic cleanup of stale transcode sessions and old cache directories
     transcode_manager.spawn_cleanup_task();
+    // Finds the video devices and what each decodes, in the background: until it ends, new
+    // transcodes take the saved options; then, while the administrator hasn't chosen a
+    // hardware acceleration type, the best device decodes
+    {
+        let manager = transcode_manager.clone();
+        let data_dir = data_dir.clone();
+        tokio::spawn(async move {
+            manager.detect_hardware(&data_dir).await;
+        });
+    }
 
     let data_dir_arc = Arc::new(data_dir);
 
@@ -588,12 +598,6 @@ async fn main() {
     {
         let state = state.clone();
         tokio::spawn(async move { rustyfin_api::sort_names::apply(&state).await });
-    }
-
-    // Background task: finds the users whose password is the empty one, for the sign-in tiles
-    {
-        let db = state.db_ro.clone();
-        tokio::spawn(async move { rustyfin_auth::find_empty_passwords(&db).await });
     }
 
     // Extract HTTP port for discovery services

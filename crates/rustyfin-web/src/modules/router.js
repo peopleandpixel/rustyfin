@@ -16,11 +16,12 @@ import {
 import { playContainer } from './queue.js';
 import { stopThemeSong } from './theme-media.js';
 import {
-    openCardMenu, toggleCardPlayed, toggleCardFavorite, setCardLikes, playCardItem, playInstantMix, openAddTo,
+    openCardMenu, toggleCardPlayed, toggleCardFavorite, setCardLikes, playCardItem, playInstantMix, downloadCardItem, openAddTo,
 } from './cardmenu.js';
 import { playAlbumFrom } from './music.js';
 import { playContainerFrom, removeFromContainer, openNewContainer } from './collections.js';
-import { renderSettings } from './settings.js';
+import { renderSettings, moveHomeLibrary } from './settings.js';
+import { photoActions, openPhotoItem } from './photos.js';
 import {
     renderAdmin, showAdminTab, setUserPolicy, removeOidcLinkAsAdmin, copyOidcCallbackUrl, saveOidcAdminSettings,
     startTaskAction, stopTaskAction,
@@ -30,7 +31,7 @@ import {
     folderBrowserSelect, closeFolderBrowser, addLibraryPathRow, removeLibraryPathRow, initScanProgressWebSocket,
 } from './library-admin.js';
 import { openPluginConfig, openPluginPriority } from './plugins.js';
-import { savePlaybackSettings } from './playback-admin.js';
+import { savePlaybackSettings, detectHardware } from './playback-admin.js';
 import { saveDlnaSettings } from './dlna-admin.js';
 import { serverPower, openLibraryEditor, removeLibraryFolder, openTriggerEditor, removeTaskTrigger } from './dashboard.js';
 import {
@@ -141,12 +142,16 @@ async function refreshItemMetadata(button, id, options) {
 
 // Clicks on rendered markup are dispatched here from data-action and data-* attributes, so server values never end up inside inline JavaScript.
 const clickActions = {
-    navigate: el => navigate(el.dataset.page, el.dataset.id),
+    // A photo card outside a photo library opens the photo viewer, as Jellyfin Web does
+    navigate: el => (el.dataset.type === 'Photo' && el.dataset.page === 'detail'
+        ? openPhotoItem(el.dataset.id, el)
+        : navigate(el.dataset.page, el.dataset.id)),
     // A video with a resume point asks first; the detail page's Resume and Play from beginning buttons are that choice.
     // The detail page's buttons and chapters also pass its version and track choice, and a chapter its start.
     // Its Play button still asks, from a fresh resume point: the page's own item may be cached.
     play: el => {
         const { id, streamType, title } = el.dataset;
+        if (streamType === 'Photo') return openPhotoItem(id, el);
         const selection = el.dataset.detailTracks === 'true' ? detailSelection(id) || {} : null;
         if (el.dataset.startTicks !== undefined) {
             playItem(id, streamType, title, { selection: { ...selection, startTicks: Number(el.dataset.startTicks) } });
@@ -172,6 +177,7 @@ const clickActions = {
     'card-like': el => setCardLikes(el, true),
     'card-dislike': el => setCardLikes(el, false),
     'card-play': el => playCardItem(el),
+    'card-download': el => downloadCardItem(el),
     'card-instant-mix': el => playInstantMix(el),
     // A timed lyric line seeks the song to its start (ticks), lyrics.js
     'seek-lyric': el => seekToTicks(Number(el.dataset.start)),
@@ -234,8 +240,12 @@ const clickActions = {
     'oidc-save-settings': () => saveOidcAdminSettings(),
     'playback-save': () => savePlaybackSettings(),
     'dlna-save': () => saveDlnaSettings(),
+    'playback-detect-hw': el => detectHardware(el),
     'plugin-edit-config': el => openPluginConfig(el.dataset.pluginId),
     'plugin-edit-priority': el => openPluginPriority(el.dataset.pluginId),
+    'move-home-library': el => moveHomeLibrary(el),
+    // Photo libraries, the photo viewer and the slideshow (photos.js)
+    ...photoActions,
 };
 document.addEventListener('click', e => {
     const el = e.target.closest('[data-action]');

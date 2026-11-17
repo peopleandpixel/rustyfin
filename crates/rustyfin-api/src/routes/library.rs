@@ -316,9 +316,30 @@ async fn get_user_views_no_user(
     Ok(Json(views_for(&state, claims.sub, include_hidden).await?))
 }
 
-/// Every library as a view (cached for all users), less those `user`'s library access leaves out
-/// and, unless `include_hidden` (Jellyfin's `includeHidden`), those in the user's
-/// `MyMediaExcludes`.
+/// Orders `views` by the user's `OrderedViews`, as Jellyfin's `UserViewManager`: the libraries it
+/// names first, in its order, then the others in their own order. Ids match with or without
+/// dashes, in any case.
+fn order_views(views: &mut Value, config: &Value) {
+    let key = |id: &str| id.replace('-', "").to_lowercase();
+    let order: Vec<String> = config["OrderedViews"]
+        .as_array()
+        .map(|ids| ids.iter().filter_map(Value::as_str).map(key).collect())
+        .unwrap_or_default();
+    if order.is_empty() {
+        return;
+    }
+    if let Some(items) = views.get_mut("Items").and_then(Value::as_array_mut) {
+        // A stable sort keeps the libraries `OrderedViews` doesn't name in their own order.
+        items.sort_by_key(|view| {
+            let id = key(view["Id"].as_str().unwrap_or(""));
+            order.iter().position(|o| *o == id).unwrap_or(usize::MAX)
+        });
+    }
+}
+
+/// Every library as a view (cached for all users), in the user's `OrderedViews` order, less those
+/// `user`'s library access leaves out and, unless `include_hidden` (Jellyfin's `includeHidden`),
+/// those in the user's `MyMediaExcludes`.
 async fn views_for(state: &AppState, user: Uuid, include_hidden: bool) -> Result<Value, ApiError> {
     let mut views = match state.cache.library_views.get("views") {
         Some(cached) => cached,
@@ -332,6 +353,12 @@ async fn views_for(state: &AppState, user: Uuid, include_hidden: bool) -> Result
             views
         }
     };
+    // In the user's order (OrderedViews)
+    let config = rustyfin_db::repo_user::get_user_by_id(&state.db_ro, user)
+        .await?
+        .map(|u| rustyfin_model::user::jellyfin_configuration(&u.configuration))
+        .unwrap_or_default();
+    order_views(&mut views, &config);
     let policy = crate::parental::user_policy(state, user).await?;
     if policy.enabled_folders().is_some()
         && let Some(items) = views.get_mut("Items").and_then(Value::as_array_mut)

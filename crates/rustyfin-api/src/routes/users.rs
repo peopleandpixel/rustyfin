@@ -44,7 +44,10 @@ pub fn login_routes() -> Router<AppState> {
 
 pub fn routes() -> Router<AppState> {
     Router::new()
-        .route("/Users", get(get_users))
+        // Jellyfin 10.9+ forms take the user from `userId`, or act for the caller.
+        .route("/Users", get(get_users).post(update_query_user))
+        .route("/Users/Password", post(change_query_password))
+        .route("/Users/Configuration", post(update_query_configuration))
         .route("/Users/Me", get(get_me))
         .route("/Users/{userId}", get(get_user))
         // Jellyfin's UpdateUser is a POST of the whole UserDto; only its Name is read.
@@ -170,13 +173,8 @@ async fn get_public_users(
             .is_none_or(|p| !p.access.is_hidden && (local || p.access.enable_remote_access))
     }) {
         let primary_image_tag = tags.get(&u.id).cloned();
-        // Outside the local network every user reads as having a password, so the internet isn't
-        // shown which accounts open with an empty one (they still sign in with it, as in Jellyfin)
-        let has_password = !local || !rustyfin_auth::is_empty_password_hash(&u.password_hash);
         out.push(PublicUserDto {
             primary_image_tag,
-            has_password,
-            has_configured_password: has_password,
             ..PublicUserDto::from(u)
         });
     }
@@ -189,8 +187,8 @@ fn client_is_local(state: &AppState, peer: SocketAddr, headers: &HeaderMap) -> b
     resolve_client(peer.ip(), headers, &state.known_proxies).is_local()
 }
 
-/// The message for a reset PIN or reset sent from outside the local network.
-const RESET_IN_NETWORK_REQUIRED: &str = "A password reset is possible only from the local network.";
+/// The answer to a reset PIN that matches nothing, which a PIN from outside the local network gets too.
+const INVALID_RESET_PIN: &str = "invalid or expired PIN";
 
 async fn create_user(
     State(state): State<AppState>,
@@ -600,13 +598,13 @@ async fn update_configuration(
 /// timing reveals neither whether the name exists nor whether the reset work was slow.
 const FORGOT_PASSWORD_DELAY: std::time::Duration = std::time::Duration::from_millis(250);
 
-/// Start a password reset. A client outside the local network gets `InNetworkRequired`, as in
-/// Jellyfin. On the local network the response is uniform whether or not the user exists, so it
-/// never reveals account existence, and it never contains the PIN. The PIN is written (mode 0600 on Unix)
+/// Start a password reset. As in Jellyfin 12.4, every client gets `PinCode` with the reset file's
+/// path, whether or not the user exists and wherever the client is, so the answer reveals neither,
+/// and it never contains the PIN. The PIN is written (mode 0600 on Unix)
 /// to a file under the data dir ONLY when the user exists AND the resolved client (see
 /// `resolve_client`) is on the local network AND the user has no pending or voided reset, since a
-/// new request never replaces an open reset. Every other local request gets the same 200 with a
-/// file path that is not created. Every answer comes `FORGOT_PASSWORD_DELAY` (250 ms) after the request
+/// new request never replaces an open reset. Every other request gets the same 200 with a file
+/// path that is not created. Every answer comes `FORGOT_PASSWORD_DELAY` (250 ms) after the request
 /// reached the handler. The reset work runs in its own task: it finishes before the answer when it
 /// is quick, and in the background when it takes longer.
 async fn forgot_password(
@@ -616,36 +614,27 @@ async fn forgot_password(
     Json(req): Json<ForgotPasswordRequest>,
 ) -> Result<Json<ForgotPasswordResult>, ApiError> {
     let deadline = tokio::time::Instant::now() + FORGOT_PASSWORD_DELAY;
-
-    // Outside the local network Jellyfin answers InNetworkRequired for every name, so the answer
-    // tells only where the client is, and names no path on the server.
-    if !client_is_local(&state, peer, &headers) {
-        tokio::time::sleep_until(deadline).await;
-        return Ok(Json(ForgotPasswordResult {
-            action: "InNetworkRequired".to_string(),
-            pin_file: String::new(),
-            pin_expiration_date: None,
-        }));
-    }
-
     let pin_path = state
         .data_dir
         .join(rustyfin_auth::reset_pin_filename(&req.entered_username));
     let expires_at = (Utc::now() + chrono::Duration::minutes(30)).to_rfc3339();
-    let handle = tokio::spawn(issue_reset_pin(
-        state.db.clone(),
-        req.entered_username.clone(),
-        pin_path.clone(),
-        expires_at.clone(),
-    ));
-    // Waited for only until the deadline; a slower task is detached and finishes alone.
-    let _ = tokio::time::timeout_at(deadline, handle).await;
+
+    if client_is_local(&state, peer, &headers) {
+        let handle = tokio::spawn(issue_reset_pin(
+            state.db.clone(),
+            req.entered_username.clone(),
+            pin_path.clone(),
+            expires_at.clone(),
+        ));
+        // Waited for only until the deadline; a slower task is detached and finishes alone.
+        let _ = tokio::time::timeout_at(deadline, handle).await;
+    }
     tokio::time::sleep_until(deadline).await;
 
     Ok(Json(ForgotPasswordResult {
         action: "PinCode".to_string(),
         pin_file: pin_path.to_string_lossy().into_owned(),
-        pin_expiration_date: Some(expires_at),
+        pin_expiration_date: expires_at,
     }))
 }
 
@@ -714,8 +703,8 @@ fn write_reset_file(path: &std::path::Path, contents: &str) -> Result<(), ApiErr
 /// Redeem a reset PIN (no username). Success: set the user's password to the PIN itself, revoke all
 /// their tokens, delete the reset file, return `{Success:true, UsersReset:[name]}`. No match → 404.
 /// Outside the local network the PIN is not tried, so wrong guesses from the internet can neither
-/// spend the attempt limit nor void the open resets; the answer is Jellyfin's failed
-/// `PinRedeemResult`.
+/// spend the attempt limit nor void the open resets; the answer is a wrong PIN's 404. (Jellyfin
+/// 12.4 tries the PIN from anywhere; it has no attempt limit to protect.)
 async fn reset_password_pin(
     State(state): State<AppState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
@@ -723,14 +712,12 @@ async fn reset_password_pin(
     Json(req): Json<ForgotPasswordPinRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     if !client_is_local(&state, peer, &headers) {
-        return Ok(Json(
-            serde_json::json!({ "Success": false, "UsersReset": [] }),
-        ));
+        return Err(ApiError::NotFound(INVALID_RESET_PIN.to_string()));
     }
     let uid = rustyfin_auth::redeem_reset_pin(&state.db, &req.pin)
         .await
         .map_err(|e| ApiError::Internal(e.to_string()))?
-        .ok_or_else(|| ApiError::NotFound("invalid or expired PIN".to_string()))?;
+        .ok_or_else(|| ApiError::NotFound(INVALID_RESET_PIN.to_string()))?;
 
     let user = rustyfin_db::repo_user::get_user_by_id(&state.db, uid)
         .await?
@@ -774,9 +761,10 @@ async fn reset_password(
     headers: HeaderMap,
     Json(req): Json<ResetPasswordRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    // As for the PIN redeem: from outside the local network no PIN is tried
+    // As for the PIN redeem: from outside the local network no PIN is tried, and the answer is a
+    // wrong PIN's
     if !client_is_local(&state, peer, &headers) {
-        return Err(ApiError::Forbidden(RESET_IN_NETWORK_REQUIRED.to_string()));
+        return Err(ApiError::BadRequest(INVALID_RESET_PIN.to_string()));
     }
     // Look up the user by username. An unknown user gets the wrong-PIN error, so the response does
     // not reveal whether the account exists.
@@ -1077,6 +1065,53 @@ struct UserImageQuery {
     user_id: Option<Uuid>,
     /// The picture's tag; a URL with one names that version, so it may be cached for long
     tag: Option<String>,
+}
+
+/// The `userId` of Jellyfin's 10.9+ user settings forms; without it they act for the caller.
+#[derive(Debug, Default, serde::Deserialize)]
+struct UserIdQuery {
+    #[serde(rename = "userId", alias = "UserId")]
+    user_id: Option<Uuid>,
+}
+
+impl UserIdQuery {
+    fn user(&self, claims: &Claims) -> Uuid {
+        self.user_id.unwrap_or(claims.sub)
+    }
+}
+
+/// POST /Users?userId=: `POST /Users/{userId}` for the query's user.
+async fn update_query_user(
+    state: State<AppState>,
+    Query(q): Query<UserIdQuery>,
+    Extension(claims): Extension<Claims>,
+    req: Json<UpdateUserNameRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let id = q.user(&claims);
+    update_user_name(state, Path(id), Extension(claims), req).await
+}
+
+/// POST /Users/Password?userId=: `POST /Users/{userId}/Password` for the query's user.
+async fn change_query_password(
+    state: State<AppState>,
+    Query(q): Query<UserIdQuery>,
+    Extension(claims): Extension<Claims>,
+    token: Option<Extension<rustyfin_auth::RequestToken>>,
+    req: Json<ChangePasswordRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let id = q.user(&claims);
+    change_password(state, Extension(claims), Path(id), token, req).await
+}
+
+/// POST /Users/Configuration?userId=: `POST /Users/{userId}/Configuration` for the query's user.
+async fn update_query_configuration(
+    state: State<AppState>,
+    Query(q): Query<UserIdQuery>,
+    Extension(claims): Extension<Claims>,
+    config: Json<serde_json::Value>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let id = q.user(&claims);
+    update_configuration(state, Extension(claims), Path(id), config).await
 }
 
 #[derive(Debug, Default, serde::Deserialize)]

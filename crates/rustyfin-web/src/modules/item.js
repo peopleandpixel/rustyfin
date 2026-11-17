@@ -378,10 +378,11 @@ async function renderDetail(itemId) {
 
         const imgSrc = item.ImageTags?.Primary ? API.imageUrl(id, 'Primary', { maxWidth: 500, tag: item.ImageTags.Primary }) : '';
         const backdropSrc = backdropUrl(item, 1920);
-        const canPlay = ['Movie', 'Episode', 'Audio', 'MusicVideo', 'Video'].includes(type);
+        // A photo's Play opens the photo viewer (photos.js)
+        const canPlay = ['Movie', 'Episode', 'Audio', 'MusicVideo', 'Video', 'Photo'].includes(type);
         // Containers play their items as a queue: Play all from the start, Shuffle in a random order
         const canPlayAll = ['Series', 'Season', 'MusicAlbum', 'MusicArtist', 'Playlist', 'BoxSet', 'Folder'].includes(type);
-        const streamType = type === 'Audio' ? 'Audio' : 'Videos';
+        const streamType = type === 'Audio' ? 'Audio' : type === 'Photo' ? 'Photo' : 'Videos';
         const resumeTicks = streamType === 'Videos' ? resumePositionTicks(item) : 0;
         detailChoice = canPlay && streamType === 'Videos'
             ? { itemId: id, sources: item.MediaSources || [], mediaSourceId: null, audioIndex: null, subtitleIndex: null }

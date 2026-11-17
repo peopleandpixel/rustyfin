@@ -194,8 +194,9 @@ function itemCard(item, options = {}) {
         })
         : '';
 
-    const canPlay = ['Movie', 'Episode', 'Audio', 'MusicVideo', 'Video'].includes(type);
-    const streamType = type === 'Audio' ? 'Audio' : 'Videos';
+    // A photo "plays" in the photo viewer (photos.js)
+    const canPlay = ['Movie', 'Episode', 'Audio', 'MusicVideo', 'Video', 'Photo'].includes(type);
+    const streamType = type === 'Audio' ? 'Audio' : type === 'Photo' ? 'Photo' : 'Videos';
 
     // Type icons
     const typeIcons = {

@@ -12,6 +12,7 @@ pub mod repo_device;
 pub mod repo_extras;
 pub mod repo_image;
 pub mod repo_instant_mix;
+pub mod repo_item_filter;
 pub mod repo_jellyfin_import;
 pub mod repo_library;
 pub mod repo_live_tv;
@@ -37,6 +38,7 @@ pub mod repo_sync_play;
 pub mod repo_token;
 pub mod repo_trickplay;
 pub mod repo_user;
+pub mod repo_virtual;
 pub mod writer;
 
 pub use writer::{WriteTx, begin_write};

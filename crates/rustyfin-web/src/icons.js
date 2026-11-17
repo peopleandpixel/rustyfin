@@ -8,7 +8,7 @@ import {
     Maximize, ArrowDownUp, Circle, SkipBack, SkipForward, Funnel, FunnelX, Shuffle, PictureInPicture2, ThumbsUp,
     ThumbsDown, Trash2, EllipsisVertical, ListPlus, FolderPlus, LayoutGrid, List, Pencil, ScanSearch,
     Images, Cast, MessageSquare, GripVertical, ListMusic, Plus, Power, Download, Share2, Upload,
-    Users, SquareCheckBig, HeartOff, CircleDashed, ChevronUp, ChevronDown,
+    Users, SquareCheckBig, HeartOff, CircleDashed, ChevronRight, ChevronUp, ChevronDown, Info, Server,
 } from 'lucide';
 
 window.lucideIcons = {
@@ -18,7 +18,7 @@ window.lucideIcons = {
     Maximize, ArrowDownUp, Circle, SkipBack, SkipForward, Funnel, FunnelX, Shuffle, PictureInPicture2, ThumbsUp,
     ThumbsDown, Trash2, EllipsisVertical, ListPlus, FolderPlus, LayoutGrid, List, Pencil, ScanSearch,
     Images, Cast, MessageSquare, GripVertical, ListMusic, Plus, Power, Download, Share2, Upload,
-    Users, SquareCheckBig, HeartOff, CircleDashed, ChevronUp, ChevronDown,
+    Users, SquareCheckBig, HeartOff, CircleDashed, ChevronRight, ChevronUp, ChevronDown, Info, Server,
 };
 
 createIcons({ icons: window.lucideIcons, attrs: { 'aria-hidden': 'true' } });

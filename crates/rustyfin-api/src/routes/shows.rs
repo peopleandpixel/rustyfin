@@ -49,7 +49,7 @@ struct NextUpQuery {
 
 /// `GET /Shows/NextUp`, with Jellyfin's `enableResumable` (default true), `enableRewatching`
 /// (default false), `nextUpDateCutoff` and `enableTotalRecordCount` (default true).
-/// `disableFirstEpisode` is obsolete in Jellyfin 10.11 and ignored there too.
+/// Jellyfin 12.4 has no `disableFirstEpisode`; it is ignored.
 async fn next_up(
     State(state): State<AppState>,
     Query(q): Query<NextUpQuery>,
@@ -186,6 +186,11 @@ async fn get_seasons(
     HiddenItems::for_caller(&state, &claims)
         .await?
         .retain(&mut seasons);
+    if !display_missing_episodes(&state.db_ro, user_id).await {
+        let virtual_ids =
+            rustyfin_db::repo_media::virtual_item_ids(&state.db_ro, series_id).await?;
+        seasons.retain(|s| !virtual_ids.contains(&s.id));
+    }
     let total = seasons.len() as i64;
 
     let tmdb_key = state
@@ -233,9 +238,11 @@ struct EpisodesQuery {
     limit: Option<i64>,
 }
 
-/// `GET /Shows/{seriesId}/Episodes`, filtered as Jellyfin's `TvShowsController.GetEpisodes` does:
-/// `isMissing`, then `startItemId` (drop the episodes before it), then `adjacentTo` (it and its
-/// neighbours), then `sortBy=Random`, then paging. The count is of the filtered list.
+/// `GET /Shows/{seriesId}/Episodes`, filtered as Jellyfin 12.4's `TvShowsController.GetEpisodes`
+/// does: `isMissing`, then `startItemId` (drop the episodes before it), then `adjacentTo` (it and
+/// its neighbours), then `sortBy=Random`, then paging. The count is of the filtered list.
+/// Jellyfin maps an alternate version's `startItemId` to its primary version; Rustyfin stores no
+/// alternate versions, so every id is already a primary one.
 async fn get_episodes(
     State(state): State<AppState>,
     Path(series_id): Path<Uuid>,
@@ -278,6 +285,12 @@ async fn get_episodes(
         .await?
         .retain(&mut episodes);
 
+    // Virtual episodes are left out unless DisplayMissingEpisodes (or an API key) asks for them
+    if !(claims.sub.is_nil() || display_missing_episodes(&state.db_ro, user_id).await) {
+        let virtual_ids =
+            rustyfin_db::repo_media::virtual_item_ids(&state.db_ro, series_id).await?;
+        episodes.retain(|e| !virtual_ids.contains(&e.id));
+    }
     if let Some(missing) = is_missing {
         // Jellyfin's IsMissingEpisode: a Virtual episode.
         episodes.retain(|e| (e.location_type == LocationType::Virtual) == missing);
@@ -336,6 +349,18 @@ async fn get_episodes(
     }))
 }
 
+/// Whether `user` set DisplayMissingEpisodes, so that virtual items (missing and unaired episodes,
+/// and seasons holding only those) are listed. False for no user.
+pub(crate) async fn display_missing_episodes(pool: &sqlx::SqlitePool, user: Option<Uuid>) -> bool {
+    let Some(user) = user else { return false };
+    rustyfin_db::repo_user::get_user_by_id(pool, user)
+        .await
+        .ok()
+        .flatten()
+        .map(|u| rustyfin_model::user::jellyfin_configuration(&u.configuration))
+        .is_some_and(|config| config["DisplayMissingEpisodes"].as_bool() == Some(true))
+}
+
 /// The items hidden from the user a route answers for: `user` (an administrator's `userId`), else
 /// the caller.
 async fn hidden_for(
@@ -349,15 +374,13 @@ async fn hidden_for(
     }
 }
 
-/// Jellyfin's `UserViewBuilder.FilterForAdjacency`: the episode `id` and the ones just before
-/// and after it. When `id` is not in the list Jellyfin's index is -1, which leaves only the
-/// first episode.
+/// Jellyfin 12.4's `UserViewBuilder.FilterForAdjacency`: the episode `id` and the ones just
+/// before and after it, or nothing when `id` is not in the list.
 fn adjacent(episodes: Vec<MediaItem>, id: Uuid) -> Vec<MediaItem> {
-    let index = episodes.iter().position(|e| e.id == id);
-    let keep = |i: usize| match index {
-        Some(at) => i + 1 >= at && i <= at + 1,
-        None => i == 0,
+    let Some(at) = episodes.iter().position(|e| e.id == id) else {
+        return Vec::new();
     };
+    let keep = |i: usize| i + 1 >= at && i <= at + 1;
     episodes
         .into_iter()
         .enumerate()

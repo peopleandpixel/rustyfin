@@ -30,6 +30,7 @@ import {
     changeSegmentAction, togglePlaybackStats, changeStillWatching, openFullPlayer, stopNowPlaying,
 } from './modules/player.js';
 import './modules/playerprefs.js';
+import { nativeShellCommand } from './modules/nativeshell.js';
 import './modules/queue.js';
 import { toggleLyrics } from './modules/lyrics.js';
 import './modules/remote.js';
@@ -40,11 +41,12 @@ import {
 import { sessionControl, openPlayOn, playOnSession } from './modules/sessions.js';
 import './modules/cardmenu.js';
 import './modules/collections.js';
+import './modules/photos.js';
 import './modules/multiselect.js';
 import './modules/screensaver.js';
 import {
     changeNextEpisodeAutoPlay, changeUiLanguage, handleSaveConfig, changeUserConfig, changeUserPref, changeHomeSection,
-    changeSubtitleAppearance, changeLatestLibrary, chooseProfileImage, deleteProfileImage,
+    changeSubtitleAppearance, changeLatestLibrary, changeMyMediaLibrary, chooseProfileImage, deleteProfileImage,
 } from './modules/settings.js';
 import './modules/playback-admin.js';
 import './modules/dlna-admin.js';
@@ -77,8 +79,8 @@ Object.assign(window, {
     submitLibraryOptions, openAddUser, closeAddUser,
     submitAddUser, clearLiveLog, setLogLevel, closePluginConfig, savePluginConfig, closePluginPriority,
     savePluginPriority, sessionControl, openPlayOn, playOnSession, changeUserConfig, changeUserPref, changeHomeSection,
-    changeSubtitleAppearance, changeLatestLibrary, chooseProfileImage, deleteProfileImage, saveGeneralSettings,
+    changeSubtitleAppearance, changeLatestLibrary, changeMyMediaLibrary, chooseProfileImage, deleteProfileImage, saveGeneralSettings,
     addLibraryFolder, renameLibrary, addTaskTrigger, showTriggerFields, toggleLyrics,
     castToDevice, stopCasting, castTogglePause,
-    castSeek, castSetVolume, castToggleMute, castAdjacent, castAudioTrack, castSubtitleTrack,
+    castSeek, castSetVolume, castToggleMute, castAdjacent, castAudioTrack, castSubtitleTrack, nativeShellCommand,
 });
