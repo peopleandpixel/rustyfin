@@ -212,7 +212,7 @@ const clickActions = {
     'user-editor-close': () => closeUserEditor(),
     'delete-library': el => deleteLibraryFromAdmin(el.dataset.id),
     'toggle-realtime-monitor': el => toggleRealtimeMonitor(el),
-    'library-options': el => openLibraryOptions(el.dataset.id, el.dataset.name),
+    'library-options': el => openLibraryOptions(el.dataset.id, el.dataset.name, el.dataset.type),
     // The dashboard's server pieces (dashboard.js)
     'server-restart': () => serverPower('restart'),
     'server-shutdown': () => serverPower('shutdown'),

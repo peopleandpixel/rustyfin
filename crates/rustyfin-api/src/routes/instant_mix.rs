@@ -102,7 +102,16 @@ async fn genre_mix(
 
 /// Or the tracks' genres when the item has none of its own.
 fn own_or(own: &[String], tracks: Vec<String>) -> Vec<String> {
-    if own.is_empty() { tracks } else { own.to_vec() }
+    let own = genre_names(own);
+    if own.is_empty() { tracks } else { own }
+}
+
+/// An item's genres as names: an item stored with no genres reads back the column's `[]`.
+fn genre_names(genres: &[String]) -> Vec<String> {
+    genres
+        .iter()
+        .flat_map(|g| rustyfin_db::repo_by_name::split_genres(g))
+        .collect()
 }
 
 /// The seed of the item `id`: a library item, an artist known only by its credits, a playlist, a
@@ -116,7 +125,7 @@ async fn seed_of(state: &AppState, claims: &Claims, id: Uuid) -> Result<Seed, Ap
         }
         let seed = match item.media_type {
             MediaType::Audio => Seed {
-                genres: Some(item.genres.clone()),
+                genres: Some(genre_names(&item.genres)),
                 first: Some(item),
             },
             MediaType::MusicAlbum | MediaType::Playlist => {
@@ -129,7 +138,7 @@ async fn seed_of(state: &AppState, claims: &Claims, id: Uuid) -> Result<Seed, Ap
                 Seed::genres(own_or(&item.genres, tracks))
             }
             media if media.is_folder() => {
-                let mut genres = item.genres.clone();
+                let mut genres = genre_names(&item.genres);
                 genres.extend(mix::track_genres_under(pool, item.id).await?);
                 Seed::genres(genres)
             }
@@ -158,7 +167,7 @@ async fn seed_of(state: &AppState, claims: &Claims, id: Uuid) -> Result<Seed, Ap
         let mut genres = Vec::new();
         for item in rustyfin_db::repo_playlist::get_playlist_items(pool, id, caller).await? {
             if item.media_type == MediaType::Audio {
-                genres.extend(item.genres);
+                genres.extend(genre_names(&item.genres));
             }
         }
         return Ok(Seed::genres(genres));

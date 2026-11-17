@@ -150,21 +150,28 @@ pub(crate) async fn start_session(
     user: User,
     token: String,
 ) -> AuthResponse {
-    // A user keeps their session on a device across sign-ins. Another user signing in with the
-    // same device id gets a session of their own, never this one.
+    // A user keeps their session of a client on a device across sign-ins. Another user, or another
+    // client, signing in with the same device id gets a session of its own, never this one.
     let existing = match device.device_id.as_str() {
         "" => None,
-        id => rustyfin_db::repo_session::find_device_session(&state.db, user.id, id)
-            .await
-            .ok()
-            .flatten(),
-    };
-    // The user's other sessions on the device are replaced below; their play state goes with them
-    if !device.device_id.is_empty() {
-        let ids = rustyfin_db::repo_session::session_ids(
+        id => rustyfin_db::repo_session::find_device_session(
             &state.db,
-            Some(user.id),
-            Some(&device.device_id),
+            user.id,
+            id,
+            Some(&device.app_name),
+        )
+        .await
+        .ok()
+        .flatten(),
+    };
+    // The user's other sessions of this client on the device are replaced below; their play state
+    // goes with them
+    if !device.device_id.is_empty() {
+        let ids = rustyfin_db::repo_session::app_session_ids(
+            &state.db,
+            user.id,
+            &device.device_id,
+            &device.app_name,
         )
         .await
         .unwrap_or_default();

@@ -1672,9 +1672,8 @@ async fn test_password_reset_endpoints_share_the_login_rate_limit() {
     // G2: ForgotPassword no longer reveals whether the user exists; unknown users get 200.
     let resp = app.clone().oneshot(forgot()).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
-    // A reset from outside the local network tries no PIN (R3 users 2)
     let resp = app.clone().oneshot(reset()).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 
     // The three endpoints draw on one budget per client
     for (name, req) in [("login", login()), ("forgot", forgot()), ("reset", reset())] {
@@ -3613,6 +3612,7 @@ async fn b118_validate_path_admin_only_after_owner() {
 const B124_WEB_MODULES: &[&str] = &[
     "admin.js",
     "auth.js",
+    "branding.js",
     "cardmenu.js",
     "cards.js",
     "cast.js",
@@ -3624,6 +3624,7 @@ const B124_WEB_MODULES: &[&str] = &[
     "item.js",
     "jellyfin-import.js",
     "library-admin.js",
+    "library-options.js",
     "library.js",
     "libtabs.js",
     "lyrics.js",
@@ -3640,6 +3641,7 @@ const B124_WEB_MODULES: &[&str] = &[
     "router.js",
     "screensaver.js",
     "search.js",
+    "server-admin.js",
     "sessions.js",
     "settings.js",
     "subtitle-admin.js",
@@ -9660,6 +9662,1003 @@ async fn test_branding_splashscreen() {
     // Endpoint may not be implemented yet; accept any response
 }
 
+// R3 client endpoints: UserDataChanged, the 10.9+ user settings forms, splash screen, movie parts
+
+/// The `UserDataChanged` events on `events` until none has come for `quiet`.
+async fn r3endpoints_user_data_events(
+    events: &mut broadcast::Receiver<WsEvent>,
+    quiet: std::time::Duration,
+) -> Vec<serde_json::Value> {
+    let mut found = Vec::new();
+    while let Ok(Ok(event)) = tokio::time::timeout(quiet, events.recv()).await {
+        if let WsEvent::UserDataChanged { data } = event {
+            found.push(data);
+        }
+    }
+    found
+}
+
+/// Writes made close together reach each user as one `UserDataChanged` per user, as Jellyfin's
+/// UserDataChangeNotifier batches them, with the item's user data and its `ItemId`; a progress
+/// report sends none.
+#[tokio::test]
+async fn r3endpoints_user_data_changes_are_sent_per_user_in_one_batch() {
+    let state = test_state().await;
+    let app = app(state.clone());
+    let (owner, owner_id, viewer, viewer_id) = g1_owner_and_viewer(&state, &app).await;
+    let movie = g1_insert_movie(&state).await;
+    let mut events = state.ws_broadcast.subscribe();
+
+    for (token, uri) in [
+        (&owner, format!("/UserFavoriteItems/{movie}")),
+        (&owner, format!("/UserPlayedItems/{movie}")),
+        (&viewer, format!("/UserFavoriteItems/{movie}")),
+    ] {
+        let (status, body) = send(&app, request("POST", &uri, Some(token), None)).await;
+        assert_eq!(status, StatusCode::OK, "{uri}: {body}");
+    }
+    let sent = r3endpoints_user_data_events(&mut events, std::time::Duration::from_secs(2)).await;
+    assert_eq!(sent.len(), 2, "one message per user: {sent:?}");
+    let for_user = |id: &str| {
+        let id = uuid::Uuid::parse_str(id).unwrap();
+        sent.iter()
+            .find(|data| uuid::Uuid::parse_str(data["UserId"].as_str().unwrap()).unwrap() == id)
+            .unwrap_or_else(|| panic!("no message for {id}: {sent:?}"))
+            .clone()
+    };
+    let owners = for_user(&owner_id);
+    let list = owners["UserDataList"].as_array().unwrap();
+    assert_eq!(list.len(), 1, "the movie once: {owners}");
+    assert_eq!(list[0]["ItemId"], movie.to_string());
+    assert_eq!(list[0]["IsFavorite"], true);
+    assert_eq!(list[0]["Played"], true);
+    let viewers = for_user(&viewer_id);
+    assert_eq!(viewers["UserDataList"][0]["IsFavorite"], true);
+    assert_eq!(viewers["UserDataList"][0]["Played"], false);
+
+    // Progress reports are left out, as in Jellyfin (UserDataSaveReason.PlaybackProgress).
+    let progress = serde_json::json!({ "ItemId": movie.to_string(), "PositionTicks": 50_000_000 });
+    let req = request(
+        "POST",
+        "/Sessions/Playing/Progress",
+        Some(&owner),
+        Some(progress),
+    );
+    assert!(send(&app, req).await.0.is_success());
+    let sent = r3endpoints_user_data_events(&mut events, std::time::Duration::from_secs(1)).await;
+    assert_eq!(sent, Vec::<serde_json::Value>::new());
+
+    // Marking it unplayed sends again.
+    let uri = format!("/UserPlayedItems/{movie}");
+    let req = request("DELETE", &uri, Some(&owner), None);
+    assert_eq!(send(&app, req).await.0, StatusCode::OK);
+    let sent = r3endpoints_user_data_events(&mut events, std::time::Duration::from_secs(2)).await;
+    assert_eq!(sent.len(), 1, "{sent:?}");
+    assert_eq!(sent[0]["UserDataList"][0]["Played"], false);
+}
+
+/// Jellyfin 10.9+'s `POST /Users?userId=`, `/Users/Password?userId=` and
+/// `/Users/Configuration?userId=` act like the `/Users/{userId}/...` forms, with the same rules;
+/// without `userId` they act for the caller.
+#[tokio::test]
+async fn r3endpoints_user_settings_take_the_user_from_the_query() {
+    let state = test_state().await;
+    let app = app(state.clone());
+    let (owner, owner_id, viewer, viewer_id) = g1_owner_and_viewer(&state, &app).await;
+
+    let config = serde_json::json!({ "PlayDefaultAudioTrack": false });
+    let uri = format!("/Users/Configuration?userId={viewer_id}");
+    let req = request("POST", &uri, Some(&viewer), Some(config.clone()));
+    assert!(send(&app, req).await.0.is_success(), "{uri}");
+    let req = request("GET", &format!("/Users/{viewer_id}"), Some(&viewer), None);
+    let (_, me) = send(&app, req).await;
+    assert_eq!(me["Configuration"]["PlayDefaultAudioTrack"], false, "{me}");
+    // Another user's settings: refused to a non-administrator.
+    let uri = format!("/Users/Configuration?userId={owner_id}");
+    let req = request("POST", &uri, Some(&viewer), Some(config));
+    assert_eq!(send(&app, req).await.0, StatusCode::FORBIDDEN);
+    // So are another user's password and name, and both stay as they were.
+    let uri = format!("/Users/Password?userId={owner_id}");
+    let pw = serde_json::json!({ "CurrentPw": "ownerpass", "NewPw": "taken" });
+    let req = request("POST", &uri, Some(&viewer), Some(pw));
+    assert_eq!(send(&app, req).await.0, StatusCode::FORBIDDEN, "{uri}");
+    let uri = format!("/Users?userId={owner_id}");
+    let name = serde_json::json!({ "Name": "renamed" });
+    let req = request("POST", &uri, Some(&viewer), Some(name));
+    assert_eq!(send(&app, req).await.0, StatusCode::FORBIDDEN, "{uri}");
+    assert!(login(&app, "owner", "ownerpass").await.is_some());
+
+    let uri = format!("/Users?userId={viewer_id}");
+    let name = serde_json::json!({ "Name": "viewer2" });
+    let req = request("POST", &uri, Some(&owner), Some(name));
+    assert!(send(&app, req).await.0.is_success(), "{uri}");
+    let req = request("GET", &format!("/Users/{viewer_id}"), Some(&owner), None);
+    assert_eq!(send(&app, req).await.1["Name"], "viewer2");
+
+    // A wrong current password is refused; without `userId` the caller changes their own.
+    let wrong = serde_json::json!({ "CurrentPw": "nope", "NewPw": "newpass" });
+    let req = request("POST", "/Users/Password", Some(&viewer), Some(wrong));
+    assert_eq!(send(&app, req).await.0, StatusCode::UNAUTHORIZED);
+    let right = serde_json::json!({ "CurrentPw": "viewerpass", "NewPw": "newpass" });
+    let req = request("POST", "/Users/Password", Some(&viewer), Some(right));
+    assert!(send(&app, req).await.0.is_success());
+    assert!(login(&app, "viewer2", "newpass").await.is_some());
+    assert!(login(&app, "viewer2", "viewerpass").await.is_none());
+}
+
+/// `GET /Branding/Splashscreen` answers the splash image from the data dir, without sign-in, and
+/// 404 while there is none, as Jellyfin does.
+#[tokio::test]
+async fn r3endpoints_splashscreen_is_served_from_the_data_dir() {
+    let state = test_state().await;
+    let app = app(state.clone());
+    let req = request("GET", "/Branding/Splashscreen", None, None);
+    assert_eq!(send(&app, req).await.0, StatusCode::NOT_FOUND);
+
+    std::fs::create_dir_all(&*state.data_dir).unwrap();
+    let png = b"\x89PNG\r\n\x1a\nr3endpoints";
+    std::fs::write(state.data_dir.join("splashscreen.png"), png).unwrap();
+    let req = request("GET", "/Branding/Splashscreen", None, None);
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(resp.headers()["content-type"], "image/png");
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    assert_eq!(&bytes[..], &png[..]);
+}
+
+/// A movie split into files (`-cd1` to `-cd3`, or ` part1`, ` part2` in the library root) is one
+/// movie at part 1, as Jellyfin's StackResolver makes it: the listings show it once, with its
+/// stack's name, it has a PartCount, its later parts come from `/Videos/{id}/AdditionalParts` in
+/// order and without an ExtraType, and they are no special features.
+#[tokio::test]
+async fn r3endpoints_movie_parts_stack_into_one_movie_with_additional_parts() {
+    let state = test_state().await;
+    let app = app(state.clone());
+    let (token, _) = admin_session(&state).await;
+    let root = std::path::PathBuf::from(media_folder(&state, "r3endpoints parts"));
+    let film = root.join("Lantern Bay (1999)");
+    for part in ["cd1", "cd2", "cd3"] {
+        if !r3extras_media(&film.join(format!("Lantern Bay (1999)-{part}.mkv")), false) {
+            return;
+        }
+    }
+    for part in ["part1", "part2"] {
+        let file = root.join(format!("Quiet Orchard (2004) {part}.mkv"));
+        assert!(r3extras_media(&file, false));
+    }
+    let lib = rustyfin_model::library::Library {
+        id: uuid::Uuid::new_v4(),
+        name: "R3 Endpoints Parts".to_string(),
+        content_type: rustyfin_model::library::LibraryContentType::Movies,
+        paths: vec![root.to_str().unwrap().to_string()],
+    };
+    rustyfin_db::repo_library::create_library(&state.db, &lib)
+        .await
+        .unwrap();
+    rustyfin_core::scanner::scan_library(&state.db, &lib)
+        .await
+        .unwrap();
+    rustyfin_core::scanner::wait_for_idle().await;
+
+    let uri = format!("/Items?ParentId={}&Recursive=true&SortBy=SortName", lib.id);
+    let (status, body) = send_authed(&app, "GET", &uri, &token, None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let items = body["Items"].as_array().unwrap().clone();
+    let names: Vec<&str> = items.iter().filter_map(|i| i["Name"].as_str()).collect();
+    assert_eq!(names, ["Lantern Bay", "Quiet Orchard"], "{body}");
+
+    for (movie, count, second) in [
+        (&items[0], 3, "Lantern Bay (1999)-cd2"),
+        (&items[1], 2, "Quiet Orchard (2004) part2"),
+    ] {
+        let movie = movie["Id"].as_str().unwrap();
+        let (status, item) =
+            send_authed(&app, "GET", &format!("/Items/{movie}"), &token, None).await;
+        assert_eq!(status, StatusCode::OK, "{item}");
+        assert_eq!(item["PartCount"], count, "{item}");
+        assert_eq!(item["SpecialFeatureCount"], 0, "{item}");
+        let uri = format!("/Videos/{movie}/AdditionalParts");
+        let (status, parts) = send_authed(&app, "GET", &uri, &token, None).await;
+        assert_eq!(status, StatusCode::OK, "{parts}");
+        let list = parts["Items"].as_array().unwrap();
+        assert_eq!(list.len(), count - 1, "{parts}");
+        assert_eq!(parts["TotalRecordCount"], count - 1);
+        assert_eq!(list[0]["Name"], second, "{parts}");
+        assert!(list.iter().all(|p| p["ExtraType"].is_null()), "{parts}");
+        let uri = format!("/Items/{movie}/SpecialFeatures");
+        let (_, specials) = send_authed(&app, "GET", &uri, &token, None).await;
+        assert_eq!(specials, serde_json::json!([]), "{specials}");
+    }
+
+    let uri = format!("/Videos/{}/AdditionalParts", uuid::Uuid::new_v4());
+    let (status, _) = send_authed(&app, "GET", &uri, &token, None).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+/// A movies library at a new folder `name` under the data dir, created but not scanned.
+async fn r3endpoints_movies_library(
+    state: &AppState,
+    name: &str,
+) -> (std::path::PathBuf, rustyfin_model::library::Library) {
+    let root = std::path::PathBuf::from(media_folder(state, name));
+    let lib = rustyfin_model::library::Library {
+        id: uuid::Uuid::new_v4(),
+        name: name.to_string(),
+        content_type: rustyfin_model::library::LibraryContentType::Movies,
+        paths: vec![root.to_str().unwrap().to_string()],
+    };
+    rustyfin_db::repo_library::create_library(&state.db, &lib)
+        .await
+        .unwrap();
+    (root, lib)
+}
+
+async fn r3endpoints_scan(state: &AppState, lib: &rustyfin_model::library::Library) {
+    rustyfin_core::scanner::scan_library(&state.db, lib)
+        .await
+        .unwrap();
+    rustyfin_core::scanner::wait_for_idle().await;
+}
+
+/// A stored row: `(id, path file name, media_type, extra_type, owner_id)`.
+type R3endpointsRow = (String, String, String, Option<String>, Option<String>);
+
+/// The stored rows of a library, by path.
+async fn r3endpoints_rows(
+    state: &AppState,
+    lib: &rustyfin_model::library::Library,
+) -> Vec<R3endpointsRow> {
+    let rows: Vec<R3endpointsRow> = sqlx::query_as(
+        "SELECT id, path, media_type, extra_type, owner_id FROM media_items
+         WHERE library_id = ?1 ORDER BY path",
+    )
+    .bind(lib.id.to_string())
+    .fetch_all(&state.db)
+    .await
+    .unwrap();
+    rows.into_iter()
+        .map(|(id, path, kind, extra, owner)| {
+            let file = path.rsplit('/').next().unwrap().to_string();
+            (id, file, kind, extra, owner)
+        })
+        .collect()
+}
+
+/// A stack that breaks up (part 1 deleted) leaves no orphan part: the stored part is the movie again,
+/// with its id, and no second movie is added at its path.
+#[tokio::test]
+async fn r3endpoints_a_broken_stack_makes_its_part_the_movie_again() {
+    let state = test_state().await;
+    let (root, lib) = r3endpoints_movies_library(&state, "r3endpoints broken stack").await;
+    let film = root.join("Copper Vale (2007)");
+    for part in ["cd1", "cd2"] {
+        if !r3extras_media(&film.join(format!("Copper Vale (2007)-{part}.mkv")), false) {
+            return;
+        }
+    }
+    r3endpoints_scan(&state, &lib).await;
+    let rows = r3endpoints_rows(&state, &lib).await;
+    let part = rows
+        .iter()
+        .find(|row| row.1 == "Copper Vale (2007)-cd2.mkv")
+        .unwrap();
+    assert_eq!(part.3.as_deref(), Some("Part"), "{rows:?}");
+    let part_id = part.0.clone();
+
+    std::fs::remove_file(film.join("Copper Vale (2007)-cd1.mkv")).unwrap();
+    r3endpoints_scan(&state, &lib).await;
+    let rows = r3endpoints_rows(&state, &lib).await;
+    assert_eq!(
+        rows,
+        vec![(
+            part_id,
+            "Copper Vale (2007)-cd2.mkv".to_string(),
+            "Movie".to_string(),
+            None,
+            None
+        )],
+        "one movie at the former part's path, with its id"
+    );
+}
+
+/// Two movies that a scan now stacks (an older scan stored part 1 and part 2 as movies of their own):
+/// part 2's watch state is merged into the movie once, and the movie keeps its own resume point.
+#[tokio::test]
+async fn r3endpoints_two_movies_that_stack_merge_their_user_data() {
+    let state = test_state().await;
+    let app = app(state.clone());
+    let (token, _) = admin_session(&state).await;
+    let (root, lib) = r3endpoints_movies_library(&state, "r3endpoints merged parts").await;
+    let film = root.join("Birch Hollow (2011)");
+    let files: Vec<std::path::PathBuf> = ["part1", "part2"]
+        .iter()
+        .map(|p| film.join(format!("Birch Hollow (2011) {p}.mkv")))
+        .collect();
+    for file in &files {
+        if !r3extras_media(file, false) {
+            return;
+        }
+    }
+    // As an older scan left them: two movies, one per file.
+    let ids: Vec<String> = (0..2).map(|_| uuid::Uuid::new_v4().to_string()).collect();
+    for (id, file) in ids.iter().zip(&files) {
+        sqlx::query(
+            "INSERT INTO media_items (id, library_id, name, media_type, path) VALUES (?, ?, ?, 'Movie', ?)",
+        )
+        .bind(id)
+        .bind(lib.id.to_string())
+        .bind("Birch Hollow")
+        .bind(file.to_str().unwrap())
+        .execute(&state.db)
+        .await
+        .unwrap();
+    }
+    let user_data = [
+        serde_json::json!({ "PlaybackPositionTicks": 70_000_000, "PlayCount": 1 }),
+        serde_json::json!({
+            "PlaybackPositionTicks": 90_000_000, "PlayCount": 3, "Played": true,
+            "IsFavorite": true, "LastPlayedDate": "2026-01-02T03:04:05Z"
+        }),
+    ];
+    for (id, data) in ids.iter().zip(user_data) {
+        let uri = format!("/UserItems/{id}/UserData");
+        let body = data.to_string();
+        let (status, answer) = send_authed(&app, "POST", &uri, &token, Some(&body)).await;
+        assert_eq!(status, StatusCode::OK, "{answer}");
+    }
+
+    r3endpoints_scan(&state, &lib).await;
+    let rows = r3endpoints_rows(&state, &lib).await;
+    assert_eq!(rows.len(), 2, "{rows:?}");
+    assert_eq!(
+        (rows[0].0.as_str(), rows[0].3.as_deref()),
+        (ids[0].as_str(), None)
+    );
+    assert_eq!(
+        (
+            rows[1].0.as_str(),
+            rows[1].3.as_deref(),
+            rows[1].4.as_deref()
+        ),
+        (ids[1].as_str(), Some("Part"), Some(ids[0].as_str())),
+        "{rows:?}"
+    );
+    let uri = format!("/UserItems/{}/UserData", ids[0]);
+    let (status, data) = send_authed(&app, "GET", &uri, &token, None).await;
+    assert_eq!(status, StatusCode::OK, "{data}");
+    assert_eq!(data["Played"], true, "{data}");
+    assert_eq!(data["IsFavorite"], true, "{data}");
+    assert_eq!(data["PlayCount"], 3, "{data}");
+    assert_eq!(data["PlaybackPositionTicks"], 70_000_000, "{data}");
+    assert!(
+        data["LastPlayedDate"]
+            .as_str()
+            .unwrap()
+            .starts_with("2026-01-02"),
+        "{data}"
+    );
+
+    // Once only: a rescan doesn't merge again.
+    let uri = format!("/UserItems/{}/UserData", ids[0]);
+    let body = serde_json::json!({ "Played": false, "IsFavorite": false }).to_string();
+    assert_eq!(
+        send_authed(&app, "POST", &uri, &token, Some(&body)).await.0,
+        StatusCode::OK
+    );
+    r3endpoints_scan(&state, &lib).await;
+    let (_, data) = send_authed(&app, "GET", &uri, &token, None).await;
+    assert_eq!(data["Played"], false, "{data}");
+    assert_eq!(data["IsFavorite"], false, "{data}");
+}
+
+/// A library whose `-cd1`/`-cd2` files an older scan stored as two versions of one movie: the
+/// rescan keeps the movie and its id, drops the part 2 version, and makes part 2 its part.
+#[tokio::test]
+async fn r3endpoints_parts_stored_as_versions_become_parts_on_rescan() {
+    let state = test_state().await;
+    let app = app(state.clone());
+    let (token, _) = admin_session(&state).await;
+    let (root, lib) = r3endpoints_movies_library(&state, "r3endpoints versions").await;
+    let film = root.join("Slate Harbor (2016)");
+    let cd1 = film.join("Slate Harbor (2016)-cd1.mkv");
+    let cd2 = film.join("Slate Harbor (2016)-cd2.mkv");
+    if !r3extras_media(&cd1, false) {
+        return;
+    }
+    r3endpoints_scan(&state, &lib).await;
+    let movies = j5_movie_ids(&state).await;
+    assert_eq!(movies.len(), 1);
+    let movie = movies[0].clone();
+    // As an older scan left them: part 2 is a second media source (version) of the movie.
+    assert!(r3extras_media(&cd2, false));
+    sqlx::query("INSERT INTO media_sources (id, item_id, uid, path) VALUES (?, ?, ?, ?)")
+        .bind(uuid::Uuid::new_v4().simple().to_string())
+        .bind(&movie)
+        .bind(uuid::Uuid::new_v4().simple().to_string())
+        .bind(cd2.to_str().unwrap())
+        .execute(&state.db)
+        .await
+        .unwrap();
+
+    r3endpoints_scan(&state, &lib).await;
+    assert_eq!(
+        j5_movie_ids(&state).await,
+        vec![movie.clone()],
+        "the same movie"
+    );
+    let (status, item) = send_authed(&app, "GET", &format!("/Items/{movie}"), &token, None).await;
+    assert_eq!(status, StatusCode::OK, "{item}");
+    assert_eq!(item["PartCount"], 2, "{item}");
+    let sources: Vec<&str> = item["MediaSources"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|s| s["Path"].as_str())
+        .collect();
+    assert_eq!(sources, [cd1.to_str().unwrap()], "{item}");
+    let uri = format!("/Videos/{movie}/AdditionalParts");
+    let (_, parts) = send_authed(&app, "GET", &uri, &token, None).await;
+    assert_eq!(parts["TotalRecordCount"], 1, "{parts}");
+    assert_eq!(parts["Items"][0]["Path"], cd2.to_str().unwrap(), "{parts}");
+}
+
+/// A library under the data dir, holding one item of each `(media_type, name)` pair.
+async fn r3endpoints_library_with(state: &AppState, items: &[(&str, &str)]) -> uuid::Uuid {
+    let dir = state
+        .data_dir
+        .join(format!("r3e-{}", uuid::Uuid::new_v4().simple()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let lib = rustyfin_model::library::Library {
+        id: uuid::Uuid::new_v4(),
+        name: format!("R3E {}", uuid::Uuid::new_v4().simple()),
+        content_type: rustyfin_model::library::LibraryContentType::Movies,
+        paths: vec![dir.to_str().unwrap().to_string()],
+    };
+    rustyfin_db::repo_library::create_library(&state.db, &lib)
+        .await
+        .unwrap();
+    for (media_type, name) in items {
+        let path = dir.join(format!("{}.mkv", uuid::Uuid::new_v4().simple()));
+        sqlx::query(
+            "INSERT INTO media_items (id, library_id, name, media_type, path) VALUES (?, ?, ?, ?, ?)",
+        )
+        .bind(uuid::Uuid::new_v4().to_string())
+        .bind(lib.id.to_string())
+        .bind(*name)
+        .bind(*media_type)
+        .bind(path.to_str().unwrap())
+        .execute(&state.db)
+        .await
+        .unwrap();
+    }
+    lib.id
+}
+
+/// The `Name`s of the items in a `/Items/Suggestions` answer, sorted.
+fn r3endpoints_names(body: &serde_json::Value) -> Vec<String> {
+    let mut names: Vec<String> = body["Items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|item| item["Name"].as_str().unwrap().to_string())
+        .collect();
+    names.sort();
+    names
+}
+
+#[tokio::test]
+async fn r3endpoints_suggestions_returns_only_requested_types() {
+    let state = test_state().await;
+    let (token, _) = admin_session(&state).await;
+    r3endpoints_library_with(
+        &state,
+        &[
+            ("Movie", "R3E Movie"),
+            ("Series", "R3E Series"),
+            ("Episode", "R3E Episode"),
+        ],
+    )
+    .await;
+    let app = app(state);
+
+    let (status, body) = send(
+        &app,
+        request(
+            "GET",
+            "/Items/Suggestions?type=Movie&type=Series&limit=6",
+            Some(&token),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(r3endpoints_names(&body), ["R3E Movie", "R3E Series"]);
+    assert_eq!(body["TotalRecordCount"], 2);
+    assert_eq!(body["StartIndex"], 0);
+
+    // The comma form names the same types.
+    let (status, body) = send(
+        &app,
+        request(
+            "GET",
+            "/Items/Suggestions?type=Movie,Series",
+            Some(&token),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(r3endpoints_names(&body), ["R3E Movie", "R3E Series"]);
+}
+
+#[tokio::test]
+async fn r3endpoints_suggestions_respects_limit() {
+    let state = test_state().await;
+    let (token, _) = admin_session(&state).await;
+    r3endpoints_library_with(
+        &state,
+        &[
+            ("Movie", "R3E One"),
+            ("Movie", "R3E Two"),
+            ("Movie", "R3E Three"),
+        ],
+    )
+    .await;
+    let app = app(state);
+
+    let (status, body) = send(
+        &app,
+        request(
+            "GET",
+            "/Items/Suggestions?type=Movie&limit=2",
+            Some(&token),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["Items"].as_array().unwrap().len(), 2);
+    // Without enableTotalRecordCount the total is the count of the returned items.
+    assert_eq!(body["TotalRecordCount"], 2);
+
+    let (status, body) = send(
+        &app,
+        request(
+            "GET",
+            "/Items/Suggestions?type=Movie&limit=2&enableTotalRecordCount=true",
+            Some(&token),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["Items"].as_array().unwrap().len(), 2);
+    assert_eq!(body["TotalRecordCount"], 3);
+}
+
+#[tokio::test]
+async fn r3endpoints_suggestions_requires_a_token() {
+    let state = test_state().await;
+    let app = app(state);
+
+    let (status, _) = send(
+        &app,
+        request("GET", "/Items/Suggestions?type=Movie&limit=6", None, None),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn r3endpoints_clientlog_requires_auth() {
+    let state = test_state().await;
+    let app = app(state);
+    let req = Request::builder()
+        .method("POST")
+        .uri("/ClientLog/Document")
+        .header("Content-Type", "text/plain")
+        .body(Body::from("no token"))
+        .unwrap();
+    let (status, _) = send(&app, req).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn r3endpoints_clientlog_writes_sanitised_file() {
+    let state = test_state().await;
+    let username = format!("logger_{}", uuid::Uuid::new_v4().simple());
+    rustyfin_auth::create_initial_user(&state.db, &username, "pw")
+        .await
+        .unwrap();
+    let user = rustyfin_db::repo_user::get_user_by_name(&state.db, &username)
+        .await
+        .unwrap()
+        .unwrap();
+    let device = rustyfin_auth::TokenDevice {
+        device_id: "r3-device".to_string(),
+        device_name: "Dev".to_string(),
+        app_name: "../x".to_string(),
+        app_version: "1.0 beta".to_string(),
+    };
+    let token = rustyfin_auth::create_token(&state.db, &user, &device)
+        .await
+        .unwrap();
+
+    let logs_dir = state.data_dir.join("logs");
+    let app = app(state.clone());
+    let body = "hello log\nline 2";
+    let req = Request::builder()
+        .method("POST")
+        .uri("/ClientLog/Document")
+        .header("Authorization", format!("Bearer {token}"))
+        .header("Content-Type", "text/plain")
+        .body(Body::from(body))
+        .unwrap();
+    let (status, json) = send(&app, req).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let name = json["FileName"].as_str().expect("FileName").to_string();
+    assert!(name.starts_with("upload_"), "{name}");
+    assert!(name.ends_with(".log"), "{name}");
+    assert!(name.contains("_1.0_beta_"), "{name}");
+    assert!(!name.contains('/') && !name.contains('\\'), "{name}");
+    assert!(!name.contains(".."), "{name}");
+
+    let written = std::fs::read_to_string(logs_dir.join(&name)).expect("log file exists");
+    assert_eq!(written, body);
+}
+
+#[tokio::test]
+async fn r3endpoints_clientlog_size_limit_is_413() {
+    let state = test_state().await;
+    let (token, _) = admin_session(&state).await;
+    let app = app(state);
+    let req = Request::builder()
+        .method("POST")
+        .uri("/ClientLog/Document")
+        .header("Authorization", format!("Bearer {token}"))
+        .header("Content-Type", "text/plain")
+        .body(Body::from(vec![b'a'; 1_000_001]))
+        .unwrap();
+    let (status, _) = send(&app, req).await;
+    assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+}
+
+/// Only the newest 50 uploads are kept: an upload deletes the oldest beyond that, and leaves the
+/// server's own log files alone.
+#[tokio::test]
+async fn r3endpoints_clientlog_keeps_the_newest_50_uploads() {
+    let state = test_state().await;
+    let (token, _) = admin_session(&state).await;
+    let logs_dir = state.data_dir.join("logs");
+    std::fs::create_dir_all(&logs_dir).unwrap();
+    let old = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+    for i in 0..60 {
+        let file =
+            std::fs::File::create(logs_dir.join(format!("upload_old_1_{i:02}.log"))).unwrap();
+        file.set_modified(old + std::time::Duration::from_secs(i))
+            .unwrap();
+    }
+    std::fs::write(logs_dir.join("rustyfin.log"), "server").unwrap();
+    let app = app(state);
+    let req = Request::builder()
+        .method("POST")
+        .uri("/ClientLog/Document")
+        .header("Authorization", format!("Bearer {token}"))
+        .body(Body::from("new"))
+        .unwrap();
+    let (status, json) = send(&app, req).await;
+    assert_eq!(status, StatusCode::OK, "{json}");
+    let mut uploads: Vec<String> = std::fs::read_dir(&logs_dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|name| name.starts_with("upload_"))
+        .collect();
+    uploads.sort();
+    assert_eq!(uploads.len(), 50, "{uploads:?}");
+    assert!(uploads.contains(&json["FileName"].as_str().unwrap().to_string()));
+    // The 11 oldest went: 00 to 10.
+    assert_eq!(uploads[0], "upload_old_1_11.log");
+    assert!(logs_dir.join("rustyfin.log").exists());
+}
+
+/// Inserts a tuner host, a channel on it, and one guide entry on that channel.
+/// Returns (channel_id, program_id).
+async fn r3endpoints_livetv_seed(state: &AppState) -> (String, String) {
+    let host_id = uuid::Uuid::new_v4().to_string();
+    let channel_id = uuid::Uuid::new_v4().to_string();
+    let program_id = uuid::Uuid::new_v4().to_string();
+    sqlx::query(
+        "INSERT INTO live_tv_tuner_hosts (id, name, type, hostname, port, username, password)
+         VALUES (?1, 'r3 host', 'm3u', 'localhost', 0, '', '')",
+    )
+    .bind(&host_id)
+    .execute(&state.db)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO live_tv_channels (id, name, channel_number, tuner_host_id, epg_id,
+                display_name, logo_url, is_radio)
+         VALUES (?1, 'r3 channel', '7', ?2, '', 'r3 channel', '', 0)",
+    )
+    .bind(&channel_id)
+    .bind(&host_id)
+    .execute(&state.db)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO live_tv_guide_entries (id, channel_id, name, description, start_time, end_time)
+         VALUES (?1, ?2, 'r3 show', 'r3 overview', '2026-11-16T18:00:00Z', '2026-11-16T19:00:00Z')",
+    )
+    .bind(&program_id)
+    .bind(&channel_id)
+    .execute(&state.db)
+    .await
+    .unwrap();
+    (channel_id, program_id)
+}
+
+#[tokio::test]
+async fn r3endpoints_livetv_recommended_programs_static_path() {
+    let state = test_state().await;
+    let (token, _) = admin_session(&state).await;
+    let app = app(state);
+
+    // New path, with the query parameters clients send (camelCase and PascalCase).
+    for uri in [
+        "/LiveTv/Programs/Recommended",
+        "/LiveTv/Programs/Recommended?isAiring=true&hasAired=false&limit=10&fields=Overview&userId=x",
+        "/LiveTv/Programs/Recommended?IsAiring=true&HasAired=false&Limit=10&UserId=x",
+    ] {
+        let (status, json) = send(&app, request("GET", uri, Some(&token), None)).await;
+        assert_eq!(status, StatusCode::OK, "{uri}");
+        assert!(json["Items"].is_array(), "{uri}: {json}");
+        assert!(json["TotalRecordCount"].is_number(), "{uri}: {json}");
+    }
+
+    // Old alias still answers.
+    let (status, json) = send(
+        &app,
+        request("GET", "/LiveTv/RecommendedPrograms", Some(&token), None),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(json["Items"].is_array());
+}
+
+#[tokio::test]
+async fn r3endpoints_livetv_recommended_is_not_swallowed_by_program_id() {
+    let state = test_state().await;
+    let (token, _) = admin_session(&state).await;
+    let app = app(state);
+
+    // Program-by-id is a Uuid path: a non-Uuid segment must not reach it, and a Uuid one must.
+    let (status, _) = send(
+        &app,
+        request("GET", "/LiveTv/Programs/Recommended", Some(&token), None),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let unknown = uuid::Uuid::new_v4();
+    let (status, _) = send(
+        &app,
+        request(
+            "GET",
+            &format!("/LiveTv/Programs/{unknown}"),
+            Some(&token),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn r3endpoints_livetv_program_by_id_still_answers() {
+    let state = test_state().await;
+    let (_, program_id) = r3endpoints_livetv_seed(&state).await;
+    let (token, _) = admin_session(&state).await;
+    let app = app(state);
+
+    let (status, json) = send(
+        &app,
+        request(
+            "GET",
+            &format!("/LiveTv/Programs/{program_id}"),
+            Some(&token),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(json["Id"], program_id);
+    assert_eq!(json["Name"], "r3 show");
+}
+
+#[tokio::test]
+async fn r3endpoints_livetv_timer_defaults_without_program() {
+    let state = test_state().await;
+    let (token, _) = admin_session(&state).await;
+    let app = app(state);
+
+    let (status, json) = send(
+        &app,
+        request("GET", "/LiveTv/Timers/Defaults", Some(&token), None),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(json["KeepUntil"], "UntilDeleted");
+    assert_eq!(json["KeepUpTo"], 0);
+    assert_eq!(json["Priority"], 0);
+    assert_eq!(json["PrePaddingSeconds"], 0);
+    assert_eq!(json["PostPaddingSeconds"], 0);
+    assert_eq!(json["IsPrePaddingRequired"], false);
+    assert_eq!(json["IsPostPaddingRequired"], false);
+    assert_eq!(json["RecordAnyTime"], true);
+    assert_eq!(json["RecordAnyChannel"], false);
+    assert_eq!(json["RecordNewOnly"], true);
+    assert_eq!(json["SkipEpisodesInLibrary"], false);
+    assert_eq!(json["Days"].as_array().map(Vec::len), Some(7), "{json}");
+    assert!(json["DayPattern"].is_null());
+    assert!(json.get("ProgramId").is_none());
+    assert!(json.get("ChannelId").is_none());
+}
+
+#[tokio::test]
+async fn r3endpoints_livetv_timer_defaults_from_program() {
+    let state = test_state().await;
+    let (channel_id, program_id) = r3endpoints_livetv_seed(&state).await;
+    let (token, _) = admin_session(&state).await;
+    let app = app(state);
+
+    for query in [
+        format!("programId={program_id}"),
+        format!("ProgramId={program_id}"),
+    ] {
+        let uri = format!("/LiveTv/Timers/Defaults?{query}");
+        let (status, json) = send(&app, request("GET", &uri, Some(&token), None)).await;
+        assert_eq!(status, StatusCode::OK, "{uri}");
+        assert_eq!(json["ProgramId"], program_id, "{uri}");
+        assert_eq!(json["ChannelId"], channel_id, "{uri}");
+        assert_eq!(json["ChannelName"], "r3 channel", "{uri}");
+        assert_eq!(json["Name"], "r3 show", "{uri}");
+        assert_eq!(json["Overview"], "r3 overview", "{uri}");
+        assert_eq!(json["StartDate"], "2026-11-16T18:00:00Z", "{uri}");
+        assert_eq!(json["EndDate"], "2026-11-16T19:00:00Z", "{uri}");
+        assert_eq!(json["ServiceName"], "m3u", "{uri}");
+        assert_eq!(json["KeepUntil"], "UntilDeleted", "{uri}");
+    }
+}
+
+#[tokio::test]
+async fn r3endpoints_livetv_timer_defaults_unknown_program_is_404() {
+    let state = test_state().await;
+    let (token, _) = admin_session(&state).await;
+    let app = app(state);
+
+    let uri = format!("/LiveTv/Timers/Defaults?programId={}", uuid::Uuid::new_v4());
+    let (status, _) = send(&app, request("GET", &uri, Some(&token), None)).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn r3endpoints_livetv_timer_by_id_still_routed() {
+    let state = test_state().await;
+    let (token, _) = admin_session(&state).await;
+    let app = app(state);
+
+    // Static Defaults must not swallow the timer-by-id route, and that route still answers.
+    let (status, json) = send(&app, request("GET", "/LiveTv/Timers", Some(&token), None)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(json["Items"].is_array());
+
+    let unknown = uuid::Uuid::new_v4();
+    let (status, _) = send(
+        &app,
+        request(
+            "GET",
+            &format!("/LiveTv/Timers/{unknown}"),
+            Some(&token),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn r3endpoints_livetv_live_streams_open_answers_null_media_source() {
+    let state = test_state().await;
+    let (token, _) = admin_session(&state).await;
+    let app = app(state);
+
+    let body = serde_json::json!({
+        "OpenToken": "r3-token",
+        "ItemId": uuid::Uuid::new_v4().to_string(),
+        "UserId": uuid::Uuid::new_v4().to_string(),
+        "PlaySessionId": "r3-play",
+        "MaxStreamingBitrate": 20000000,
+        "DeviceProfile": {}
+    });
+    let (status, json) = send(
+        &app,
+        request("POST", "/LiveStreams/Open", Some(&token), Some(body)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(json.get("MediaSource").is_some());
+    assert!(json["MediaSource"].is_null());
+
+    // Query-string form, no body.
+    let (status, json) = send(
+        &app,
+        request(
+            "POST",
+            "/LiveStreams/Open?openToken=r3-token&playSessionId=r3-play",
+            Some(&token),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(json["MediaSource"].is_null());
+}
+
+#[tokio::test]
+async fn r3endpoints_livetv_live_streams_close_is_204() {
+    let state = test_state().await;
+    let (token, _) = admin_session(&state).await;
+    let app = app(state);
+
+    let (status, _) = send(
+        &app,
+        request(
+            "POST",
+            "/LiveStreams/Close?liveStreamId=r3-unknown",
+            Some(&token),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+}
+
+#[tokio::test]
+async fn r3endpoints_livetv_new_paths_require_auth() {
+    let state = test_state().await;
+    let app = app(state);
+
+    for (method, uri) in [
+        ("GET", "/LiveTv/Programs/Recommended"),
+        ("GET", "/LiveTv/Timers/Defaults"),
+        ("POST", "/LiveStreams/Open"),
+        ("POST", "/LiveStreams/Close?liveStreamId=x"),
+    ] {
+        let (status, _) = send(&app, request(method, uri, None, None)).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{method} {uri}");
+    }
+}
+
+#[tokio::test]
+async fn r3endpoints_livetv_old_live_stream_path_still_answers() {
+    let state = test_state().await;
+    let (token, _) = admin_session(&state).await;
+    let app = app(state);
+
+    let (status, _) = send(
+        &app,
+        request(
+            "POST",
+            "/LiveTv/LiveStream",
+            Some(&token),
+            Some(serde_json::json!({ "OpenToken": "r3" })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+}
+
 // ── Quick Connect Tests ──
 
 #[tokio::test]
@@ -14705,6 +15704,7 @@ async fn g12_stub() -> (String, G12Hits) {
             "/movie/7101" => serde_json::json!({
                 "id": 7101,
                 "title": "Wrong Film",
+                "original_language": "en",
                 "overview": "Not the item's film",
                 "release_date": "1985-03-01"
             }),
@@ -17720,7 +18720,8 @@ async fn r3extras2_id(
 /// A show's `Extras` folder holds the series' extras, as in Jellyfin, while `Specials` is season 0. An
 /// episode's suffix files and its episode folder's extras folders are its extras, never episodes; a suffix
 /// file that names no episode next to it stays an episode. The episode pages' counts and lists show them,
-/// and `HasSpecialFeature` finds the series and episodes that have some.
+/// and, as in Jellyfin 12.4, `HasSpecialFeature` and `HasTrailer` find the items that have some and the
+/// season and series above them; the series' own `Unknown` extra (`Extras/`) is no special feature there.
 #[tokio::test]
 async fn r3extras2_tv_extras_belong_to_series_seasons_and_episodes() {
     let state = test_state().await;
@@ -17816,7 +18817,7 @@ async fn r3extras2_tv_extras_belong_to_series_seasons_and_episodes() {
     .await;
     assert_eq!(
         r3extras2_names(&with),
-        ["S01E01", "S01E02", "Show"],
+        ["S01E01", "S01E02", "Season 1", "Show"],
         "{with}"
     );
     let trailers = get(format!(
@@ -17824,11 +18825,16 @@ async fn r3extras2_tv_extras_belong_to_series_seasons_and_episodes() {
         lib.id
     ))
     .await;
-    assert_eq!(r3extras2_names(&trailers), ["Season 1"], "{trailers}");
+    assert_eq!(
+        r3extras2_names(&trailers),
+        ["Season 1", "Show"],
+        "{trailers}"
+    );
 }
 
 /// `/Items?HasTrailer`, `HasSpecialFeature`, `HasThemeSong` and `HasThemeVideo` keep the items with (true) or
-/// without (false) that kind of extra, each counted as `LocalTrailerCount` and `SpecialFeatureCount` count them.
+/// without (false) that kind of extra, as Jellyfin 12.4 does: an `Unknown` extra (`extras/`) is no special
+/// feature for the filter.
 #[tokio::test]
 async fn r3extras2_has_filters_find_items_by_their_extras() {
     let state = test_state().await;
@@ -17846,6 +18852,7 @@ async fn r3extras2_has_filters_find_items_by_their_extras() {
             "Gamma/Gamma.mkv",
             "Gamma/featurettes/Making Of.mkv",
             "Delta/Delta.mkv",
+            "Delta/extras/Bonus.mkv",
         ],
     )
     .await
@@ -18102,7 +19109,7 @@ async fn r3extras2_an_old_extras_season_becomes_series_extras_and_goes() {
         None,
     )
     .await;
-    assert_eq!(r3extras_ids(&features), [episode.clone()]);
+    assert_eq!(r3extras_ids(&features), std::slice::from_ref(&episode));
     let (_, item) = send_authed(
         &app,
         "GET",
@@ -23828,10 +24835,6 @@ async fn r2parental_lists_leave_out_items_above_the_limit() {
     let ids_query = format!("/Items?Ids={},{gentle}", w.id("Rough"));
     let checks = [
         ("/Items/Latest?Limit=100".to_string(), "Rough"),
-        (
-            format!("/Users/{}/Items/Latest?Limit=100", w.kid_id),
-            "Rough",
-        ),
         ("/Search/Hints?searchTerm=Ro".to_string(), "Rough"),
         ("/Search/Hints?searchTerm=Grim".to_string(), "Grim Show"),
         ("/Search?Term=Rough".to_string(), "Rough"),
@@ -23871,6 +24874,13 @@ async fn r2parental_lists_leave_out_items_above_the_limit() {
                 "{uri}: {hidden} in {names:?}"
             );
         }
+    }
+    // The kid's Latest is the kid's, as in Jellyfin, even when the administrator asks for it.
+    let uri = format!("/Users/{}/Items/Latest?Limit=100", w.kid_id);
+    for token in [&w.admin, &w.kid] {
+        let (names, _) = w.names(token, &uri).await;
+        assert!(!names.is_empty(), "{uri}");
+        assert!(!names.contains(&"Rough".to_string()), "{uri}: {names:?}");
     }
 
     assert_eq!(
@@ -26230,6 +27240,14 @@ async fn r3parental_items_carry_the_fields_jellyfin_web_reads() {
         .unwrap_or_else(|| panic!("{body}"));
     assert_eq!(studio["UserData"]["IsFavorite"], false, "{studio}");
     assert_eq!(studio["UserData"]["ItemId"], studio["Id"], "{studio}");
+    // As in Jellyfin: not with EnableUserData=false, and never on the genre lists.
+    for uri in ["/Studios?EnableUserData=false", "/Genres", "/MusicGenres"] {
+        let (status, body) = w.get(&w.kid, uri).await;
+        assert_eq!(status, StatusCode::OK, "{uri}");
+        assert!(!body.to_string().contains("UserData"), "{uri}: {body}");
+    }
+    let (_, genres) = w.get(&w.kid, "/Genres").await;
+    assert!(genres.to_string().contains("Family"), "{genres}");
 }
 
 // ── G1: authorization ──
@@ -31475,16 +32493,15 @@ async fn r3users2_public(
 }
 
 #[tokio::test]
-async fn r3users2_public_users_say_whether_they_have_a_password() {
+async fn r3users2_public_users_always_report_a_password() {
     let state = test_state().await;
     let app = app(state.clone());
     assert_eq!(
         post_startup_user(&app, None, "owner", "pw-owner").await,
         StatusCode::NO_CONTENT
     );
-    // A password set to the empty one: the tile signs in at a click
+    // A password set to the empty one, and no password hash at all (password sign-in off)
     add_user(&state, "kid", "", false).await;
-    // No password hash at all: password sign-in is off for the user, so the tile asks
     let sso = add_user(&state, "sso", "pw-sso", false).await;
     sqlx::query("UPDATE users SET password_hash = '' WHERE id = ?")
         .bind(sso.to_string())
@@ -31492,24 +32509,20 @@ async fn r3users2_public_users_say_whether_they_have_a_password() {
         .await
         .unwrap();
 
-    let users = r3users2_public(&app).await;
-    assert_eq!(users["owner"]["HasPassword"], true, "{users:?}");
-    assert_eq!(users["owner"]["HasConfiguredPassword"], true);
-    assert_eq!(users["kid"]["HasPassword"], false, "{users:?}");
-    assert_eq!(users["kid"]["HasConfiguredPassword"], false);
-    assert_eq!(users["sso"]["HasPassword"], true, "{users:?}");
-    // Only what a tile needs: no policy, configuration or hash
-    assert!(users["owner"].get("Policy").is_none());
-    assert!(users["owner"].get("PasswordHash").is_none());
+    // As in Jellyfin 12.4, HasPassword and HasConfiguredPassword are always true, on any network
+    for app in [app.clone(), remote_app(state.clone())] {
+        let users = r3users2_public(&app).await;
+        for name in ["owner", "kid", "sso"] {
+            assert_eq!(users[name]["HasPassword"], true, "{name}: {users:?}");
+            assert_eq!(users[name]["HasConfiguredPassword"], true, "{name}");
+        }
+        // Only what a tile needs: no policy, configuration or hash
+        assert!(users["owner"].get("Policy").is_none());
+        assert!(users["owner"].get("PasswordHash").is_none());
+    }
 
-    // A user without a password signs in from the tile with an empty one, as in Jellyfin
+    // An empty password still signs in, through the form the tile opens
     assert!(login(&app, "kid", "").await.is_some());
-
-    // Outside the local network no user is shown as opening without a password
-    let remote = remote_app(state.clone());
-    let users = r3users2_public(&remote).await;
-    assert_eq!(users["kid"]["HasPassword"], true, "{users:?}");
-    assert_eq!(users["kid"]["HasConfiguredPassword"], true);
 }
 
 #[tokio::test]
@@ -31522,11 +32535,11 @@ async fn r3users2_public_users_outside_the_network_need_remote_access() {
             serde_json::json!({ "EnableRemoteAccess": false }),
         )
         .await;
-    assert_eq!(status, StatusCode::NO_CONTENT);
+    assert_eq!(status, StatusCode::OK);
     let (status, _) = t
         .policy(&t.owner, &t.ada_id, serde_json::json!({ "IsHidden": true }))
         .await;
-    assert_eq!(status, StatusCode::NO_CONTENT);
+    assert_eq!(status, StatusCode::OK);
 
     let local = r3users2_public(&t.app).await;
     assert!(
@@ -31548,7 +32561,7 @@ async fn r3users2_public_users_outside_the_network_need_remote_access() {
 }
 
 #[tokio::test]
-async fn r3users2_forgot_password_outside_the_network_is_in_network_required() {
+async fn r3users2_forgot_password_answers_alike_and_writes_only_locally() {
     let state = test_state().await;
     let local_app = app(state.clone());
     assert_eq!(
@@ -31569,10 +32582,15 @@ async fn r3users2_forgot_password_outside_the_network_is_in_network_required() {
             ),
         )
         .await;
+        // As in Jellyfin 12.4: PinCode and the file's path for every name and every client
         assert_eq!(status, StatusCode::OK, "{body}");
-        assert_eq!(body["Action"], "InNetworkRequired", "{name}: {body}");
-        assert_eq!(body["PinFile"], "", "no server path for a remote client");
-        assert!(body["PinExpirationDate"].is_null());
+        assert_eq!(body["Action"], "PinCode", "{name}: {body}");
+        assert!(
+            body["PinFile"]
+                .as_str()
+                .is_some_and(|f| f.contains("passwordreset-"))
+        );
+        assert!(body["PinExpirationDate"].is_string());
     }
     let pin_files = std::fs::read_dir(&*state.data_dir)
         .unwrap()
@@ -31616,18 +32634,41 @@ async fn r3users2_forgot_password_outside_the_network_is_in_network_required() {
     let (status, _) = send(&local_app, redeem(pin.clone())).await;
     assert_eq!(status, StatusCode::NOT_FOUND, "a PIN is single use");
     assert!(login(&local_app, "owner", &pin).await.is_some());
+
+    // As in Jellyfin 12.4, a PIN typed without its dashes matches too
+    let (_, body) = send(
+        &local_app,
+        request(
+            "POST",
+            "/Users/ForgotPassword",
+            None,
+            Some(serde_json::json!({ "EnteredUsername": "owner" })),
+        ),
+    )
+    .await;
+    let path = std::path::PathBuf::from(body["PinFile"].as_str().unwrap());
+    let pin = await_reset_pin(&path).await.expect("a second PIN file");
+    let typed = pin.replace('-', "").to_lowercase();
+    let (status, body) = send(&local_app, redeem(typed.clone())).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(
+        login(&local_app, "owner", &typed.to_uppercase())
+            .await
+            .is_some()
+    );
 }
+
+/// A labelled remote client: its router and the headers it sends.
+type R3users2RemoteClient = (
+    &'static str,
+    axum::Router,
+    Vec<(&'static str, &'static str)>,
+);
 
 /// The ways a client outside the local network reaches the reset routes: a public peer, a public
 /// peer claiming a local address in X-Forwarded-For, and a local peer that isn't a listed proxy
 /// passing on a public address.
-fn r3users2_remote_clients(
-    state: &AppState,
-) -> Vec<(
-    &'static str,
-    axum::Router,
-    Vec<(&'static str, &'static str)>,
-)> {
+fn r3users2_remote_clients(state: &AppState) -> Vec<R3users2RemoteClient> {
     let public = || {
         build_router(state.clone()).layer(MockConnectInfo(
             "203.0.113.5:4000".parse::<SocketAddr>().unwrap(),
@@ -31700,9 +32741,8 @@ async fn r3users2_reset_routes_try_no_pin_outside_the_network() {
                 ),
             )
             .await;
-            assert_eq!(status, StatusCode::OK, "{label}: {body}");
-            assert_eq!(body["Success"], false, "{label}: {body}");
-            assert_eq!(body["UsersReset"], serde_json::json!([]), "{label}");
+            // The answer of a PIN that matches nothing
+            assert_eq!(status, StatusCode::NOT_FOUND, "{label}: {body}");
 
             let (status, body) = send(
                 &remote,
@@ -31713,7 +32753,7 @@ async fn r3users2_reset_routes_try_no_pin_outside_the_network() {
                 ),
             )
             .await;
-            assert_eq!(status, StatusCode::FORBIDDEN, "{label}: {body}");
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{label}: {body}");
         }
     }
     assert!(
@@ -51492,6 +52532,7 @@ async fn r3music2_lyrics_read_upload_and_delete() {
     let (admin, _) = admin_session(&state).await;
     let (user, _) = j6_user_session(&state).await;
     let pool = state.db.clone();
+    let cache = state.cache.clone();
     let uploads = state.data_dir.join("metadata").join("lyrics");
     let app = app(state);
 
@@ -51519,6 +52560,8 @@ async fn r3music2_lyrics_read_upload_and_delete() {
     rustyfin_core::lyrics::sync_sidecars(&pool, library, &rustyfin_db::repo_media::PathScope::All)
         .await
         .unwrap();
+    // A scan drops the cached answers when it ends; this test runs only its lyric-file pass.
+    cache.invalidate_on_scan();
     let item = b27_answer(&app, &format!("/Items/{synced}"), &admin).await;
     assert_eq!(has(&item), true, "{item}");
     let list = b27_answer(
@@ -51983,6 +53026,102 @@ async fn r3cast_a_token_keeps_at_most_four_receiver_sessions() {
     assert!(!r3s_session(&app, &ctl, "r3s-ctl").await.is_null());
 }
 
+// Jellyfin 12.4's session key is the client, the device and the user: two users naming one device,
+// or one user's two clients on it, get a session each, and the same three again reuse theirs
+#[tokio::test]
+async fn r3cast_sessions_are_keyed_by_client_device_and_user() {
+    let state = test_state().await;
+    let app = app(state.clone());
+    let (ctl, owner, _) = r3s_owner(&app).await;
+    add_user(&state, "guest", "guestpass", false).await;
+    let (guest, _) = r3s_login(&app, "guest", "guestpass", "r3cast-guest").await;
+    let caps = |client: &str, token: &str| {
+        let auth = format!(
+            r#"MediaBrowser Client="{client}", Device="Shared", DeviceId="r3cast-shared", Version="1", Token="{token}""#
+        );
+        Request::builder()
+            .method("POST")
+            .uri("/Sessions/Capabilities/Full")
+            .header("Authorization", auth)
+            .header("Content-Type", "application/json")
+            .body(Body::from(r#"{"PlayableMediaTypes":["Video"]}"#))
+            .unwrap()
+    };
+    let owner_of = |id: &str| {
+        let state = state.clone();
+        let id = id.to_string();
+        async move {
+            sqlx::query_scalar::<_, String>("SELECT user_id FROM sessions WHERE id = ?1")
+                .bind(id)
+                .fetch_one(&state.db)
+                .await
+                .unwrap()
+        }
+    };
+
+    assert_eq!(
+        send(&app, caps("Chromecast", &owner)).await.0,
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(
+        send(&app, caps("Chromecast", &guest)).await.0,
+        StatusCode::NO_CONTENT
+    );
+    let shared = r3cast_sessions_on(&state, "r3cast-shared").await;
+    assert_eq!(shared.len(), 2, "one session per user on the shared device");
+    let mut users = Vec::new();
+    for id in &shared {
+        users.push(owner_of(id).await);
+    }
+    users.sort();
+    users.dedup();
+    assert_eq!(
+        users.len(),
+        2,
+        "the guest didn't take over the owner's session"
+    );
+
+    // Another client of the owner on the same device id: a third session
+    assert_eq!(
+        send(&app, caps("Other Client", &owner)).await.0,
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(r3cast_sessions_on(&state, "r3cast-shared").await.len(), 3);
+    // The same client, device and user again: no new session
+    assert_eq!(
+        send(&app, caps("Chromecast", &owner)).await.0,
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(r3cast_sessions_on(&state, "r3cast-shared").await.len(), 3);
+
+    // A sign-in of one client on a device leaves the user's other clients' sessions there
+    let (_, _) = r3s_login(&app, "owner", "ownerpass", "r3s-tgt").await;
+    assert!(!r3s_session(&app, &ctl, "r3s-tgt").await.is_null());
+    let sign_in = |client: &str| {
+        Request::builder()
+            .method("POST")
+            .uri("/Users/AuthenticateByName")
+            .header("Content-Type", "application/json")
+            .header(
+                "X-Emby-Authorization",
+                format!(r#"MediaBrowser Client="{client}", Device="Box", DeviceId="r3cast-box", Version="1""#),
+            )
+            .body(Body::from(
+                serde_json::json!({ "Username": "owner", "Pw": "ownerpass" }).to_string(),
+            ))
+            .unwrap()
+    };
+    assert_eq!(send(&app, sign_in("App A")).await.0, StatusCode::OK);
+    assert_eq!(send(&app, sign_in("App B")).await.0, StatusCode::OK);
+    assert_eq!(r3cast_sessions_on(&state, "r3cast-box").await.len(), 2);
+    assert_eq!(send(&app, sign_in("App A")).await.0, StatusCode::OK);
+    assert_eq!(
+        r3cast_sessions_on(&state, "r3cast-box").await.len(),
+        2,
+        "App A keeps one"
+    );
+}
+
 // A receiver's session ends with the token it was made with: on sign-out, and on revocation
 #[tokio::test]
 async fn r3cast_receiver_sessions_end_with_their_token() {
@@ -52302,7 +53441,21 @@ async fn r3queues_user_views_include_hidden() {
 async fn r3queues_resume_exclude_active_sessions() {
     let state = test_state().await;
     let app = app(state.clone());
-    let (token, user) = admin_session(&state).await;
+    let (_, user) = admin_session(&state).await;
+    // A token with a device, so its reports have a session to play on.
+    let account = rustyfin_db::repo_user::get_user_by_id(&state.db, user)
+        .await
+        .unwrap()
+        .unwrap();
+    let device = rustyfin_auth::TokenDevice {
+        device_id: "r3q-device".to_string(),
+        device_name: "R3Q Phone".to_string(),
+        app_name: "R3Q".to_string(),
+        app_version: "1.0".to_string(),
+    };
+    let token = rustyfin_auth::create_token(&state.db, &account, &device)
+        .await
+        .unwrap();
     let (_, [e1, e2, _]) = g1f_insert_show(&state).await;
     // The start report first: it writes its own play state, which the positions below replace.
     let (status, _) = send(
@@ -52553,4 +53706,538 @@ async fn r3queues_next_up_cutoff_reads_finished_plays() {
     assert_eq!(r3queues_ids(&body), Vec::<uuid::Uuid>::new());
     let (_, body) = r3queues_get(&app, &token, "/Shows/NextUp?nextUpDateCutoff=2010-01-01").await;
     assert_eq!(r3queues_ids(&body), vec![e2]);
+}
+
+// r3dash3: admin dashboard 3 (library options, networking, API keys, devices, branding, backups)
+
+// Every LibraryOptions field Jellyfin Web sends is stored and returned, with Jellyfin's names for
+// chapter images and trickplay and its defaults for the fields never saved.
+#[tokio::test]
+async fn r3dash3_library_options_round_trip_every_field() {
+    let state = test_state().await;
+    let app = app(state.clone());
+    let (owner, _, viewer, _) = g1_owner_and_viewer(&state, &app).await;
+    let lib = create_library_via_api(&app, &state, &owner, "R3 Dash3 Options", "Movies").await;
+    let (_, before) = send_authed(
+        &app,
+        "GET",
+        &format!("/Library/{lib}/Options"),
+        &owner,
+        None,
+    )
+    .await;
+    assert_eq!(before["SeasonZeroDisplayName"], "Specials", "{before}");
+    assert_eq!(before["EnableInternetProviders"], true, "{before}");
+    assert_eq!(before["AllowEmbeddedSubtitles"], "AllowAll", "{before}");
+    assert_eq!(before["EnableTrickplayImageExtraction"], false, "{before}");
+
+    let sent = serde_json::json!({
+        "EnableRealtimeMonitor": false,
+        "EnableChapterImageExtraction": true,
+        "PreferredMetadataLanguage": "de",
+        "MetadataCountryCode": "DE",
+        "SaveLocalMetadata": true,
+        "AutomaticRefreshIntervalDays": 90,
+        "EnableEmbeddedTitles": true,
+        "MetadataSavers": ["Nfo"],
+        "AllowEmbeddedSubtitles": "AllowText",
+        "SubtitleDownloadLanguages": ["deu"],
+        "TypeOptions": [{
+            "Type": "Movie",
+            "MetadataFetchers": ["OMDb"],
+            "MetadataFetcherOrder": ["OMDb", "TMDb"],
+            "ImageFetchers": ["TMDb"],
+            "ImageFetcherOrder": ["TMDb"],
+            "ImageOptions": [{ "Type": "Backdrop", "Limit": 3, "MinWidth": 1280 }],
+        }],
+        "PathInfos": [{ "Path": "/stale/copy" }],
+    });
+    let body = serde_json::json!({ "Id": lib, "LibraryOptions": sent }).to_string();
+    let (status, answer) = send_authed(
+        &app,
+        "POST",
+        "/Library/VirtualFolders/LibraryOptions",
+        &owner,
+        Some(&body),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{answer}");
+    let (_, saved) = send_authed(
+        &app,
+        "GET",
+        &format!("/Library/{lib}/Options"),
+        &owner,
+        None,
+    )
+    .await;
+    for (field, value) in sent.as_object().unwrap() {
+        if field == "PathInfos" {
+            continue;
+        }
+        assert_eq!(&saved[field], value, "{field}: {saved}");
+    }
+    assert_eq!(saved["EnableChapterExtraction"], true, "{saved}");
+    assert!(saved.get("PathInfos").is_none(), "{saved}");
+    let (_, folders) = send_authed(&app, "GET", "/Library/VirtualFolders", &owner, None).await;
+    let folder = folders
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|f| f["ItemId"] == lib.to_string())
+        .unwrap();
+    assert_eq!(folder["LibraryOptions"]["TypeOptions"], sent["TypeOptions"]);
+    assert_eq!(folder["LibraryOptions"]["EnableRealtimeMonitor"], false);
+
+    // Jellyfin Web posts back what it read, both names included: nothing changes
+    let body = serde_json::json!({ "Id": lib, "LibraryOptions": saved }).to_string();
+    let (status, _) = send_authed(
+        &app,
+        "POST",
+        "/Library/VirtualFolders/LibraryOptions",
+        &owner,
+        Some(&body),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let (_, again) = send_authed(
+        &app,
+        "GET",
+        &format!("/Library/{lib}/Options"),
+        &owner,
+        None,
+    )
+    .await;
+    assert_eq!(again, saved);
+
+    let (status, _) = send_authed(
+        &app,
+        "GET",
+        &format!("/Library/{lib}/Options"),
+        &viewer,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn r3dash3_available_options_are_jellyfin_shaped() {
+    let state = test_state().await;
+    let app = app(state.clone());
+    let (owner, _, viewer, _) = g1_owner_and_viewer(&state, &app).await;
+    let (status, tv) = send_authed(
+        &app,
+        "GET",
+        "/Libraries/AvailableOptions?libraryContentType=tvshows&isNewLibrary=false",
+        &owner,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{tv}");
+    assert_eq!(tv["MetadataSavers"][0]["Name"], "Nfo", "{tv}");
+    assert!(tv["SubtitleFetchers"].is_array(), "{tv}");
+    assert!(tv["LyricFetchers"].is_array(), "{tv}");
+    assert!(tv["MediaSegmentProviders"].is_array(), "{tv}");
+    let types: Vec<&str> = tv["TypeOptions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["Type"].as_str().unwrap())
+        .collect();
+    assert_eq!(types, ["Series", "Season", "Episode"]);
+    for t in tv["TypeOptions"].as_array().unwrap() {
+        assert!(t["MetadataFetchers"].is_array(), "{t}");
+        assert!(t["ImageFetchers"].is_array(), "{t}");
+        assert!(
+            t["SupportedImageTypes"]
+                .as_array()
+                .unwrap()
+                .contains(&serde_json::json!("Primary"))
+        );
+        assert!(t["DefaultImageOptions"].is_array(), "{t}");
+    }
+    let (_, movies) = send_authed(
+        &app,
+        "GET",
+        "/Libraries/AvailableOptions?libraryContentType=movies",
+        &owner,
+        None,
+    )
+    .await;
+    assert_eq!(movies["TypeOptions"][0]["Type"], "Movie", "{movies}");
+    let (status, _) = send_authed(&app, "GET", "/Libraries/AvailableOptions", &viewer, None).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+}
+
+// The named configuration `network` has Jellyfin's NetworkConfiguration shape, stores what an
+// administrator saves (unknown fields too), refuses bad values, and hides the certificate
+// password from other users.
+#[tokio::test]
+async fn r3dash3_network_configuration_round_trips() {
+    let state = test_state().await;
+    let app = app(state.clone());
+    let (owner, _, viewer, _) = g1_owner_and_viewer(&state, &app).await;
+    let uri = "/System/Configuration/network";
+    let (status, net) = send_authed(&app, "GET", uri, &owner, None).await;
+    assert_eq!(status, StatusCode::OK);
+    for field in [
+        "BaseUrl",
+        "EnableHttps",
+        "RequireHttps",
+        "CertificatePath",
+        "InternalHttpPort",
+        "InternalHttpsPort",
+        "PublicHttpPort",
+        "PublicHttpsPort",
+        "AutoDiscovery",
+        "EnableUPnP",
+        "EnableIPv4",
+        "EnableIPv6",
+        "EnableRemoteAccess",
+        "LocalNetworkSubnets",
+        "LocalNetworkAddresses",
+        "KnownProxies",
+        "IgnoreVirtualInterfaces",
+        "VirtualInterfaceNames",
+        "EnablePublishedServerUriByRequest",
+        "PublishedServerUriBySubnet",
+        "RemoteIPFilter",
+        "IsRemoteIPFilterBlacklist",
+    ] {
+        assert!(net.get(field).is_some(), "{field}: {net}");
+    }
+    assert_eq!(net["InternalHttpPort"], 8096);
+
+    let mut changed = net.clone();
+    changed["InternalHttpPort"] = serde_json::json!(8300);
+    changed["KnownProxies"] = serde_json::json!(["10.0.0.0/8"]);
+    changed["CertificatePassword"] = serde_json::json!("cert-secret");
+    changed["SomeFutureField"] = serde_json::json!(7);
+    let (status, answer) = send_authed(&app, "POST", uri, &owner, Some(&changed.to_string())).await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{answer}");
+    let (_, saved) = send_authed(&app, "GET", uri, &owner, None).await;
+    assert_eq!(saved, changed);
+    let startup = rustyfin_api::named_config::network_startup(&state.data_dir);
+    assert_eq!(startup.bind.as_deref(), Some("0.0.0.0:8300"));
+    assert_eq!(startup.known_proxies.as_deref(), Some("10.0.0.0/8"));
+
+    let (_, seen) = send_authed(&app, "GET", uri, &viewer, None).await;
+    assert_eq!(seen["CertificatePassword"], "", "{seen}");
+    assert_eq!(seen["InternalHttpPort"], 8300);
+
+    for bad in [
+        serde_json::json!({ "InternalHttpPort": 70000 }),
+        serde_json::json!({ "KnownProxies": ["not an address"] }),
+        serde_json::json!([1, 2]),
+    ] {
+        let (status, _) = send_authed(&app, "POST", uri, &owner, Some(&bad.to_string())).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{bad}");
+    }
+    let (status, _) = send_authed(&app, "POST", uri, &viewer, Some(&changed.to_string())).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let (_, kept) = send_authed(&app, "GET", uri, &owner, None).await;
+    assert_eq!(kept, changed);
+}
+
+// Branding saved through the named configuration `branding` is what the anonymous branding
+// endpoints answer.
+#[tokio::test]
+async fn r3dash3_branding_is_saved_and_served_before_sign_in() {
+    let state = test_state().await;
+    let app = app(state.clone());
+    let (owner, _, viewer, _) = g1_owner_and_viewer(&state, &app).await;
+    let body = serde_json::json!({
+        "LoginDisclaimer": "Family server",
+        "CustomCss": ".x { color: red; }",
+        "SplashscreenEnabled": true,
+    });
+    let (status, _) = send_authed(
+        &app,
+        "POST",
+        "/System/Configuration/branding",
+        &owner,
+        Some(&body.to_string()),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let (status, _) = send_authed(
+        &app,
+        "POST",
+        "/System/Configuration/branding",
+        &viewer,
+        Some(&serde_json::json!({ "CustomCss": "" }).to_string()),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+
+    let (status, config) = send(&app, request("GET", "/Branding/Configuration", None, None)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(config, body);
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/Branding/Css")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert!(
+        resp.headers()["content-type"]
+            .to_str()
+            .unwrap()
+            .starts_with("text/css")
+    );
+    let css = resp.into_body().collect().await.unwrap().to_bytes();
+    assert_eq!(&css[..], b".x { color: red; }");
+}
+
+// An API key is created once (its key in that answer only), listed by a hint, works as an
+// administrator's credentials, and stops working when revoked.
+#[tokio::test]
+async fn r3dash3_api_keys_create_list_use_revoke() {
+    let state = test_state().await;
+    let app = app(state.clone());
+    let (owner, _, viewer, _) = g1_owner_and_viewer(&state, &app).await;
+    let (status, created) =
+        send_authed(&app, "POST", "/Auth/Keys?app=Test%20App", &owner, None).await;
+    assert_eq!(status, StatusCode::OK, "{created}");
+    let key = created["AccessToken"].as_str().unwrap().to_string();
+    let id = created["Id"].as_str().unwrap().to_string();
+    assert_eq!(key.len(), 32);
+
+    let (status, list) = send_authed(&app, "GET", "/Auth/Keys", &owner, None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(list["TotalRecordCount"], 1, "{list}");
+    let item = &list["Items"][0];
+    assert_eq!(item["Id"], id.as_str());
+    assert_eq!(item["AppName"], "Test App");
+    assert_eq!(item["AccessToken"], format!("…{}", &key[28..]));
+    assert!(!list.to_string().contains(&key), "{list}");
+
+    // The key is an administrator's credentials
+    let (status, users) = send_authed(&app, "GET", "/Users", &key, None).await;
+    assert_eq!(status, StatusCode::OK, "{users}");
+    let (_, list) = send_authed(&app, "GET", "/Auth/Keys", &owner, None).await;
+    assert!(list["Items"][0]["DateLastActivity"].is_string(), "{list}");
+
+    let (status, _) = send_authed(&app, "POST", "/Auth/Keys", &owner, None).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "app is required");
+    let (status, _) = send_authed(&app, "POST", "/Auth/Keys?app=x", &viewer, None).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let (status, _) = send_authed(&app, "DELETE", &format!("/Auth/Keys/{id}"), &viewer, None).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+
+    let (status, _) = send_authed(&app, "DELETE", &format!("/Auth/Keys/{id}"), &owner, None).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let (status, _) = send_authed(&app, "GET", "/Users", &key, None).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    let (status, _) = send_authed(&app, "DELETE", &format!("/Auth/Keys/{id}"), &owner, None).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    // Jellyfin revokes by the key itself
+    let (_, created) = send_authed(&app, "POST", "/Auth/Keys?app=Other", &owner, None).await;
+    let key = created["AccessToken"].as_str().unwrap();
+    let (status, _) = send_authed(&app, "DELETE", &format!("/Auth/Keys/{key}"), &owner, None).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let (_, list) = send_authed(&app, "GET", "/Auth/Keys", &owner, None).await;
+    assert_eq!(list["TotalRecordCount"], 0, "{list}");
+}
+
+// GET /Devices answers 200 and lists the device a user signed in with; it can be renamed.
+#[tokio::test]
+async fn r3dash3_devices_lists_a_signed_in_device() {
+    let state = test_state().await;
+    let app = app(state.clone());
+    let (owner, _, _, _) = g1_owner_and_viewer(&state, &app).await;
+    let req = Request::builder()
+        .method("POST")
+        .uri("/Users/AuthenticateByName")
+        .header("Content-Type", "application/json")
+        .header(
+            "X-Emby-Authorization",
+            r#"MediaBrowser Client="Test TV", Device="Lounge", DeviceId="r3dash3-tv", Version="1.2.3""#,
+        )
+        .body(Body::from(
+            serde_json::json!({ "Username": "viewer", "Pw": "viewerpass" }).to_string(),
+        ))
+        .unwrap();
+    let (status, _) = send(&app, req).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, devices) = send_authed(&app, "GET", "/Devices", &owner, None).await;
+    assert_eq!(status, StatusCode::OK, "{devices}");
+    let tv = devices["Items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|d| d["Id"] == "r3dash3-tv")
+        .unwrap_or_else(|| panic!("{devices}"));
+    assert_eq!(tv["Name"], "Lounge");
+    assert_eq!(tv["AppName"], "Test TV");
+    assert_eq!(tv["LastUserName"], "viewer");
+
+    let (status, _) = send_authed(
+        &app,
+        "POST",
+        "/Devices/Options?id=r3dash3-tv",
+        &owner,
+        Some(r#"{"CustomName":"Kids TV"}"#),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let (_, info) = send_authed(&app, "GET", "/Devices/Info?id=r3dash3-tv", &owner, None).await;
+    assert_eq!(info["CustomName"], "Kids TV");
+    let (status, _) = send_authed(&app, "DELETE", "/Devices?id=r3dash3-tv", &owner, None).await;
+    assert!(status.is_success(), "{status}");
+    let (_, devices) = send_authed(&app, "GET", "/Devices", &owner, None).await;
+    assert!(!devices.to_string().contains("r3dash3-tv"), "{devices}");
+}
+
+// A backup is a Jellyfin-shaped manifest over one SQLite file in the data dir: created, listed,
+// downloaded, staged for a restore, and restored with its settings files at the next start.
+#[tokio::test]
+async fn r3dash3_backups_create_list_download_restore() {
+    let state = test_state().await;
+    let app = app(state.clone());
+    let (owner, _, viewer, _) = g1_owner_and_viewer(&state, &app).await;
+    std::fs::write(
+        state.data_dir.join("branding.json"),
+        r#"{"LoginDisclaimer":"then"}"#,
+    )
+    .unwrap();
+    let (status, manifest) = send_authed(
+        &app,
+        "POST",
+        "/Backup/Create",
+        &owner,
+        Some(r#"{"Metadata":true,"Trickplay":false,"Subtitles":false}"#),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{manifest}");
+    let name = manifest["Path"].as_str().unwrap().to_string();
+    assert!(
+        name.starts_with("rustyfin-backup-") && name.ends_with(".db"),
+        "{name}"
+    );
+    assert!(manifest["ServerVersion"].is_string());
+    assert!(manifest["BackupEngineVersion"].is_string());
+    assert!(manifest["DateCreated"].is_string());
+    assert_eq!(manifest["Options"]["Database"], true);
+    assert_eq!(
+        manifest["Options"]["Metadata"], false,
+        "images are not backed up"
+    );
+    assert!(state.data_dir.join("backups").join(&name).is_file());
+
+    let (_, list) = send_authed(&app, "GET", "/Backup", &owner, None).await;
+    assert_eq!(list, serde_json::json!([manifest]));
+    let (_, one) = send_authed(
+        &app,
+        "GET",
+        &format!("/Backup/Manifest?path={name}"),
+        &owner,
+        None,
+    )
+    .await;
+    assert_eq!(one, manifest);
+    for path in ["../test.db", "%2Fetc%2Fpasswd", "nope.db"] {
+        let (status, _) = send_authed(
+            &app,
+            "GET",
+            &format!("/Backup/Download?path={path}"),
+            &owner,
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{path}");
+    }
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!("/Backup/Download?path={name}"))
+                .header("Authorization", format!("Bearer {owner}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert!(
+        resp.headers()["content-disposition"]
+            .to_str()
+            .unwrap()
+            .contains(&name)
+    );
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    assert!(bytes.starts_with(b"SQLite format 3\0"));
+    let (status, _) = send_authed(&app, "GET", "/Backup", &viewer, None).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+
+    // Staged, then done at the next start against a database file in the data dir
+    std::fs::write(
+        state.data_dir.join("branding.json"),
+        r#"{"LoginDisclaimer":"now"}"#,
+    )
+    .unwrap();
+    let body = serde_json::json!({ "ArchiveFileName": name }).to_string();
+    let (status, answer) = send_authed(&app, "POST", "/Backup/Restore", &owner, Some(&body)).await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{answer}");
+    let db = state.data_dir.join("restored.db");
+    std::fs::write(&db, b"the database before the restore").unwrap();
+    let restored = rustyfin_api::backup_archive::apply_pending_restore(&state.data_dir, &db)
+        .await
+        .unwrap();
+    assert_eq!(restored.as_deref(), Some(name.as_str()));
+    assert_eq!(
+        std::fs::read_to_string(state.data_dir.join("branding.json")).unwrap(),
+        r#"{"LoginDisclaimer":"then"}"#
+    );
+    let kept: Vec<_> = std::fs::read_dir(state.data_dir.join("backups"))
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_name().to_string_lossy().starts_with("pre-restore-"))
+        .collect();
+    assert_eq!(kept.len(), 1);
+    let pool = rustyfin_db::init_db(db.to_str().unwrap()).await.unwrap();
+    let users: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM users")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(users, 2);
+    let leftover: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM sqlite_master WHERE name = 'rustyfin_backup'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(leftover, 0);
+    // Nothing staged any more
+    let again = rustyfin_api::backup_archive::apply_pending_restore(&state.data_dir, &db)
+        .await
+        .unwrap();
+    assert_eq!(again, None);
+
+    let (status, _) = send_authed(&app, "DELETE", &format!("/Backup/{name}"), &owner, None).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let (_, list) = send_authed(&app, "GET", "/Backup", &owner, None).await;
+    assert_eq!(list, serde_json::json!([]));
+    let restore = serde_json::json!({ "ArchiveFileName": "../test.db" }).to_string();
+    let (status, _) = send_authed(&app, "POST", "/Backup/Restore", &owner, Some(&restore)).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+// The dashboard's Networking, API keys, Devices, Branding and Backups tabs
+// (tests/web/r3dash3_server_admin.mjs).
+#[test]
+fn r3dash3_web_server_admin() {
+    b124_node_test("r3dash3_server_admin.mjs");
+}
+
+// The library options editor (tests/web/r3dash3_library_options.mjs).
+#[test]
+fn r3dash3_web_library_options() {
+    b124_node_test("r3dash3_library_options.mjs");
 }

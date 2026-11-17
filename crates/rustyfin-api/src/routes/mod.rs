@@ -1,8 +1,10 @@
 mod activity;
 mod additional;
+mod additional_parts;
 mod auth;
 mod backup;
 mod branding;
+mod client_log;
 mod collections;
 mod configuration;
 mod devices;
@@ -36,6 +38,7 @@ mod shows;
 mod startup;
 mod streaming;
 mod subtitle;
+mod suggestions;
 mod sync_play;
 mod system;
 mod transcode;
@@ -166,6 +169,9 @@ pub fn build_router(state: AppState) -> Router {
         .merge(additional::routes())
         .merge(instant_mix::routes())
         .merge(lyrics::routes())
+        .merge(additional_parts::routes())
+        .merge(suggestions::routes())
+        .merge(client_log::routes())
         .merge(media_segments::routes())
         .merge(trickplay::routes())
         .merge(

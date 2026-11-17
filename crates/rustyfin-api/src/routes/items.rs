@@ -439,6 +439,13 @@ async fn enrich_item(
         .unwrap_or_default();
     item.local_trailer_count = Some(trailers);
     item.special_feature_count = Some(specials);
+    // A movie split into files: Jellyfin's PartCount, part 1 included.
+    let parts = rustyfin_db::repo_extras::additional_part_count(pool, item.id)
+        .await
+        .unwrap_or(0);
+    if parts > 0 {
+        item.part_count = Some(parts as i32 + 1);
+    }
 
     // Parallel queries: images, chapters, trickplay, user_data, people, studios
     // These are independent and can run concurrently instead of sequentially.
@@ -2602,13 +2609,14 @@ async fn get_items(
                 .await?;
         item_ids = Some(narrow_ids(item_ids, ids));
     }
-    // HasTrailer, HasSpecialFeature, HasThemeSong and HasThemeVideo: by the item's own extras, the way
-    // LocalTrailerCount and SpecialFeatureCount count them. True keeps only their owners; false leaves the
-    // owners out with the hidden items, so neither reads the ids of the whole library.
+    // HasTrailer, HasSpecialFeature, HasThemeSong and HasThemeVideo, as in Jellyfin 12.4: an item matches
+    // when it or an item inside it has that kind of extra (`owners_with_extras`). A special feature is any
+    // extra but a trailer, a theme or an `Unknown` one (`extras/`). True keeps the matches; false leaves
+    // them out with the hidden items, so neither reads the ids of the whole library.
     let mut without: Vec<String> = Vec::new();
     for (has, types) in [
         (query.has_trailer(), &["Trailer"][..]),
-        (query.has_special_feature(), SPECIAL_FEATURE_TYPES),
+        (query.has_special_feature(), &SPECIAL_FEATURE_TYPES[1..]),
         (query.has_theme_song(), &["ThemeSong"][..]),
         (query.has_theme_video(), &["ThemeVideo"][..]),
     ] {
@@ -2980,7 +2988,8 @@ async fn get_intros() -> Json<Value> {
     Json(empty_result())
 }
 
-/// The extra types that Jellyfin lists as special features (`BaseItem.DisplayExtraTypes`).
+/// The extra types that Jellyfin lists as special features (`BaseItem.DisplayExtraTypes`). `Unknown` comes
+/// first: the `HasSpecialFeature` filter takes the rest.
 const SPECIAL_FEATURE_TYPES: &[&str] = &[
     "Unknown",
     "BehindTheScenes",
@@ -2994,7 +3003,7 @@ const SPECIAL_FEATURE_TYPES: &[&str] = &[
 ];
 
 /// The extras of `owner` with one of `types`, as full items for `user_id`, each with its `ExtraType`.
-async fn extra_items(
+pub(crate) async fn extra_items(
     state: &AppState,
     owner: Uuid,
     user_id: Uuid,

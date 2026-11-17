@@ -1087,6 +1087,47 @@ async fn scan_flat_library(
     // it doesn't name) is a movie file like any other, and a stored extra there becomes a movie again,
     // keeping its id.
     let is_root = |folder: &Path| library.paths.iter().any(|p| Path::new(p) == folder);
+    // A movie split into files (`movie-cd1.mkv`, `movie-cd2.mkv`) is one movie at its part 1, as in
+    // Jellyfin's StackResolver; the later parts are stored as its parts (`ExtraKind::Part`).
+    let mut part_extras: Vec<extras::FoundExtra> = Vec::new();
+    let mut stack_names: HashMap<PathBuf, String> = HashMap::new();
+    if reads_extras {
+        for (folder, files) in movie_files.iter_mut() {
+            for stack in naming::video_stacks(files) {
+                let (first, rest) = stack.files.split_first().expect("a stack has parts");
+                files.retain(|file| !rest.contains(file));
+                part_extras.extend(rest.iter().map(|part| extras::FoundExtra {
+                    path: part.clone(),
+                    owner_dir: folder.clone(),
+                    kind: naming::ExtraKind::Part,
+                    owner_name: String::new(),
+                    owner_paths: vec![first.clone()],
+                    of_episode: false,
+                }));
+                stack_names.insert(first.clone(), stack.name);
+            }
+        }
+    }
+    // A stored part that is no part now (its stack broke up: part 1 renamed or deleted) is a movie
+    // again, keeping its id, so the reconcile below finds it at its path instead of adding a second
+    // movie there. A part whose file is gone becomes a movie that the removal then deletes.
+    let stale_parts: Vec<String> = if reads_extras {
+        let parts: HashSet<String> = part_extras
+            .iter()
+            .map(|part| part.path.to_string_lossy().into_owned())
+            .collect();
+        rustyfin_db::repo_extras::items_by_path(pool, library.id, &filter)
+            .await?
+            .into_iter()
+            .filter(|(path, row)| {
+                row.extra_type.as_deref() == Some(naming::ExtraKind::Part.as_str())
+                    && !parts.contains(path)
+            })
+            .map(|(path, _)| path)
+            .collect()
+    } else {
+        Vec::new()
+    };
     let folder_groups: HashMap<PathBuf, Vec<naming::VersionGroup>> = movie_files
         .iter()
         .map(|(folder, files)| {
@@ -1095,7 +1136,7 @@ async fn scan_flat_library(
         })
         .collect();
     let movie_folders: HashSet<PathBuf> = movie_files.keys().cloned().collect();
-    let mut released: Vec<String> = Vec::new();
+    let mut released: Vec<String> = stale_parts;
     let mut owned_extras: Vec<extras::FoundExtra> = Vec::new();
     let unowned_files = found_extras
         .into_iter()
@@ -1130,7 +1171,8 @@ async fn scan_flat_library(
                 .push(file);
         }
     }
-    let found_extras = owned_extras;
+    let mut found_extras = owned_extras;
+    found_extras.append(&mut part_extras);
     // A failure here stops the scan: the reconcile would otherwise add a second movie at the same path.
     rustyfin_db::repo_extras::release_extras(pool, library.id, &released, "Movie").await?;
 
@@ -1141,7 +1183,18 @@ async fn scan_flat_library(
             .paths
             .iter()
             .any(|p| Path::new(p) == folder.as_path());
-        movie_groups.extend(naming::group_movie_files(folder, files, is_library_root));
+        let mut groups = naming::group_movie_files(folder, files, is_library_root);
+        // In a library root the title comes from the file: a stacked movie's from its stack's name.
+        if is_library_root {
+            for group in &mut groups {
+                if let Some(name) = stack_names.get(&group.files[0]) {
+                    let clean = naming::clean_name(name);
+                    group.title = clean.title;
+                    group.year = clean.year.or(group.year);
+                }
+            }
+        }
+        movie_groups.extend(groups);
     }
     // The items whose file is gone are read first: a group with no owner may take one over.
     let gone =

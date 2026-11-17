@@ -54,10 +54,6 @@ pub fn admin_routes() -> Router<AppState> {
             "/System/Configuration/{key}",
             post(update_configuration_by_key),
         )
-        .route(
-            "/System/Configuration/Branding",
-            post(update_branding_config),
-        )
         .route("/System/Info/Storage", get(get_storage_info))
         .route("/System/Logs/Log", get(get_logs_log))
         .route("/System/Shutdown", post(shutdown))
@@ -1120,6 +1116,10 @@ async fn get_configuration_by_key(
         }
         return Ok(Json(serde_json::Value::Object(options)));
     }
+    if crate::named_config::handles(&key) {
+        let options = crate::named_config::load(&state.data_dir, &key, claims.is_admin).await;
+        return Ok(Json(serde_json::Value::Object(options)));
+    }
     let json = configuration_json(&state, claims.is_admin).await?;
     Ok(Json(
         json.get(&key).cloned().unwrap_or(serde_json::json!({})),
@@ -1134,6 +1134,18 @@ async fn update_configuration_by_key(
 ) -> Result<StatusCode, ApiError> {
     if key.eq_ignore_ascii_case(ENCODING_KEY) {
         save_encoding_configuration(&state, body).await?;
+        tracing::info!("configuration key updated: {}", key);
+        return Ok(StatusCode::NO_CONTENT);
+    }
+    if crate::named_config::handles(&key) {
+        use crate::named_config::SaveError;
+        crate::named_config::save(&state.data_dir, &key, body)
+            .await
+            .map_err(|e| match e {
+                SaveError::Invalid(m) => ApiError::BadRequest(m),
+                SaveError::TooLarge(m) => ApiError::PayloadTooLarge(m),
+                SaveError::Io(m) => ApiError::Internal(m),
+            })?;
         tracing::info!("configuration key updated: {}", key);
         return Ok(StatusCode::NO_CONTENT);
     }
@@ -1195,35 +1207,6 @@ fn merge_json_values(
         }
         other => other,
     }
-}
-
-/// POST /System/Configuration/Branding - Update branding configuration
-async fn update_branding_config(
-    State(state): State<AppState>,
-    Json(body): Json<serde_json::Value>,
-) -> Result<StatusCode, ApiError> {
-    // Extract branding settings and store in cache
-    if let Some(enabled) = body.get("SplashscreenEnabled").and_then(|v| v.as_bool()) {
-        state
-            .cache
-            .branding
-            .insert("splashscreen_enabled".to_string(), enabled.to_string());
-    }
-    if let Some(css) = body.get("CustomCss").and_then(|v| v.as_str()) {
-        state
-            .cache
-            .branding
-            .insert("custom_css".to_string(), css.to_string());
-    }
-    if let Some(disclaimer) = body.get("LoginDisclaimer").and_then(|v| v.as_str()) {
-        state
-            .cache
-            .branding
-            .insert("login_disclaimer".to_string(), disclaimer.to_string());
-    }
-
-    tracing::info!("branding configuration updated");
-    Ok(StatusCode::NO_CONTENT)
 }
 
 /// GET /System/Info/Storage - Get storage information

@@ -42,67 +42,12 @@ fn argon2_verify(password: &str, hash: &str) -> Result<bool, AuthError> {
         .is_ok())
 }
 
-/// Hashes a password. Argon2 is slow, so it runs on the blocking pool (M-15). A hash of the empty
-/// password is remembered (see `is_empty_password_hash`).
+/// Hashes a password. Argon2 is slow, so it runs on the blocking pool (M-15).
 pub async fn hash_password(password: &str) -> Result<String, AuthError> {
     let p = password.to_owned();
-    let hash = tokio::task::spawn_blocking(move || argon2_hash(&p))
+    tokio::task::spawn_blocking(move || argon2_hash(&p))
         .await
-        .map_err(|_| AuthError::HashError)??;
-    if password.is_empty() {
-        remember_empty_password_hash(&hash);
-    }
-    Ok(hash)
-}
-
-/// The stored hashes known to be of the empty password: filled when such a hash is made, and by
-/// `find_empty_passwords` at startup for the users stored before. Only the hashes in use matter,
-/// so the set holds no more than the users with an empty password, plus any such hash replaced
-/// since startup.
-fn empty_password_hashes() -> &'static std::sync::Mutex<std::collections::HashSet<String>> {
-    static HASHES: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
-        std::sync::OnceLock::new();
-    HASHES.get_or_init(Default::default)
-}
-
-fn remember_empty_password_hash(hash: &str) {
-    if let Ok(mut set) = empty_password_hashes().lock() {
-        set.insert(hash.to_string());
-    }
-}
-
-/// Whether `hash` is known to be of the empty password, so the user signs in without one. A
-/// lookup only, no Argon2 work, for the unauthenticated `GET /Users/Public`. Unknown counts as no:
-/// that user's tile then asks for a password, and sign-in still checks it.
-pub fn is_empty_password_hash(hash: &str) -> bool {
-    !hash.is_empty()
-        && empty_password_hashes()
-            .lock()
-            .is_ok_and(|set| set.contains(hash))
-}
-
-/// Run once at startup in the background: checks each stored hash against the empty password (one
-/// Argon2 verify per user, on the blocking pool, one at a time) and remembers the matches, so
-/// `is_empty_password_hash` knows the users stored before this start.
-pub async fn find_empty_passwords(pool: &SqlitePool) {
-    let users = match repo_user::get_all_users(pool).await {
-        Ok(users) => users,
-        Err(e) => {
-            tracing::warn!(error = %e, "could not list users to find empty passwords");
-            return;
-        }
-    };
-    for user in users {
-        if user.password_hash.is_empty() {
-            continue;
-        }
-        if verify_password("", &user.password_hash)
-            .await
-            .unwrap_or(false)
-        {
-            remember_empty_password_hash(&user.password_hash);
-        }
-    }
+        .map_err(|_| AuthError::HashError)?
 }
 
 /// Verifies a password against its hash. Runs on the blocking pool (M-15).
@@ -145,9 +90,10 @@ pub fn normalize_reset_pin(pin: &str) -> String {
     pin.trim().to_uppercase()
 }
 
-/// SHA-256 hex of the normalized PIN. Only this is stored, so a database leak exposes no live PIN.
+/// SHA-256 hex of the normalized PIN without its dashes, which Jellyfin 12.4 ignores when it
+/// compares PINs. Only this is stored, so a database leak exposes no live PIN.
 fn reset_pin_hash(pin: &str) -> String {
-    Sha256::digest(normalize_reset_pin(pin).as_bytes())
+    Sha256::digest(normalize_reset_pin(pin).replace('-', "").as_bytes())
         .iter()
         .map(|b| format!("{b:02x}"))
         .collect()
@@ -379,6 +325,29 @@ pub async fn token_device(
             (uid, device)
         },
     ))
+}
+
+/// A new API key: stored by its hash, with its last four characters as the hint. Returns its id
+/// and the key, which only this caller ever sees.
+pub async fn create_api_key(
+    pool: &SqlitePool,
+    app_name: &str,
+) -> Result<(String, String), AuthError> {
+    let key = generate_token();
+    let id = Uuid::new_v4().simple().to_string();
+    let hint = &key[key.len() - 4..];
+    rustyfin_db::repo_api_key::insert(pool, &id, &token_hash(&key), hint, app_name).await?;
+    Ok((id, key))
+}
+
+/// Whether `key` is a live API key; one that is gets its last activity recorded.
+pub async fn validate_api_key(pool: &SqlitePool, key: &str) -> Result<bool, AuthError> {
+    Ok(rustyfin_db::repo_api_key::use_key(pool, &token_hash(key)).await?)
+}
+
+/// Revokes the API key with this id, or this key. Returns whether one was revoked.
+pub async fn revoke_api_key(pool: &SqlitePool, id_or_key: &str) -> Result<bool, AuthError> {
+    Ok(rustyfin_db::repo_api_key::delete(pool, id_or_key, &token_hash(id_or_key)).await?)
 }
 
 /// Revokes a single token.

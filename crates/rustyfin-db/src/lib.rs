@@ -4,6 +4,7 @@
 pub mod busy;
 pub mod pool_watch;
 pub mod repo_activity;
+pub mod repo_api_key;
 pub mod repo_by_name;
 pub mod repo_chapter;
 pub mod repo_collection;
