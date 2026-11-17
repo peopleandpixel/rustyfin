@@ -979,7 +979,20 @@ impl TaskScheduler {
         if let Err(e) = saved {
             tracing::warn!(task = id, error = %e, "could not save the task's last result");
         }
-        // A failed task goes in the activity log, as in Jellyfin.
+        // A failed task goes in the activity log and to the notification providers, as in
+        // Jellyfin.
+        if let Some(error) = &failed {
+            let message = if error.is_empty() {
+                format!("{name} failed")
+            } else {
+                format!("{name} failed: {error}")
+            };
+            self.plugin_manager.notify(
+                crate::plugin_manager::NotificationEvent::TaskFailed,
+                &format!("{name} failed"),
+                &message,
+            );
+        }
         if let Some(error) = failed
             && let Err(e) = rustyfin_db::repo_activity::log_activity(
                 &self.db,
