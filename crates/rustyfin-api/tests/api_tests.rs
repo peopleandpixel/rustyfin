@@ -32717,11 +32717,13 @@ async fn b35_deleting_items_under_a_parent_clears_their_data() {
     b35_favourite_and_play(&app, &bob_t, bob, episodes[0]).await;
     b35_pin(&state, bob, series, season, episodes[1]).await;
 
+    // Jellyfin 12.4's DELETE /Items deletes the listed ids (here the series' one child, the
+    // season, with the episodes under it); a ParentId alone deletes nothing.
     let (status, body) = send(
         &app,
         request(
             "DELETE",
-            &format!("/Items?ParentId={series}"),
+            &format!("/Items?ids={season}"),
             Some(&owner_t),
             None,
         ),
