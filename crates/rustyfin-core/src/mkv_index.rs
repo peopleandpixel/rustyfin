@@ -16,8 +16,39 @@
 //! the frames. Nothing here reads, scans or keeps more than a fixed amount.
 
 use std::fs::File;
-use std::os::unix::fs::FileExt;
+use std::io;
 use std::path::Path;
+
+#[cfg(unix)]
+use std::os::unix::fs::FileExt;
+#[cfg(windows)]
+use std::os::windows::fs::FileExt;
+
+/// Cross-platform equivalent of `std::os::unix::fs::FileExt::read_exact_at`.
+/// On Windows this emulates the behavior using `seek_read` in a loop.
+fn read_exact_at(file: &File, buf: &mut [u8], offset: u64) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        file.read_exact_at(buf, offset)
+    }
+    #[cfg(windows)]
+    {
+        let mut remaining = buf;
+        let mut current_offset = offset;
+        while !remaining.is_empty() {
+            let n = file.seek_read(remaining, current_offset)?;
+            if n == 0 {
+                return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "failed to read exact bytes"));
+            }
+            current_offset = current_offset.checked_add(n as u64).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidInput, "offset overflow")
+            })?;
+            let tmp = remaining;
+            remaining = &mut tmp[n..];
+        }
+        Ok(())
+    }
+}
 
 /// Why a key frame couldn't be read through the index. The tile then reads it with ffprobe.
 pub(crate) const INDEX_FAILED: &str = "the Matroska index led to no key frame";
@@ -168,7 +199,7 @@ fn read(file: &File, at: u64, len: u64, most: u64) -> Option<Vec<u8>> {
         return None;
     }
     let mut buf = vec![0; usize::try_from(len).ok()?];
-    file.read_exact_at(&mut buf, at).ok()?;
+    read_exact_at(file, &mut buf, at).ok()?;
     Some(buf)
 }
 
